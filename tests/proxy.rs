@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
@@ -622,6 +622,58 @@ async fn an_upstream_that_never_sends_headers_is_retried_as_a_transient_failure(
     let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+fn imf_date(epoch_secs: u64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (epoch_secs / 86_400) as i64;
+    let secs_of_day = epoch_secs % 86_400;
+    let (hour, minute, second) = (
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60,
+    );
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    let weekday = WEEKDAYS[(((days % 7) + 7 + 4) % 7) as usize];
+    format!(
+        "{weekday}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} GMT",
+        MONTHS[(month - 1) as usize]
+    )
+}
+
+#[tokio::test]
+async fn a_429_with_an_http_date_retry_after_cools_the_key_for_that_long() {
+    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let when: &'static str = Box::leak(imf_date(now + 20).into_boxed_str());
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(429, "slow down", Some(("retry-after", when)))],
+    );
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let retry: u64 = res.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((18..=20).contains(&retry), "retry-after was {retry}");
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
 }
 
 #[tokio::test]

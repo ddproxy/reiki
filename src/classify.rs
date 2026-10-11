@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
@@ -16,8 +18,106 @@ pub enum Outcome {
     PassThrough,
 }
 
-pub fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
-    value?.trim().parse::<u64>().ok().map(Duration::from_secs)
+pub fn parse_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    match value.parse::<u64>() {
+        Ok(seconds) => Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER)),
+        Err(_) => http_date_delta(value, now),
+    }
+}
+
+fn http_date_delta(value: &str, now: SystemTime) -> Option<Duration> {
+    let then = parse_http_date(value)?;
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // A date in the past means the window has already closed, so the key is usable now.
+    let delta = then.saturating_sub(now_secs as i64).max(0) as u64;
+    Some(Duration::from_secs(delta).min(MAX_RETRY_AFTER))
+}
+
+// IMF-fixdate, the only form RFC 9110 requires: `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn parse_http_date(value: &str) -> Option<i64> {
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = tokens.as_slice() else {
+        return None;
+    };
+    if day.len() != 2 || year.len() != 4 {
+        return None;
+    }
+    let day = parse_number(day)?;
+    let month = month_number(month)?;
+    let year = parse_number(year)?;
+    let (hour, minute, second) = parse_time(time)?;
+    build_epoch(year, month, day, hour, minute, second)
+}
+
+fn parse_number(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok()
+}
+
+fn parse_time(value: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = value.split(':');
+    let hour = parse_number(parts.next()?)?;
+    let minute = parse_number(parts.next()?)?;
+    let second = parse_number(parts.next()?)?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn month_number(value: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(value))
+        .map(|i| i as i64 + 1)
+}
+
+fn build_epoch(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+// Days since 1970-01-01, Proleptic Gregorian (Howard Hinnant's days_from_civil).
+fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -29,6 +129,15 @@ fn is_edge_block_page(body: &str) -> bool {
 }
 
 pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> Outcome {
+    classify_at(status, retry_after, body_snippet, SystemTime::now())
+}
+
+pub fn classify_at(
+    status: u16,
+    retry_after: Option<&str>,
+    body_snippet: &str,
+    now: SystemTime,
+) -> Outcome {
     let body = body_snippet.to_ascii_lowercase();
     match status {
         200..=399 => Outcome::Success,
@@ -50,7 +159,10 @@ pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> O
             ) {
                 Outcome::KeyFailure(FailureClass::QuotaExhausted)
             } else {
-                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(retry_after)))
+                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
+                    retry_after,
+                    now,
+                )))
             }
         }
         403 => {
@@ -67,7 +179,10 @@ pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> O
             if contains_any(&body, &["model access is disabled", "access is disabled"]) {
                 Outcome::KeyFailure(FailureClass::AccessDisabled)
             } else if contains_any(&body, &["rate limit"]) {
-                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(retry_after)))
+                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
+                    retry_after,
+                    now,
+                )))
             } else {
                 Outcome::KeyFailure(FailureClass::Transient)
             }
@@ -88,13 +203,62 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_delta_seconds_is_used() {
+        assert_eq!(
+            parse_retry_after(Some("30"), UNIX_EPOCH),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_a_future_http_date() {
+        assert_eq!(
+            parse_retry_after(Some("Thu, 01 Jan 1970 00:10:00 GMT"), UNIX_EPOCH),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn a_past_http_date_yields_zero() {
+        assert_eq!(
+            parse_retry_after(Some("Wed, 31 Dec 1969 23:59:00 GMT"), UNIX_EPOCH),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn an_http_date_over_the_cap_is_clamped() {
+        assert_eq!(
+            parse_retry_after(Some("Fri, 02 Jan 1970 01:00:00 GMT"), UNIX_EPOCH),
+            Some(MAX_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn a_malformed_retry_after_is_none() {
+        assert_eq!(parse_retry_after(Some("not a date"), UNIX_EPOCH), None);
+    }
+
+    #[test]
+    fn a_leap_day_is_valid_and_an_impossible_day_is_not() {
+        assert_eq!(
+            parse_retry_after(Some("Thu, 29 Feb 2024 00:00:00 GMT"), UNIX_EPOCH),
+            Some(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            parse_retry_after(Some("Fri, 30 Feb 2024 00:00:00 GMT"), UNIX_EPOCH),
+            None
+        );
+    }
+
+    #[test]
     fn rate_limit_uses_retry_after_seconds() {
         assert_eq!(
             classify(429, Some("30"), "Rate limit exceeded"),
             Outcome::KeyFailure(FailureClass::RateLimited(Some(Duration::from_secs(30))))
         );
         assert_eq!(
-            classify(429, Some("Wed, 21 Oct 2026 07:28:00 GMT"), "slow down"),
+            classify(429, Some("not a date"), "slow down"),
             Outcome::KeyFailure(FailureClass::RateLimited(None))
         );
         assert_eq!(

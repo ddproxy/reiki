@@ -12,6 +12,9 @@ struct Cli {
     /// Path to the configuration file.
     #[arg(long, default_value = "/etc/reiki/reiki.toml", global = true)]
     config: PathBuf,
+    /// Address to listen on; overrides `listen` in the config.
+    #[arg(long, global = true)]
+    listen: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -27,6 +30,21 @@ enum Command {
 fn fail(message: &str) -> ! {
     eprintln!("reiki: {message}");
     std::process::exit(1);
+}
+
+fn effective_listen(flag: Option<&str>, env: Option<&str>, config: &str) -> Result<String, String> {
+    let chosen = flag.or(env).unwrap_or(config);
+    if let Err(e) = chosen.parse::<std::net::SocketAddr>() {
+        // `TcpListener::bind` also accepts `host:port`, so allow that instead
+        // of rejecting a hostname outright.
+        let host_port = chosen
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+        if !host_port {
+            return Err(format!("invalid listen address `{chosen}`: {e}"));
+        }
+    }
+    Ok(chosen.to_owned())
 }
 
 #[tokio::main]
@@ -52,10 +70,13 @@ async fn main() {
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
     let config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
+    let env_listen = std::env::var("REIKI_LISTEN").ok();
+    let listen = effective_listen(cli.listen.as_deref(), env_listen.as_deref(), &config.listen)
+        .unwrap_or_else(|e| fail(&e));
 
     if let Some(Command::Check) = cli.command {
         println!(
-            "ok: {} upstream(s), {} key(s), {} stream(s)",
+            "ok: {} upstream(s), {} key(s), {} stream(s), listening on {listen}",
             config.upstream.len(),
             keys.len(),
             config.streams.len()
@@ -63,7 +84,6 @@ async fn main() {
         return;
     }
 
-    let listen = config.listen.clone();
     let app = App::new(config, keys, Policy::default());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -76,5 +96,54 @@ async fn main() {
         .await;
     if let Err(e) = served {
         fail(&format!("server error: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_listen;
+
+    #[test]
+    fn config_address_is_used_when_the_flag_and_variable_are_absent() {
+        assert_eq!(
+            effective_listen(None, None, "127.0.0.1:4097").unwrap(),
+            "127.0.0.1:4097"
+        );
+    }
+
+    #[test]
+    fn the_variable_overrides_the_config_address() {
+        assert_eq!(
+            effective_listen(None, Some("0.0.0.0:5000"), "127.0.0.1:4097").unwrap(),
+            "0.0.0.0:5000"
+        );
+    }
+
+    #[test]
+    fn the_flag_overrides_the_variable_and_the_config_address() {
+        assert_eq!(
+            effective_listen(
+                Some("127.0.0.1:6000"),
+                Some("0.0.0.0:5000"),
+                "127.0.0.1:4097"
+            )
+            .unwrap(),
+            "127.0.0.1:6000"
+        );
+    }
+
+    #[test]
+    fn a_hostname_is_accepted() {
+        assert_eq!(
+            effective_listen(Some("localhost:4097"), None, "127.0.0.1:4097").unwrap(),
+            "localhost:4097"
+        );
+    }
+
+    #[test]
+    fn an_invalid_address_is_rejected() {
+        let err = effective_listen(Some("not-an-address"), None, "127.0.0.1:4097").unwrap_err();
+        assert!(err.contains("invalid listen address"), "error was: {err}");
+        assert!(effective_listen(None, Some("127.0.0.1:99999"), "").is_err());
     }
 }

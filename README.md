@@ -11,7 +11,7 @@ install -m 0755 target/release/reiki /usr/local/bin/
 
 ## Configure
 
-Reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to change it).
+Reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to change it). Override the `listen` address with `--listen <addr>` or `REIKI_LISTEN`; the flag wins over the variable, and both win over the file. `reiki check` prints the address Reiki will use.
 
 ```toml
 listen = "127.0.0.1:4097"

@@ -4,6 +4,8 @@ Reiki is a reverse proxy that holds several upstream API keys and switches to th
 
 ## Install
 
+Download a prebuilt binary (Linux musl and macOS, x86_64 and aarch64) from the [releases page](https://github.com/ddproxy/reiki/releases), or build from source:
+
 ```bash
 cargo build --release
 install -m 0755 target/release/reiki /usr/local/bin/

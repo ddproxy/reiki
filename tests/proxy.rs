@@ -238,6 +238,28 @@ async fn forwards_path_query_body_and_headers_and_swaps_only_the_credential() {
 }
 
 #[tokio::test]
+async fn accepts_a_query_key_token_and_removes_it_before_forwarding() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    let res = h
+        .client
+        .post(format!(
+            "{}/zen/chat/completions?key=tok-a&alt=sse",
+            h.relay
+        ))
+        .header("user-agent", "gemini-client")
+        .body("{\"m\":1}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let calls = h.mock.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].authorization, "Bearer up-a");
+    assert_eq!(calls[0].path_and_query, "/v1/chat/completions?alt=sse");
+    assert!(!calls[0].path_and_query.contains("key"));
+}
+
+#[tokio::test]
 async fn fails_over_on_429_replaying_the_same_body_and_remembers_the_cooldown() {
     let h = harness(&one_stream(), Policy::default()).await;
     h.mock.script(

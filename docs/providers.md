@@ -7,7 +7,7 @@ Each provider is an `[upstream.<name>]` table in `reiki.toml`. A client reaches 
 - Set `base_url` to the root the provider's own SDK uses by default.
 - Set the client's base URL to `http://127.0.0.1:4097/<name>`. The SDK then appends its usual paths, and Reiki forwards them to `base_url`.
 - Set `auth_header` and `auth_format` to the way the provider expects the key. The defaults are `authorization` and `Bearer {key}`.
-- Clients send their stream token in `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`, whichever their SDK uses for the key.
+- Clients send their stream token in `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, whichever their SDK uses for the key. The headers win; the query parameter is the last resort.
 
 One stream can chain keys from several providers. A request only uses keys from the provider named in its path.
 
@@ -57,7 +57,7 @@ auth_header = "x-goog-api-key"
 auth_format = "{key}"
 ```
 
-Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`. Reiki treats that as a rejected key. Clients that send the key as a `?key=` query parameter are not supported; use the `x-goog-api-key` header.
+Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`. Reiki treats that as a rejected key. A client that sends the key as a `?key=` query parameter is accepted when no credential header is present, and Reiki removes the parameter before forwarding.
 
 Verified live with an invalid key, including a client authenticating with `x-goog-api-key`.
 

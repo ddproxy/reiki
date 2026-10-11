@@ -44,7 +44,7 @@ strategy = "sticky"                       # or "round_robin"
 
 Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
 
-Clients send the stream token as `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`. Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
+Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, in that order of preference. Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
 
 `GET /__reiki/healthz` returns 200 and `ok` when Reiki is up. It needs no token.
 

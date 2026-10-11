@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode}
 use axum::response::Response;
 use axum::Router;
 
-use crate::auth::{constant_time_eq, extract_token, sha256_hex};
+use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
 use crate::chain::{Chain, KeyState, Policy};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
@@ -230,7 +230,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return Response::new(Body::from("ok"));
     }
 
-    let Some(token) = extract_token(&parts.headers) else {
+    let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
     };
     let Some(stream) = app.authenticate(&token) else {
@@ -254,9 +254,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     };
 
     let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
-    if let Some(query) = parts.uri.query() {
+    if let Some(query) = parts.uri.query().and_then(strip_query_key) {
         url.push('?');
-        url.push_str(query);
+        url.push_str(&query);
     }
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.

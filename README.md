@@ -11,12 +11,18 @@ Reiki is a reverse proxy that holds several upstream API keys and switches to th
 
 ## Install
 
-Download a prebuilt binary (Linux musl and macOS, x86_64 and aarch64) from the [releases page](https://github.com/ddproxy/reiki/releases), or build from source:
+Download the archive for your platform from the [releases page](https://github.com/ddproxy/reiki/releases). Builds cover Linux (static musl) and macOS, on x86_64 and aarch64.
 
 ```bash
-cargo build --release
-install -m 0755 target/release/reiki /usr/local/bin/
+VERSION=v0.1.1
+TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
+curl -fsSLO https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz
+curl -fsSL https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz.sha256 | shasum -a 256 -c
+tar xzf reiki-$VERSION-$TARGET.tar.gz
+install -m 0755 reiki-$VERSION-$TARGET/reiki /usr/local/bin/
 ```
+
+To build from source instead, install Rust 1.85 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`.
 
 ## Configure
 

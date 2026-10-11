@@ -117,6 +117,10 @@ impl KeyState {
         }
     }
 
+    pub fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
+        self.health.retain(|name, _| keep(name));
+    }
+
     /// Time until the first key of the chain becomes usable again. `None` when every key
     /// is disabled, which has no recovery time.
     pub fn soonest_recovery(&self, chain: &[String], now: Instant) -> Option<Duration> {
@@ -352,5 +356,17 @@ mod tests {
     fn an_empty_chain_picks_nothing() {
         let mut chain = Chain::new(vec![], Strategy::Sticky);
         assert_eq!(chain.pick(&KeyState::default(), Instant::now()), None);
+    }
+
+    #[test]
+    fn retain_keys_keeps_known_health_and_drops_the_rest() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("keep", FailureClass::Unauthorized, &policy, now);
+        state.record_failure("gone", FailureClass::Unauthorized, &policy, now);
+        state.retain_keys(|name| name == "keep");
+        assert!(!state.is_available("keep", now));
+        assert!(state.is_available("gone", now));
     }
 }

@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use reiki::chain::Policy;
@@ -47,6 +48,23 @@ fn effective_listen(flag: Option<&str>, env: Option<&str>, config: &str) -> Resu
     Ok(chosen.to_owned())
 }
 
+#[cfg(unix)]
+fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
+    let _handle = tokio::spawn(async move {
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGHUP reload handler");
+                return;
+            }
+        };
+        while hangup.recv().await.is_some() {
+            app.reload_from_file(&config);
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -85,6 +103,8 @@ async fn main() {
     }
 
     let app = App::new(config, keys, Policy::default());
+    #[cfg(unix)]
+    spawn_sighup_reload(Arc::clone(&app), cli.config.clone());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot bind {listen}: {e}")));

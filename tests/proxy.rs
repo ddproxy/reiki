@@ -144,12 +144,41 @@ async fn serve(router: Router) -> String {
 
 struct Harness {
     mock: Arc<Mock>,
+    mock_url: String,
     relay: String,
     client: reqwest::Client,
+    app: Arc<App>,
 }
 
 fn sha(token: &str) -> String {
     reiki::auth::sha256_hex(token)
+}
+
+fn config_for(
+    mock_url: &str,
+    keys: &[(&str, &str)],
+    streams: &[(&str, &str, &[&str])],
+) -> (Config, HashMap<String, Secret>) {
+    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n");
+    let mut map = HashMap::new();
+    for (name, secret) in keys {
+        text.push_str(&format!(
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+        ));
+        map.insert((*name).to_owned(), Secret::new(*secret));
+    }
+    for (name, token, chain) in streams {
+        let chain = chain
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            sha(token)
+        ));
+    }
+    (Config::parse(&text).unwrap(), map)
 }
 
 async fn harness(streams: &[(&str, &str, &[&str])], policy: Policy) -> Harness {
@@ -169,37 +198,16 @@ async fn harness_with_timeout(
     )
     .await;
 
-    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n");
-    let mut keys = HashMap::new();
-    for k in ["a", "b", "c", "d"] {
-        text.push_str(&format!(
-            "[keys.{k}]\nupstream = \"zen\"\nfile = \"/unused/{k}\"\n"
-        ));
-        keys.insert(k.to_owned(), Secret::new(format!("up-{k}")));
-    }
-    for (name, token, chain) in streams {
-        let chain = chain
-            .iter()
-            .map(|k| format!("\"{k}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        text.push_str(&format!(
-            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
-            sha(token)
-        ));
-    }
-    let config = Config::parse(&text).unwrap();
-    let relay = serve(router(App::with_header_timeout(
-        config,
-        keys,
-        policy,
-        header_timeout,
-    )))
-    .await;
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let (config, keys) = config_for(&mock_url, &keys, streams);
+    let app = App::with_header_timeout(config, keys, policy, header_timeout);
+    let relay = serve(router(Arc::clone(&app))).await;
     Harness {
         mock,
+        mock_url,
         relay,
         client: reqwest::Client::new(),
+        app,
     }
 }
 
@@ -211,6 +219,11 @@ impl Harness {
             .header("user-agent", "opencode/1.18.35")
             .header("x-opencode-session", "ses_123")
             .body(body.to_owned())
+    }
+
+    fn reload(&self, keys: &[(&str, &str)], streams: &[(&str, &str, &[&str])]) {
+        let (config, keys) = config_for(&self.mock_url, keys, streams);
+        self.app.reload(config, keys);
     }
 }
 
@@ -609,4 +622,127 @@ async fn an_upstream_that_never_sends_headers_is_retried_as_a_transient_failure(
     let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+#[tokio::test]
+async fn reload_adds_a_stream_and_a_key() {
+    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    h.reload(
+        &[("a", "up-a"), ("e", "up-e")],
+        &[("ct", "tok-a", &["a"]), ("new", "tok-new", &["e"])],
+    );
+    let res = h.post("tok-new", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-e"]);
+}
+
+#[tokio::test]
+async fn reload_with_an_invalid_config_keeps_the_old_snapshot_serving() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    let path = std::env::temp_dir().join(format!("reiki-bad-{}.toml", std::process::id()));
+    std::fs::write(&path, "listen = 5\nthis is not toml").unwrap();
+    h.app.reload_from_file(&path);
+    let _ = std::fs::remove_file(&path);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn reload_keeps_health_for_an_unchanged_key() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+
+    h.reload(
+        &[("a", "up-a"), ("b", "up-b")],
+        &[("ct", "tok-a", &["a", "b"])],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
+}
+
+#[tokio::test]
+async fn reload_resets_health_when_a_key_secret_changes() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+
+    h.reload(
+        &[("a", "up-a-rotated"), ("b", "up-b")],
+        &[("ct", "tok-a", &["a", "b"])],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-a-rotated"]);
+}
+
+#[tokio::test]
+async fn an_in_flight_request_finishes_against_the_snapshot_it_started_with() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Slow(
+            vec!["data: one\n\n", "data: two\n\n", "data: three\n\n"],
+            Duration::from_millis(300),
+        )],
+    );
+    let mut res = h
+        .post("tok-a", "/zen/chat/completions", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let first = res.chunk().await.unwrap().unwrap();
+    assert_eq!(&first[..], b"data: one\n\n");
+
+    h.reload(&[("b", "up-b")], &[("ct", "tok-a", &["b"])]);
+
+    let mut rest = Vec::new();
+    while let Some(chunk) = res.chunk().await.unwrap() {
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        String::from_utf8(rest).unwrap(),
+        "data: two\n\ndata: three\n\n"
+    );
+
+    let res = h
+        .post("tok-a", "/zen/chat/completions", "2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
 }

@@ -66,14 +66,14 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 | 400 with an empty-balance body | Cool the key for 5 h |
 | 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
 | 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
-| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts |
+| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts or you rotate the key file and reload |
 | Other 5xx, connection error, timeout | Retry once on the same key, then cool it for 30 s after the second failure in a row |
 | 403 that is a CDN block page | Pass through unchanged |
 | Other 4xx | Pass through unchanged |
 
 A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
 
-Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Keys are read once at startup, so restart Reiki after changing a key file or the config.
+Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 
 See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, and [docs/security.md](docs/security.md) for the security model.
 

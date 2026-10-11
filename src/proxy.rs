@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -73,11 +74,70 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
     Ok(keys)
 }
 
-pub struct App {
+struct Snapshot {
     config: Config,
     keys: HashMap<String, Secret>,
-    health: Mutex<KeyState>,
     chains: HashMap<String, Mutex<Chain>>,
+}
+
+impl Snapshot {
+    fn new(config: Config, keys: HashMap<String, Secret>) -> Self {
+        let chains = config
+            .streams
+            .iter()
+            .map(|(name, stream)| {
+                (
+                    name.clone(),
+                    Mutex::new(Chain::new(stream.chain.clone(), stream.strategy.into())),
+                )
+            })
+            .collect();
+        Self {
+            config,
+            keys,
+            chains,
+        }
+    }
+
+    fn authenticate(&self, token: &str) -> Option<&str> {
+        let hash = sha256_hex(token);
+        let mut found = None;
+        // Check every stream so timing does not reveal which one matched.
+        for (name, stream) in &self.config.streams {
+            if constant_time_eq(&stream.token_sha256.to_ascii_lowercase(), &hash) {
+                found = Some(name.as_str());
+            }
+        }
+        found
+    }
+
+    fn pick(
+        &self,
+        health: &Mutex<KeyState>,
+        stream: &str,
+        upstream: &str,
+        skip: &[String],
+    ) -> Option<String> {
+        let health = health.lock().ok()?;
+        let mut chain = self.chains.get(stream)?.lock().ok()?;
+        let keys = &self.config.keys;
+        chain
+            .pick_where(&health, Instant::now(), |k| {
+                !skip.iter().any(|s| s == k) && keys.get(k).is_some_and(|c| c.upstream == upstream)
+            })
+            .map(str::to_owned)
+    }
+
+    fn soonest_recovery(&self, health: &Mutex<KeyState>, stream: &str) -> Option<Duration> {
+        let health = health.lock().ok()?;
+        let chain = self.chains.get(stream)?.lock().ok()?;
+        health.soonest_recovery(chain.keys(), Instant::now())
+    }
+}
+
+pub struct App {
+    snapshot: RwLock<Arc<Snapshot>>,
+    health: Mutex<KeyState>,
     policy: Policy,
     client: reqwest::Client,
     header_timeout: Duration,
@@ -94,59 +154,70 @@ impl App {
         policy: Policy,
         header_timeout: Duration,
     ) -> Arc<Self> {
-        let chains = config
-            .streams
-            .iter()
-            .map(|(name, stream)| {
-                (
-                    name.clone(),
-                    Mutex::new(Chain::new(stream.chain.clone(), stream.strategy.into())),
-                )
-            })
-            .collect();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(Self {
-            config,
-            keys,
+            snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
-            chains,
             policy,
             client,
             header_timeout,
         })
     }
 
-    fn authenticate(&self, token: &str) -> Option<&str> {
-        let hash = sha256_hex(token);
-        let mut found = None;
-        // Check every stream so timing does not reveal which one matched.
-        for (name, stream) in &self.config.streams {
-            if constant_time_eq(&stream.token_sha256.to_ascii_lowercase(), &hash) {
-                found = Some(name.as_str());
+    fn snapshot(&self) -> Arc<Snapshot> {
+        let guard = self
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Swap in a new config and key set. A request keeps the snapshot it started with.
+    pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
+        let next = Arc::new(Snapshot::new(config, keys));
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.config.listen != next.config.listen {
+            tracing::warn!(
+                from = %current.config.listen,
+                to = %next.config.listen,
+                "listen changed; restart reiki to change the listen address"
+            );
+        }
+        if let Ok(mut health) = self.health.lock() {
+            health.retain_keys(|name| next.keys.contains_key(name));
+            for (name, secret) in &next.keys {
+                let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
+                if !unchanged {
+                    health.enable(name);
+                }
             }
         }
-        found
+        *current = next;
     }
 
-    fn pick(&self, stream: &str, upstream: &str, skip: &[String]) -> Option<String> {
-        let health = self.health.lock().ok()?;
-        let mut chain = self.chains.get(stream)?.lock().ok()?;
-        let keys = &self.config.keys;
-        chain
-            .pick_where(&health, Instant::now(), |k| {
-                !skip.iter().any(|s| s == k) && keys.get(k).is_some_and(|c| c.upstream == upstream)
-            })
-            .map(str::to_owned)
-    }
-
-    fn soonest_recovery(&self, stream: &str) -> Option<Duration> {
-        let health = self.health.lock().ok()?;
-        let chain = self.chains.get(stream)?.lock().ok()?;
-        health.soonest_recovery(chain.keys(), Instant::now())
+    /// Re-read the config and key files, keeping the current snapshot on any error.
+    pub fn reload_from_file(&self, path: &Path) {
+        let loaded = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")))
+            .and_then(|config| {
+                let keys = load_keys(&config).map_err(|e| e.to_string())?;
+                Ok((config, keys))
+            });
+        match loaded {
+            Ok((config, keys)) => {
+                self.reload(config, keys);
+                tracing::info!("reloaded config and keys");
+            }
+            Err(e) => tracing::warn!(error = %e, "reload failed; keeping the current config"),
+        }
     }
 }
 
@@ -230,10 +301,14 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return Response::new(Body::from("ok"));
     }
 
+    // Take one snapshot for the whole request, so a reload cannot change what is
+    // already in flight.
+    let snapshot = app.snapshot();
+
     let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
     };
-    let Some(stream) = app.authenticate(&token) else {
+    let Some(stream) = snapshot.authenticate(&token) else {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
     };
     let stream = stream.to_owned();
@@ -241,7 +316,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let Some((upstream_name, rest)) = split_upstream(parts.uri.path()) else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "no upstream in path");
     };
-    let Some(upstream) = app.config.upstream.get(upstream_name) else {
+    let Some(upstream) = snapshot.config.upstream.get(upstream_name) else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "unknown upstream");
     };
 
@@ -260,19 +335,19 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     }
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
-    let max_attempts = app
+    let max_attempts = snapshot
         .chains
         .get(&stream)
-        .map_or(1, |_| app.config.streams[&stream].chain.len() + 1);
+        .map_or(1, |_| snapshot.config.streams[&stream].chain.len() + 1);
 
     let mut skip: Vec<String> = Vec::new();
     let mut last_refusal: Option<Response> = None;
 
     for _ in 0..max_attempts {
-        let Some(key_name) = app.pick(&stream, upstream_name, &skip) else {
+        let Some(key_name) = snapshot.pick(&app.health, &stream, upstream_name, &skip) else {
             break;
         };
-        let Some(secret) = app.keys.get(&key_name) else {
+        let Some(secret) = snapshot.keys.get(&key_name) else {
             break;
         };
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
@@ -351,7 +426,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     if let Some(refusal) = last_refusal {
         return refusal;
     }
-    exhausted(&app, &stream)
+    exhausted(&snapshot, &app.health, &stream)
 }
 
 fn record(
@@ -367,13 +442,13 @@ fn record(
     }
 }
 
-fn exhausted(app: &App, stream: &str) -> Response {
+fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Response {
     let mut response = json_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "reiki_exhausted",
         "every key in this stream's chain is unavailable",
     );
-    if let Some(wait) = app.soonest_recovery(stream) {
+    if let Some(wait) = snapshot.soonest_recovery(health, stream) {
         let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
         if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);

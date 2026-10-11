@@ -5,7 +5,7 @@
 - Clients never see upstream keys. Reiki removes the client's credential headers (`authorization`, `x-api-key`, `x-goog-api-key`) and any `key` query parameter, then sets the upstream's header from the key file.
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
 - Upstreams come only from the config. A request cannot choose its own destination, so Reiki is not an open proxy.
-- Keys are read from the files named in the config, once at startup. Reiki does not check file permissions, so create them with mode 0600.
+- Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions, so create them with mode 0600.
 
 ## Network
 

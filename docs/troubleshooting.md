@@ -21,7 +21,7 @@ These come from Reiki itself. Any other status is the upstream's answer, passed 
 | 413 | `too_large`: `request body too large` | The body is over 8 MB |
 | 503 | `reiki_exhausted` | Every key in the stream's chain is cooling or out of rotation |
 
-A 503 carries `Retry-After` (at least 1 second) when some key will recover. It carries none when every key is out of rotation, because those keys stay out until Reiki restarts.
+A 503 carries `Retry-After` (at least 1 second) when some key will recover. It carries none when every key is out of rotation, because those keys stay out until you replace the key file and send SIGHUP, or restart Reiki.
 
 ## Logs
 
@@ -35,7 +35,7 @@ Key values and stream tokens are never logged.
 
 ## Common problems
 
-**503 right after start.** Look for `upstream key failed` lines at `warn`. A key rejected with 401 stays out of rotation until restart; fix the key and restart Reiki.
+**503 right after start.** Look for `upstream key failed` lines at `warn`. A key rejected with 401 stays out of rotation until you replace the key file and send SIGHUP, or restart Reiki.
 
 **401 from Reiki.** Hash the token the client sends and compare it with `token_sha256`: `printf '%s' "$TOKEN" | reiki hash-token`.
 

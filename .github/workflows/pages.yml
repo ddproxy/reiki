@@ -33,11 +33,11 @@ jobs:
           cp -r docs site/docs
           {
             printf -- '---\ntitle: Reiki\n---\n\n'
-            sed '1{/^# /d}' README.md
+            sed -e '/<picture>/,/<\/picture>/c\  <img src="docs/assets/logo.png" alt="Reiki logo" width="200">' -e '/^# Reiki$/d' README.md
           } > site/index.md
           for page in site/docs/*.md; do
             title=$(sed -n '1s/^# //p' "$page")
-            { printf -- '---\ntitle: %s\n---\n\n' "$title"; sed '1{/^# /d}' "$page"; } > "$page.tmp"
+            { printf -- '---\ntitle: %s\n---\n\n' "$title"; cat "$page"; } > "$page.tmp"
             mv "$page.tmp" "$page"
           done
           cat > site/_config.yml <<CONFIG

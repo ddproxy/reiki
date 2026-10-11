@@ -44,22 +44,29 @@ strategy = "sticky"                       # or "round_robin"
 
 Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
 
-Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
+Clients send the stream token as `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`. Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
 
-`GET /__reiki/healthz` returns 200 when Reiki is up.
+`GET /__reiki/healthz` returns 200 and `ok` when Reiki is up. It needs no token.
 
 ## Failover
 
-| Response | Action |
+| Upstream response | Action |
 | --- | --- |
 | 429 | Cool the key for `Retry-After`, or 60 s |
-| Quota exhausted, 402, or 400 with an empty-balance body | Cool the key for 5 h |
-| Access disabled | Try the next key for that request only; the key stays in rotation |
-| 401, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts |
-| 5xx, timeout | Retry once, then cool the key for 30 s |
+| 402, or 429 with a quota phrase in the body (`quota`, `usage exceeded`, `insufficient`) | Cool the key for 5 h |
+| 400 with an empty-balance body | Cool the key for 5 h |
+| 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
+| 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
+| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts |
+| Other 5xx, connection error, timeout | Retry once on the same key, then cool it for 30 s after the second failure in a row |
+| 403 that is a CDN block page | Pass through unchanged |
 | Other 4xx | Pass through unchanged |
 
-A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503, with `Retry-After` when a key will recover.
+A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
+
+Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Keys are read once at startup, so restart Reiki after changing a key file or the config.
+
+See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, and [docs/security.md](docs/security.md) for the security model.
 
 ## Develop
 

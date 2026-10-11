@@ -1,0 +1,29 @@
+[package]
+name = "reiki"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Key-failover relay for LLM APIs"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

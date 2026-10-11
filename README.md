@@ -1,6 +1,6 @@
-# reiki
+# Reiki
 
-A reverse proxy that holds several upstream API keys and switches to the next one when a key hits a rate limit, runs out of quota or is disabled. Clients authenticate with their own token and never see an upstream key.
+Reiki is a reverse proxy that holds several upstream API keys and switches to the next one when a key hits a rate limit, runs out of quota or is disabled. Clients authenticate with their own token and never see an upstream key.
 
 ## Install
 
@@ -11,7 +11,7 @@ install -m 0755 target/release/reiki /usr/local/bin/
 
 ## Configure
 
-reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to change it).
+Reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to change it).
 
 ```toml
 listen = "127.0.0.1:4097"
@@ -38,28 +38,49 @@ strategy = "sticky"                       # or "round_robin"
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
 - Keys live in files, never in the config. Keep them mode 0600.
 - Generate the token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
-- Validate the setup with `reiki check`, then start the relay with `reiki`.
+- Validate the setup with `reiki check`, then start Reiki with `reiki`.
 
 ## Use
 
-Point the client at `http://127.0.0.1:4097/<upstream>/...` and send the stream token as the bearer token. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
+Point the client at `http://127.0.0.1:4097/<upstream>/...` and send the stream token as the bearer token. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through. Any HTTP API that authenticates with a header can be an upstream.
 
 For OpenCode, set the provider's `baseURL` to `http://127.0.0.1:4097/zen/v1` and its `apiKey` to the stream token.
 
-`GET /__reiki/healthz` returns 200 when the relay is up.
+`GET /__reiki/healthz` returns 200 when Reiki is up.
+
+## Other providers
+
+Each `[upstream.*]` table sets the base URL and where the key goes. Keys and streams then refer to it by name. One stream can chain keys from several upstreams, and a request only uses keys that belong to the upstream in its path.
+
+```toml
+[upstream.openai]
+base_url = "https://api.openai.com/v1"
+
+[upstream.anthropic]
+base_url = "https://api.anthropic.com/v1"
+auth_header = "x-api-key"
+auth_format = "{key}"
+
+[upstream.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+auth_header = "x-goog-api-key"
+auth_format = "{key}"
+```
+
+Checked against the live OpenAI, Anthropic and Gemini APIs with deliberately invalid keys: the credential header is swapped and a rejected key moves the request to the next key. Clients can send their stream token as `Authorization: Bearer` or `x-api-key`. Quota and rate-limit handling for those providers follows their documented error bodies and is covered by unit tests, but has not been exercised with a real exhausted key.
 
 ## Failover
 
 | Response | Action |
 | --- | --- |
 | 429 | Cool the key for `Retry-After`, or 60 s |
-| Quota exhausted, 402 | Cool the key for 5 h |
+| Quota exhausted, 402, or 400 with an empty-balance body | Cool the key for 5 h |
 | Access disabled | Try the next key for that request only; the key stays in rotation |
-| 401 | Take the key out of rotation until reiki restarts |
+| 401, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts |
 | 5xx, timeout | Retry once, then cool the key for 30 s |
 | Other 4xx | Pass through unchanged |
 
-A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, reiki returns 503, with `Retry-After` when a key will recover.
+A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503, with `Retry-After` when a key will recover.
 
 ## Develop
 

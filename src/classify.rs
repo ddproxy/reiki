@@ -34,6 +34,15 @@ pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> O
         200..=399 => Outcome::Success,
         401 => Outcome::KeyFailure(FailureClass::Unauthorized),
         402 => Outcome::KeyFailure(FailureClass::QuotaExhausted),
+        400 => {
+            if contains_any(&body, &["api key not valid", "api_key_invalid"]) {
+                Outcome::KeyFailure(FailureClass::Unauthorized)
+            } else if contains_any(&body, &["credit balance is too low"]) {
+                Outcome::KeyFailure(FailureClass::QuotaExhausted)
+            } else {
+                Outcome::PassThrough
+            }
+        }
         429 => {
             if contains_any(
                 &body,
@@ -185,6 +194,36 @@ mod tests {
         assert_eq!(
             classify(429, None, "USAGE EXCEEDED"),
             Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn a_rejected_api_key_reported_as_a_400_is_unauthorized() {
+        let body = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#;
+        assert_eq!(
+            classify(400, None, body),
+            Outcome::KeyFailure(FailureClass::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn an_empty_credit_balance_reported_as_a_400_is_quota_exhausted() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#;
+        assert_eq!(
+            classify(400, None, body),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn other_400_responses_pass_through() {
+        assert_eq!(
+            classify(
+                400,
+                None,
+                r#"{"error":{"message":"max_tokens is required"}}"#
+            ),
+            Outcome::PassThrough
         );
     }
 }

@@ -16,6 +16,8 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+pub const CREDENTIAL_HEADERS: [&str; 2] = ["x-api-key", "x-goog-api-key"];
+
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         let value = value.trim();
@@ -23,11 +25,13 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
             return Some(value[7..].trim().to_owned());
         }
     }
-    headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty())
+    CREDENTIAL_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 #[cfg(test)]
@@ -61,6 +65,9 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_static("tok-3"));
         assert_eq!(extract_token(&h).as_deref(), Some("tok-3"));
+        let mut h = HeaderMap::new();
+        h.insert("x-goog-api-key", HeaderValue::from_static("tok-4"));
+        assert_eq!(extract_token(&h).as_deref(), Some("tok-4"));
         assert_eq!(extract_token(&HeaderMap::new()), None);
         let mut h = HeaderMap::new();
         h.insert("authorization", HeaderValue::from_static("Basic abc"));

@@ -42,32 +42,11 @@ strategy = "sticky"                       # or "round_robin"
 
 ## Use
 
-Point the client at `http://127.0.0.1:4097/<upstream>/...` and send the stream token as the bearer token. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through. Any HTTP API that authenticates with a header can be an upstream.
+Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
 
-For OpenCode, set the provider's `baseURL` to `http://127.0.0.1:4097/zen/v1` and its `apiKey` to the stream token.
+Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
 
 `GET /__reiki/healthz` returns 200 when Reiki is up.
-
-## Other providers
-
-Each `[upstream.*]` table sets the base URL and where the key goes. Keys and streams then refer to it by name. One stream can chain keys from several upstreams, and a request only uses keys that belong to the upstream in its path.
-
-```toml
-[upstream.openai]
-base_url = "https://api.openai.com/v1"
-
-[upstream.anthropic]
-base_url = "https://api.anthropic.com/v1"
-auth_header = "x-api-key"
-auth_format = "{key}"
-
-[upstream.gemini]
-base_url = "https://generativelanguage.googleapis.com/v1beta"
-auth_header = "x-goog-api-key"
-auth_format = "{key}"
-```
-
-Checked against the live OpenAI, Anthropic and Gemini APIs with deliberately invalid keys: the credential header is swapped and a rejected key moves the request to the next key. Clients can send their stream token as `Authorization: Bearer` or `x-api-key`. Quota and rate-limit handling for those providers follows their documented error bodies and is covered by unit tests, but has not been exercised with a real exhausted key.
 
 ## Failover
 

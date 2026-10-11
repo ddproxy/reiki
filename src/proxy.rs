@@ -184,6 +184,7 @@ fn skip_header(name: &HeaderName) -> bool {
             | "content-length"
             | "authorization"
             | "x-api-key"
+            | "x-goog-api-key"
             | "accept-encoding"
     )
 }
@@ -450,6 +451,7 @@ mod tests {
             HeaderValue::from_static("Bearer caller-token"),
         );
         inbound.insert("x-api-key", HeaderValue::from_static("caller-token"));
+        inbound.insert("x-goog-api-key", HeaderValue::from_static("caller-token"));
         inbound.insert("user-agent", HeaderValue::from_static("opencode/1.0"));
         inbound.insert("x-custom", HeaderValue::from_static("keep"));
         inbound.insert("connection", HeaderValue::from_static("close"));
@@ -459,6 +461,7 @@ mod tests {
         assert_eq!(out["user-agent"], "opencode/1.0");
         assert_eq!(out["x-custom"], "keep");
         assert!(out.get("x-api-key").is_none());
+        assert!(out.get("x-goog-api-key").is_none());
         assert!(out.get("connection").is_none());
         assert!(out.get("host").is_none());
         assert!(!out

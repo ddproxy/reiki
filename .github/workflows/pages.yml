@@ -1,0 +1,69 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - docs/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The Forgejo mirror also reads this directory and has no Pages service.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        id: pages
+      - name: Assemble the site from README.md and docs/
+        run: |
+          mkdir -p site
+          cp -r docs site/docs
+          {
+            printf -- '---\ntitle: Reiki\n---\n\n'
+            sed '1{/^# /d}' README.md
+          } > site/index.md
+          for page in site/docs/*.md; do
+            title=$(sed -n '1s/^# //p' "$page")
+            { printf -- '---\ntitle: %s\n---\n\n' "$title"; sed '1{/^# /d}' "$page"; } > "$page.tmp"
+            mv "$page.tmp" "$page"
+          done
+          cat > site/_config.yml <<CONFIG
+          title: Reiki
+          description: Key-failover relay for LLM APIs
+          theme: jekyll-theme-minimal
+          baseurl: ${{ steps.pages.outputs.base_path }}
+          plugins:
+            - jekyll-relative-links
+          relative_links:
+            enabled: true
+            collections: false
+          CONFIG
+      - uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697 # v1.0.13
+        with:
+          source: ./site
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+
+  deploy:
+    needs: build
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

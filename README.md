@@ -48,9 +48,11 @@ file = "/etc/reiki/keys/zen-b"
 token_sha256 = "<sha256 of the client token>"
 chain = ["zen-a", "zen-b"]                # tried in order
 strategy = "sticky"                       # or "round_robin"
+# rate_limit_per_minute = 60              # optional; off unless set
 ```
 
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
+- `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - Keys live in files, never in the config. Keep them mode 0600.
 - Generate the token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
 - Validate the setup with `reiki check`, then start Reiki with `reiki`.

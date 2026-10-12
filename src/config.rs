@@ -14,6 +14,7 @@ pub enum ConfigError {
     BadTokenHash(String),
     DuplicateToken(String, String),
     InsecureUpstream(String),
+    InvalidRateLimit(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -38,6 +39,12 @@ impl fmt::Display for ConfigError {
             }
             Self::InsecureUpstream(name) => {
                 write!(f, "upstream `{name}` must use an https base_url")
+            }
+            Self::InvalidRateLimit(stream) => {
+                write!(
+                    f,
+                    "stream `{stream}` has a rate_limit_per_minute of 0; it must be at least 1"
+                )
             }
         }
     }
@@ -94,6 +101,8 @@ pub struct StreamConfig {
     pub chain: Vec<String>,
     #[serde(default = "default_strategy")]
     pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub rate_limit_per_minute: Option<u32>,
 }
 
 fn default_strategy() -> StrategyConfig {
@@ -153,6 +162,9 @@ impl Config {
                     });
                 }
             }
+            if stream.rate_limit_per_minute == Some(0) {
+                return Err(ConfigError::InvalidRateLimit(name.clone()));
+            }
             let hash = stream.token_sha256.as_str();
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(ConfigError::BadTokenHash(name.clone()));
@@ -204,6 +216,25 @@ file = "/etc/reiki/keys/zen-b"
         assert_eq!(config.upstream["zen"].auth_header, "authorization");
         assert_eq!(config.upstream["zen"].auth_format, "Bearer {key}");
         assert_eq!(config.streams["client-a"].strategy, StrategyConfig::Sticky);
+        assert_eq!(config.streams["client-a"].rate_limit_per_minute, None);
+    }
+
+    #[test]
+    fn parses_a_stream_rate_limit_and_rejects_zero() {
+        let limited = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\nrate_limit_per_minute = 60\n"
+        ));
+        assert_eq!(
+            Config::parse(&limited).unwrap().streams["s"].rate_limit_per_minute,
+            Some(60)
+        );
+        let zero = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"zen-a\"]\nrate_limit_per_minute = 0\n"
+        ));
+        assert_eq!(
+            Config::parse(&zero).unwrap_err(),
+            ConfigError::InvalidRateLimit("s".into())
+        );
     }
 
     #[test]

@@ -159,6 +159,15 @@ fn config_for(
     keys: &[(&str, &str)],
     streams: &[(&str, &str, &[&str])],
 ) -> (Config, HashMap<String, Secret>) {
+    config_with_limits(mock_url, keys, streams, &[])
+}
+
+fn config_with_limits(
+    mock_url: &str,
+    keys: &[(&str, &str)],
+    streams: &[(&str, &str, &[&str])],
+    limits: &[(&str, u32)],
+) -> (Config, HashMap<String, Secret>) {
     let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n");
     let mut map = HashMap::new();
     for (name, secret) in keys {
@@ -173,8 +182,13 @@ fn config_for(
             .map(|k| format!("\"{k}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        let limit = limits
+            .iter()
+            .find(|(limited, _)| limited == name)
+            .map(|(_, limit)| format!("\nrate_limit_per_minute = {limit}"))
+            .unwrap_or_default();
         text.push_str(&format!(
-            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]{limit}\n",
             sha(token)
         ));
     }
@@ -200,6 +214,43 @@ async fn harness_with_timeout(
 
     let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
     let (config, keys) = config_for(&mock_url, &keys, streams);
+    assemble(mock, mock_url, config, keys, policy, header_timeout).await
+}
+
+async fn harness_with_limits(
+    streams: &[(&str, &str, &[&str])],
+    limits: &[(&str, u32)],
+    policy: Policy,
+) -> Harness {
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let (config, keys) = config_with_limits(&mock_url, &keys, streams, limits);
+    assemble(
+        mock,
+        mock_url,
+        config,
+        keys,
+        policy,
+        Duration::from_secs(120),
+    )
+    .await
+}
+
+async fn assemble(
+    mock: Arc<Mock>,
+    mock_url: String,
+    config: Config,
+    keys: HashMap<String, Secret>,
+    policy: Policy,
+    header_timeout: Duration,
+) -> Harness {
     let app = App::with_header_timeout(config, keys, policy, header_timeout);
     let relay = serve(router(Arc::clone(&app))).await;
     Harness {
@@ -418,6 +469,40 @@ async fn returns_503_with_retry_after_when_the_whole_chain_is_exhausted() {
         !body.contains("up-a") && !body.contains("up-b"),
         "error leaked a key"
     );
+}
+
+#[tokio::test]
+async fn a_limited_stream_gets_429_while_an_unlimited_one_shares_the_key_unchanged() {
+    let streams: Vec<(&str, &str, &[&str])> = vec![
+        ("limited", "tok-lim", &["a", "b"]),
+        ("free", "tok-free", &["a", "b"]),
+    ];
+    let h = harness_with_limits(&streams, &[("limited", 2)], Policy::default()).await;
+
+    for body in ["1", "2"] {
+        let res = h.post("tok-lim", "/zen/x", body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+    }
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+
+    let res = h.post("tok-lim", "/zen/x", "3").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    let retry: u64 = res.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry >= 1, "retry-after was {retry}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("rate_limited"), "body was {body}");
+    // The rejected request never reached the upstream.
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+
+    // A stream with no limit still serves the same first key, so the 429s left
+    // the shared key's health and the chain position untouched.
+    let res = h.post("tok-free", "/zen/x", "4").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a", "up-a"]);
 }
 
 #[tokio::test]

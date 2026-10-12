@@ -19,6 +19,42 @@ const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_PATH: &str = "/__reiki/healthz";
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Fixed-window request counter for one stream. A window is a minute long; the
+/// first request starts it. Counters live in the snapshot, so a reload resets them.
+struct RateLimiter {
+    limit: u32,
+    window_start: Instant,
+    used: u32,
+}
+
+impl RateLimiter {
+    fn new(limit: u32, now: Instant) -> Self {
+        Self {
+            limit,
+            window_start: now,
+            used: 0,
+        }
+    }
+
+    /// Counts one request against the window. Returns the wait until the window
+    /// resets when the request is over the limit; the counter is not advanced then.
+    fn check(&mut self, now: Instant) -> Result<(), Duration> {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= RATE_LIMIT_WINDOW {
+            self.window_start = now;
+            self.used = 0;
+        }
+        if self.used >= self.limit {
+            return Err(
+                RATE_LIMIT_WINDOW.saturating_sub(now.saturating_duration_since(self.window_start))
+            );
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
 
 pub struct Secret(String);
 
@@ -78,6 +114,7 @@ struct Snapshot {
     config: Config,
     keys: HashMap<String, Secret>,
     chains: HashMap<String, Mutex<Chain>>,
+    limiters: HashMap<String, Mutex<RateLimiter>>,
 }
 
 impl Snapshot {
@@ -92,11 +129,29 @@ impl Snapshot {
                 )
             })
             .collect();
+        let now = Instant::now();
+        let limiters = config
+            .streams
+            .iter()
+            .filter_map(|(name, stream)| {
+                stream
+                    .rate_limit_per_minute
+                    .map(|limit| (name.clone(), Mutex::new(RateLimiter::new(limit, now))))
+            })
+            .collect();
         Self {
             config,
             keys,
             chains,
+            limiters,
         }
+    }
+
+    /// Counts a request against the stream's rate limit, if it has one. Returns
+    /// the wait until the window resets when the stream is over the limit.
+    fn rate_limit_retry_after(&self, stream: &str, now: Instant) -> Option<Duration> {
+        let mut limiter = self.limiters.get(stream)?.lock().ok()?;
+        limiter.check(now).err()
     }
 
     fn authenticate(&self, token: &str) -> Option<&str> {
@@ -239,6 +294,19 @@ fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
     response
 }
 
+fn rate_limited_response(wait: Duration) -> Response {
+    let mut response = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "stream request rate limit exceeded",
+    );
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 fn skip_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -312,6 +380,13 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
     };
     let stream = stream.to_owned();
+
+    // A stream's own rate limit is checked before any key is picked, so a
+    // rejected request never reaches the upstream or touches key health.
+    if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
+        tracing::warn!(stream = %stream, "stream rate limit exceeded");
+        return rate_limited_response(wait);
+    }
 
     let Some((upstream_name, rest)) = split_upstream(parts.uri.path()) else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "no upstream in path");
@@ -511,6 +586,32 @@ mod tests {
         assert_eq!(split_upstream("/zen"), Some(("zen", "")));
         assert_eq!(split_upstream("/"), None);
         assert_eq!(split_upstream("//x"), None);
+    }
+
+    #[test]
+    fn rate_limiter_allows_the_limit_then_reports_a_reset_wait() {
+        let now = Instant::now();
+        let mut limiter = RateLimiter::new(2, now);
+        assert_eq!(limiter.check(now), Ok(()));
+        assert_eq!(limiter.check(now), Ok(()));
+        let wait = limiter.check(now).unwrap_err();
+        assert!(wait > Duration::ZERO && wait <= RATE_LIMIT_WINDOW);
+
+        // The wait shrinks as the window advances, then the window resets.
+        let later = limiter.check(now + Duration::from_secs(45)).unwrap_err();
+        assert!(later < wait, "{later:?} was not shorter than {wait:?}");
+        assert_eq!(limiter.check(now + RATE_LIMIT_WINDOW), Ok(()));
+    }
+
+    #[test]
+    fn a_rejected_request_does_not_advance_the_used_count() {
+        let now = Instant::now();
+        let mut limiter = RateLimiter::new(1, now);
+        assert_eq!(limiter.check(now), Ok(()));
+        for _ in 0..5 {
+            assert!(limiter.check(now).is_err());
+        }
+        assert_eq!(limiter.check(now + RATE_LIMIT_WINDOW), Ok(()));
     }
 
     #[test]

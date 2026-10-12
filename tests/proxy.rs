@@ -148,6 +148,7 @@ struct Harness {
     relay: String,
     client: reqwest::Client,
     app: Arc<App>,
+    admin: Option<String>,
 }
 
 fn sha(token: &str) -> String {
@@ -243,6 +244,57 @@ async fn harness_with_limits(
     .await
 }
 
+async fn harness_with_admin(
+    streams: &[(&str, &str, &[&str])],
+    admin_token: &str,
+    policy: Policy,
+) -> Harness {
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n");
+    let mut key_map = HashMap::new();
+    for (name, secret) in keys {
+        text.push_str(&format!(
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+        ));
+        key_map.insert(name.to_owned(), Secret::new(secret));
+    }
+    for (name, token, chain) in streams {
+        let chain = chain
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            sha(token)
+        ));
+    }
+    text.push_str(&format!(
+        "[admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n",
+        sha(admin_token)
+    ));
+    let config = Config::parse(&text).unwrap();
+    let app = App::with_header_timeout(config, key_map, policy, Duration::from_secs(120));
+    let relay = serve(router(Arc::clone(&app))).await;
+    let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
+    Harness {
+        mock,
+        mock_url,
+        relay,
+        client: reqwest::Client::new(),
+        app,
+        admin: Some(admin),
+    }
+}
+
 async fn assemble(
     mock: Arc<Mock>,
     mock_url: String,
@@ -259,6 +311,7 @@ async fn assemble(
         relay,
         client: reqwest::Client::new(),
         app,
+        admin: None,
     }
 }
 
@@ -882,4 +935,138 @@ async fn an_in_flight_request_finishes_against_the_snapshot_it_started_with() {
         .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+}
+
+#[tokio::test]
+async fn admin_endpoints_require_the_bearer_token() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    let admin = h.admin.as_ref().unwrap();
+    for path in ["/status", "/metrics"] {
+        let no_auth = h.client.get(format!("{admin}{path}")).send().await.unwrap();
+        assert_eq!(no_auth.status(), 401, "{path} without a token");
+        let wrong = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("not-the-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401, "{path} with a wrong token");
+        let ok = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200, "{path} with the token");
+    }
+}
+
+#[tokio::test]
+async fn admin_status_reports_key_and_stream_state_without_secrets() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "30")),
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let admin = h.admin.as_ref().unwrap();
+    let body = h
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(body.contains("\"name\":\"ct\""), "body was {body}");
+    assert!(body.contains("\"state\":\"available\""), "body was {body}");
+    assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
+    assert!(body.contains("\"retry_after_seconds\":"), "body was {body}");
+    assert!(body.contains("\"current_key\":\"b\""), "body was {body}");
+    assert!(!body.contains("up-a"), "status leaked a key value: {body}");
+    assert!(!body.contains("tok-a"), "status leaked a token: {body}");
+    assert!(
+        !body.contains(&sha("tok-a")),
+        "status leaked a token hash: {body}"
+    );
+    assert!(
+        !body.contains("/unused/"),
+        "status leaked a file path: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_metrics_increment_after_a_failover_without_leaking() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "30")),
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let admin = h.admin.as_ref().unwrap();
+    let text = h
+        .client
+        .get(format!("{admin}/metrics"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        text.contains("reiki_requests_total{stream=\"ct\",upstream=\"zen\",status=\"success\"} 1"),
+        "text was {text}"
+    );
+    assert!(
+        text.contains("reiki_failovers_total{stream=\"ct\",key=\"a\",class=\"rate_limited\"} 1"),
+        "text was {text}"
+    );
+    assert!(
+        text.contains("reiki_cooldowns_total{key=\"a\",class=\"rate_limited\"} 1"),
+        "text was {text}"
+    );
+    assert!(
+        text.contains("reiki_keys{state=\"cooling\"} 1"),
+        "text was {text}"
+    );
+    assert!(!text.contains("up-a"), "metrics leaked a key value: {text}");
+    assert!(
+        !text.contains(&sha("tok-a")),
+        "metrics leaked a token hash: {text}"
+    );
+    assert!(
+        !text.contains("/unused/"),
+        "metrics leaked a file path: {text}"
+    );
 }

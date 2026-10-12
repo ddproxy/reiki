@@ -91,10 +91,17 @@ async fn main() {
     let env_listen = std::env::var("REIKI_LISTEN").ok();
     let listen = effective_listen(cli.listen.as_deref(), env_listen.as_deref(), &config.listen)
         .unwrap_or_else(|e| fail(&e));
+    let admin_listen = config.admin.as_ref().map(|admin| admin.listen.clone());
+    if admin_listen.as_deref() == Some(listen.as_str()) {
+        fail("admin listen must differ from the client listen address");
+    }
 
     if let Some(Command::Check) = cli.command {
+        let admin = admin_listen
+            .as_ref()
+            .map_or(String::new(), |addr| format!(", admin on {addr}"));
         println!(
-            "ok: {} upstream(s), {} key(s), {} stream(s), listening on {listen}",
+            "ok: {} upstream(s), {} key(s), {} stream(s), listening on {listen}{admin}",
             config.upstream.len(),
             keys.len(),
             config.streams.len()
@@ -108,6 +115,18 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot bind {listen}: {e}")));
+    if let Some(addr) = &admin_listen {
+        let admin_listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| fail(&format!("cannot bind admin {addr}: {e}")));
+        tracing::info!(%addr, "reiki admin listening");
+        let admin_router = reiki::admin::router(Arc::clone(&app));
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, admin_router).await {
+                tracing::error!(error = %e, "admin server error");
+            }
+        });
+    }
     tracing::info!(%listen, "reiki listening");
     let served = axum::serve(listener, router(app))
         .with_graceful_shutdown(async {

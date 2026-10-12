@@ -15,6 +15,8 @@ pub enum ConfigError {
     DuplicateToken(String, String),
     InsecureUpstream(String),
     InvalidRateLimit(String),
+    BadAdminTokenHash,
+    AdminListenConflict,
 }
 
 impl fmt::Display for ConfigError {
@@ -46,6 +48,15 @@ impl fmt::Display for ConfigError {
                     "stream `{stream}` has a rate_limit_per_minute of 0; it must be at least 1"
                 )
             }
+            Self::BadAdminTokenHash => {
+                write!(
+                    f,
+                    "admin token_sha256 is not 64 hex characters (it must not be empty)"
+                )
+            }
+            Self::AdminListenConflict => {
+                write!(f, "admin listen must differ from the client listen address")
+            }
         }
     }
 }
@@ -63,6 +74,8 @@ pub struct Config {
     pub keys: BTreeMap<String, KeyConfig>,
     #[serde(default)]
     pub streams: BTreeMap<String, StreamConfig>,
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
 }
 
 fn default_listen() -> String {
@@ -107,6 +120,13 @@ pub struct StreamConfig {
 
 fn default_strategy() -> StrategyConfig {
     StrategyConfig::Sticky
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    pub listen: String,
+    pub token_sha256: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +186,7 @@ impl Config {
                 return Err(ConfigError::InvalidRateLimit(name.clone()));
             }
             let hash = stream.token_sha256.as_str();
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !is_sha256_hex(hash) {
                 return Err(ConfigError::BadTokenHash(name.clone()));
             }
             if let Some((other, _)) = seen.iter().find(|(_, h)| h.eq_ignore_ascii_case(hash)) {
@@ -177,8 +197,20 @@ impl Config {
             }
             seen.push((name.as_str(), hash));
         }
+        if let Some(admin) = &self.admin {
+            if !is_sha256_hex(&admin.token_sha256) {
+                return Err(ConfigError::BadAdminTokenHash);
+            }
+            if admin.listen == self.listen {
+                return Err(ConfigError::AdminListenConflict);
+            }
+        }
         Ok(())
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -323,5 +355,56 @@ file = "/etc/reiki/keys/zen-b"
             Strategy::from(config.streams["s"].strategy),
             Strategy::RoundRobin
         );
+    }
+
+    #[test]
+    fn admin_is_absent_by_default() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert!(Config::parse(&text).unwrap().admin.is_none());
+    }
+
+    #[test]
+    fn parses_an_admin_listener() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{HASH_B}\"\n"
+        ));
+        let admin = Config::parse(&text).unwrap().admin.unwrap();
+        assert_eq!(admin.listen, "127.0.0.1:4098");
+        assert_eq!(admin.token_sha256, HASH_B);
+    }
+
+    #[test]
+    fn rejects_a_bad_admin_token_hash() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"nope\"\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadAdminTokenHash
+        );
+    }
+
+    #[test]
+    fn rejects_an_admin_listen_equal_to_the_client_listen() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4097\"\ntoken_sha256 = \"{HASH_B}\"\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::AdminListenConflict
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_fields_in_the_admin_table() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{HASH_B}\"\ntoken = \"oops\"\n"
+        ));
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
     }
 }

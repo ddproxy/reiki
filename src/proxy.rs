@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
@@ -14,6 +15,7 @@ use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
 use crate::chain::{Chain, KeyState, Policy};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
+use crate::metrics::{FailureKind, Metrics, StatusClass};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -110,10 +112,10 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
     Ok(keys)
 }
 
-struct Snapshot {
-    config: Config,
-    keys: HashMap<String, Secret>,
-    chains: HashMap<String, Mutex<Chain>>,
+pub(crate) struct Snapshot {
+    pub(crate) config: Config,
+    pub(crate) keys: HashMap<String, Secret>,
+    pub(crate) chains: HashMap<String, Mutex<Chain>>,
     limiters: HashMap<String, Mutex<RateLimiter>>,
 }
 
@@ -196,6 +198,7 @@ pub struct App {
     policy: Policy,
     client: reqwest::Client,
     header_timeout: Duration,
+    metrics: Metrics,
 }
 
 impl App {
@@ -220,15 +223,24 @@ impl App {
             policy,
             client,
             header_timeout,
+            metrics: Metrics::new(),
         })
     }
 
-    fn snapshot(&self) -> Arc<Snapshot> {
+    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
         let guard = self
             .snapshot
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(&guard)
+    }
+
+    pub(crate) fn health(&self) -> &Mutex<KeyState> {
+        &self.health
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// Swap in a new config and key set. A request keeps the snapshot it started with.
@@ -385,6 +397,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     // rejected request never reaches the upstream or touches key health.
     if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
         tracing::warn!(stream = %stream, "stream rate limit exceeded");
+        app.metrics.record_rate_limit_rejection(&stream);
         return rate_limited_response(wait);
     }
 
@@ -403,6 +416,48 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         );
     };
 
+    let response = forward(
+        &app,
+        Forward {
+            snapshot: &snapshot,
+            stream: &stream,
+            upstream_name,
+            upstream,
+            parts: &parts,
+            rest,
+        },
+        body,
+    )
+    .await;
+    app.metrics.record_request(
+        &stream,
+        upstream_name,
+        StatusClass::from_status(response.status().as_u16()),
+    );
+    response
+}
+
+/// Everything one in-flight request needs, kept together so `forward` stays
+/// within the argument limit.
+struct Forward<'a> {
+    snapshot: &'a Snapshot,
+    stream: &'a str,
+    upstream_name: &'a str,
+    upstream: &'a crate::config::Upstream,
+    parts: &'a Parts,
+    rest: &'a str,
+}
+
+async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
+    let Forward {
+        snapshot,
+        stream,
+        upstream_name,
+        upstream,
+        parts,
+        rest,
+    } = fwd;
+
     let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
     if let Some(query) = parts.uri.query().and_then(strip_query_key) {
         url.push('?');
@@ -412,16 +467,22 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
     let max_attempts = snapshot
         .chains
-        .get(&stream)
-        .map_or(1, |_| snapshot.config.streams[&stream].chain.len() + 1);
+        .get(stream)
+        .map_or(1, |_| snapshot.config.streams[stream].chain.len() + 1);
 
     let mut skip: Vec<String> = Vec::new();
     let mut last_refusal: Option<Response> = None;
+    let mut pending_failover: Option<(String, FailureKind)> = None;
 
     for _ in 0..max_attempts {
-        let Some(key_name) = snapshot.pick(&app.health, &stream, upstream_name, &skip) else {
+        let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
             break;
         };
+        // Only count a failover once the next key is actually in hand, so a dead
+        // end does not inflate the counter.
+        if let Some((failed_key, kind)) = pending_failover.take() {
+            app.metrics.record_failover(stream, &failed_key, kind);
+        }
         let Some(secret) = snapshot.keys.get(&key_name) else {
             break;
         };
@@ -441,13 +502,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         let response = match sent {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
-                record(
-                    &app,
-                    &stream,
-                    &key_name,
-                    crate::classify::FailureClass::Transient,
-                    None,
-                );
+                record(app, stream, &key_name, FailureClass::Transient, None);
+                pending_failover = Some((key_name, FailureKind::Transient));
                 continue;
             }
         };
@@ -488,12 +544,14 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
                 // next key; if none helps, hand the upstream's own answer back to the caller.
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream refused this request");
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, trying the next key");
-                skip.push(key_name);
+                skip.push(key_name.clone());
+                pending_failover = Some((key_name, FailureKind::AccessDisabled));
                 last_refusal = Some(buffered_response(status, &response_headers, snippet));
             }
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
-                record(&app, &stream, &key_name, class, Some(status.as_u16()));
+                record(app, stream, &key_name, class, Some(status.as_u16()));
+                pending_failover = Some((key_name, FailureKind::from(class)));
             }
         }
     }
@@ -501,18 +559,15 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     if let Some(refusal) = last_refusal {
         return refusal;
     }
-    exhausted(&snapshot, &app.health, &stream)
+    exhausted(snapshot, &app.health, stream)
 }
 
-fn record(
-    app: &App,
-    stream: &str,
-    key: &str,
-    class: crate::classify::FailureClass,
-    status: Option<u16>,
-) {
+fn record(app: &App, stream: &str, key: &str, class: FailureClass, status: Option<u16>) {
     if let Ok(mut health) = app.health.lock() {
         let cooled = health.record_failure(key, class, &app.policy, Instant::now());
+        if cooled {
+            app.metrics.record_cooldown(key, FailureKind::from(class));
+        }
         tracing::warn!(stream, key, ?class, ?status, cooled, "upstream key failed");
     }
 }

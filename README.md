@@ -49,12 +49,17 @@ token_sha256 = "<sha256 of the client token>"
 chain = ["zen-a", "zen-b"]                # tried in order
 strategy = "sticky"                       # or "round_robin"
 # rate_limit_per_minute = 60              # optional; off unless set
+
+[admin]                                    # optional; off unless set
+listen = "127.0.0.1:4098"                  # must differ from `listen`
+token_sha256 = "<sha256 of the admin token>"
 ```
 
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
 - `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
+- `[admin]` opens a separate listener for `GET /status` (JSON) and `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - Keys live in files, never in the config. Keep them mode 0600.
-- Generate the token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
+- Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
 - Validate the setup with `reiki check`, then start Reiki with `reiki`.
 
 ## Use
@@ -85,7 +90,7 @@ A failed request replays on the next key as long as no response bytes have reach
 
 Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 
-See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, and [docs/security.md](docs/security.md) for the security model.
+See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, [docs/security.md](docs/security.md) for the security model, and [docs/monitoring.md](docs/monitoring.md) for the optional admin listener.
 
 ## Develop
 

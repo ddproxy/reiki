@@ -42,12 +42,38 @@ pub struct KeyState {
     health: HashMap<String, KeyHealth>,
 }
 
+/// Coarse view of a key's rotation state for operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// Usable right now.
+    Available,
+    /// Temporarily out; becomes usable again after the duration.
+    Cooling(Duration),
+    /// Disabled until an operator re-enables it.
+    OutOfRotation,
+}
+
 impl KeyState {
     pub fn is_available(&self, key: &str, now: Instant) -> bool {
         match self.health.get(key) {
             None => true,
             Some(h) => !h.disabled && h.cooling_until.is_none_or(|until| until <= now),
         }
+    }
+
+    pub fn status(&self, key: &str, now: Instant) -> KeyStatus {
+        match self.health.get(key) {
+            Some(h) if h.disabled => KeyStatus::OutOfRotation,
+            _ => match self.cooling_remaining(key, now) {
+                Some(remaining) => KeyStatus::Cooling(remaining),
+                None => KeyStatus::Available,
+            },
+        }
+    }
+
+    /// Count of consecutive transient failures since the last success.
+    pub fn consecutive_failures(&self, key: &str) -> u32 {
+        self.health.get(key).map_or(0, |h| h.transient_failures)
     }
 
     pub fn is_disabled(&self, key: &str) -> bool {
@@ -150,6 +176,19 @@ impl Chain {
 
     pub fn keys(&self) -> &[String] {
         &self.keys
+    }
+
+    /// The key this chain would prefer next, ignoring health. Read-only companion to `pick`.
+    pub fn current(&self) -> Option<&str> {
+        let n = self.keys.len();
+        if n == 0 {
+            return None;
+        }
+        let index = match self.strategy {
+            Strategy::Sticky => self.cursor % n,
+            Strategy::RoundRobin => (self.cursor + 1) % n,
+        };
+        self.keys.get(index).map(String::as_str)
     }
 
     pub fn pick(&mut self, state: &KeyState, now: Instant) -> Option<&str> {
@@ -368,5 +407,50 @@ mod tests {
         state.retain_keys(|name| name == "keep");
         assert!(!state.is_available("keep", now));
         assert!(state.is_available("gone", now));
+    }
+
+    #[test]
+    fn status_reports_availability_cooling_and_rotation() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        assert_eq!(state.status("fresh", now), KeyStatus::Available);
+        state.record_failure(
+            "cool",
+            FailureClass::RateLimited(Some(secs(10))),
+            &policy,
+            now,
+        );
+        assert_eq!(
+            state.status("cool", now + secs(4)),
+            KeyStatus::Cooling(secs(6))
+        );
+        assert_eq!(state.status("cool", now + secs(10)), KeyStatus::Available);
+        state.record_failure("dead", FailureClass::Unauthorized, &policy, now);
+        assert_eq!(state.status("dead", now), KeyStatus::OutOfRotation);
+    }
+
+    #[test]
+    fn consecutive_failures_tracks_transient_strikes() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::Transient, &policy, now);
+        assert_eq!(state.consecutive_failures("a"), 1);
+        state.record_failure("a", FailureClass::RateLimited(None), &policy, now);
+        assert_eq!(state.consecutive_failures("a"), 1);
+        state.record_success("a");
+        assert_eq!(state.consecutive_failures("a"), 0);
+        assert_eq!(state.consecutive_failures("unknown"), 0);
+    }
+
+    #[test]
+    fn current_reflects_the_strategy_without_mutating() {
+        let sticky = Chain::new(keys(&["a", "b"]), Strategy::Sticky);
+        assert_eq!(sticky.current(), Some("a"));
+        let round_robin = Chain::new(keys(&["a", "b"]), Strategy::RoundRobin);
+        assert_eq!(round_robin.current(), Some("b"));
+        let empty = Chain::new(Vec::new(), Strategy::Sticky);
+        assert_eq!(empty.current(), None);
     }
 }

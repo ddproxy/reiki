@@ -23,4 +23,5 @@ Key values and stream tokens are not logged. Request and response bodies are not
 
 - A stream's chain is shared state: two streams that list the same key share its cooldown, and a key rejected with 401 is out of rotation for every stream that lists it.
 - Streams are not a security boundary against each other beyond key separation. Run separate instances for mutually untrusted clients.
-- There is no per-stream rate limit.
+- A stream's `rate_limit_per_minute`, when set, caps that stream and is enforced before a key is picked.
+- The optional admin listener (`[admin]`) is a second socket guarded by its own bearer token, compared by hash in constant time. Keep it on loopback. It exposes key names, upstream names and stream routing, but never key values, token hashes or file paths.

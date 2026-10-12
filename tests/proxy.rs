@@ -17,6 +17,7 @@ struct Call {
     authorization: String,
     user_agent: String,
     custom: String,
+    content_length: String,
     body: Vec<u8>,
 }
 
@@ -80,6 +81,7 @@ async fn mock_handler(State(mock): State<Arc<Mock>>, req: Request) -> Response {
         authorization: authorization.clone(),
         user_agent: header("user-agent"),
         custom: header("x-opencode-session"),
+        content_length: header("content-length"),
         body,
     });
     let key = authorization.trim_start_matches("Bearer ").to_owned();
@@ -295,6 +297,51 @@ async fn harness_with_admin(
     }
 }
 
+async fn harness_with_upstream(
+    streams: &[(&str, &str, &[&str])],
+    upstream_extra: &str,
+    policy: Policy,
+) -> Harness {
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{upstream_extra}");
+    let mut key_map = HashMap::new();
+    for (name, secret) in keys {
+        text.push_str(&format!(
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+        ));
+        key_map.insert(name.to_owned(), Secret::new(secret));
+    }
+    for (name, token, chain) in streams {
+        let chain = chain
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            sha(token)
+        ));
+    }
+    let config = Config::parse(&text).unwrap();
+    assemble(
+        mock,
+        mock_url,
+        config,
+        key_map,
+        policy,
+        Duration::from_secs(120),
+    )
+    .await
+}
+
 async fn assemble(
     mock: Arc<Mock>,
     mock_url: String,
@@ -403,6 +450,65 @@ async fn fails_over_on_429_replaying_the_same_body_and_remembers_the_cooldown() 
         .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
+}
+
+#[tokio::test]
+async fn an_upstream_rewrites_the_model_and_drops_params_before_every_replay() {
+    let h = harness_with_upstream(
+        &one_stream(),
+        "model_aliases = { \"gpt-4o\" = \"zen-gpt-4o\" }\ndrop_params = [\"stream_options\"]\n",
+        Policy::default(),
+    )
+    .await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "30")),
+        )],
+    );
+
+    let body = r#"{"model":"gpt-4o","stream_options":{"include_usage":true},"messages":[{"role":"user","content":"caf\u00e9 世界"}]}"#;
+    let expected =
+        r#"{"model":"zen-gpt-4o","messages":[{"role":"user","content":"caf\u00e9 世界"}]}"#;
+
+    let res = h
+        .post("tok-a", "/zen/chat/completions", body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+
+    let calls = h.mock.calls();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(
+            std::str::from_utf8(&call.body).unwrap(),
+            expected,
+            "the upstream saw an unrewritten body"
+        );
+        assert_eq!(
+            call.content_length,
+            expected.len().to_string(),
+            "content-length did not match the rewritten body"
+        );
+    }
+    assert_eq!(calls[0].body, calls[1].body, "the replay body differed");
+}
+
+#[tokio::test]
+async fn an_upstream_without_model_settings_forwards_the_body_unchanged() {
+    let h = harness_with_upstream(&one_stream(), "", Policy::default()).await;
+    let body = r#"{"model":"gpt-4o","stream_options":true}"#;
+    let res = h
+        .post("tok-a", "/zen/chat/completions", body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.calls()[0].body, body.as_bytes());
 }
 
 #[tokio::test]

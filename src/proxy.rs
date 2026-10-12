@@ -16,6 +16,7 @@ use crate::chain::{Chain, KeyState, Policy};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
+use crate::rewrite::rewrite_body;
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -415,6 +416,10 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             "request body too large",
         );
     };
+
+    // Rewrite once, before the failover loop, so every key replay sends the same
+    // bytes. reqwest sets content-length from the rewritten body on each send.
+    let body = rewrite_body(body, &upstream.model_aliases, &upstream.drop_params);
 
     let response = forward(
         &app,

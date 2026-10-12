@@ -35,6 +35,8 @@ listen = "127.0.0.1:4097"
 base_url = "https://opencode.ai/zen/v1"   # must be https
 # auth_header = "authorization"           # defaults
 # auth_format = "Bearer {key}"
+# model_aliases = { "gpt-4o" = "opencode/gpt-4o" }  # rewrite the top-level `model`
+# drop_params = ["stream_options"]        # remove these top-level keys
 
 [keys.zen-a]
 upstream = "zen"
@@ -58,6 +60,7 @@ token_sha256 = "<sha256 of the admin token>"
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
 - `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
+- `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
 - Keys live in files, never in the config. Keep them mode 0600.
 - Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
 - Validate the setup with `reiki check`, then start Reiki with `reiki`.

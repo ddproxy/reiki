@@ -15,6 +15,8 @@ pub enum ConfigError {
     DuplicateToken(String, String),
     InsecureUpstream(String),
     InvalidRateLimit(String),
+    EmptyModelAlias(String),
+    EmptyDropParam(String),
     BadAdminTokenHash,
     AdminListenConflict,
 }
@@ -47,6 +49,15 @@ impl fmt::Display for ConfigError {
                     f,
                     "stream `{stream}` has a rate_limit_per_minute of 0; it must be at least 1"
                 )
+            }
+            Self::EmptyModelAlias(name) => {
+                write!(
+                    f,
+                    "upstream `{name}` has an empty model_aliases key or value"
+                )
+            }
+            Self::EmptyDropParam(name) => {
+                write!(f, "upstream `{name}` has an empty drop_params entry")
             }
             Self::BadAdminTokenHash => {
                 write!(
@@ -90,6 +101,10 @@ pub struct Upstream {
     pub auth_header: String,
     #[serde(default = "default_auth_format")]
     pub auth_format: String,
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    pub drop_params: Vec<String>,
 }
 
 fn default_auth_header() -> String {
@@ -159,6 +174,14 @@ impl Config {
                 || upstream.base_url.starts_with("http://localhost");
             if !upstream.base_url.starts_with("https://") && !local {
                 return Err(ConfigError::InsecureUpstream(name.clone()));
+            }
+            if upstream.model_aliases.keys().any(String::is_empty)
+                || upstream.model_aliases.values().any(String::is_empty)
+            {
+                return Err(ConfigError::EmptyModelAlias(name.clone()));
+            }
+            if upstream.drop_params.iter().any(String::is_empty) {
+                return Err(ConfigError::EmptyDropParam(name.clone()));
             }
         }
         for (name, key) in &self.keys {
@@ -406,5 +429,52 @@ file = "/etc/reiki/keys/zen-b"
             Config::parse(&text).unwrap_err(),
             ConfigError::Parse(_)
         ));
+    }
+
+    #[test]
+    fn parses_model_aliases_and_drop_params() {
+        let text = format!(
+            r#"
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+model_aliases = {{ "gpt-4o" = "opencode/gpt-4o" }}
+drop_params = ["stream_options", "reasoning_effort"]
+
+[keys.zen-a]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-a"
+
+[streams.s]
+token_sha256 = "{HASH_A}"
+chain = ["zen-a"]
+"#
+        );
+        let config = Config::parse(&text).unwrap();
+        let upstream = &config.upstream["zen"];
+        assert_eq!(upstream.model_aliases["gpt-4o"], "opencode/gpt-4o");
+        assert_eq!(upstream.drop_params, ["stream_options", "reasoning_effort"]);
+    }
+
+    #[test]
+    fn rejects_an_empty_model_alias() {
+        for aliases in [r#"{ "" = "x" }"#, r#"{ "gpt-4o" = "" }"#] {
+            let text = format!(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\nmodel_aliases = {aliases}\n"
+            );
+            assert_eq!(
+                Config::parse(&text).unwrap_err(),
+                ConfigError::EmptyModelAlias("zen".into())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_empty_drop_param() {
+        let text =
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\ndrop_params = [\"\"]\n";
+        assert_eq!(
+            Config::parse(text).unwrap_err(),
+            ConfigError::EmptyDropParam("zen".into())
+        );
     }
 }

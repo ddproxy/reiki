@@ -11,6 +11,22 @@ Each provider is an `[upstream.<name>]` table in `reiki.toml`. A client reaches 
 
 One stream can chain keys from several providers. A request only uses keys from the provider named in its path.
 
+## Rewriting the request body
+
+Some providers name models differently, and some reject parameters others accept. Two optional upstream settings adjust the JSON body before Reiki sends it:
+
+- `model_aliases = { "gpt-4o" = "opencode/gpt-4o" }` replaces the top-level `model` string when it matches a key.
+- `drop_params = ["stream_options"]` removes the listed top-level keys.
+
+```toml
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+model_aliases = { "gpt-4o" = "opencode/gpt-4o" }
+drop_params = ["stream_options"]
+```
+
+Reiki rewrites the body once before it picks a key, so a failover to the next key replays the same bytes. A body that is not a JSON object, a missing or non-string `model`, an unknown model, and a non-matching `drop_params` all pass through byte-for-byte unchanged. Only top-level keys are dropped; nested objects are left alone.
+
 ## OpenAI
 
 ```toml

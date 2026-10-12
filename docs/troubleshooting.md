@@ -44,6 +44,8 @@ Key values and stream tokens are never logged.
 
 **404 from the upstream.** The client base URL and `base_url` disagree. The client must use `http://127.0.0.1:4097/<name>`, and `base_url` must be the root the provider's SDK uses. See [providers](providers.md).
 
+**A key stays cooling for hours.** A quota-exhausted key cools for 5 h by default. Set `quota_resets` on the key to end its cooldown at the provider's next reset instead; see the config section of the README.
+
 **A request fails after two minutes.** Reiki waits 120 s for upstream response headers, then counts a transient failure and tries again.
 
 **429 from Reiki.** The stream hit its `rate_limit_per_minute`. Wait for `Retry-After`, or raise the limit. Reloading config resets the counter.

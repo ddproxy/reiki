@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Request, State};
@@ -201,6 +201,8 @@ pub struct App {
     header_timeout: Duration,
     metrics: Metrics,
     state_path: OnceLock<PathBuf>,
+    /// Overrides the wall clock for tests; production reads the system clock.
+    wall_clock: OnceLock<SystemTime>,
 }
 
 impl App {
@@ -227,6 +229,7 @@ impl App {
             header_timeout,
             metrics: Metrics::new(),
             state_path: OnceLock::new(),
+            wall_clock: OnceLock::new(),
         })
     }
 
@@ -249,6 +252,19 @@ impl App {
     /// Point the app at the file it persists key health in. Set once at startup.
     pub fn set_state_path(&self, path: PathBuf) {
         let _ = self.state_path.set(path);
+    }
+
+    /// Fix the wall clock, so reset schedules can be tested against a known
+    /// instant. Unset in production, where the system clock is read.
+    pub fn set_wall_clock(&self, now: SystemTime) {
+        let _ = self.wall_clock.set(now);
+    }
+
+    fn wall_now(&self) -> SystemTime {
+        self.wall_clock
+            .get()
+            .copied()
+            .unwrap_or_else(SystemTime::now)
     }
 
     /// Apply persisted key health. Missing or corrupt state is ignored.
@@ -547,7 +563,14 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         let response = match sent {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
-                record(app, stream, &key_name, FailureClass::Transient, None);
+                record(
+                    app,
+                    snapshot,
+                    stream,
+                    &key_name,
+                    FailureClass::Transient,
+                    None,
+                );
                 pending_failover = Some((key_name, FailureKind::Transient));
                 continue;
             }
@@ -603,7 +626,14 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             }
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
-                record(app, stream, &key_name, class, Some(status.as_u16()));
+                record(
+                    app,
+                    snapshot,
+                    stream,
+                    &key_name,
+                    class,
+                    Some(status.as_u16()),
+                );
                 pending_failover = Some((key_name, FailureKind::from(class)));
             }
         }
@@ -615,15 +645,38 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
     exhausted(snapshot, &app.health, stream)
 }
 
-fn record(app: &App, stream: &str, key: &str, class: FailureClass, status: Option<u16>) {
+fn record(
+    app: &App,
+    snapshot: &Snapshot,
+    stream: &str,
+    key: &str,
+    class: FailureClass,
+    status: Option<u16>,
+) {
+    let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now());
     if let Ok(mut health) = app.health.lock() {
-        let cooled = health.record_failure(key, class, &app.policy, Instant::now());
+        let cooled =
+            health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
         if cooled {
             app.metrics.record_cooldown(key, FailureKind::from(class));
         }
         tracing::warn!(stream, key, ?class, ?status, cooled, "upstream key failed");
     }
     app.persist_state();
+}
+
+/// The cooldown for a quota failure when the key names a reset schedule; `None`
+/// otherwise, so the fixed policy window applies.
+fn quota_cooldown(
+    snapshot: &Snapshot,
+    key: &str,
+    class: FailureClass,
+    now: SystemTime,
+) -> Option<Duration> {
+    if class != FailureClass::QuotaExhausted {
+        return None;
+    }
+    snapshot.config.quota_reset(key)?.next_after(now)
 }
 
 fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Response {

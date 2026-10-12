@@ -198,6 +198,43 @@ fn config_with_limits(
     (Config::parse(&text).unwrap(), map)
 }
 
+fn config_with_quota_resets(
+    mock_url: &str,
+    keys: &[(&str, &str)],
+    resets: &[(&str, &str)],
+    streams: &[(&str, &str, &[&str])],
+) -> (Config, HashMap<String, Secret>) {
+    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n");
+    let mut map = HashMap::new();
+    for (name, secret) in keys {
+        let reset = resets
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| format!("\nquota_resets = \"{value}\""))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"{reset}\n"
+        ));
+        map.insert((*name).to_owned(), Secret::new(*secret));
+    }
+    for (name, token, chain) in streams {
+        let chain = chain
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            sha(token)
+        ));
+    }
+    text.push_str(&format!(
+        "[admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n",
+        sha("admin-secret")
+    ));
+    (Config::parse(&text).unwrap(), map)
+}
+
 async fn harness(streams: &[(&str, &str, &[&str])], policy: Policy) -> Harness {
     harness_with_timeout(streams, policy, Duration::from_secs(120)).await
 }
@@ -285,6 +322,35 @@ async fn harness_with_admin(
     ));
     let config = Config::parse(&text).unwrap();
     let app = App::with_header_timeout(config, key_map, policy, Duration::from_secs(120));
+    let relay = serve(router(Arc::clone(&app))).await;
+    let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
+    Harness {
+        mock,
+        mock_url,
+        relay,
+        client: reqwest::Client::new(),
+        app,
+        admin: Some(admin),
+    }
+}
+
+async fn harness_with_quota_resets(
+    streams: &[(&str, &str, &[&str])],
+    resets: &[(&str, &str)],
+    now: SystemTime,
+) -> Harness {
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let (config, keys) = config_with_quota_resets(&mock_url, &keys, resets, streams);
+    let app = App::with_header_timeout(config, keys, Policy::default(), Duration::from_secs(120));
+    app.set_wall_clock(now);
     let relay = serve(router(Arc::clone(&app))).await;
     let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
     Harness {
@@ -1231,4 +1297,62 @@ async fn a_restart_keeps_a_cooling_key_cooling() {
     assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
 
     let _ = std::fs::remove_file(&state);
+}
+
+fn retry_after_seconds(body: &str, key: &str) -> u64 {
+    let marker = format!("\"name\":\"{key}\"");
+    let rest = &body[body.find(&marker).expect("key in status")..];
+    let field = "\"retry_after_seconds\":";
+    let value = &rest[rest.find(field).expect("retry_after_seconds in status") + field.len()..];
+    value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("a number")
+}
+
+#[tokio::test]
+async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
+    // 2026-01-01T23:59:57Z, so the next `daily 00:00 UTC` reset is 3 seconds out.
+    let now = UNIX_EPOCH + Duration::from_secs(1_767_311_997);
+    let h = harness_with_quota_resets(
+        &[("ct", "tok-a", &["a", "b"][..])],
+        &[("a", "daily 00:00 UTC")],
+        now,
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Status(402, "quota exhausted", None)]);
+    h.mock
+        .script("up-b", vec![Reply::Status(402, "quota exhausted", None)]);
+
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+
+    let admin = h.admin.as_ref().unwrap();
+    let body = h
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // `a` has a schedule, so it cools only until the reset; `b` has none and
+    // keeps the fixed five-hour window.
+    let a = retry_after_seconds(&body, "a");
+    assert!(
+        (1..=5).contains(&a),
+        "key a cooled for {a}s; body was {body}"
+    );
+    let b = retry_after_seconds(&body, "b");
+    assert!(
+        (17_990..=18_000).contains(&b),
+        "key b cooled for {b}s; body was {body}"
+    );
 }

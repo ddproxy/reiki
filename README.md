@@ -41,6 +41,7 @@ base_url = "https://opencode.ai/zen/v1"   # must be https
 [keys.zen-a]
 upstream = "zen"
 file = "/etc/reiki/keys/zen-a"            # file holding the key
+# quota_resets = "daily 00:00 UTC"        # end a quota cooldown at the next reset
 
 [keys.zen-b]
 upstream = "zen"
@@ -61,6 +62,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
+- `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
 - Keys live in files, never in the config. Keep them mode 0600.
 - Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
 - Validate the setup with `reiki check`, then start Reiki with `reiki`.
@@ -78,8 +80,8 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 | Upstream response | Action |
 | --- | --- |
 | 429 | Cool the key for `Retry-After`, or 60 s |
-| 402, or 429 with a quota phrase in the body (`quota`, `usage exceeded`, `insufficient`) | Cool the key for 5 h |
-| 400 with an empty-balance body | Cool the key for 5 h |
+| 402, or 429 with a quota phrase in the body (`quota`, `usage exceeded`, `insufficient`) | Cool the key for 5 h, or until the key's `quota_resets` instant |
+| 400 with an empty-balance body | Cool the key for 5 h, or until the key's `quota_resets` instant |
 | 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
 | 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
 | 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until you rotate the key file and reload |

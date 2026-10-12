@@ -4,6 +4,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::chain::Strategy;
+use crate::quota::Reset;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -15,6 +16,7 @@ pub enum ConfigError {
     DuplicateToken(String, String),
     InsecureUpstream(String),
     InvalidRateLimit(String),
+    BadQuotaResets { key: String, reason: String },
     EmptyModelAlias(String),
     EmptyDropParam(String),
     BadAdminTokenHash,
@@ -49,6 +51,9 @@ impl fmt::Display for ConfigError {
                     f,
                     "stream `{stream}` has a rate_limit_per_minute of 0; it must be at least 1"
                 )
+            }
+            Self::BadQuotaResets { key, reason } => {
+                write!(f, "key `{key}` has an invalid quota_resets: {reason}")
             }
             Self::EmptyModelAlias(name) => {
                 write!(
@@ -87,6 +92,8 @@ pub struct Config {
     pub streams: BTreeMap<String, StreamConfig>,
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    #[serde(skip)]
+    quota_resets: BTreeMap<String, Reset>,
 }
 
 fn default_listen() -> String {
@@ -120,6 +127,8 @@ fn default_auth_format() -> String {
 pub struct KeyConfig {
     pub upstream: String,
     pub file: String,
+    #[serde(default)]
+    pub quota_resets: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,9 +171,31 @@ impl From<StrategyConfig> for Strategy {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let mut config: Config =
+            toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.resolve_quota_resets()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The parsed reset schedule for a key, if it has one.
+    pub fn quota_reset(&self, key: &str) -> Option<Reset> {
+        self.quota_resets.get(key).copied()
+    }
+
+    fn resolve_quota_resets(&mut self) -> Result<(), ConfigError> {
+        let mut resets = BTreeMap::new();
+        for (name, key) in &self.keys {
+            if let Some(value) = &key.quota_resets {
+                let reset = Reset::parse(value).map_err(|reason| ConfigError::BadQuotaResets {
+                    key: name.clone(),
+                    reason,
+                })?;
+                resets.insert(name.clone(), reset);
+            }
+        }
+        self.quota_resets = resets;
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -476,5 +507,87 @@ chain = ["zen-a"]
             Config::parse(text).unwrap_err(),
             ConfigError::EmptyDropParam("zen".into())
         );
+    }
+
+    #[test]
+    fn parses_a_key_quota_reset_schedule() {
+        let daily = Config::parse(&base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        )))
+        .unwrap();
+        assert_eq!(daily.quota_reset("zen-a"), None, "unset stays unavailable");
+
+        for (value, expected) in [
+            (
+                "daily 00:00 UTC",
+                Reset::Daily {
+                    hour: 0,
+                    minute: 0,
+                    offset_seconds: 0,
+                },
+            ),
+            (
+                "monthly 1 03:30 +02:00",
+                Reset::Monthly {
+                    day: 1,
+                    hour: 3,
+                    minute: 30,
+                    offset_seconds: 7_200,
+                },
+            ),
+        ] {
+            let config = Config::parse(&single_key_config(value)).unwrap();
+            assert_eq!(config.quota_reset("only"), Some(expected));
+        }
+    }
+
+    fn single_key_config(value: &str) -> String {
+        format!(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.only]\nupstream = \"zen\"\nfile = \"/x\"\nquota_resets = \"{value}\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"only\"]\n"
+        )
+    }
+
+    #[test]
+    fn rejects_an_invalid_quota_reset_schedule() {
+        for value in [
+            "hourly 00:00 UTC",
+            "daily 24:00 UTC",
+            "daily 00:00 +15:00",
+            "monthly 0 00:00 UTC",
+            "monthly 29 00:00 UTC",
+        ] {
+            let err = Config::parse(&single_key_config(value)).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadQuotaResets { .. }),
+                "`{value}` should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_which_key_has_a_bad_quota_reset() {
+        let err = Config::parse(&single_key_config("nonsense")).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::BadQuotaResets {
+                key: "only".into(),
+                reason: "`nonsense` is not `daily HH:MM <zone>` or `monthly D HH:MM <zone>`".into(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "key `only` has an invalid quota_resets: `nonsense` is not `daily HH:MM <zone>` or `monthly D HH:MM <zone>`"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_beside_quota_resets_is_still_rejected() {
+        let text = single_key_config("daily 00:00 UTC") + "quota_reset = \"daily 00:00 UTC\"\n";
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
     }
 }

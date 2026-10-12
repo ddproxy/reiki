@@ -136,6 +136,20 @@ impl KeyState {
         policy: &Policy,
         now: Instant,
     ) -> bool {
+        self.record_failure_with(key, class, policy, now, None)
+    }
+
+    /// Like `record_failure`, but a quota-exhausted failure cools for
+    /// `quota_cooldown` when the caller derived one from a reset schedule; when
+    /// it is `None` the policy's fixed window applies.
+    pub fn record_failure_with(
+        &mut self,
+        key: &str,
+        class: FailureClass,
+        policy: &Policy,
+        now: Instant,
+        quota_cooldown: Option<Duration>,
+    ) -> bool {
         let h = self.health.entry(key.to_owned()).or_default();
         match class {
             FailureClass::Unauthorized => {
@@ -147,7 +161,7 @@ impl KeyState {
                 true
             }
             FailureClass::QuotaExhausted => {
-                h.cooling_until = Some(now + policy.quota_exhausted);
+                h.cooling_until = Some(now + quota_cooldown.unwrap_or(policy.quota_exhausted));
                 true
             }
             FailureClass::AccessDisabled => {
@@ -284,6 +298,53 @@ mod tests {
         assert!(!state.is_available("a", now + secs(9)));
         assert_eq!(state.cooling_remaining("a", now + secs(4)), Some(secs(6)));
         assert!(state.is_available("a", now + secs(10)));
+    }
+
+    #[test]
+    fn a_quota_reset_cooldown_overrides_the_fixed_window() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        assert!(state.record_failure_with(
+            "a",
+            FailureClass::QuotaExhausted,
+            &policy,
+            now,
+            Some(secs(5))
+        ));
+        assert_eq!(state.cooling_remaining("a", now), Some(secs(5)));
+        assert!(!state.is_available("a", now + secs(4)));
+        assert!(state.is_available("a", now + secs(5)));
+    }
+
+    #[test]
+    fn a_cleared_quota_cooldown_falls_back_to_the_policy() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure_with("a", FailureClass::QuotaExhausted, &policy, now, None);
+        assert_eq!(
+            state.cooling_remaining("a", now),
+            Some(policy.quota_exhausted)
+        );
+    }
+
+    #[test]
+    fn a_quota_cooldown_does_not_change_other_classes() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure_with(
+            "a",
+            FailureClass::AccessDisabled,
+            &policy,
+            now,
+            Some(secs(5)),
+        );
+        assert_eq!(
+            state.cooling_remaining("a", now),
+            Some(policy.access_disabled)
+        );
     }
 
     #[test]

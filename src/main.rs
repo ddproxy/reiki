@@ -61,6 +61,9 @@ fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
         };
         while hangup.recv().await.is_some() {
             app.reload_from_file(&config);
+            // Key files may have been rotated since the last load; re-apply the
+            // saved health so a restarted cooldown is not lost on reload.
+            app.load_persisted_state();
         }
     });
 }
@@ -110,6 +113,8 @@ async fn main() {
     }
 
     let app = App::new(config, keys, Policy::default());
+    app.set_state_path(reiki::state::path_for(&cli.config));
+    app.load_persisted_state();
     #[cfg(unix)]
     spawn_sighup_reload(Arc::clone(&app), cli.config.clone());
     let listener = tokio::net::TcpListener::bind(&listen)

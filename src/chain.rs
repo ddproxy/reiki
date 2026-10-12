@@ -53,6 +53,16 @@ pub enum KeyStatus {
     OutOfRotation,
 }
 
+/// A key's health without the monotonic clock, so it can cross a process
+/// boundary. The cooldown is a remaining duration that the caller re-anchors to
+/// its own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedHealth {
+    pub disabled: bool,
+    pub cooling: Option<Duration>,
+    pub transient_failures: u32,
+}
+
 impl KeyState {
     pub fn is_available(&self, key: &str, now: Instant) -> bool {
         match self.health.get(key) {
@@ -86,6 +96,36 @@ impl KeyState {
             .cooling_until
             .and_then(|until| until.checked_duration_since(now))
             .filter(|d| !d.is_zero())
+    }
+
+    /// Every known key's health, for persistence. Cooldowns are expressed as a
+    /// remaining duration rather than an instant.
+    pub fn snapshot(&self, now: Instant) -> HashMap<String, SavedHealth> {
+        self.health
+            .iter()
+            .map(|(name, h)| {
+                (
+                    name.clone(),
+                    SavedHealth {
+                        disabled: h.disabled,
+                        cooling: self.cooling_remaining(name, now),
+                        transient_failures: h.transient_failures,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Apply saved health to a key, anchoring the cooldown to `now`.
+    pub fn restore(&mut self, key: &str, saved: SavedHealth, now: Instant) {
+        self.health.insert(
+            key.to_owned(),
+            KeyHealth {
+                cooling_until: saved.cooling.map(|cooling| now + cooling),
+                disabled: saved.disabled,
+                transient_failures: saved.transient_failures,
+            },
+        );
     }
 
     /// Record a key-level failure. Returns true when the key is now out of rotation.
@@ -452,5 +492,38 @@ mod tests {
         assert_eq!(round_robin.current(), Some("b"));
         let empty = Chain::new(Vec::new(), Strategy::Sticky);
         assert_eq!(empty.current(), None);
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip_key_health() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure(
+            "cool",
+            FailureClass::RateLimited(Some(secs(40))),
+            &policy,
+            now,
+        );
+        state.record_failure("dead", FailureClass::Unauthorized, &policy, now);
+
+        let saved = state.snapshot(now);
+        let mut restored = KeyState::default();
+        for (name, health) in &saved {
+            restored.restore(name, *health, now);
+        }
+        assert_eq!(restored.cooling_remaining("cool", now), Some(secs(40)));
+        assert!(!restored.is_available("dead", now + secs(100_000)));
+    }
+
+    #[test]
+    fn restore_preserves_transient_strikes() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        state.record_failure("a", FailureClass::Transient, &Policy::default(), now);
+        let saved = state.snapshot(now);
+        let mut restored = KeyState::default();
+        restored.restore("a", saved["a"], now);
+        assert_eq!(restored.consecutive_failures("a"), 1);
     }
 }

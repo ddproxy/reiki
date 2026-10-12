@@ -24,7 +24,7 @@ These come from Reiki itself. Any other status is the upstream's answer, passed 
 
 A 429 from Reiki comes from a stream's `rate_limit_per_minute`, carries `Retry-After` in whole seconds, and is decided before any key is picked, so no key enters cooldown. The counter lives in memory and resets on reload.
 
-A 503 carries `Retry-After` (at least 1 second) when some key will recover. It carries none when every key is out of rotation, because those keys stay out until you replace the key file and send SIGHUP, or restart Reiki.
+A 503 carries `Retry-After` (at least 1 second) when some key will recover. It carries none when every key is out of rotation, because those keys stay out until you replace the key file and send SIGHUP.
 
 ## Logs
 
@@ -38,7 +38,7 @@ Key values and stream tokens are never logged.
 
 ## Common problems
 
-**503 right after start.** Look for `upstream key failed` lines at `warn`. A key rejected with 401 stays out of rotation until you replace the key file and send SIGHUP, or restart Reiki.
+**503 right after start.** Look for `upstream key failed` lines at `warn`. A key rejected with 401 stays out of rotation until you replace the key file and send SIGHUP; the disabled state is saved to `<config>.state` and restored on restart.
 
 **401 from Reiki.** Hash the token the client sends and compare it with `token_sha256`: `printf '%s' "$TOKEN" | reiki hash-token`.
 

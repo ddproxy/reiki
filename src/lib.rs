@@ -6,3 +6,4 @@ pub mod config;
 pub mod metrics;
 pub mod proxy;
 pub mod rewrite;
+pub mod state;

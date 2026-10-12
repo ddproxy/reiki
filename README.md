@@ -82,7 +82,7 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 | 400 with an empty-balance body | Cool the key for 5 h |
 | 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
 | 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
-| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until Reiki restarts or you rotate the key file and reload |
+| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until you rotate the key file and reload |
 | Other 5xx, connection error, timeout | Retry once on the same key, then cool it for 30 s after the second failure in a row |
 | 403 that is a CDN block page | Pass through unchanged |
 | Other 4xx | Pass through unchanged |
@@ -90,6 +90,8 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
 
 `Retry-After` is read as delta-seconds or as an HTTP-date (IMF-fixdate, such as `Sun, 06 Nov 1994 08:49:37 GMT`); a cooldown taken from it is capped at 24 h.
+
+Key health is saved next to the config, as `<config>.state`, and restored at startup and on reload, so cooldowns and out-of-rotation keys survive a restart. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy; a missing or unreadable state file is ignored with a warning.
 
 Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 

@@ -1176,3 +1176,59 @@ async fn admin_metrics_increment_after_a_failover_without_leaking() {
         "metrics leaked a file path: {text}"
     );
 }
+
+#[tokio::test]
+async fn a_restart_keeps_a_cooling_key_cooling() {
+    let state =
+        std::env::temp_dir().join(format!("reiki-state-restart-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.app.set_state_path(state.clone());
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "60")),
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+
+    // A fresh process over the same state file must not reuse the cooled key.
+    let h2 = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h2.app.set_state_path(state.clone());
+    h2.app.load_persisted_state();
+    assert_eq!(
+        h2.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h2.mock.keys_called(), ["up-b"]);
+
+    let admin = h2.admin.as_ref().unwrap();
+    let body = h2
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
+
+    let _ = std::fs::remove_file(&state);
+}

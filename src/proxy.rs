@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -12,7 +12,7 @@ use axum::response::Response;
 use axum::Router;
 
 use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
-use crate::chain::{Chain, KeyState, Policy};
+use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
@@ -200,6 +200,7 @@ pub struct App {
     client: reqwest::Client,
     header_timeout: Duration,
     metrics: Metrics,
+    state_path: OnceLock<PathBuf>,
 }
 
 impl App {
@@ -225,6 +226,7 @@ impl App {
             client,
             header_timeout,
             metrics: Metrics::new(),
+            state_path: OnceLock::new(),
         })
     }
 
@@ -242,6 +244,44 @@ impl App {
 
     pub(crate) fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// Point the app at the file it persists key health in. Set once at startup.
+    pub fn set_state_path(&self, path: PathBuf) {
+        let _ = self.state_path.set(path);
+    }
+
+    /// Apply persisted key health. Missing or corrupt state is ignored.
+    pub fn load_persisted_state(&self) {
+        let Some(path) = self.state_path.get() else {
+            return;
+        };
+        let config = self.snapshot();
+        let saved = crate::state::load(path, &config.config);
+        self.restore_state(saved);
+    }
+
+    fn restore_state(&self, saved: HashMap<String, SavedHealth>) {
+        if saved.is_empty() {
+            return;
+        }
+        if let Ok(mut health) = self.health.lock() {
+            let now = Instant::now();
+            for (name, saved_health) in saved {
+                health.restore(&name, saved_health, now);
+            }
+        }
+    }
+
+    fn persist_state(&self) {
+        let Some(path) = self.state_path.get() else {
+            return;
+        };
+        let snapshot = match self.health.lock() {
+            Ok(health) => health.snapshot(Instant::now()),
+            Err(_) => return,
+        };
+        crate::state::save(path, &snapshot);
     }
 
     /// Swap in a new config and key set. A request keeps the snapshot it started with.
@@ -523,8 +563,16 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             "forwarded"
         );
         if status.is_success() || status.is_redirection() {
-            if let Ok(mut health) = app.health.lock() {
+            let had_failures = if let Ok(mut health) = app.health.lock() {
+                let had = health.consecutive_failures(&key_name) > 0;
                 health.record_success(&key_name);
+                had
+            } else {
+                false
+            };
+            // Only write when this success changed what is on disk.
+            if had_failures {
+                app.persist_state();
             }
             return stream_response(response);
         }
@@ -575,6 +623,7 @@ fn record(app: &App, stream: &str, key: &str, class: FailureClass, status: Optio
         }
         tracing::warn!(stream, key, ?class, ?status, cooled, "upstream key failed");
     }
+    app.persist_state();
 }
 
 fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Response {

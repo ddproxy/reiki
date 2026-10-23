@@ -846,6 +846,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "reiki-plugin",
+ "reiki-requestlog",
  "reqwest",
  "serde",
  "serde_json",
@@ -862,6 +863,18 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
+]
+
+[[package]]
+name = "reiki-requestlog"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "reiki-plugin",
+ "serde_json",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

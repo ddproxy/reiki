@@ -246,9 +246,13 @@ fn on_error(name: &str, table: &toml::Table) -> Result<OnError, ConfigError> {
 /// });
 /// ```
 pub fn builtin() -> Vec<Registration> {
-    #[allow(unused_mut)]
-    let mut plugins = Vec::new();
-    plugins
+    vec![
+        #[cfg(feature = "plugin-requestlog")]
+        Registration {
+            name: reiki_requestlog::NAME,
+            build: reiki_requestlog::build,
+        },
+    ]
 }
 
 #[cfg(test)]

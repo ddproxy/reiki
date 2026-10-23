@@ -1,0 +1,22 @@
+[package]
+name = "reiki-requestlog"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Reiki plugin that logs requests to a file and a live stream"
+license = "MIT"
+publish = false
+
+[dependencies]
+reiki-plugin = { path = "../reiki-plugin" }
+bytes = "1"
+http = "1"
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

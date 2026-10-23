@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-plugin"]
+members = ["crates/reiki-plugin", "crates/reiki-requestlog"]
 resolver = "2"
 
 [package]
@@ -26,11 +26,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
+reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 futures-core = "0.3"
 
 [features]
-default = []
+default = ["plugin-requestlog"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
+plugin-requestlog = ["dep:reiki-requestlog"]
 
 [dev-dependencies]
 futures-util = "0.3"

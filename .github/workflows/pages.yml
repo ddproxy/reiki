@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   build:
-    # The Forgejo mirror also reads this directory and has no Pages service.
+    # Pages exists only on github.com; skip the job on other hosts.
     if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:

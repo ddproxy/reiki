@@ -1,10 +1,14 @@
 [package]
 name = "reiki"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.99"
 description = "Key-failover relay for LLM APIs"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ddproxy/reiki"
+keywords = ["proxy", "api-key", "failover", "llm"]
+categories = ["web-programming::http-server", "command-line-utilities"]
 publish = false
 
 [dependencies]

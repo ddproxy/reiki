@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The runner image (Alpine, host executor) has a C toolchain but no Rust.
+      # Self-hosted runner images may lack Rust; install it only when missing.
       - name: Install Rust
         run: |
           if ! command -v cargo >/dev/null 2>&1; then

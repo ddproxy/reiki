@@ -14,7 +14,7 @@ Reiki is a reverse proxy that holds several upstream API keys and switches to th
 Download the archive for your platform from the [releases page](https://github.com/ddproxy/reiki/releases). Builds cover Linux (static musl) and macOS, on x86_64 and aarch64.
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
 curl -fsSLO https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz
 curl -fsSL https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz.sha256 | shasum -a 256 -c
@@ -22,7 +22,7 @@ tar xzf reiki-$VERSION-$TARGET.tar.gz
 install -m 0755 reiki-$VERSION-$TARGET/reiki /usr/local/bin/
 ```
 
-To build from source instead, install Rust 1.85 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`.
+To build from source instead, install Rust 1.99 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`.
 
 ## Configure
 
@@ -93,7 +93,7 @@ A failed request replays on the next key as long as no response bytes have reach
 
 `Retry-After` is read as delta-seconds or as an HTTP-date (IMF-fixdate, such as `Sun, 06 Nov 1994 08:49:37 GMT`); a cooldown taken from it is capped at 24 h.
 
-Key health is saved next to the config, as `<config>.state`, and restored at startup and on reload, so cooldowns and out-of-rotation keys survive a restart. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy; a missing or unreadable state file is ignored with a warning.
+Key health is saved next to the config, as `<config>.state`, and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as; otherwise Reiki logs a warning and runs without persistence. A reload keeps the live health of keys whose files did not change and resets the keys whose files did, and does not read the state file again. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy; a missing or unreadable state file is ignored with a warning.
 
 Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 

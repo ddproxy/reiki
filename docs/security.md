@@ -19,6 +19,14 @@ Reiki forwards every request header except hop-by-hop headers (`connection`, `ke
 
 Key values and stream tokens are not logged. Request and response bodies are not logged, except the first 160 characters of upstream error bodies at `debug` level.
 
+## Plugins
+
+Plugins are compiled into the binary and run inside the Reiki process, so a plugin is as trusted as Reiki itself. See [plugins](plugins.md) for the hooks.
+
+- A plugin sees each request's headers, including the client token, and the whole request and response bodies. It never receives an upstream key; the key is attached after the plugin hooks have run, and an `authorization` header set by a plugin is dropped.
+- Hooks are synchronous, have no timeout and are not isolated from panics, so a faulty plugin can stall or end its own request. Only compile in plugins you have read.
+- Plugin settings are read at startup. A reload does not rebuild plugins.
+
 ## Limits
 
 - A stream's chain is shared state: two streams that list the same key share its cooldown, and a key rejected with 401 is out of rotation for every stream that lists it.

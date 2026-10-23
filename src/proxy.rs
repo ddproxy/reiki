@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,12 +12,14 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use futures_core::Stream;
 
 use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
+use crate::plugins::PluginChain;
 use crate::rewrite::rewrite_body;
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
@@ -213,11 +217,17 @@ pub struct App {
     persist_lock: Mutex<()>,
     /// Overrides the wall clock for tests; production reads the system clock.
     wall_clock: OnceLock<SystemTime>,
+    plugins: Arc<PluginChain>,
 }
 
 impl App {
-    pub fn new(config: Config, keys: HashMap<String, Secret>, policy: Policy) -> Arc<Self> {
-        Self::with_header_timeout(config, keys, policy, RESPONSE_HEADER_TIMEOUT)
+    pub fn new(
+        config: Config,
+        keys: HashMap<String, Secret>,
+        policy: Policy,
+        plugins: PluginChain,
+    ) -> Arc<Self> {
+        Self::with_plugins(config, keys, policy, RESPONSE_HEADER_TIMEOUT, plugins)
     }
 
     pub fn with_header_timeout(
@@ -225,6 +235,16 @@ impl App {
         keys: HashMap<String, Secret>,
         policy: Policy,
         header_timeout: Duration,
+    ) -> Arc<Self> {
+        Self::with_plugins(config, keys, policy, header_timeout, PluginChain::default())
+    }
+
+    pub fn with_plugins(
+        config: Config,
+        keys: HashMap<String, Secret>,
+        policy: Policy,
+        header_timeout: Duration,
+        plugins: PluginChain,
     ) -> Arc<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -241,6 +261,7 @@ impl App {
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
+            plugins: Arc::new(plugins),
         })
     }
 
@@ -312,7 +333,8 @@ impl App {
         crate::state::save(path, &snapshot);
     }
 
-    /// Swap in a new config and key set. A request keeps the snapshot it started with.
+    /// Swap in a new config and key set. A request keeps the snapshot it started
+    /// with. Plugins are built at startup and are not rebuilt here.
     pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
         let next = Arc::new(Snapshot::new(config, keys));
         let mut current = self
@@ -385,7 +407,7 @@ pub fn router(app: Arc<App>) -> Router {
 fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
     let body = format!(
         "{{\"error\":{{\"type\":\"{kind}\",\"message\":\"{}\"}}}}",
-        message.replace('"', "'")
+        json_escape(message)
     );
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
@@ -394,6 +416,23 @@ fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
         HeaderValue::from_static("application/json"),
     );
     response
+}
+
+/// Escapes text for use inside a JSON string literal.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn rate_limited_response(wait: Duration) -> Response {
@@ -466,7 +505,7 @@ fn split_upstream(path: &str) -> Option<(&str, &str)> {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     if parts.uri.path() == HEALTH_PATH && parts.method == Method::GET {
         return Response::new(Body::from("ok"));
     }
@@ -505,6 +544,21 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             "request body too large",
         );
     };
+    let mut body = body;
+
+    // Run request hooks once, before the failover loop, so every attempt sees
+    // the same transformed request.
+    let mut plugin_states = app.plugins.states();
+    if let Err(blocked) = app.plugins.on_request(
+        &mut plugin_states,
+        &stream,
+        upstream_name,
+        &parts.method,
+        &mut parts.headers,
+        &mut body,
+    ) {
+        return json_error(blocked.status, "blocked", &blocked.message);
+    }
 
     // Rewrite once, before the failover loop, so every key replay sends the same
     // bytes. reqwest sets content-length from the rewritten body on each send.
@@ -519,6 +573,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             upstream,
             parts: &parts,
             rest,
+            plugin_states,
         },
         body,
     )
@@ -540,6 +595,7 @@ struct Forward<'a> {
     upstream: &'a crate::config::Upstream,
     parts: &'a Parts,
     rest: &'a str,
+    plugin_states: Vec<Box<dyn Any + Send>>,
 }
 
 async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
@@ -550,6 +606,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         upstream,
         parts,
         rest,
+        mut plugin_states,
     } = fwd;
 
     let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
@@ -565,9 +622,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         .map_or(1, |_| snapshot.config.streams[stream].chain.len() + 1);
 
     let mut skip: Vec<String> = Vec::new();
-    let mut last_refusal: Option<Response> = None;
+    let mut last_refusal: Option<(StatusCode, HeaderMap, Bytes)> = None;
     let mut pending_failover: Option<(String, FailureKind)> = None;
-
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
             break;
@@ -630,7 +686,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             if had_failures {
                 app.persist_state();
             }
-            return stream_response(response);
+            return stream_response(app, plugin_states, response);
         }
 
         let retry_after = response
@@ -644,7 +700,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
 
         match classify(status.as_u16(), retry_after.as_deref(), &text) {
             Outcome::Success | Outcome::PassThrough => {
-                return buffered_response(status, &response_headers, snippet);
+                return finish_buffered(
+                    &app.plugins,
+                    &mut plugin_states,
+                    status,
+                    &response_headers,
+                    snippet,
+                );
             }
             Outcome::KeyFailure(FailureClass::AccessDisabled) => {
                 // "Model access is disabled" can depend on the endpoint or model of this one
@@ -655,7 +717,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, trying the next key");
                 skip.push(key_name.clone());
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
-                last_refusal = Some(buffered_response(status, &response_headers, snippet));
+                last_refusal = Some((status, response_headers, snippet));
             }
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
@@ -672,8 +734,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         }
     }
 
-    if let Some(refusal) = last_refusal {
-        return refusal;
+    if let Some((status, headers, body)) = last_refusal {
+        return finish_buffered(&app.plugins, &mut plugin_states, status, &headers, body);
     }
     exhausted(snapshot, &app.health, stream)
 }
@@ -747,18 +809,111 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
-fn stream_response(response: reqwest::Response) -> Response {
-    let status = response.status();
+fn stream_response(
+    app: &App,
+    plugin_states: Vec<Box<dyn Any + Send>>,
+    response: reqwest::Response,
+) -> Response {
+    let mut status = response.status();
     let mut headers = HeaderMap::new();
     copy_response_headers(response.headers(), &mut headers);
     // Pass the length through when the upstream gave one, so non-chunked bodies stay non-chunked.
     if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
         headers.insert(header::CONTENT_LENGTH, length.clone());
     }
-    let mut out = Response::new(Body::from_stream(response.bytes_stream()));
+    let body = if app.plugins.is_empty() {
+        Body::from_stream(response.bytes_stream())
+    } else {
+        let mut states = plugin_states;
+        // A plugin that changes the body length must drop content-length here.
+        app.plugins
+            .on_response_head(&mut states, &mut status, &mut headers);
+        Body::from_stream(PluginBody {
+            chain: Arc::clone(&app.plugins),
+            states,
+            inner: Box::pin(response.bytes_stream()),
+            done: false,
+        })
+    };
+    let mut out = Response::new(body);
     *out.status_mut() = status;
     *out.headers_mut() = headers;
     out
+}
+
+/// Runs the response hooks over a body that arrived in one piece.
+fn finish_buffered(
+    chain: &PluginChain,
+    states: &mut [Box<dyn Any + Send>],
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    if chain.is_empty() {
+        return buffered_response(status, headers, body);
+    }
+    let mut status = status;
+    let mut headers = headers.clone();
+    chain.on_response_head(states, &mut status, &mut headers);
+    let mut body = body;
+    chain.on_response_chunk(states, &mut body, true);
+    buffered_response(status, &headers, body)
+}
+
+/// Streams the upstream body through the plugin chain a chunk at a time.
+///
+/// Each chunk is released as soon as its plugins have seen it, so a placeholder
+/// split across chunks only delays the chunks it spans. The final empty poll
+/// gives plugins the `is_last` call to release anything they held back.
+struct PluginBody {
+    chain: Arc<PluginChain>,
+    states: Vec<Box<dyn Any + Send>>,
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    done: bool,
+}
+
+impl Stream for PluginBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.done = true;
+                    let mut tail = Bytes::new();
+                    this.chain
+                        .on_response_chunk(&mut this.states, &mut tail, true);
+                    return if tail.is_empty() {
+                        Poll::Ready(None)
+                    } else {
+                        Poll::Ready(Some(Ok(tail)))
+                    };
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                }
+                Poll::Ready(Some(Ok(mut chunk))) => {
+                    this.chain
+                        .on_response_chunk(&mut this.states, &mut chunk, false);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+            }
+        }
+    }
 }
 
 fn buffered_response(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Response {
@@ -771,6 +926,22 @@ fn buffered_response(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_escape_produces_text_a_json_parser_gives_back_unchanged() {
+        for text in [
+            "plain",
+            "quote \" and backslash \\ and slash /",
+            "line\nbreak\r\ttab",
+            "control \u{1} \u{1f} end",
+            "unicode é — 日本",
+            "",
+        ] {
+            let wrapped = format!("\"{}\"", json_escape(text));
+            let parsed: String = serde_json::from_str(&wrapped).unwrap();
+            assert_eq!(parsed, text, "{wrapped}");
+        }
+    }
 
     #[test]
     fn splits_the_upstream_name_off_the_path() {

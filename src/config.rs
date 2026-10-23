@@ -21,6 +21,8 @@ pub enum ConfigError {
     EmptyDropParam(String),
     BadAdminTokenHash,
     AdminListenConflict,
+    UnknownPlugin { name: String, known: Vec<String> },
+    PluginConfig { name: String, message: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -73,6 +75,23 @@ impl fmt::Display for ConfigError {
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
+            Self::UnknownPlugin { name, known } => {
+                if known.is_empty() {
+                    write!(
+                        f,
+                        "plugin `{name}` is not compiled in; no plugins are compiled in"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "plugin `{name}` is not compiled in; compiled-in plugins: {}",
+                        known.join(", ")
+                    )
+                }
+            }
+            Self::PluginConfig { name, message } => {
+                write!(f, "plugin `{name}`: {message}")
+            }
         }
     }
 }
@@ -94,6 +113,8 @@ pub struct Config {
     pub admin: Option<AdminConfig>,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
+    #[serde(default)]
+    pub plugins: BTreeMap<String, toml::Table>,
 }
 
 fn default_listen() -> String {
@@ -655,5 +676,23 @@ chain = ["zen-a"]
             Config::parse(text),
             Err(ConfigError::InsecureUpstream(_))
         ));
+    }
+
+    #[test]
+    fn plugin_tables_are_kept_for_the_plugin_to_read() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n\
+             [plugins.secrets]\nenabled = false\npath = \"/etc/reiki/secrets.toml\"\n"
+        ));
+        let config = Config::parse(&text).unwrap();
+        let table = &config.plugins["secrets"];
+        assert_eq!(
+            table.get("enabled").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            table.get("path").and_then(toml::Value::as_str),
+            Some("/etc/reiki/secrets.toml")
+        );
     }
 }

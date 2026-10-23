@@ -843,14 +843,25 @@ version = "0.1.2"
 dependencies = [
  "axum",
  "clap",
+ "futures-core",
  "futures-util",
+ "reiki-plugin",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "reiki-plugin"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
 ]
 
 [[package]]

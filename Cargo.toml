@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/reiki-plugin"]
+resolver = "2"
+
 [package]
 name = "reiki"
 version = "0.1.2"
@@ -21,9 +25,16 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+reiki-plugin = { path = "crates/reiki-plugin" }
+futures-core = "0.3"
+
+[features]
+default = []
+# Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
 
 [dev-dependencies]
 futures-util = "0.3"
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 
 [lints.rust]

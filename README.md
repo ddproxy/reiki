@@ -97,6 +97,8 @@ Key health is saved next to the config, as `<config>.state`, and restored at sta
 
 Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 
+Behaviour can be extended with compiled-in plugins; see [docs/plugins.md](docs/plugins.md).
+
 See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, [docs/security.md](docs/security.md) for the security model, and [docs/monitoring.md](docs/monitoring.md) for the optional admin listener.
 
 ## Develop

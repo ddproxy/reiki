@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -176,8 +176,12 @@ impl Snapshot {
         upstream: &str,
         skip: &[String],
     ) -> Option<String> {
-        let health = health.lock().ok()?;
-        let mut chain = self.chains.get(stream)?.lock().ok()?;
+        let health = health.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut chain = self
+            .chains
+            .get(stream)?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let keys = &self.config.keys;
         chain
             .pick_where(&health, Instant::now(), |k| {
@@ -187,8 +191,12 @@ impl Snapshot {
     }
 
     fn soonest_recovery(&self, health: &Mutex<KeyState>, stream: &str) -> Option<Duration> {
-        let health = health.lock().ok()?;
-        let chain = self.chains.get(stream)?.lock().ok()?;
+        let health = health.lock().unwrap_or_else(PoisonError::into_inner);
+        let chain = self
+            .chains
+            .get(stream)?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         health.soonest_recovery(chain.keys(), Instant::now())
     }
 }
@@ -201,6 +209,8 @@ pub struct App {
     header_timeout: Duration,
     metrics: Metrics,
     state_path: OnceLock<PathBuf>,
+    /// Held across snapshot and write, so a stale snapshot cannot land after a newer one.
+    persist_lock: Mutex<()>,
     /// Overrides the wall clock for tests; production reads the system clock.
     wall_clock: OnceLock<SystemTime>,
 }
@@ -229,15 +239,13 @@ impl App {
             header_timeout,
             metrics: Metrics::new(),
             state_path: OnceLock::new(),
+            persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
         })
     }
 
     pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
-        let guard = self
-            .snapshot
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(&guard)
     }
 
@@ -293,6 +301,10 @@ impl App {
         let Some(path) = self.state_path.get() else {
             return;
         };
+        let _guard = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let snapshot = match self.health.lock() {
             Ok(health) => health.snapshot(Instant::now()),
             Err(_) => return,
@@ -306,7 +318,7 @@ impl App {
         let mut current = self
             .snapshot
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if current.config.listen != next.config.listen {
             tracing::warn!(
                 from = %current.config.listen,
@@ -324,6 +336,13 @@ impl App {
             }
         }
         *current = next;
+    }
+
+    /// The SIGHUP action. Live health is authoritative once running, so the state
+    /// file is deliberately not replayed here: it would revive the disabled flag
+    /// of a key whose secret was just rotated.
+    pub fn reload_on_hangup(&self, path: &Path) {
+        self.reload_from_file(path);
     }
 
     /// Re-read the config and key files, keeping the current snapshot on any error.
@@ -805,5 +824,32 @@ mod tests {
         assert!(!out
             .values()
             .any(|v| v.to_str().is_ok_and(|s| s.contains("caller-token"))));
+    }
+    #[test]
+    fn a_poisoned_lock_does_not_turn_every_pick_into_a_miss() {
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n",
+            crate::auth::sha256_hex("tok")
+        );
+        let config = Config::parse(&text).unwrap();
+        let keys = HashMap::from([("a".to_owned(), Secret::new("up-a"))]);
+        let snapshot = Snapshot::new(config, keys);
+        let health = Arc::new(Mutex::new(KeyState::default()));
+
+        let poisoner = Arc::clone(&health);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the health lock");
+        })
+        .join();
+        assert!(health.is_poisoned());
+
+        assert_eq!(
+            snapshot.pick(&health, "s", "zen", &[]),
+            Some("a".to_owned())
+        );
+        assert!(snapshot.soonest_recovery(&health, "s").is_some());
     }
 }

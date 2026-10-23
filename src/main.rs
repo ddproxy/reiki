@@ -60,10 +60,7 @@ fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
             }
         };
         while hangup.recv().await.is_some() {
-            app.reload_from_file(&config);
-            // Key files may have been rotated since the last load; re-apply the
-            // saved health so a restarted cooldown is not lost on reload.
-            app.load_persisted_state();
+            app.reload_on_hangup(&config);
         }
     });
 }

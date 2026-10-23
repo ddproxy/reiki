@@ -1356,3 +1356,65 @@ async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
         "key b cooled for {b}s; body was {body}"
     );
 }
+
+#[tokio::test]
+async fn a_sighup_reload_does_not_revive_the_old_state_of_a_rotated_key() {
+    let dir = std::env::temp_dir().join(format!("reiki-hup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = dir.join("reiki.toml.state");
+
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.app.set_state_path(state.clone());
+
+    // Key files exist before the failure is persisted, so the state file is newer
+    // than they are and would normally be trusted on a replay.
+    let write_config = |a_secret: &str| {
+        std::fs::write(dir.join("a"), a_secret).unwrap();
+        std::fs::write(dir.join("b"), "up-b").unwrap();
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"{}/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
+             [keys.b]\nupstream = \"zen\"\nfile = \"{}\"\n\
+             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
+            h.mock_url,
+            dir.join("a").display(),
+            dir.join("b").display(),
+            sha("tok-a")
+        );
+        let path = dir.join("reiki.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    write_config("up-a");
+    std::thread::sleep(Duration::from_millis(30));
+
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+    assert!(state.exists(), "the 401 should have been persisted");
+
+    // Rotate the secret on disk, then reload as SIGHUP does.
+    let path = write_config("up-a-rotated");
+    h.app.reload_on_hangup(&path);
+
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-a-rotated"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -80,11 +80,18 @@ fn access_allowed(app: &App, headers: &HeaderMap) -> bool {
     let Ok(value) = value.to_str() else {
         return false;
     };
-    let Some(token) = value.strip_prefix("Bearer ") else {
+    let Some(token) = bearer_token(value) else {
         return false;
     };
     let hash = sha256_hex(token);
     constant_time_eq(&admin.token_sha256.to_ascii_lowercase(), &hash)
+}
+
+/// The credential of an `Authorization: Bearer <token>` value. The scheme name is
+/// case-insensitive.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 fn unauthorized() -> Response {
@@ -191,6 +198,17 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_but_the_token_is_exact() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Bearer Abc"), Some("Abc"));
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+    }
 
     #[test]
     fn json_string_escapes_control_characters() {

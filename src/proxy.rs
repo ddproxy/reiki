@@ -326,6 +326,20 @@ impl App {
                 "listen changed; restart reiki to change the listen address"
             );
         }
+        let admin_listen = |snapshot: &Snapshot| {
+            snapshot
+                .config
+                .admin
+                .as_ref()
+                .map(|admin| admin.listen.clone())
+        };
+        if admin_listen(&current) != admin_listen(&next) {
+            tracing::warn!(
+                from = ?admin_listen(&current),
+                to = ?admin_listen(&next),
+                "admin listener changed; restart reiki to apply it"
+            );
+        }
         if let Ok(mut health) = self.health.lock() {
             health.retain_keys(|name| next.keys.contains_key(name));
             for (name, secret) in &next.keys {

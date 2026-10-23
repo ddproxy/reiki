@@ -10,7 +10,7 @@ listen = "127.0.0.1:4098"                 # must differ from the client `listen`
 token_sha256 = "<sha256 of the admin token>"
 ```
 
-Both fields are required. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address alongside the client one.
+Both fields are required. The admin address is bound at startup, so adding, removing or moving `[admin]` needs a restart; a changed token hash is picked up on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address alongside the client one.
 
 ## Authenticate
 

@@ -5,6 +5,7 @@
 ### Added
 
 - Optional admin listener with `GET /status` (per-key state, cooldown time left, per-stream chain) and `GET /metrics` in Prometheus format.
+- The admin listen address must differ from the client one; startup and `reiki check` reject a match. The admin address is bound at startup, and a reload that changes it logs a warning.
 - Optional per-stream rate limit, `rate_limit_per_minute`.
 - Per-upstream `model_aliases` and `drop_params` body rewrites.
 - Key health persisted next to the config as `<config>.state`, so cooldowns and out-of-rotation keys survive a restart.
@@ -13,6 +14,7 @@
 
 ### Fixed
 
+- The admin listener accepts the `Bearer` scheme in any letter case, as HTTP requires.
 - A SIGHUP reload no longer replays the state file, which could revive the disabled flag of a key whose secret had just been rotated.
 - State writes are serialised, so an older snapshot cannot overwrite a newer one.
 - A poisoned internal lock no longer turns every request into a 503.

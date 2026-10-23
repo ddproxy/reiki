@@ -201,9 +201,7 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         for (name, upstream) in &self.upstream {
             // Loopback http is allowed so tests and local mocks work.
-            let local = upstream.base_url.starts_with("http://127.0.0.1")
-                || upstream.base_url.starts_with("http://localhost");
-            if !upstream.base_url.starts_with("https://") && !local {
+            if !upstream.base_url.starts_with("https://") && !is_loopback_http(&upstream.base_url) {
                 return Err(ConfigError::InsecureUpstream(name.clone()));
             }
             if upstream.model_aliases.keys().any(String::is_empty)
@@ -265,6 +263,36 @@ impl Config {
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True for an `http://` URL whose host is exactly a loopback name. A prefix
+/// match would also accept `http://localhost.example` or `http://127.0.0.1@evil`.
+fn is_loopback_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, tail)) if tail.is_empty() || tail.starts_with(':') => {
+                return addr == "::1" && tail.get(1..).is_none_or(is_port);
+            }
+            _ => return false,
+        },
+        None => match authority.split_once(':') {
+            Some((host, port)) if is_port(port) => host,
+            Some(_) => return false,
+            None => authority,
+        },
+    };
+    host == "127.0.0.1" || host == "localhost"
+}
+
+fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 5 && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -588,6 +616,44 @@ chain = ["zen-a"]
         assert!(matches!(
             Config::parse(&text).unwrap_err(),
             ConfigError::Parse(_)
+        ));
+    }
+    #[test]
+    fn loopback_http_matches_only_exact_hosts() {
+        for ok in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost/x",
+            "http://localhost:3000",
+            "http://[::1]:9000/v1",
+            "http://[::1]",
+        ] {
+            assert!(is_loopback_http(ok), "{ok} should be loopback");
+        }
+        for bad in [
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.10",
+            "http://127.0.0.1@evil.example",
+            "http://localhost:80@evil.example/",
+            "http://localhost:port",
+            "http://[::2]",
+            "http://[::1]x",
+            "https://localhost",
+            "ftp://127.0.0.1",
+            "http://",
+        ] {
+            assert!(!is_loopback_http(bad), "{bad} should not be loopback");
+        }
+    }
+
+    #[test]
+    fn config_rejects_a_lookalike_loopback_upstream() {
+        let text = "[upstream.x]\nbase_url = \"http://localhost.evil.example\"\n";
+        assert!(matches!(
+            Config::parse(text),
+            Err(ConfigError::InsecureUpstream(_))
         ));
     }
 }

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Key-failover relay for LLM APIs"

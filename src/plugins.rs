@@ -203,6 +203,19 @@ impl PluginChain {
     }
 }
 
+/// The plugin tables with `dry_run = true` added, for `reiki check`, so plugins validate
+/// their settings without opening files or sockets.
+pub fn with_dry_run(configured: &BTreeMap<String, toml::Table>) -> BTreeMap<String, toml::Table> {
+    configured
+        .iter()
+        .map(|(name, table)| {
+            let mut table = table.clone();
+            table.insert("dry_run".to_owned(), Value::Boolean(true));
+            (name.clone(), table)
+        })
+        .collect()
+}
+
 fn enabled(name: &str, table: &toml::Table) -> Result<bool, ConfigError> {
     match table.get("enabled") {
         None => Ok(true),

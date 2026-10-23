@@ -16,6 +16,7 @@ file = "/var/lib/reiki/requests.jsonl"
 - A name that is not compiled into this binary is a startup error, so a typo cannot silently do nothing.
 - `enabled = false` turns a configured plugin off.
 - `on_error` is `"pass_through"` (default) or `"reject"`. It decides what happens when a plugin reports that it could not apply (a skip): `pass_through` logs it and carries on, `reject` answers the client with 503. A plugin that deliberately rejects a request always rejects, whatever `on_error` says.
+- `reiki check` adds `dry_run = true` to every plugin table. A plugin should then validate its settings only, and not open files, sockets or threads, so the check has no side effects and works while Reiki is running.
 - Plugin settings are read at startup. A SIGHUP reload does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
 - Plugins run in the order they are registered in `src/plugins.rs`, not in the order of the config file.
 

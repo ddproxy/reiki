@@ -18,7 +18,7 @@ const DEFAULT_FILE_KEEP: u32 = 5;
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
-const HOST_KEYS: &[&str] = &["enabled", "on_error"];
+const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
@@ -39,6 +39,7 @@ pub struct Config {
     pub response: bool,
     pub redact: bool,
     pub queue: usize,
+    pub dry_run: bool,
 }
 
 impl Config {
@@ -99,6 +100,16 @@ impl Config {
         let queue = integer(table, "queue", DEFAULT_QUEUE as u64, 16, 65_536)? as usize;
 
         let headers = headers(table)?;
+        let dry_run = match table.get("dry_run") {
+            None => false,
+            Some(Value::Boolean(value)) => *value,
+            Some(other) => {
+                return Err(format!(
+                    "`dry_run` must be a boolean, got {}",
+                    other.type_str()
+                ))
+            }
+        };
         let redact = match table.get("redact") {
             None => true,
             Some(Value::Boolean(value)) => *value,
@@ -121,6 +132,7 @@ impl Config {
             response,
             redact,
             queue,
+            dry_run,
         })
     }
 }

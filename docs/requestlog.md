@@ -2,11 +2,7 @@
 
 The `requestlog` plugin records the requests that pass through Reiki as JSON lines. It writes them to a file, streams them live over a Unix socket, or both.
 
-It is compiled in only when you build with the `plugin-requestlog` feature:
-
-```bash
-cargo build --release --features plugin-requestlog
-```
+It is a bundled plugin, compiled in by the default `plugin-requestlog` feature and inactive until a `[plugins.requestlog]` table exists. Build with `--no-default-features` to leave it out.
 
 ## Configure
 
@@ -25,7 +21,7 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `file` | none | Append-only JSON lines file, created with mode 0600. An existing file is tightened to 0600. |
 | `file_max_bytes` | 52428800 | Rotate when the next line would pass this size. `0` never rotates. |
 | `file_keep` | 5 | Rotated files kept as `<file>.1` (newest) to `<file>.N`. `0` discards the old file at rotation. |
-| `socket` | none | Unix socket created with mode 0600. A stale socket file is replaced; a socket another process is listening on is an error. |
+| `socket` | none | Unix socket created with mode 0600. It must sit in a directory that is not writable by everyone. A stale socket file is replaced; a socket another process is listening on, or any other kind of file at that path, is an error and is left alone. |
 | `body` | `full` | `full` logs the request body, `summary` logs counts only, `none` logs its size only. |
 | `max_body_bytes` | 65536 | Longest body text logged (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
 | `headers` | none | Request headers to log, matched case-insensitively, each value cut at 256 bytes. Credential headers are refused (see below). |
@@ -33,7 +29,9 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `redact` | `true` | Mask credential-shaped text (see below). |
 | `queue` | 1024 | Records buffered for the writer thread (16 to 65536). |
 
-`enabled` and `on_error` are handled by Reiki itself, as for every plugin.
+`enabled` and `on_error` are handled by Reiki itself, as for every plugin. `reiki check` validates this table without creating the file or the socket.
+
+Stopping Reiki with a signal leaves the socket file behind; the next start replaces it.
 
 ## Records
 

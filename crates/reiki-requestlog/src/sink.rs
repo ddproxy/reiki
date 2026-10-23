@@ -82,7 +82,7 @@ pub use unix::SocketHub;
 #[cfg(unix)]
 mod unix {
     use std::io::{self, ErrorKind, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,14 +108,32 @@ mod unix {
 
     impl SocketHub {
         pub fn bind(path: &Path) -> io::Result<Self> {
-            if path.exists() {
-                if UnixStream::connect(path).is_ok() {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if std::fs::metadata(parent)?.permissions().mode() & 0o002 != 0 {
                     return Err(io::Error::new(
-                        ErrorKind::AddrInUse,
-                        "another process is already listening on that socket",
+                        ErrorKind::PermissionDenied,
+                        "the socket's directory is writable by everyone",
                     ));
                 }
-                std::fs::remove_file(path)?;
+            }
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if !meta.file_type().is_socket() => {
+                    return Err(io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "something that is not a socket already exists at that path",
+                    ));
+                }
+                Ok(_) => {
+                    if UnixStream::connect(path).is_ok() {
+                        return Err(io::Error::new(
+                            ErrorKind::AddrInUse,
+                            "another process is already listening on that socket",
+                        ));
+                    }
+                    std::fs::remove_file(path)?;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
             let listener = UnixListener::bind(path)?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -161,7 +179,11 @@ mod unix {
             if let Some(handle) = self.accept.take() {
                 let _ = handle.join();
             }
-            let _ = std::fs::remove_file(&self.path);
+            let still_ours = std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|meta| meta.file_type().is_socket());
+            if still_ours {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 
@@ -355,6 +377,28 @@ mod tests {
         }
 
         #[test]
+        fn a_regular_file_at_the_path_is_refused_and_left_alone() {
+            let dir = temp("sockfile");
+            let path = dir.join("req.sock");
+            std::fs::write(&path, "precious").unwrap();
+            let err = SocketHub::bind(&path).err().unwrap();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "precious");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_directory_anyone_can_write_to_is_refused() {
+            let dir = temp("sockperm");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = SocketHub::bind(&dir.join("req.sock")).err().unwrap();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(SocketHub::bind(&dir.join("req.sock")).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn a_second_hub_on_a_live_socket_is_refused_but_a_stale_file_is_replaced() {
             let dir = temp("socksecond");
             let path = dir.join("req.sock");
@@ -362,7 +406,9 @@ mod tests {
             assert!(SocketHub::bind(&path).is_err());
             drop(first);
 
-            std::fs::write(&path, "stale").unwrap();
+            // A listener that is dropped leaves its socket file behind: a stale socket.
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            assert!(path.exists() && UnixStream::connect(&path).is_err());
             let again = SocketHub::bind(&path).unwrap();
             assert!(UnixStream::connect(&path).is_ok());
             drop(again);

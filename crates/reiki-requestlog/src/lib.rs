@@ -88,6 +88,14 @@ fn new_id() -> String {
 
 impl RequestLog {
     pub fn new(config: Config) -> Result<Self, String> {
+        if config.dry_run {
+            return Ok(Self {
+                config: Arc::new(config),
+                tx: None,
+                dropped: Arc::new(AtomicU64::new(0)),
+                writer: None,
+            });
+        }
         let file = match &config.file {
             Some(path) => Some(
                 FileSink::open(path, config.file_max_bytes, config.file_keep)
@@ -346,6 +354,32 @@ mod tests {
             .map(|r| r["id"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(ids.len(), 50);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dry_run_validates_without_touching_the_filesystem() {
+        let dir = dir("dry");
+        let path = dir.join("req.jsonl");
+        let sock = dir.join("req.sock");
+        let text = format!(
+            "file = \"{}\"\nsocket = \"{}\"\ndry_run = true",
+            path.display(),
+            sock.display()
+        );
+        let plugin = build(&text.parse().unwrap()).unwrap();
+        drive(plugin.as_ref(), &[], "{}", 200);
+        drop(plugin);
+        assert!(
+            !path.exists() && !sock.exists(),
+            "a dry run must not create anything"
+        );
+        assert!(build(
+            &"dry_run = true\nbody = \"all\"\nfile = \"/x\""
+                .parse()
+                .unwrap()
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

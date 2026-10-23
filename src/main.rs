@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::plugins::{builtin, PluginChain};
+use reiki::plugins::{builtin, with_dry_run, PluginChain};
 use reiki::proxy::{load_keys, router, App};
 
 #[derive(Parser)]
@@ -89,7 +89,13 @@ async fn main() {
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
     let config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
-    let plugins = PluginChain::build(&config.plugins, &builtin())
+    let checking = matches!(cli.command, Some(Command::Check));
+    let plugin_tables = if checking {
+        with_dry_run(&config.plugins)
+    } else {
+        config.plugins.clone()
+    };
+    let plugins = PluginChain::build(&plugin_tables, &builtin())
         .unwrap_or_else(|e| fail(&format!("config: {e}")));
     let env_listen = std::env::var("REIKI_LISTEN").ok();
     let listen = effective_listen(cli.listen.as_deref(), env_listen.as_deref(), &config.listen)
@@ -104,13 +110,16 @@ async fn main() {
             .as_ref()
             .map_or(String::new(), |addr| format!(", admin on {addr}"));
         let names = plugins.names().collect::<Vec<_>>();
+        let plugin_part = if names.is_empty() {
+            String::new()
+        } else {
+            format!(", {} plugin(s)[{}]", names.len(), names.join(", "))
+        };
         println!(
-            "ok: {} upstream(s), {} key(s), {} stream(s), {} plugin(s)[{}], listening on {listen}{admin}",
+            "ok: {} upstream(s), {} key(s), {} stream(s){plugin_part}, listening on {listen}{admin}",
             config.upstream.len(),
             keys.len(),
             config.streams.len(),
-            names.len(),
-            names.join(", ")
         );
         return;
     }

@@ -132,12 +132,12 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
             .headers
             .iter()
             .map(|(name, value)| {
-                let value = truncate(value, MAX_HEADER_VALUE);
                 let value = if config.redact {
-                    redact::secrets(&value).into_owned()
+                    redact::secrets(value).into_owned()
                 } else {
-                    value
+                    value.clone()
                 };
+                let value = truncate(&value, MAX_HEADER_VALUE);
                 (name.clone(), Value::String(value))
             })
             .collect();

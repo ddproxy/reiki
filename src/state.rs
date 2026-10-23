@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::chain::SavedHealth;
 use crate::config::Config;
 
+/// Longest cooldown a state file may restore. Quota resets can be monthly, so
+/// the cap is a year; it only guards against a hand-edited recovery time that
+/// would overflow `Instant`.
+const MAX_RESTORED_COOLDOWN: Duration = Duration::from_secs(366 * 24 * 60 * 60);
+
 /// The state file sits next to the config file. It records key health only:
 /// names, cooldowns, the disabled flag and consecutive failures. It never holds
 /// a key value or a hash of one, so a changed secret is detected from the key
@@ -47,7 +52,7 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
             continue;
         }
         let cooling = if entry.recovery > now {
-            Some(Duration::from_millis(entry.recovery - now))
+            Some(Duration::from_millis(entry.recovery - now).min(MAX_RESTORED_COOLDOWN))
         } else {
             None
         };
@@ -265,6 +270,36 @@ mod tests {
         assert!(!text.contains(&crate::auth::sha256_hex("sk-fake-secret")));
         assert!(!text.contains("/unused/"));
         assert!(text.contains("a"));
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn an_absurd_recovery_time_is_capped_instead_of_overflowing() {
+        let path = temp_path("absurd");
+        let config = config_with_keys(&[("a", "/unused/a")]);
+        let now = unix_millis(SystemTime::now());
+        write_state(&path, now, &[("a", false, i64::MAX as u64, 0)]);
+
+        let loaded = load(&path, &config);
+        let cooling = loaded["a"].cooling.unwrap();
+        assert_eq!(cooling, MAX_RESTORED_COOLDOWN);
+
+        // Anchoring the capped value to the monotonic clock must not panic.
+        let mut state = KeyState::default();
+        state.restore("a", loaded["a"], Instant::now());
+        assert!(state.cooling_remaining("a", Instant::now()).is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_month_long_quota_cooldown_survives_a_restart() {
+        let path = temp_path("month");
+        let config = config_with_keys(&[("a", "/unused/a")]);
+        let now = unix_millis(SystemTime::now());
+        let in_20_days = now + 20 * 86_400_000;
+        write_state(&path, now, &[("a", false, in_20_days, 0)]);
+
+        let cooling = load(&path, &config)["a"].cooling.unwrap();
+        assert!(cooling > Duration::from_secs(19 * 86_400));
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,15 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- A panic in a plugin hook is caught and logged instead of ending the request. A panic in `on_request` counts as a skip, so `on_error` applies.
-- While a plugin is configured, responses are streamed without a `content-length`, so plugins can change body lengths and the final `is_last` chunk call always happens.
-- The request body is limited to 8 MB again after the plugins have run.
-- A SIGHUP reload checks the plugin tables, keeping the old config on an unknown plugin or a bad setting, and warns when plugin settings changed.
-- `PluginError` and the hook context types are `#[non_exhaustive]`; the contexts have `new` functions.
-
 ## 0.2.0
 
 ### Added
@@ -19,6 +9,11 @@
 
 ### Changed
 
+- A panic in a plugin hook is caught and logged instead of ending the request. A panic in `on_request` counts as a skip, so `on_error` applies.
+- While a plugin is configured, responses are streamed without a `content-length`, so plugins can change body lengths and the final `is_last` chunk call always happens.
+- The request body is limited to 8 MB again after the plugins have run; a larger body is refused with 413.
+- A SIGHUP reload checks the plugin tables, keeping the old config on an unknown plugin or a bad setting, and warns when plugin settings changed.
+- `PluginError` and the hook context types are `#[non_exhaustive]`; the contexts have `new` functions.
 - `reiki check` lists the compiled-in plugins that are configured, as `N plugin(s)[names]`, and validates their settings without side effects. With no plugins configured its output is unchanged.
 - Library users: `App::new` takes the plugin chain as a fourth argument, and `plugins` and `reiki_plugin` are new public items.
 

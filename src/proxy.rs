@@ -218,6 +218,8 @@ pub struct App {
     /// Overrides the wall clock for tests; production reads the system clock.
     wall_clock: OnceLock<SystemTime>,
     plugins: Arc<PluginChain>,
+    /// The plugin tables the running chain was built from, which a reload cannot change.
+    plugin_tables: std::collections::BTreeMap<String, toml::Table>,
 }
 
 impl App {
@@ -251,6 +253,7 @@ impl App {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
@@ -262,6 +265,7 @@ impl App {
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
             plugins: Arc::new(plugins),
+            plugin_tables,
         })
     }
 
@@ -355,7 +359,7 @@ impl App {
                 .as_ref()
                 .map(|admin| admin.listen.clone())
         };
-        if current.config.plugins != next.config.plugins {
+        if self.plugin_tables != next.config.plugins {
             tracing::warn!("plugin settings changed; restart reiki to apply them");
         }
         if admin_listen(&current) != admin_listen(&next) {
@@ -699,7 +703,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             if had_failures {
                 app.persist_state();
             }
-            return stream_response(app, plugin_states, response);
+            return stream_response(app, plugin_states, response, parts.method == Method::HEAD);
         }
 
         let retry_after = response
@@ -826,6 +830,7 @@ fn stream_response(
     app: &App,
     plugin_states: Vec<Box<dyn Any + Send>>,
     response: reqwest::Response,
+    is_head: bool,
 ) -> Response {
     let mut status = response.status();
     let mut headers = HeaderMap::new();
@@ -842,8 +847,13 @@ fn stream_response(
         app.plugins
             .on_response_head(&mut states, &mut status, &mut headers);
         // A plugin may change the body length, and a known length would also stop
-        // the final `is_last` call from being made.
-        headers.remove(header::CONTENT_LENGTH);
+        // the final `is_last` call from being made. These responses carry no body, so
+        // their length is only metadata.
+        let bodyless =
+            is_head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+        if !bodyless {
+            headers.remove(header::CONTENT_LENGTH);
+        }
         Body::from_stream(PluginBody {
             chain: Arc::clone(&app.plugins),
             states,

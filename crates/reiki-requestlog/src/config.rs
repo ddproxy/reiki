@@ -18,6 +18,8 @@ const DEFAULT_FILE_KEEP: u32 = 5;
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
+/// Below the 104-byte limit of the smallest platform (macOS), leaving room for the terminator.
+const MAX_SOCKET_PATH: usize = 100;
 const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,14 @@ impl Config {
 
         let file = path(table, "file")?;
         let socket = path(table, "socket")?;
+        if socket
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().len() > MAX_SOCKET_PATH)
+        {
+            return Err(format!(
+                "`socket` is longer than {MAX_SOCKET_PATH} bytes, which a Unix socket path cannot be"
+            ));
+        }
         if file.is_none() && socket.is_none() {
             return Err("set `file`, `socket` or both; nothing would be logged".to_owned());
         }
@@ -231,6 +241,16 @@ mod tests {
         assert!(parse("socket = \"/run/r.sock\"\nfiel = 1")
             .unwrap_err()
             .contains("fiel"));
+    }
+
+    #[test]
+    fn a_socket_path_too_long_for_unix_is_refused_up_front() {
+        let long = format!("/run/{}/r.sock", "d".repeat(100));
+        assert!(parse(&format!("socket = \"{long}\""))
+            .unwrap_err()
+            .contains("longer"));
+        let ok = format!("/run/{}/r.sock", "d".repeat(40));
+        assert!(parse(&format!("socket = \"{ok}\"")).is_ok());
     }
 
     #[test]

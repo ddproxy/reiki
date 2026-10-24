@@ -21,7 +21,7 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `file` | none | Append-only JSON lines file, created with mode 0600. An existing file is tightened to 0600. |
 | `file_max_bytes` | 52428800 | Rotate when the next line would pass this size. `0` never rotates. |
 | `file_keep` | 5 | Rotated files kept as `<file>.1` (newest) to `<file>.N`. `0` discards the old file at rotation. |
-| `socket` | none | Unix socket created with mode 0600. It must sit in a directory that is not writable by everyone. A stale socket file is replaced; a socket another process is listening on, or any other kind of file at that path, is an error and is left alone. |
+| `socket` | none | Unix socket created with mode 0600. It must sit in a directory that is not writable by everyone, and keeping that directory private (mode 0700) is best, since the socket is created first and restricted a moment later. The path must be at most 100 bytes. A stale socket file is replaced; a socket another process is listening on, or any other kind of file at that path, is an error and is left alone. |
 | `body` | `full` | `full` logs the request body, `summary` logs counts only, `none` logs its size only. |
 | `max_body_bytes` | 65536 | Longest body text logged (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
 | `headers` | none | Request headers to log, matched case-insensitively, each value cut at 256 bytes. Credential headers are refused (see below). |

@@ -579,3 +579,32 @@ async fn a_body_a_plugin_made_too_large_is_refused_like_any_oversize_body() {
     assert_eq!(body["error"]["type"], "too_large");
     assert!(h.mock.calls().is_empty(), "the upstream must not be called");
 }
+
+#[tokio::test]
+async fn a_head_response_keeps_its_content_length_while_plugins_are_active() {
+    let registry = vec![Registration {
+        name: "append-end",
+        build: |_| Ok(Box::new(AppendAtEnd) as Box<dyn Plugin>),
+    }];
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.append-end]\n",
+        registry,
+    )
+    .await;
+    let res = h
+        .client
+        .head(format!("{}/zen/x", h.relay))
+        .bearer_auth("tok-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers()
+            .get("content-length")
+            .map(|v| v.to_str().unwrap()),
+        Some("11")
+    );
+}

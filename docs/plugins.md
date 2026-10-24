@@ -35,10 +35,9 @@ A plugin is trusted code that runs inside the Reiki process.
 - The request path and query string are not passed to plugins.
 - `on_response_head` receives the upstream status and headers. `on_response_chunk` receives each body chunk and may rewrite it.
 - Hooks are synchronous and run on the request's task. A hook that blocks is not interrupted, and there is no timeout. Do slow work, such as file writes, on a thread of your own.
-- A panic in a hook is caught and logged with the plugin and hook name. A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or is answered with 503. A panic in `on_response_head` or `on_response_chunk` leaves that response, or that chunk, as it was.
-- While any plugin is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. The final `on_response_chunk` call, with `is_last` set, always follows the last chunk.
+- A panic in a hook is caught and logged with the plugin and hook name, and the request carries on. Changes the hook made before it panicked are kept, and the plugin's own state may be left half-updated. A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or is answered with 503. Rust's default panic handler also prints the panic message and location to stderr, outside the log settings, so do not `unwrap` or `expect` on request data.
+- While any plugin is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. HEAD, 204 and 304 responses keep theirs, as they have no body. When the body ends normally the final `on_response_chunk` call, with `is_last` set, follows the last chunk. It does not happen after an upstream read error or when the client disconnects, so use the per-request state being dropped as the end-of-response signal.
 - The request body is limited to 8 MB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
-- A plugin that needs to know when a response has ended can also rely on its per-request state being dropped at that point.
 
 ## Write a plugin
 

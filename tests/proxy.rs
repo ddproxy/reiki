@@ -1418,3 +1418,58 @@ async fn a_sighup_reload_does_not_revive_the_old_state_of_a_rotated_key() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_serving() {
+    let dir = std::env::temp_dir().join(format!("reiki-badplugin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let h = harness(&one_stream(), Policy::default()).await;
+
+    let write_config = |a_secret: &str, extra: &str| {
+        std::fs::write(dir.join("a"), a_secret).unwrap();
+        std::fs::write(dir.join("b"), "up-b").unwrap();
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"{}/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
+             [keys.b]\nupstream = \"zen\"\nfile = \"{}\"\n\
+             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n{extra}",
+            h.mock_url,
+            dir.join("a").display(),
+            dir.join("b").display(),
+            sha("tok-a")
+        );
+        let path = dir.join("reiki.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+
+    let path = write_config("up-a-rotated", "[plugins.not-a-plugin]\n");
+    h.app.reload_on_hangup(&path);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a"],
+        "the refused reload must not have applied the rotated key"
+    );
+
+    let path = write_config("up-a-rotated", "");
+    h.app.reload_on_hangup(&path);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a-rotated"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

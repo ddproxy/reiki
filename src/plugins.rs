@@ -112,7 +112,7 @@ impl PluginChain {
     }
 
     /// Runs `on_request` on every plugin, in order, mutating the request in
-    /// place. Stops at the first rejection.
+    /// place. Stops at the first rejection. A panicking hook counts as a skip.
     pub fn on_request(
         &self,
         states: &mut [Box<dyn Any + Send>],
@@ -123,15 +123,19 @@ impl PluginChain {
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
         for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
-            let mut ctx = RequestCtx {
+            let mut ctx = RequestCtx::new(
                 stream,
                 upstream,
                 method,
-                headers: &mut *headers,
-                body: &mut *body,
-                state: &mut **state,
-            };
-            match entry.plugin.on_request(&mut ctx) {
+                &mut *headers,
+                &mut *body,
+                &mut **state,
+            );
+            let result = guard(entry.plugin.name(), "on_request", || {
+                entry.plugin.on_request(&mut ctx)
+            })
+            .unwrap_or_else(|| Err(PluginError::Skip("plugin panicked".to_owned())));
+            match result {
                 Ok(()) => {}
                 Err(PluginError::Reject(status, message)) => {
                     tracing::warn!(
@@ -142,32 +146,39 @@ impl PluginChain {
                     );
                     return Err(Blocked { status, message });
                 }
-                Err(PluginError::Skip(message)) => match entry.on_error {
-                    OnError::PassThrough => {
-                        tracing::debug!(
-                            plugin = entry.plugin.name(),
-                            %message,
-                            "plugin skipped the request"
-                        );
+                Err(other) => {
+                    let message = match other {
+                        PluginError::Skip(message) => message,
+                        unknown => unknown.to_string(),
+                    };
+                    match entry.on_error {
+                        OnError::PassThrough => {
+                            tracing::debug!(
+                                plugin = entry.plugin.name(),
+                                %message,
+                                "plugin skipped the request"
+                            );
+                        }
+                        OnError::Reject => {
+                            tracing::warn!(
+                                plugin = entry.plugin.name(),
+                                %message,
+                                "plugin skipped the request; rejecting per on_error"
+                            );
+                            return Err(Blocked {
+                                status: StatusCode::SERVICE_UNAVAILABLE,
+                                message,
+                            });
+                        }
                     }
-                    OnError::Reject => {
-                        tracing::warn!(
-                            plugin = entry.plugin.name(),
-                            %message,
-                            "plugin skipped the request; rejecting per on_error"
-                        );
-                        return Err(Blocked {
-                            status: StatusCode::SERVICE_UNAVAILABLE,
-                            message,
-                        });
-                    }
-                },
+                }
             }
         }
         Ok(())
     }
 
-    /// Runs `on_response_head` on every plugin, in order.
+    /// Runs `on_response_head` on every plugin, in order. A panicking hook is
+    /// logged and skipped.
     pub fn on_response_head(
         &self,
         states: &mut [Box<dyn Any + Send>],
@@ -175,17 +186,15 @@ impl PluginChain {
         headers: &mut HeaderMap,
     ) {
         for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
-            let mut ctx = ResponseHeadCtx {
-                status: &mut *status,
-                headers: &mut *headers,
-                state: &mut **state,
-            };
-            entry.plugin.on_response_head(&mut ctx);
+            let mut ctx = ResponseHeadCtx::new(&mut *status, &mut *headers, &mut **state);
+            let _ = guard(entry.plugin.name(), "on_response_head", || {
+                entry.plugin.on_response_head(&mut ctx);
+            });
         }
     }
 
     /// Runs `on_response_chunk` on every plugin, in order, letting each rewrite
-    /// `chunk` before the next sees it.
+    /// `chunk` before the next sees it. A panicking hook is logged and skipped.
     pub fn on_response_chunk(
         &self,
         states: &mut [Box<dyn Any + Send>],
@@ -193,12 +202,21 @@ impl PluginChain {
         is_last: bool,
     ) {
         for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
-            let mut ctx = ChunkCtx {
-                chunk: &mut *chunk,
-                is_last,
-                state: &mut **state,
-            };
-            entry.plugin.on_response_chunk(&mut ctx);
+            let mut ctx = ChunkCtx::new(&mut *chunk, is_last, &mut **state);
+            let _ = guard(entry.plugin.name(), "on_response_chunk", || {
+                entry.plugin.on_response_chunk(&mut ctx);
+            });
+        }
+    }
+}
+
+/// Runs a plugin hook, turning a panic into a logged `None` so one faulty plugin cannot take the request task down.
+fn guard<T>(plugin: &str, hook: &str, run: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::error!(plugin, hook, "plugin panicked; the hook was abandoned");
+            None
         }
     }
 }
@@ -478,5 +496,20 @@ mod tests {
             release.extend_from_slice(&chunk);
             assert_eq!(release, b"echo s3cr3t end", "split at {split}");
         }
+    }
+
+    #[test]
+    fn with_dry_run_marks_every_table_and_leaves_the_rest_alone() {
+        let tables = configured("[append]\nenabled = true\n[other]\nx = 1\n");
+        let dry = with_dry_run(&tables);
+        for (name, table) in &dry {
+            assert_eq!(table.get("dry_run"), Some(&Value::Boolean(true)), "{name}");
+        }
+        assert_eq!(dry["append"].get("enabled"), Some(&Value::Boolean(true)));
+        assert_eq!(dry["other"].get("x"), Some(&Value::Integer(1)));
+        assert!(
+            tables["append"].get("dry_run").is_none(),
+            "the input must not change"
+        );
     }
 }

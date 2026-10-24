@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A panic in a plugin hook is caught and logged instead of ending the request. A panic in `on_request` counts as a skip, so `on_error` applies.
+- While a plugin is configured, responses are streamed without a `content-length`, so plugins can change body lengths and the final `is_last` chunk call always happens.
+- The request body is limited to 8 MB again after the plugins have run.
+- A SIGHUP reload checks the plugin tables, keeping the old config on an unknown plugin or a bad setting, and warns when plugin settings changed.
+- `PluginError` and the hook context types are `#[non_exhaustive]`; the contexts have `new` functions.
+
 ## 0.2.0
 
 ### Added

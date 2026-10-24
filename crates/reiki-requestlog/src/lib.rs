@@ -259,28 +259,24 @@ mod tests {
         }
         let mut payload = Bytes::from(body.to_owned());
         plugin
-            .on_request(&mut RequestCtx {
-                stream: "zen",
-                upstream: "zen",
-                method: &Method::POST,
-                headers: &mut map,
-                body: &mut payload,
-                state: state.as_mut(),
-            })
+            .on_request(&mut RequestCtx::new(
+                "zen",
+                "zen",
+                &Method::POST,
+                &mut map,
+                &mut payload,
+                state.as_mut(),
+            ))
             .unwrap();
         let mut code = StatusCode::from_u16(status).unwrap();
-        plugin.on_response_head(&mut ResponseHeadCtx {
-            status: &mut code,
-            headers: &mut HeaderMap::new(),
-            state: state.as_mut(),
-        });
+        plugin.on_response_head(&mut ResponseHeadCtx::new(
+            &mut code,
+            &mut HeaderMap::new(),
+            state.as_mut(),
+        ));
         for (chunk, is_last) in [("hel", false), ("lo", false), ("", true)] {
             let mut bytes = Bytes::from(chunk);
-            plugin.on_response_chunk(&mut ChunkCtx {
-                chunk: &mut bytes,
-                is_last,
-                state: state.as_mut(),
-            });
+            plugin.on_response_chunk(&mut ChunkCtx::new(&mut bytes, is_last, state.as_mut()));
         }
     }
 

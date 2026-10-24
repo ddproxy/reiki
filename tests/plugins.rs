@@ -430,3 +430,152 @@ async fn a_rejection_message_with_special_characters_is_valid_json() {
     );
     assert!(h.mock.calls().is_empty(), "the upstream must not be called");
 }
+
+struct PanicOnRequest;
+impl Plugin for PanicOnRequest {
+    fn name(&self) -> &str {
+        "panic-request"
+    }
+    fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+        panic!("boom in on_request");
+    }
+}
+
+struct PanicOnResponse;
+impl Plugin for PanicOnResponse {
+    fn name(&self) -> &str {
+        "panic-response"
+    }
+    fn on_response_head(&self, _ctx: &mut ResponseHeadCtx<'_>) {
+        panic!("boom in on_response_head");
+    }
+    fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {
+        panic!("boom in on_response_chunk");
+    }
+}
+
+fn panic_registry() -> Vec<Registration> {
+    vec![
+        Registration {
+            name: "panic-request",
+            build: |_| Ok(Box::new(PanicOnRequest) as Box<dyn Plugin>),
+        },
+        Registration {
+            name: "panic-response",
+            build: |_| Ok(Box::new(PanicOnResponse) as Box<dyn Plugin>),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_panic_in_on_request_is_a_skip_and_the_proxy_keeps_serving() {
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.panic-request]\n",
+        panic_registry(),
+    )
+    .await;
+    for _ in 0..3 {
+        let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+        assert_eq!(res.status(), 200, "pass_through should let the request on");
+        assert_eq!(res.text().await.unwrap(), "{\"ok\":true}");
+    }
+}
+
+#[tokio::test]
+async fn a_panic_in_on_request_rejects_when_on_error_says_reject() {
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.panic-request]\non_error = \"reject\"\n",
+        panic_registry(),
+    )
+    .await;
+    let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    assert!(h.mock.calls().is_empty(), "the upstream must not be called");
+    let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+    assert_eq!(res.status(), 503, "the proxy must still be answering");
+}
+
+#[tokio::test]
+async fn panics_in_the_response_hooks_do_not_lose_the_response() {
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.panic-response]\n",
+        panic_registry(),
+    )
+    .await;
+    for _ in 0..2 {
+        let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.text().await.unwrap(), "{\"ok\":true}");
+    }
+}
+
+/// Appends a marker in its final call, and never touches content-length itself.
+struct AppendAtEnd;
+impl Plugin for AppendAtEnd {
+    fn name(&self) -> &str {
+        "append-end"
+    }
+    fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+        if ctx.is_last {
+            let mut text = ctx.chunk.to_vec();
+            text.extend_from_slice(b"[END]");
+            *ctx.chunk = Bytes::from(text);
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_final_chunk_call_happens_even_when_upstream_sent_a_content_length() {
+    let registry = vec![Registration {
+        name: "append-end",
+        build: |_| Ok(Box::new(AppendAtEnd) as Box<dyn Plugin>),
+    }];
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.append-end]\n",
+        registry,
+    )
+    .await;
+    let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.headers().get("content-length").is_none());
+    assert_eq!(res.text().await.unwrap(), "{\"ok\":true}[END]");
+}
+
+struct Inflate;
+impl Plugin for Inflate {
+    fn name(&self) -> &str {
+        "inflate"
+    }
+    fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+        *ctx.body = Bytes::from(vec![b'a'; 9 * 1024 * 1024]);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_body_a_plugin_made_too_large_is_refused_like_any_oversize_body() {
+    let registry = vec![Registration {
+        name: "inflate",
+        build: |_| Ok(Box::new(Inflate) as Box<dyn Plugin>),
+    }];
+    let h = harness_with_plugins(
+        &one_stream(),
+        Policy::default(),
+        "[plugins.inflate]\n",
+        registry,
+    )
+    .await;
+    let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
+    assert_eq!(res.status(), 413);
+    let body: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "too_large");
+    assert!(h.mock.calls().is_empty(), "the upstream must not be called");
+}

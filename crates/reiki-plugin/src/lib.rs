@@ -39,6 +39,7 @@ pub trait Plugin: Send + Sync {
 
 /// A hook declined or failed. The relay decides what to do with it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PluginError {
     /// Return the status and message to the client without calling upstream.
     Reject(StatusCode, String),
@@ -60,6 +61,7 @@ impl std::error::Error for PluginError {}
 
 /// The request before it is sent upstream. `state` is this request's value from
 /// [`Plugin::new_state`], downcast it with `Any::downcast_mut`.
+#[non_exhaustive]
 pub struct RequestCtx<'a> {
     pub stream: &'a str,
     pub upstream: &'a str,
@@ -71,6 +73,7 @@ pub struct RequestCtx<'a> {
 
 /// The upstream response head. A plugin that changes the response body length
 /// must remove `content-length` here so the relay does not forward a stale one.
+#[non_exhaustive]
 pub struct ResponseHeadCtx<'a> {
     pub status: &'a mut StatusCode,
     pub headers: &'a mut HeaderMap,
@@ -81,8 +84,53 @@ pub struct ResponseHeadCtx<'a> {
 /// bytes that are safe to release, and release the rest when `is_last` is true.
 /// Holding bytes lets a placeholder split across chunks be reassembled before
 /// it is replaced.
+#[non_exhaustive]
 pub struct ChunkCtx<'a> {
     pub chunk: &'a mut Bytes,
     pub is_last: bool,
     pub state: &'a mut (dyn Any + Send),
+}
+
+impl<'a> RequestCtx<'a> {
+    pub fn new(
+        stream: &'a str,
+        upstream: &'a str,
+        method: &'a Method,
+        headers: &'a mut HeaderMap,
+        body: &'a mut Bytes,
+        state: &'a mut (dyn Any + Send),
+    ) -> Self {
+        Self {
+            stream,
+            upstream,
+            method,
+            headers,
+            body,
+            state,
+        }
+    }
+}
+
+impl<'a> ResponseHeadCtx<'a> {
+    pub fn new(
+        status: &'a mut StatusCode,
+        headers: &'a mut HeaderMap,
+        state: &'a mut (dyn Any + Send),
+    ) -> Self {
+        Self {
+            status,
+            headers,
+            state,
+        }
+    }
+}
+
+impl<'a> ChunkCtx<'a> {
+    pub fn new(chunk: &'a mut Bytes, is_last: bool, state: &'a mut (dyn Any + Send)) -> Self {
+        Self {
+            chunk,
+            is_last,
+            state,
+        }
+    }
 }

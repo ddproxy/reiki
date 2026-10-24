@@ -355,6 +355,9 @@ impl App {
                 .as_ref()
                 .map(|admin| admin.listen.clone())
         };
+        if current.config.plugins != next.config.plugins {
+            tracing::warn!("plugin settings changed; restart reiki to apply them");
+        }
         if admin_listen(&current) != admin_listen(&next) {
             tracing::warn!(
                 from = ?admin_listen(&current),
@@ -388,6 +391,9 @@ impl App {
             .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")))
             .and_then(|config| {
                 let keys = load_keys(&config).map_err(|e| e.to_string())?;
+                let dry = crate::plugins::with_dry_run(&config.plugins);
+                crate::plugins::PluginChain::build(&dry, &crate::plugins::builtin())
+                    .map_err(|e| format!("config: {e}"))?;
                 Ok((config, keys))
             });
         match loaded {
@@ -558,6 +564,13 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         &mut body,
     ) {
         return json_error(blocked.status, "blocked", &blocked.message);
+    }
+    if body.len() > MAX_REQUEST_BODY {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "request body too large",
+        );
     }
 
     // Rewrite once, before the failover loop, so every key replay sends the same
@@ -828,6 +841,9 @@ fn stream_response(
         // A plugin that changes the body length must drop content-length here.
         app.plugins
             .on_response_head(&mut states, &mut status, &mut headers);
+        // A plugin may change the body length, and a known length would also stop
+        // the final `is_last` call from being made.
+        headers.remove(header::CONTENT_LENGTH);
         Body::from_stream(PluginBody {
             chain: Arc::clone(&app.plugins),
             states,

@@ -24,8 +24,8 @@ Key values and stream tokens are not logged. Request and response bodies are not
 Plugins are compiled into the binary and run inside the Reiki process, so a plugin is as trusted as Reiki itself. See [plugins](plugins.md) for the hooks.
 
 - A plugin sees each request's headers, including the client token, and the whole request and response bodies. It never receives an upstream key; the key is attached after the plugin hooks have run, and an `authorization` header set by a plugin is dropped.
-- Hooks are synchronous, have no timeout and are not isolated from panics, so a faulty plugin can stall or end its own request. Only compile in plugins you have read.
-- Plugin settings are read at startup. A reload does not rebuild plugins.
+- Hooks are synchronous and have no timeout, so a plugin that blocks stalls its own request. A panic in a hook is caught and logged and does not end the request task. Only compile in plugins you have read.
+- Plugin settings are read at startup. A reload checks them and warns when they changed, but does not rebuild plugins.
 
 ## Limits
 

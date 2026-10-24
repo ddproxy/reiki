@@ -17,7 +17,7 @@ file = "/var/lib/reiki/requests.jsonl"
 - `enabled = false` turns a configured plugin off.
 - `on_error` is `"pass_through"` (default) or `"reject"`. It decides what happens when a plugin reports that it could not apply (a skip): `pass_through` logs it and carries on, `reject` answers the client with 503. A plugin that deliberately rejects a request always rejects, whatever `on_error` says.
 - `reiki check` adds `dry_run = true` to every plugin table. A plugin should then validate its settings only, and not open files, sockets or threads, so the check has no side effects and works while Reiki is running.
-- Plugin settings are read at startup. A SIGHUP reload does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
+- Plugin settings are read at startup. A SIGHUP reload checks the plugin tables (an unknown plugin name or a bad setting keeps the old config) and logs a warning when they changed, but does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
 - Plugins run in the order they are registered in `src/plugins.rs`, not in the order of the config file.
 
 ## Bundled plugins
@@ -34,13 +34,15 @@ A plugin is trusted code that runs inside the Reiki process.
 - It sees the client's own headers, including the client token, and the whole request body. It never receives an upstream key: the key is attached after the hooks have run, and any `authorization` header a plugin sets is dropped.
 - The request path and query string are not passed to plugins.
 - `on_response_head` receives the upstream status and headers. `on_response_chunk` receives each body chunk and may rewrite it.
-- Hooks are synchronous and run on the request's task. A hook that blocks, or panics, affects that request; there is no timeout and no panic isolation. Do slow work, such as file writes, on a thread of your own.
-- A plugin that rewrites response bodies and changes their length must remove `content-length` in `on_response_head`. Without a known length the response is streamed, and the final `is_last` call arrives after the last chunk. For a response with a known length the body is delivered without that final call, so a plugin that holds bytes back until `is_last` would never release them.
-- A plugin that needs to know when a response has ended can rely on its per-request state being dropped at that point.
+- Hooks are synchronous and run on the request's task. A hook that blocks is not interrupted, and there is no timeout. Do slow work, such as file writes, on a thread of your own.
+- A panic in a hook is caught and logged with the plugin and hook name. A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or is answered with 503. A panic in `on_response_head` or `on_response_chunk` leaves that response, or that chunk, as it was.
+- While any plugin is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. The final `on_response_chunk` call, with `is_last` set, always follows the last chunk.
+- The request body is limited to 8 MB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
+- A plugin that needs to know when a response has ended can also rely on its per-request state being dropped at that point.
 
 ## Write a plugin
 
-A plugin implements the `Plugin` trait from the `reiki-plugin` crate in this repository. The crate is not published; depend on it by path.
+A plugin implements the `Plugin` trait from the `reiki-plugin` crate in this repository. The crate is not published; depend on it by path. The error and context types are `#[non_exhaustive]`, so new fields and variants can be added without breaking plugins; Reiki builds the contexts, and tests can use their `new` functions.
 
 ```rust
 use reiki_plugin::{Plugin, PluginError, RequestCtx};

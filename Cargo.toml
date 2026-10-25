@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-plugin", "crates/reiki-requestlog"]
+members = ["crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
 resolver = "2"
 
 [package]
@@ -20,18 +20,20 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "gzip", "deflate", "brotli", "zstd"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
+reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 futures-core = "0.3"
 
 [features]
-default = ["plugin-requestlog"]
+default = ["plugin-placeholders", "plugin-requestlog"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
+plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 
 [dev-dependencies]

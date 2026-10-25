@@ -28,9 +28,18 @@ pub struct RequestEvent {
     pub stream: String,
     pub upstream: String,
     pub method: String,
+    pub path: String,
     pub headers: Vec<(String, String)>,
     pub body_bytes: usize,
     pub body: Option<Bytes>,
+}
+
+/// One upstream attempt: the key's name in the config and the status it returned.
+pub struct AttemptEvent {
+    pub key: String,
+    pub status: Option<u16>,
+    /// The upstream's error body, only in `response = "body"` mode.
+    pub body: Option<Vec<u8>>,
 }
 
 pub struct ResponseEvent {
@@ -39,6 +48,12 @@ pub struct ResponseEvent {
     pub status: Option<u16>,
     pub duration_ms: u64,
     pub bytes: u64,
+    /// The key that produced the response, `None` when Reiki answered itself.
+    pub key: Option<String>,
+    pub attempts: Vec<AttemptEvent>,
+    /// The leading part of the response body, only in `response = "body"` mode.
+    pub body: Option<Vec<u8>>,
+    pub body_truncated: bool,
 }
 
 /// Sinks owned by the writer thread.
@@ -104,17 +119,44 @@ pub fn render(config: &Config, event: Event) -> String {
     match event {
         Event::Request(request) => render_request(config, request),
         Event::Shutdown => String::new(),
-        Event::Response(response) => json!({
-            "v": 1,
-            "event": "response",
-            "id": response.id,
-            "ts": rfc3339_millis(response.at),
-            "status": response.status,
-            "duration_ms": response.duration_ms,
-            "bytes": response.bytes,
-        })
-        .to_string(),
+        Event::Response(response) => render_response(config, response),
     }
+}
+
+fn render_response(config: &Config, response: ResponseEvent) -> String {
+    let mut record = Map::new();
+    record.insert("v".into(), json!(1));
+    record.insert("event".into(), json!("response"));
+    record.insert("id".into(), json!(response.id));
+    record.insert("ts".into(), json!(rfc3339_millis(response.at)));
+    record.insert("status".into(), json!(response.status));
+    record.insert("duration_ms".into(), json!(response.duration_ms));
+    record.insert("bytes".into(), json!(response.bytes));
+    record.insert("key".into(), json!(response.key));
+    if !response.attempts.is_empty() {
+        let attempts: Vec<Value> = response
+            .attempts
+            .iter()
+            .map(|a| {
+                let mut entry = Map::new();
+                entry.insert("key".into(), json!(a.key));
+                entry.insert("status".into(), json!(a.status));
+                if let Some(body) = a.body.as_deref().filter(|b| !b.is_empty()) {
+                    entry.insert("body".into(), full_body(config, body).0);
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        record.insert("attempts".into(), Value::Array(attempts));
+    }
+    if let Some(body) = response.body.filter(|b| !b.is_empty()) {
+        let (value, cut) = full_body(config, &body);
+        record.insert("body".into(), value);
+        if cut || response.body_truncated {
+            record.insert("body_truncated".into(), json!(true));
+        }
+    }
+    Value::Object(record).to_string()
 }
 
 fn render_request(config: &Config, request: RequestEvent) -> String {
@@ -126,6 +168,7 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
     record.insert("stream".into(), json!(request.stream));
     record.insert("upstream".into(), json!(request.upstream));
     record.insert("method".into(), json!(request.method));
+    record.insert("path".into(), json!(request.path));
 
     if !request.headers.is_empty() {
         let headers: Map<String, Value> = request
@@ -248,6 +291,7 @@ mod tests {
             stream: "zen".to_owned(),
             upstream: "zen".to_owned(),
             method: "POST".to_owned(),
+            path: "/zen/chat/completions".to_owned(),
             headers: vec![("user-agent".to_owned(), "opencode/1.18.35".to_owned())],
             body_bytes: body.len(),
             body: Some(Bytes::from(body.to_owned())),
@@ -381,6 +425,21 @@ mod tests {
                 status: Some(200),
                 duration_ms: 42,
                 bytes: 1234,
+                key: Some("zen-primary".to_owned()),
+                attempts: vec![
+                    AttemptEvent {
+                        key: "zen-first".to_owned(),
+                        status: Some(403),
+                        body: Some(br#"{"error":"refused"}"#.to_vec()),
+                    },
+                    AttemptEvent {
+                        key: "zen-primary".to_owned(),
+                        status: Some(200),
+                        body: None,
+                    },
+                ],
+                body: None,
+                body_truncated: false,
             }),
         );
         let record: Value = serde_json::from_str(&line).unwrap();
@@ -388,5 +447,56 @@ mod tests {
         assert_eq!(record["status"], 200);
         assert_eq!(record["duration_ms"], 42);
         assert_eq!(record["bytes"], 1234);
+        assert_eq!(record["key"], "zen-primary");
+        assert_eq!(record["attempts"][0]["key"], "zen-first");
+        assert_eq!(record["attempts"][0]["status"], 403);
+        assert_eq!(record["attempts"][0]["body"]["error"], "refused");
+        assert!(record["attempts"][1].get("body").is_none());
+        assert!(record.get("body").is_none());
+    }
+
+    fn response_with(body: Option<&[u8]>, truncated: bool) -> ResponseEvent {
+        ResponseEvent {
+            id: "abc".to_owned(),
+            at: UNIX_EPOCH,
+            status: Some(200),
+            duration_ms: 1,
+            bytes: 10,
+            key: Some("k".to_owned()),
+            attempts: Vec::new(),
+            body: body.map(<[u8]>::to_vec),
+            body_truncated: truncated,
+        }
+    }
+
+    #[test]
+    fn a_response_body_is_parsed_masked_and_marked_when_cut() {
+        let json = br#"{"answer":"ok","note":"Bearer abcdefghijklmnopqrstuvwxyz0123456789"}"#;
+        let record: Value = serde_json::from_str(&render(
+            &config(""),
+            Event::Response(response_with(Some(json), false)),
+        ))
+        .unwrap();
+        assert_eq!(record["body"]["answer"], "ok");
+        assert!(!record
+            .to_string()
+            .contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(record.get("body_truncated").is_none());
+
+        let sse = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
+        let record: Value = serde_json::from_str(&render(
+            &config(""),
+            Event::Response(response_with(Some(sse), true)),
+        ))
+        .unwrap();
+        assert!(record["body"].as_str().unwrap().contains("[DONE]"));
+        assert_eq!(record["body_truncated"], true);
+
+        let record: Value = serde_json::from_str(&render(
+            &config(""),
+            Event::Response(response_with(Some(b""), false)),
+        ))
+        .unwrap();
+        assert!(record.get("body").is_none());
     }
 }

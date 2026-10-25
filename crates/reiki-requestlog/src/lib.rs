@@ -19,13 +19,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
-use reiki_plugin::{ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
+use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
-pub use config::{BodyMode, Config, DENIED_HEADERS};
+pub use config::{BodyMode, Config, ResponseMode, DENIED_HEADERS};
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
-use writer::{Event, RequestEvent, ResponseEvent, Sinks};
+use writer::{AttemptEvent, Event, RequestEvent, ResponseEvent, Sinks};
 
 /// The `[plugins.requestlog]` table this plugin reads.
 pub const NAME: &str = "requestlog";
@@ -51,14 +51,20 @@ struct RequestState {
     status: Option<u16>,
     bytes: u64,
     requested: bool,
-    log_response: bool,
+    response: ResponseMode,
+    /// The most response body bytes kept, the same cap as the request body.
+    max_body: usize,
+    key: Option<String>,
+    attempts: Vec<AttemptEvent>,
+    body: Vec<u8>,
+    body_truncated: bool,
     tx: SyncSender<Event>,
     dropped: Arc<AtomicU64>,
 }
 
 impl Drop for RequestState {
     fn drop(&mut self) {
-        if !(self.requested && self.log_response) {
+        if !self.requested || self.response == ResponseMode::None {
             return;
         }
         let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -68,6 +74,10 @@ impl Drop for RequestState {
             status: self.status,
             duration_ms,
             bytes: self.bytes,
+            key: self.key.take(),
+            attempts: std::mem::take(&mut self.attempts),
+            body: (self.response == ResponseMode::Body).then(|| std::mem::take(&mut self.body)),
+            body_truncated: self.body_truncated,
         });
         if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -175,7 +185,12 @@ impl Plugin for RequestLog {
             status: None,
             bytes: 0,
             requested: false,
-            log_response: self.config.response,
+            response: self.config.response,
+            max_body: self.config.max_body_bytes,
+            key: None,
+            attempts: Vec::new(),
+            body: Vec::new(),
+            body_truncated: false,
             tx,
             dropped: Arc::clone(&self.dropped),
         })
@@ -206,6 +221,7 @@ impl Plugin for RequestLog {
             stream: ctx.stream.to_owned(),
             upstream: ctx.upstream.to_owned(),
             method: ctx.method.as_str().to_owned(),
+            path: ctx.path.to_owned(),
             headers,
             body_bytes: ctx.body.len(),
             body,
@@ -213,15 +229,36 @@ impl Plugin for RequestLog {
         Ok(())
     }
 
+    fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) {
+        if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
+            let body = (state.response == ResponseMode::Body && !ctx.body.is_empty())
+                .then(|| ctx.body[..ctx.body.len().min(state.max_body)].to_vec());
+            state.attempts.push(AttemptEvent {
+                key: ctx.key.to_owned(),
+                status: ctx.status,
+                body,
+            });
+        }
+    }
+
     fn on_response_head(&self, ctx: &mut ResponseHeadCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
             state.status = Some(ctx.status.as_u16());
+            state.key = Some(ctx.key.to_owned());
         }
     }
 
     fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
             state.bytes += ctx.chunk.len() as u64;
+            if state.response == ResponseMode::Body {
+                let room = state.max_body.saturating_sub(state.body.len());
+                let take = ctx.chunk.len().min(room);
+                state.body.extend_from_slice(&ctx.chunk[..take]);
+                if take < ctx.chunk.len() {
+                    state.body_truncated = true;
+                }
+            }
         }
     }
 }
@@ -263,13 +300,21 @@ mod tests {
                 "zen",
                 "zen",
                 &Method::POST,
+                "/zen/chat/completions",
                 &mut map,
                 &mut payload,
                 state.as_mut(),
             ))
             .unwrap();
+        plugin.on_attempt(&mut AttemptCtx::new(
+            "zen-primary",
+            Some(status),
+            &[],
+            state.as_mut(),
+        ));
         let mut code = StatusCode::from_u16(status).unwrap();
         plugin.on_response_head(&mut ResponseHeadCtx::new(
+            "zen-primary",
             &mut code,
             &mut HeaderMap::new(),
             state.as_mut(),

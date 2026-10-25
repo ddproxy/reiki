@@ -37,6 +37,8 @@ base_url = "https://opencode.ai/zen/v1"   # must be https
 # auth_format = "Bearer {key}"
 # model_aliases = { "gpt-4o" = "opencode/gpt-4o" }  # rewrite the top-level `model`
 # drop_params = ["stream_options"]        # remove these top-level keys
+# http2 = true                            # negotiate HTTP/2 (default: HTTP/1.1)
+# forward_accept_encoding = true          # send the client's Accept-Encoding (default: identity)
 
 [keys.zen-a]
 upstream = "zen"
@@ -62,6 +64,10 @@ token_sha256 = "<sha256 of the admin token>"
 - `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
+- `http2` lets Reiki negotiate HTTP/2 with that upstream over TLS, and `forward_accept_encoding` sends the client's own `Accept-Encoding` upstream instead of `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself, so error bodies are still read for key failover, and sends the client plain bytes. Both are off by default; see [docs/providers.md](docs/providers.md).
+- `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
+- `[tunnel]` adds a CONNECT-only forward proxy with a destination allowlist, so a client's own TLS session reaches the destination untouched. See [docs/tunnel.md](docs/tunnel.md).
+- `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
 - `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
 - Keys live in files, never in the config. Keep them mode 0600.
 - Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`.

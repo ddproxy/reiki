@@ -25,7 +25,7 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `body` | `full` | `full` logs the request body, `summary` logs counts only, `none` logs its size only. |
 | `max_body_bytes` | 65536 | Longest body text logged (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
 | `headers` | none | Request headers to log, matched case-insensitively, each value cut at 256 bytes. Credential headers are refused (see below). |
-| `response` | `status` | `status` writes a response record per request, `none` writes none. |
+| `response` | `status` | `status` writes a response record per request with its status, size, serving key and attempts. `body` adds the response body, cut at `max_body_bytes`. `none` writes no response record. |
 | `redact` | `true` | Mask credential-shaped text (see below). |
 | `queue` | 1024 | Records buffered for the writer thread (16 to 65536). |
 
@@ -39,7 +39,7 @@ Every record is one line with `"v":1`. A request produces two records that share
 
 ```json
 {"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"ct","upstream":"zen","method":"POST","headers":{"user-agent":"opencode/1.18.35"},"body_bytes":75,"body":{"model":"big-pickle","messages":[{"role":"user","content":"hello there"}]}}
-{"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.540Z","status":200,"duration_ms":249,"bytes":11}
+{"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2025-01-01T12:00:00.000Z","status":200,"duration_ms":249,"bytes":11,"key":"zen-primary","attempts":[{"key":"zen-primary","status":200}]}
 ```
 
 - `stream` is the Reiki stream (client) and `upstream` the provider name from the config.
@@ -47,7 +47,9 @@ Every record is one line with `"v":1`. A request produces two records that share
 - The response record is written once the response has finished, or the client has gone away. `status` is the upstream status, and `null` when Reiki answered without an upstream response, for example when every key is cooling. `bytes` is the size of the response body as it passed through the plugin. Response bodies are never logged.
 - If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows.
 
-The log does not say which key served a request, and it does not include the request path; the plugin interface does not expose either.
+The request record carries the request `path` without its query string. The response record carries `key`, the name in the config of the key that produced the response (`null` when Reiki answered itself), and `attempts`, every key tried in order with the upstream status it returned (`null` for a connection error or timeout). Only key names are logged, never a key's value.
+
+With `response = "body"` each failed entry in `attempts` also carries the upstream's error `body`, and the response record carries `body`, the leading part of the response body: parsed JSON when the whole body is JSON and fits, otherwise text, so an event stream appears as its raw `data:` lines. It is masked like the request body, and `body_truncated` is set when it was cut at `max_body_bytes`. Responses Reiki generates itself, such as a 503 when every key is unavailable, are not passed through the plugins and have no body here.
 
 ## Watch it live
 

@@ -9,5 +9,6 @@ pub mod proxy;
 pub mod quota;
 pub mod rewrite;
 pub mod state;
+pub mod tunnel;
 
 pub use reiki_plugin;

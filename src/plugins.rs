@@ -13,7 +13,7 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
 use toml::Value;
 
-use reiki_plugin::{ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
+use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
 use crate::config::ConfigError;
 
@@ -46,6 +46,15 @@ pub struct Registration {
 struct Entry {
     plugin: Box<dyn Plugin>,
     on_error: OnError,
+}
+
+/// Who is asking and for what, as the request hooks see it.
+pub struct RequestMeta<'a> {
+    pub stream: &'a str,
+    pub upstream: &'a str,
+    pub method: &'a Method,
+    /// The request path without its query string.
+    pub path: &'a str,
 }
 
 /// The configured plugins in chain order, run on every request.
@@ -116,17 +125,16 @@ impl PluginChain {
     pub fn on_request(
         &self,
         states: &mut [Box<dyn Any + Send>],
-        stream: &str,
-        upstream: &str,
-        method: &Method,
+        meta: &RequestMeta<'_>,
         headers: &mut HeaderMap,
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
         for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
             let mut ctx = RequestCtx::new(
-                stream,
-                upstream,
-                method,
+                meta.stream,
+                meta.upstream,
+                meta.method,
+                meta.path,
                 &mut *headers,
                 &mut *body,
                 &mut **state,
@@ -177,23 +185,42 @@ impl PluginChain {
         Ok(())
     }
 
-    /// Runs `on_response_head` on every plugin, in order. A panicking hook is
-    /// logged and skipped.
+    /// Runs `on_attempt` on every plugin, in order. A panicking hook is logged
+    /// and skipped.
+    pub fn on_attempt(
+        &self,
+        states: &mut [Box<dyn Any + Send>],
+        key: &str,
+        status: Option<u16>,
+        body: &[u8],
+    ) {
+        for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
+            let mut ctx = AttemptCtx::new(key, status, body, &mut **state);
+            let _ = guard(entry.plugin.name(), "on_attempt", || {
+                entry.plugin.on_attempt(&mut ctx);
+            });
+        }
+    }
+
+    /// Runs `on_response_head` on every plugin, in reverse order, so the plugin that
+    /// touched the request first sees the response last. A panicking hook is logged
+    /// and skipped.
     pub fn on_response_head(
         &self,
         states: &mut [Box<dyn Any + Send>],
+        key: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
     ) {
-        for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
-            let mut ctx = ResponseHeadCtx::new(&mut *status, &mut *headers, &mut **state);
+        for (entry, state) in self.entries.iter().zip(states.iter_mut()).rev() {
+            let mut ctx = ResponseHeadCtx::new(key, &mut *status, &mut *headers, &mut **state);
             let _ = guard(entry.plugin.name(), "on_response_head", || {
                 entry.plugin.on_response_head(&mut ctx);
             });
         }
     }
 
-    /// Runs `on_response_chunk` on every plugin, in order, letting each rewrite
+    /// Runs `on_response_chunk` on every plugin, in reverse order, letting each rewrite
     /// `chunk` before the next sees it. A panicking hook is logged and skipped.
     pub fn on_response_chunk(
         &self,
@@ -201,7 +228,7 @@ impl PluginChain {
         chunk: &mut Bytes,
         is_last: bool,
     ) {
-        for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
+        for (entry, state) in self.entries.iter().zip(states.iter_mut()).rev() {
             let mut ctx = ChunkCtx::new(&mut *chunk, is_last, &mut **state);
             let _ = guard(entry.plugin.name(), "on_response_chunk", || {
                 entry.plugin.on_response_chunk(&mut ctx);
@@ -277,7 +304,14 @@ fn on_error(name: &str, table: &toml::Table) -> Result<OnError, ConfigError> {
 /// });
 /// ```
 pub fn builtin() -> Vec<Registration> {
+    // Order matters: placeholders must mask before the request log sees the request,
+    // and, because responses run in reverse, restore only after the log has seen the response.
     vec![
+        #[cfg(feature = "plugin-placeholders")]
+        Registration {
+            name: reiki_placeholders::NAME,
+            build: reiki_placeholders::build,
+        },
         #[cfg(feature = "plugin-requestlog")]
         Registration {
             name: reiki_requestlog::NAME,
@@ -396,7 +430,17 @@ mod tests {
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
         let mut headers = HeaderMap::new();
-        chain.on_request(states, "default", "zen", &Method::POST, &mut headers, body)
+        chain.on_request(
+            states,
+            &RequestMeta {
+                stream: "default",
+                upstream: "zen",
+                method: &Method::POST,
+                path: "/zen/chat/completions",
+            },
+            &mut headers,
+            body,
+        )
     }
 
     #[test]
@@ -412,6 +456,38 @@ mod tests {
         let chain =
             PluginChain::build(&configured("[append]\nenabled = false\n"), &registry()).unwrap();
         assert!(chain.is_empty());
+    }
+
+    struct Tag(&'static str);
+    impl Plugin for Tag {
+        fn name(&self) -> &str {
+            "tag"
+        }
+        fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+            let mut bytes = ctx.chunk.to_vec();
+            bytes.extend_from_slice(self.0.as_bytes());
+            *ctx.chunk = Bytes::from(bytes);
+        }
+    }
+
+    #[test]
+    fn response_hooks_run_in_reverse_registry_order() {
+        let registry = vec![
+            Registration {
+                name: "first",
+                build: |_| Ok(Box::new(Tag("A"))),
+            },
+            Registration {
+                name: "second",
+                build: |_| Ok(Box::new(Tag("B"))),
+            },
+        ];
+        let chain = PluginChain::build(&configured("[first]\n[second]\n"), &registry).unwrap();
+        let mut states = chain.states();
+        let mut chunk = Bytes::from_static(b"x");
+        chain.on_response_chunk(&mut states, &mut chunk, false);
+        // The last plugin to see the request sees the response first, so it tags first.
+        assert_eq!(&chunk[..], b"xBA");
     }
 
     #[test]
@@ -481,7 +557,7 @@ mod tests {
         let mut status = StatusCode::OK;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, "31".parse().unwrap());
-        chain.on_response_head(&mut states, &mut status, &mut headers);
+        chain.on_response_head(&mut states, "key-a", &mut status, &mut headers);
         assert!(headers.get(CONTENT_LENGTH).is_none());
 
         let payload = b"echo <PLACEHOLDER> end";

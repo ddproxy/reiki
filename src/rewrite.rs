@@ -42,7 +42,10 @@ fn rewrite(body: &[u8], aliases: &BTreeMap<String, String>, drop: &[String]) -> 
             }
             if member.key == b"model" && member.is_string {
                 let raw = &body[member.value_start + 1..member.value_end - 1];
-                if let Some(mapped) = std::str::from_utf8(raw).ok().and_then(|m| aliases.get(m)) {
+                if let Some(mapped) = std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|m| aliases.get(m).or_else(|| aliases.get("*")))
+                {
                     changed = true;
                     return Action::Replace(json_string(mapped));
                 }
@@ -213,6 +216,24 @@ mod tests {
     fn run(body: &str, aliases: &BTreeMap<String, String>, drop: &[&str]) -> Bytes {
         let drop: Vec<String> = drop.iter().map(|d| (*d).to_owned()).collect();
         rewrite_body(Bytes::copy_from_slice(body.as_bytes()), aliases, &drop)
+    }
+
+    #[test]
+    fn a_wildcard_alias_catches_models_without_their_own_entry() {
+        let map = aliases(&[("a", "x"), ("*", "fallback/free")]);
+        assert_eq!(
+            run(r#"{"model":"a"}"#, &map, &[]),
+            Bytes::from_static(br#"{"model":"x"}"#)
+        );
+        assert_eq!(
+            run(r#"{"model":"other"}"#, &map, &[]),
+            Bytes::from_static(br#"{"model":"fallback/free"}"#)
+        );
+        assert_eq!(
+            run(r#"{"messages":[]}"#, &map, &[]),
+            Bytes::from_static(br#"{"messages":[]}"#),
+            "no model, nothing to map"
+        );
     }
 
     #[test]

@@ -87,7 +87,7 @@ async fn main() {
 
     let text = std::fs::read_to_string(&cli.config)
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
-    let config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
+    let mut config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let checking = matches!(cli.command, Some(Command::Check));
     let plugin_tables = if checking {
@@ -109,6 +109,10 @@ async fn main() {
         let admin = admin_listen
             .as_ref()
             .map_or(String::new(), |addr| format!(", admin on {addr}"));
+        let admin = match &config.tunnel {
+            Some(tunnel) => format!("{admin}, tunnel on {}", tunnel.listen),
+            None => admin,
+        };
         let names = plugins.names().collect::<Vec<_>>();
         let plugin_part = if names.is_empty() {
             String::new()
@@ -124,6 +128,7 @@ async fn main() {
         return;
     }
 
+    let tunnel_config = config.tunnel.take();
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.load_persisted_state();
@@ -143,6 +148,16 @@ async fn main() {
                 tracing::error!(error = %e, "admin server error");
             }
         });
+    }
+    if let Some(tunnel) = &tunnel_config {
+        let tunnel_listener = tokio::net::TcpListener::bind(&tunnel.listen)
+            .await
+            .unwrap_or_else(|e| fail(&format!("cannot bind tunnel {}: {e}", tunnel.listen)));
+        tracing::info!(addr = %tunnel.listen, destinations = tunnel.allow.len(), "reiki tunnel listening");
+        tokio::spawn(reiki::tunnel::serve(
+            tunnel_listener,
+            Arc::new(reiki::tunnel::Tunnel::new(tunnel)),
+        ));
     }
     tracing::info!(%listen, "reiki listening");
     let served = axum::serve(listener, router(app))

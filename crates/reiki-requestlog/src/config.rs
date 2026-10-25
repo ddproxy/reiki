@@ -29,6 +29,17 @@ pub enum BodyMode {
     None,
 }
 
+/// What the plugin records about each response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// Nothing.
+    None,
+    /// Status, duration, size, the serving key and every attempt.
+    Status,
+    /// Everything in `Status`, plus the response body.
+    Body,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub file: Option<PathBuf>,
@@ -38,7 +49,7 @@ pub struct Config {
     pub body: BodyMode,
     pub max_body_bytes: usize,
     pub headers: Vec<String>,
-    pub response: bool,
+    pub response: ResponseMode,
     pub redact: bool,
     pub queue: usize,
     pub dry_run: bool,
@@ -89,11 +100,12 @@ impl Config {
             }
         };
         let response = match string(table, "response")?.as_deref() {
-            None | Some("status") => true,
-            Some("none") => false,
+            None | Some("status") => ResponseMode::Status,
+            Some("body") => ResponseMode::Body,
+            Some("none") => ResponseMode::None,
             Some(other) => {
                 return Err(format!(
-                    "`response` must be \"status\" or \"none\", got \"{other}\""
+                    "`response` must be \"status\", \"body\" or \"none\", got \"{other}\""
                 ))
             }
         };
@@ -224,7 +236,8 @@ mod tests {
     fn defaults_apply_when_only_a_file_is_set() {
         let config = parse("file = \"/var/log/reiki/req.jsonl\"").unwrap();
         assert_eq!(config.body, BodyMode::Full);
-        assert!(config.response && config.redact);
+        assert_eq!(config.response, ResponseMode::Status);
+        assert!(config.redact);
         assert_eq!(config.file_keep, 5);
         assert_eq!(config.max_body_bytes, 65_536);
         assert!(config.headers.is_empty() && config.socket.is_none());
@@ -282,7 +295,19 @@ mod tests {
     #[test]
     fn modes_and_ranges_are_validated() {
         assert!(parse("file = \"/x\"\nbody = \"all\"").is_err());
-        assert!(parse("file = \"/x\"\nresponse = \"body\"").is_err());
+        assert!(parse("file = \"/x\"\nresponse = \"all\"").is_err());
+        assert_eq!(
+            parse("file = \"/x\"\nresponse = \"body\"")
+                .unwrap()
+                .response,
+            ResponseMode::Body
+        );
+        assert_eq!(
+            parse("file = \"/x\"\nresponse = \"none\"")
+                .unwrap()
+                .response,
+            ResponseMode::None
+        );
         assert!(parse("file = \"/x\"\nmax_body_bytes = 0").is_err());
         assert!(parse("file = \"/x\"\nmax_body_bytes = 99999999").is_err());
         assert!(parse("file = \"/x\"\nqueue = 4").is_err());

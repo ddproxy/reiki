@@ -18,22 +18,24 @@ file = "/var/lib/reiki/requests.jsonl"
 - `on_error` is `"pass_through"` (default) or `"reject"`. It decides what happens when a plugin reports that it could not apply (a skip): `pass_through` logs it and carries on, `reject` answers the client with 503. A plugin that deliberately rejects a request always rejects, whatever `on_error` says.
 - `reiki check` adds `dry_run = true` to every plugin table. A plugin should then validate its settings only, and not open files, sockets or threads, so the check has no side effects and works while Reiki is running.
 - Plugin settings are read at startup. A SIGHUP reload checks the plugin tables (an unknown plugin name or a bad setting keeps the old config) and logs a warning when they changed, but does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
-- Plugins run in the order they are registered in `src/plugins.rs`, not in the order of the config file.
+- Plugins run in the order they are registered in `src/plugins.rs`, not in the order of the config file. Request hooks run in that order; response hooks run in the reverse order, so the plugin that changed the request first sees the response last and can undo its change before the client gets it.
 
 ## Bundled plugins
 
 | Plugin | Feature | What it does |
 | --- | --- | --- |
+| `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
 
 ## What a plugin can see and do
 
 A plugin is trusted code that runs inside the Reiki process.
 
-- Before a key is chosen, `on_request` receives the stream name, the upstream name, the method, the request headers and the request body. It can change the headers and the body, or reject the request with a status and a message. It runs once per request, so every failover attempt sends the same transformed request.
+- Before a key is chosen, `on_request` receives the stream name, the upstream name, the method, the request path, the request headers and the request body. It can change the headers and the body, or reject the request with a status and a message. It runs once per request, so every failover attempt sends the same transformed request.
 - It sees the client's own headers, including the client token, and the whole request body. It never receives an upstream key: the key is attached after the hooks have run, and any `authorization` header a plugin sets is dropped.
-- The request path and query string are not passed to plugins.
-- `on_response_head` receives the upstream status and headers. `on_response_chunk` receives each body chunk and may rewrite it.
+- The request path is passed to plugins, the query string is not.
+- `on_attempt` runs after each upstream attempt, including the ones that fail over to the next key. It receives the key's name from the config, the upstream status (`None` when no response arrived) and, for an error response, the start of its body. It never receives a key's secret.
+- `on_response_head` receives the name of the key that produced the response, the upstream status and the headers. `on_response_chunk` receives each body chunk and may rewrite it.
 - Hooks are synchronous and run on the request's task. A hook that blocks is not interrupted, and there is no timeout. Do slow work, such as file writes, on a thread of your own.
 - A panic in a hook is caught and logged with the plugin and hook name, and the request carries on. Changes the hook made before it panicked are kept, and the plugin's own state may be left half-updated. A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or is answered with 503. Rust's default panic handler also prints the panic message and location to stderr, outside the log settings, so do not `unwrap` or `expect` on request data.
 - While any plugin is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. HEAD, 204 and 304 responses keep theirs, as they have no body. When the body ends normally the final `on_response_chunk` call, with `is_last` set, follows the last chunk. It does not happen after an upstream read error or when the client disconnects, so use the per-request state being dropped as the end-of-response signal.

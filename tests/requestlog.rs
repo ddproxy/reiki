@@ -155,11 +155,24 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     assert_eq!(records[0]["stream"], "ct");
     assert_eq!(records[0]["upstream"], "zen");
     assert_eq!(records[0]["method"], "POST");
+    assert_eq!(records[0]["path"], "/zen/chat/completions");
     assert_eq!(records[0]["headers"]["user-agent"], "opencode/1.18.35");
     assert_eq!(records[0]["body"]["messages"][0]["content"], "hello there");
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["id"], records[0]["id"]);
     assert_eq!(records[1]["status"], 200);
+    // The response record names the key that served it and each key tried, by its config name.
+    assert_eq!(records[1]["key"], "b");
+    assert_eq!(
+        records[1]["attempts"],
+        serde_json::json!([
+            {"key": "a", "status": 429},
+            {"key": "b", "status": 200},
+        ])
+    );
+    // The default mode records no response body, not even for a failed attempt.
+    assert!(records[1].get("body").is_none());
+    assert!(records[1]["attempts"][0].get("body").is_none());
 
     let text = std::fs::read_to_string(&path).unwrap();
     for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
@@ -242,4 +255,81 @@ async fn an_invalid_plugin_table_stops_the_chain_from_building() {
     );
     let config = Config::parse(&text).unwrap();
     assert!(PluginChain::build(&config.plugins, &builtin()).is_err());
+}
+
+#[tokio::test]
+async fn body_mode_records_the_response_body_and_never_a_key() {
+    let rig = Rig::start(
+        "respbody",
+        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"",
+    )
+    .await;
+    let path = rig.dir.join("req.jsonl");
+
+    let response = rig
+        .post("/zen/chat/completions", "{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let records = records_when(&path, 2);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1]["body"]["ok"], true);
+    assert_eq!(records[1]["key"], "b");
+    // The failed attempt keeps the upstream's own error text.
+    assert_eq!(records[1]["attempts"][0]["body"], "Rate limit exceeded");
+    assert!(records[1]["attempts"][1].get("body").is_none());
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
+        assert!(!text.contains(secret), "{secret} leaked into the log");
+    }
+    let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test]
+async fn a_streamed_response_body_is_kept_up_to_the_cap_and_marked_cut() {
+    let rig = Rig::start(
+        "respcap",
+        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"\nmax_body_bytes = 20",
+    )
+    .await;
+    let path = rig.dir.join("req.jsonl");
+
+    let response = rig.post("/zen/stream", "{}").send().await.unwrap();
+    let text = response.text().await.unwrap();
+    assert!(text.len() > 20);
+
+    let records = records_when(&path, 2);
+    assert_eq!(records.len(), 2, "{records:?}");
+    let body = records[1]["body"].as_str().unwrap();
+    assert!(body.starts_with("data: one"), "{body}");
+    assert!(body.len() <= 20, "{body}");
+    assert_eq!(records[1]["body_truncated"], true);
+    // The byte count still covers the whole response.
+    assert_eq!(records[1]["bytes"], text.len());
+    let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test]
+async fn an_exhausted_chain_logs_every_attempt_and_no_serving_key() {
+    let rig = Rig::start("attempts", "file = \"{dir}/req.jsonl\"").await;
+    let path = rig.dir.join("req.jsonl");
+
+    let response = rig.post("/zen/limited", "{}").send().await.unwrap();
+    assert_eq!(response.status(), 503);
+
+    let records = records_when(&path, 2);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(records[1]["key"].is_null(), "{}", records[1]);
+    assert_eq!(
+        records[1]["attempts"],
+        serde_json::json!([
+            {"key": "a", "status": 429},
+            {"key": "b", "status": 429},
+        ])
+    );
+    let _ = std::fs::remove_dir_all(&rig.dir);
 }

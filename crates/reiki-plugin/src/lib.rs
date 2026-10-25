@@ -29,6 +29,10 @@ pub trait Plugin: Send + Sync {
         Ok(())
     }
 
+    /// Called after each upstream attempt, in order, including attempts that fail
+    /// over to the next key. The default does nothing.
+    fn on_attempt(&self, _ctx: &mut AttemptCtx<'_>) {}
+
     /// Called when the upstream response head arrives, before any body bytes.
     fn on_response_head(&self, _ctx: &mut ResponseHeadCtx<'_>) {}
 
@@ -66,8 +70,24 @@ pub struct RequestCtx<'a> {
     pub stream: &'a str,
     pub upstream: &'a str,
     pub method: &'a Method,
+    /// The request path as the client sent it, without the query string.
+    pub path: &'a str,
     pub headers: &'a mut HeaderMap,
     pub body: &'a mut Bytes,
+    pub state: &'a mut (dyn Any + Send),
+}
+
+/// One upstream attempt. `key` is the name of the key in the config, never its
+/// secret value.
+#[non_exhaustive]
+pub struct AttemptCtx<'a> {
+    pub key: &'a str,
+    /// The upstream status, or `None` when no response arrived (a connection
+    /// error or a timeout).
+    pub status: Option<u16>,
+    /// The start of the upstream's error body; empty for a success, which streams
+    /// through [`Plugin::on_response_chunk`], and when no response arrived.
+    pub body: &'a [u8],
     pub state: &'a mut (dyn Any + Send),
 }
 
@@ -75,6 +95,8 @@ pub struct RequestCtx<'a> {
 /// must remove `content-length` here so the relay does not forward a stale one.
 #[non_exhaustive]
 pub struct ResponseHeadCtx<'a> {
+    /// The name of the key in the config that produced this response.
+    pub key: &'a str,
     pub status: &'a mut StatusCode,
     pub headers: &'a mut HeaderMap,
     pub state: &'a mut (dyn Any + Send),
@@ -96,6 +118,7 @@ impl<'a> RequestCtx<'a> {
         stream: &'a str,
         upstream: &'a str,
         method: &'a Method,
+        path: &'a str,
         headers: &'a mut HeaderMap,
         body: &'a mut Bytes,
         state: &'a mut (dyn Any + Send),
@@ -104,7 +127,24 @@ impl<'a> RequestCtx<'a> {
             stream,
             upstream,
             method,
+            path,
             headers,
+            body,
+            state,
+        }
+    }
+}
+
+impl<'a> AttemptCtx<'a> {
+    pub fn new(
+        key: &'a str,
+        status: Option<u16>,
+        body: &'a [u8],
+        state: &'a mut (dyn Any + Send),
+    ) -> Self {
+        Self {
+            key,
+            status,
             body,
             state,
         }
@@ -113,11 +153,13 @@ impl<'a> RequestCtx<'a> {
 
 impl<'a> ResponseHeadCtx<'a> {
     pub fn new(
+        key: &'a str,
         status: &'a mut StatusCode,
         headers: &'a mut HeaderMap,
         state: &'a mut (dyn Any + Send),
     ) -> Self {
         Self {
+            key,
             status,
             headers,
             state,

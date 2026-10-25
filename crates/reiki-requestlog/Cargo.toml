@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 reiki-plugin = { path = "../reiki-plugin" }
+reiki-redact = { path = "../reiki-redact" }
 bytes = "1"
 http = "1"
 serde_json = "1"

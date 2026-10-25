@@ -19,12 +19,16 @@ use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
-use crate::plugins::PluginChain;
+use crate::plugins::{PluginChain, RequestMeta};
 use crate::rewrite::rewrite_body;
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Stands in for the stream name when a request needs none.
+const PASSTHROUGH_STREAM: &str = "passthrough";
+/// Stands in for the key name on a request that used none of Reiki's keys.
+const PASSTHROUGH_KEY: &str = "-";
 const HEALTH_PATH: &str = "/__reiki/healthz";
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
@@ -209,7 +213,10 @@ pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
     policy: Policy,
+    /// HTTP/1.1 only, for upstreams without `http2`.
     client: reqwest::Client,
+    /// Negotiates HTTP/2 where the upstream offers it, for upstreams with `http2`.
+    client_h2: reqwest::Client,
     header_timeout: Duration,
     metrics: Metrics,
     state_path: OnceLock<PathBuf>,
@@ -248,17 +255,26 @@ impl App {
         header_timeout: Duration,
         plugins: PluginChain,
     ) -> Arc<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let build = |http1_only: bool| {
+            let builder = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none());
+            let builder = if http1_only {
+                builder.http1_only()
+            } else {
+                builder
+            };
+            builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        };
+        let client = build(true);
+        let client_h2 = build(false);
         let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             policy,
             client,
+            client_h2,
             header_timeout,
             metrics: Metrics::new(),
             state_path: OnceLock::new(),
@@ -479,18 +495,27 @@ fn skip_header(name: &HeaderName) -> bool {
     )
 }
 
-fn upstream_headers(inbound: &HeaderMap, auth_header: &str, auth_value: &str) -> HeaderMap {
+fn upstream_headers(
+    inbound: &HeaderMap,
+    auth_header: &str,
+    auth_value: &str,
+    forward_accept_encoding: bool,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in inbound {
-        if !skip_header(name) {
+        let keep_encoding = forward_accept_encoding && name == header::ACCEPT_ENCODING;
+        if keep_encoding || !skip_header(name) {
             out.append(name.clone(), value.clone());
         }
     }
-    // Compressed error bodies cannot be classified, so ask for plain responses.
-    out.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
+    // Unless the client's own value is forwarded (the client sent none, or the upstream
+    // is set to pass it on), ask for plain responses so error bodies can be classified.
+    if !out.contains_key(header::ACCEPT_ENCODING) {
+        out.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
     if let (Ok(name), Ok(mut value)) = (
         HeaderName::from_bytes(auth_header.as_bytes()),
         HeaderValue::from_str(auth_value),
@@ -524,21 +549,30 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     // already in flight.
     let snapshot = app.snapshot();
 
-    let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
-        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
-    };
-    let Some(stream) = snapshot.authenticate(&token) else {
-        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
-    };
-    let stream = stream.to_owned();
+    // The client's own credentials go upstream, so there is no Reiki token to check.
+    let passthrough = split_upstream(parts.uri.path())
+        .and_then(|(name, _)| snapshot.config.upstream.get(name))
+        .is_some_and(|u| u.passthrough);
+    let stream = if passthrough {
+        PASSTHROUGH_STREAM.to_owned()
+    } else {
+        let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
+            return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
+        };
+        let Some(stream) = snapshot.authenticate(&token) else {
+            return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
+        };
+        let stream = stream.to_owned();
 
-    // A stream's own rate limit is checked before any key is picked, so a
-    // rejected request never reaches the upstream or touches key health.
-    if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
-        tracing::warn!(stream = %stream, "stream rate limit exceeded");
-        app.metrics.record_rate_limit_rejection(&stream);
-        return rate_limited_response(wait);
-    }
+        // A stream's own rate limit is checked before any key is picked, so a
+        // rejected request never reaches the upstream or touches key health.
+        if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
+            tracing::warn!(stream = %stream, "stream rate limit exceeded");
+            app.metrics.record_rate_limit_rejection(&stream);
+            return rate_limited_response(wait);
+        }
+        stream
+    };
 
     let Some((upstream_name, rest)) = split_upstream(parts.uri.path()) else {
         return json_error(StatusCode::NOT_FOUND, "not_found", "no upstream in path");
@@ -559,14 +593,16 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     // Run request hooks once, before the failover loop, so every attempt sees
     // the same transformed request.
     let mut plugin_states = app.plugins.states();
-    if let Err(blocked) = app.plugins.on_request(
-        &mut plugin_states,
-        &stream,
-        upstream_name,
-        &parts.method,
-        &mut parts.headers,
-        &mut body,
-    ) {
+    let meta = RequestMeta {
+        stream: &stream,
+        upstream: upstream_name,
+        method: &parts.method,
+        path: parts.uri.path(),
+    };
+    if let Err(blocked) =
+        app.plugins
+            .on_request(&mut plugin_states, &meta, &mut parts.headers, &mut body)
+    {
         return json_error(blocked.status, "blocked", &blocked.message);
     }
     if body.len() > MAX_REQUEST_BODY {
@@ -579,28 +615,79 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
 
     // Rewrite once, before the failover loop, so every key replay sends the same
     // bytes. reqwest sets content-length from the rewritten body on each send.
-    let body = rewrite_body(body, &upstream.model_aliases, &upstream.drop_params);
+    let rewritten = rewrite_body(body.clone(), &upstream.model_aliases, &upstream.drop_params);
 
-    let response = forward(
-        &app,
-        Forward {
-            snapshot: &snapshot,
-            stream: &stream,
-            upstream_name,
-            upstream,
-            parts: &parts,
-            rest,
-            plugin_states,
+    let mut used = upstream_name;
+    let first = Forward {
+        snapshot: &snapshot,
+        stream: &stream,
+        upstream_name,
+        upstream,
+        parts: &parts,
+        rest,
+        plugin_states,
+    };
+    let mut result = if upstream.passthrough {
+        forward_passthrough(&app, first, rewritten).await
+    } else {
+        forward(&app, first, rewritten).await
+    };
+
+    // One hop only: when nothing is left to try here, hand the request to the
+    // fallback upstream, re-mapped for it, instead of failing the client.
+    if let (Err(spent), Some(fallback)) = (&mut result, &upstream.fallback) {
+        if let Some(target) = snapshot.config.upstream.get(&fallback.upstream) {
+            tracing::warn!(stream = %stream, from = upstream_name, to = %fallback.upstream, "falling back");
+            let failed = spent
+                .refusal
+                .as_ref()
+                .map_or(StatusCode::SERVICE_UNAVAILABLE, |r| r.1);
+            app.metrics.record_request(
+                &stream,
+                upstream_name,
+                StatusClass::from_status(failed.as_u16()),
+            );
+            let body = rewrite_body(body, &fallback.model_aliases, &[]);
+            let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
+            used = fallback.upstream.as_str();
+            result = forward(
+                &app,
+                Forward {
+                    snapshot: &snapshot,
+                    stream: &stream,
+                    upstream_name: used,
+                    upstream: target,
+                    parts: &parts,
+                    rest,
+                    plugin_states: std::mem::take(&mut spent.plugin_states),
+                },
+                body,
+            )
+            .await;
+        }
+    }
+    let response = match result {
+        Ok(response) => response,
+        Err(spent) => match spent.refusal {
+            Some((key, status, headers, body)) => {
+                let mut states = spent.plugin_states;
+                finish_buffered(&app.plugins, &mut states, &key, status, &headers, body)
+            }
+            None => exhausted(&snapshot, &app.health, &stream),
         },
-        body,
-    )
-    .await;
+    };
     app.metrics.record_request(
         &stream,
-        upstream_name,
+        used,
         StatusClass::from_status(response.status().as_u16()),
     );
     response
+}
+
+/// A request whose chain ran dry; the plugin state lets a fallback continue it.
+struct Spent {
+    refusal: Option<(String, StatusCode, HeaderMap, Bytes)>,
+    plugin_states: Vec<Box<dyn Any + Send>>,
 }
 
 /// Everything one in-flight request needs, kept together so `forward` stays
@@ -615,7 +702,7 @@ struct Forward<'a> {
     plugin_states: Vec<Box<dyn Any + Send>>,
 }
 
-async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
+async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, Box<Spent>> {
     let Forward {
         snapshot,
         stream,
@@ -626,11 +713,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         mut plugin_states,
     } = fwd;
 
-    let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
-    if let Some(query) = parts.uri.query().and_then(strip_query_key) {
-        url.push('?');
-        url.push_str(&query);
-    }
+    let url = target_url(upstream, rest, parts);
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
     let max_attempts = snapshot
@@ -639,7 +722,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         .map_or(1, |_| snapshot.config.streams[stream].chain.len() + 1);
 
     let mut skip: Vec<String> = Vec::new();
-    let mut last_refusal: Option<(StatusCode, HeaderMap, Bytes)> = None;
+    let mut last_refusal: Option<(String, StatusCode, HeaderMap, Bytes)> = None;
     let mut pending_failover: Option<(String, FailureKind)> = None;
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
@@ -654,11 +737,21 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             break;
         };
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
-        let headers = upstream_headers(&parts.headers, &upstream.auth_header, &auth_value);
+        let headers = upstream_headers(
+            &parts.headers,
+            &upstream.auth_header,
+            &auth_value,
+            upstream.forward_accept_encoding,
+        );
+        let client = if upstream.http2 {
+            &app.client_h2
+        } else {
+            &app.client
+        };
 
         let sent = tokio::time::timeout(
             app.header_timeout,
-            app.client
+            client
                 .request(parts.method.clone(), &url)
                 .headers(headers)
                 .body(body.clone())
@@ -669,6 +762,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         let response = match sent {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
+                app.plugins
+                    .on_attempt(&mut plugin_states, &key_name, None, &[]);
                 record(
                     app,
                     snapshot,
@@ -689,9 +784,12 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             method = %parts.method,
             path = %parts.uri.path(),
             status = status.as_u16(),
+            version = ?response.version(),
             "forwarded"
         );
         if status.is_success() || status.is_redirection() {
+            app.plugins
+                .on_attempt(&mut plugin_states, &key_name, Some(status.as_u16()), &[]);
             let had_failures = if let Ok(mut health) = app.health.lock() {
                 let had = health.consecutive_failures(&key_name) > 0;
                 health.record_success(&key_name);
@@ -703,7 +801,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             if had_failures {
                 app.persist_state();
             }
-            return stream_response(app, plugin_states, response, parts.method == Method::HEAD);
+            return Ok(stream_response(
+                app,
+                plugin_states,
+                &key_name,
+                response,
+                parts.method == Method::HEAD,
+            ));
         }
 
         let retry_after = response
@@ -713,17 +817,24 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
             .map(str::to_owned);
         let response_headers = response.headers().clone();
         let snippet = read_limited(response).await;
+        app.plugins.on_attempt(
+            &mut plugin_states,
+            &key_name,
+            Some(status.as_u16()),
+            &snippet,
+        );
         let text = String::from_utf8_lossy(&snippet);
 
         match classify(status.as_u16(), retry_after.as_deref(), &text) {
             Outcome::Success | Outcome::PassThrough => {
-                return finish_buffered(
+                return Ok(finish_buffered(
                     &app.plugins,
                     &mut plugin_states,
+                    &key_name,
                     status,
                     &response_headers,
                     snippet,
-                );
+                ));
             }
             Outcome::KeyFailure(FailureClass::AccessDisabled) => {
                 // "Model access is disabled" can depend on the endpoint or model of this one
@@ -733,8 +844,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream refused this request");
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, trying the next key");
                 skip.push(key_name.clone());
+                last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
-                last_refusal = Some((status, response_headers, snippet));
             }
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
@@ -751,10 +862,111 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Response {
         }
     }
 
-    if let Some((status, headers, body)) = last_refusal {
-        return finish_buffered(&app.plugins, &mut plugin_states, status, &headers, body);
+    Err(Box::new(Spent {
+        refusal: last_refusal,
+        plugin_states,
+    }))
+}
+
+/// Sends the request as the client made it, credentials included, and returns any answer.
+async fn forward_passthrough(
+    app: &App,
+    fwd: Forward<'_>,
+    body: Bytes,
+) -> Result<Response, Box<Spent>> {
+    let Forward {
+        upstream,
+        parts,
+        rest,
+        mut plugin_states,
+        ..
+    } = fwd;
+    let url = target_url(upstream, rest, parts);
+    let client = if upstream.http2 {
+        &app.client_h2
+    } else {
+        &app.client
+    };
+    let sent = tokio::time::timeout(
+        app.header_timeout,
+        client
+            .request(parts.method.clone(), &url)
+            .headers(passthrough_headers(
+                &parts.headers,
+                upstream.forward_accept_encoding,
+            ))
+            .body(body)
+            .send(),
+    )
+    .await;
+    match sent {
+        Ok(Ok(response)) => {
+            let status = response.status();
+            tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version(), "passed through");
+            app.plugins.on_attempt(
+                &mut plugin_states,
+                PASSTHROUGH_KEY,
+                Some(status.as_u16()),
+                &[],
+            );
+            Ok(stream_response(
+                app,
+                plugin_states,
+                PASSTHROUGH_KEY,
+                response,
+                parts.method == Method::HEAD,
+            ))
+        }
+        Ok(Err(error)) => {
+            app.plugins
+                .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+            tracing::warn!(%error, "passthrough request failed");
+            Ok(json_error(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the upstream could not be reached",
+            ))
+        }
+        Err(_) => {
+            app.plugins
+                .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+            Ok(json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway_timeout",
+                "the upstream did not answer in time",
+            ))
+        }
     }
-    exhausted(snapshot, &app.health, stream)
+}
+
+fn target_url(upstream: &crate::config::Upstream, rest: &str, parts: &Parts) -> String {
+    let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
+    if let Some(query) = parts.uri.query().and_then(strip_query_key) {
+        url.push('?');
+        url.push_str(&query);
+    }
+    url
+}
+
+/// Every end-to-end header as the client sent it, credentials included.
+fn passthrough_headers(inbound: &HeaderMap, forward_accept_encoding: bool) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in inbound {
+        let keep = matches!(
+            name.as_str(),
+            "authorization" | "x-api-key" | "x-goog-api-key"
+        ) || (forward_accept_encoding && name == header::ACCEPT_ENCODING);
+        if keep || !skip_header(name) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    if !out.contains_key(header::ACCEPT_ENCODING) {
+        out.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
+    out
 }
 
 fn record(
@@ -829,6 +1041,7 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
 fn stream_response(
     app: &App,
     plugin_states: Vec<Box<dyn Any + Send>>,
+    key: &str,
     response: reqwest::Response,
     is_head: bool,
 ) -> Response {
@@ -845,7 +1058,7 @@ fn stream_response(
         let mut states = plugin_states;
         // A plugin that changes the body length must drop content-length here.
         app.plugins
-            .on_response_head(&mut states, &mut status, &mut headers);
+            .on_response_head(&mut states, key, &mut status, &mut headers);
         // A plugin may change the body length, and a known length would also stop
         // the final `is_last` call from being made. These responses carry no body, so
         // their length is only metadata.
@@ -871,6 +1084,7 @@ fn stream_response(
 fn finish_buffered(
     chain: &PluginChain,
     states: &mut [Box<dyn Any + Send>],
+    key: &str,
     status: StatusCode,
     headers: &HeaderMap,
     body: Bytes,
@@ -880,7 +1094,7 @@ fn finish_buffered(
     }
     let mut status = status;
     let mut headers = headers.clone();
-    chain.on_response_head(states, &mut status, &mut headers);
+    chain.on_response_head(states, key, &mut status, &mut headers);
     let mut body = body;
     chain.on_response_chunk(states, &mut body, true);
     buffered_response(status, &headers, body)
@@ -1024,7 +1238,12 @@ mod tests {
         inbound.insert("x-custom", HeaderValue::from_static("keep"));
         inbound.insert("connection", HeaderValue::from_static("close"));
         inbound.insert("host", HeaderValue::from_static("127.0.0.1:4097"));
-        let out = upstream_headers(&inbound, "authorization", "Bearer upstream-key");
+        inbound.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        let out = upstream_headers(&inbound, "authorization", "Bearer upstream-key", false);
+        assert_eq!(out["accept-encoding"], "identity");
         assert_eq!(out["authorization"], "Bearer upstream-key");
         assert_eq!(out["user-agent"], "opencode/1.0");
         assert_eq!(out["x-custom"], "keep");
@@ -1036,6 +1255,26 @@ mod tests {
             .values()
             .any(|v| v.to_str().is_ok_and(|s| s.contains("caller-token"))));
     }
+
+    #[test]
+    fn the_clients_accept_encoding_is_forwarded_only_when_asked() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        let out = upstream_headers(&inbound, "authorization", "Bearer k", true);
+        assert_eq!(out["accept-encoding"], "gzip, deflate, br, zstd");
+        assert_eq!(out.get_all("accept-encoding").iter().count(), 1);
+
+        // A client that sent none still gets plain responses, never a library default.
+        let out = upstream_headers(&HeaderMap::new(), "authorization", "Bearer k", true);
+        assert_eq!(out["accept-encoding"], "identity");
+
+        let out = upstream_headers(&inbound, "authorization", "Bearer k", false);
+        assert_eq!(out["accept-encoding"], "identity");
+    }
+
     #[test]
     fn a_poisoned_lock_does_not_turn_every_pick_into_a_miss() {
         let text = format!(

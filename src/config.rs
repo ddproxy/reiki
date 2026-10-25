@@ -9,20 +9,49 @@ use crate::quota::Reset;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
     Parse(String),
-    UnknownUpstream { key: String, upstream: String },
-    UnknownKey { stream: String, key: String },
+    UnknownUpstream {
+        key: String,
+        upstream: String,
+    },
+    UnknownKey {
+        stream: String,
+        key: String,
+    },
     EmptyChain(String),
     BadTokenHash(String),
     DuplicateToken(String, String),
     InsecureUpstream(String),
     InvalidRateLimit(String),
-    BadQuotaResets { key: String, reason: String },
+    BadQuotaResets {
+        key: String,
+        reason: String,
+    },
     EmptyModelAlias(String),
     EmptyDropParam(String),
+    BadFallback {
+        upstream: String,
+        reason: String,
+    },
+    PassthroughKey {
+        key: String,
+        upstream: String,
+    },
+    FallbackWithoutKeys {
+        stream: String,
+        upstream: String,
+        fallback: String,
+    },
     BadAdminTokenHash,
     AdminListenConflict,
-    UnknownPlugin { name: String, known: Vec<String> },
-    PluginConfig { name: String, message: String },
+    BadTunnel(String),
+    UnknownPlugin {
+        name: String,
+        known: Vec<String>,
+    },
+    PluginConfig {
+        name: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -66,12 +95,32 @@ impl fmt::Display for ConfigError {
             Self::EmptyDropParam(name) => {
                 write!(f, "upstream `{name}` has an empty drop_params entry")
             }
+            Self::BadFallback { upstream, reason } => {
+                write!(f, "upstream `{upstream}` has an invalid fallback: {reason}")
+            }
+            Self::FallbackWithoutKeys {
+                stream,
+                upstream,
+                fallback,
+            } => {
+                write!(
+                    f,
+                    "stream `{stream}` uses upstream `{upstream}`, which falls back to `{fallback}`, but the stream's chain has no `{fallback}` key"
+                )
+            }
+            Self::PassthroughKey { key, upstream } => {
+                write!(
+                    f,
+                    "key `{key}` belongs to upstream `{upstream}`, which is a passthrough and never uses Reiki's keys"
+                )
+            }
             Self::BadAdminTokenHash => {
                 write!(
                     f,
                     "admin token_sha256 is not 64 hex characters (it must not be empty)"
                 )
             }
+            Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -111,6 +160,9 @@ pub struct Config {
     pub streams: BTreeMap<String, StreamConfig>,
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// Optional CONNECT-only forward proxy that copies bytes without reading them.
+    #[serde(default)]
+    pub tunnel: Option<TunnelConfig>,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
@@ -133,6 +185,30 @@ pub struct Upstream {
     pub model_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub drop_params: Vec<String>,
+    /// Negotiate HTTP/2 with this upstream when it offers it. Off keeps HTTP/1.1.
+    #[serde(default)]
+    pub http2: bool,
+    /// Send the client's own `Accept-Encoding` upstream instead of `identity`.
+    /// Reiki decodes compressed responses itself so errors can still be read.
+    #[serde(default)]
+    pub forward_accept_encoding: bool,
+    /// Where a request goes when every key of this upstream is unavailable.
+    #[serde(default)]
+    pub fallback: Option<Fallback>,
+    /// Act as a plain reverse proxy: the client's own credentials go upstream untouched,
+    /// no Reiki token is needed and no key from the chain is used.
+    #[serde(default)]
+    pub passthrough: bool,
+}
+
+/// One hop to another upstream, used only when the chain has no usable key left here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    pub upstream: String,
+    /// Applied to the request before the target upstream's own `model_aliases`; `"*"` matches any model.
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, String>,
 }
 
 fn default_auth_header() -> String {
@@ -172,6 +248,23 @@ fn default_strategy() -> StrategyConfig {
 pub struct AdminConfig {
     pub listen: String,
     pub token_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelConfig {
+    pub listen: String,
+    /// Destinations a client may open: `host`, `host:port` (default 443), `*.host` or `*`.
+    pub allow: Vec<String>,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Lets the tunnel reach loopback addresses. For tests and local development only.
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+fn default_connect_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +309,27 @@ impl Config {
             }
         }
         self.quota_resets = resets;
+        if let Some(tunnel) = &self.tunnel {
+            let reason = if tunnel.allow.is_empty() {
+                Some("allow lists no destinations".to_owned())
+            } else if let Some(bad) = tunnel.allow.iter().find(|r| !crate::tunnel::valid_rule(r)) {
+                Some(format!("`{bad}` is not a valid allow entry"))
+            } else if tunnel.connect_timeout_secs == 0 {
+                Some("connect_timeout_secs must be at least 1".to_owned())
+            } else if tunnel.listen == self.listen
+                || self
+                    .admin
+                    .as_ref()
+                    .is_some_and(|a| a.listen == tunnel.listen)
+            {
+                Some("listen must differ from the client and admin listen addresses".to_owned())
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(ConfigError::BadTunnel(reason));
+            }
+        }
         Ok(())
     }
 
@@ -233,10 +347,43 @@ impl Config {
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
             }
+            if upstream.passthrough && upstream.fallback.is_some() {
+                return Err(ConfigError::BadFallback {
+                    upstream: name.clone(),
+                    reason: "a passthrough has no keys to run out of".to_owned(),
+                });
+            }
+            if let Some(fallback) = &upstream.fallback {
+                let reason = if fallback.upstream == *name {
+                    Some("it names the upstream itself")
+                } else if !self.upstream.contains_key(&fallback.upstream) {
+                    Some("it names an unknown upstream")
+                } else if fallback
+                    .model_aliases
+                    .iter()
+                    .any(|(k, v)| k.is_empty() || v.is_empty())
+                {
+                    Some("model_aliases has an empty key or value")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return Err(ConfigError::BadFallback {
+                        upstream: name.clone(),
+                        reason: reason.to_owned(),
+                    });
+                }
+            }
         }
         for (name, key) in &self.keys {
-            if !self.upstream.contains_key(&key.upstream) {
+            let Some(upstream) = self.upstream.get(&key.upstream) else {
                 return Err(ConfigError::UnknownUpstream {
+                    key: name.clone(),
+                    upstream: key.upstream.clone(),
+                });
+            };
+            if upstream.passthrough {
+                return Err(ConfigError::PassthroughKey {
                     key: name.clone(),
                     upstream: key.upstream.clone(),
                 });
@@ -252,6 +399,23 @@ impl Config {
                     return Err(ConfigError::UnknownKey {
                         stream: name.clone(),
                         key: key.clone(),
+                    });
+                }
+            }
+            for key in &stream.chain {
+                let used = &self.keys[key].upstream;
+                let Some(fallback) = &self.upstream[used].fallback else {
+                    continue;
+                };
+                let has_target = stream
+                    .chain
+                    .iter()
+                    .any(|k| self.keys[k].upstream == fallback.upstream);
+                if !has_target {
+                    return Err(ConfigError::FallbackWithoutKeys {
+                        stream: name.clone(),
+                        upstream: used.clone(),
+                        fallback: fallback.upstream.clone(),
                     });
                 }
             }
@@ -533,6 +697,36 @@ chain = ["zen-a"]
         let upstream = &config.upstream["zen"];
         assert_eq!(upstream.model_aliases["gpt-4o"], "opencode/gpt-4o");
         assert_eq!(upstream.drop_params, ["stream_options", "reasoning_effort"]);
+    }
+
+    #[test]
+    fn transport_options_default_off_and_parse_when_set() {
+        let text = |options: &str| {
+            format!(
+                r#"
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+{options}
+
+[keys.zen-a]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-a"
+
+[streams.s]
+token_sha256 = "{HASH_A}"
+chain = ["zen-a"]
+"#
+            )
+        };
+        let plain = Config::parse(&text("")).unwrap();
+        assert!(!plain.upstream["zen"].http2);
+        assert!(!plain.upstream["zen"].forward_accept_encoding);
+
+        let set = Config::parse(&text("http2 = true\nforward_accept_encoding = true")).unwrap();
+        assert!(set.upstream["zen"].http2);
+        assert!(set.upstream["zen"].forward_accept_encoding);
+
+        assert!(Config::parse(&text("http2 = \"yes\"")).is_err());
     }
 
     #[test]

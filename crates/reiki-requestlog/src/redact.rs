@@ -3,127 +3,27 @@ use std::borrow::Cow;
 use serde_json::Value;
 
 const MASK: &str = "[REDACTED]";
-
-/// Token prefixes with the fewest token characters that must follow, so ordinary words are left alone.
-const PREFIXES: &[(&str, usize)] = &[
-    ("sk-", 20),
-    ("oc_sk_", 16),
-    ("ghp_", 30),
-    ("gho_", 30),
-    ("ghu_", 30),
-    ("ghs_", 30),
-    ("ghr_", 30),
-    ("github_pat_", 30),
-    ("glpat-", 16),
-    ("AKIA", 16),
-    ("ASIA", 16),
-    ("AIza", 30),
-    ("xoxb-", 20),
-    ("xoxp-", 20),
-    ("xoxa-", 20),
-    ("xoxs-", 20),
-    ("eyJ", 40),
-];
-
-const BEARER: &[u8] = b"bearer ";
-const BEARER_MIN: usize = 16;
-
-fn is_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_token(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-}
-
-fn token_len(bytes: &[u8]) -> usize {
-    bytes.iter().take_while(|b| is_token(**b)).count()
-}
+const PRIVATE_KEY_MASK: &str = "[REDACTED PRIVATE KEY]";
 
 /// Masks credential-shaped substrings; borrows the input when nothing matched.
 pub fn secrets(text: &str) -> Cow<'_, str> {
-    let bytes = text.as_bytes();
-    let mut out: Option<String> = None;
+    let spans = reiki_redact::scan(text);
+    if spans.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    let mut i = 0;
-
-    let replace =
-        |out: &mut Option<String>, from: usize, to: usize, copied: &mut usize, mask: &str| {
-            let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
-            buf.push_str(&text[*copied..from]);
-            buf.push_str(mask);
-            *copied = to;
-        };
-
-    while i < bytes.len() {
-        let boundary = i == 0 || !is_word(bytes[i - 1]);
-        if !boundary {
-            i += 1;
-            continue;
-        }
-
-        if bytes[i..].starts_with(b"-----BEGIN ") {
-            if let Some(end) = private_key_end(text, i) {
-                replace(&mut out, i, end, &mut copied, "[REDACTED PRIVATE KEY]");
-                i = end;
-                continue;
-            }
-        }
-
-        if bytes.len() - i >= BEARER.len()
-            && bytes[i..i + BEARER.len()].eq_ignore_ascii_case(BEARER)
-        {
-            let start = i + BEARER.len();
-            let len = token_len(&bytes[start..]);
-            if len >= BEARER_MIN {
-                replace(&mut out, start, start + len, &mut copied, MASK);
-                i = start + len;
-                continue;
-            }
-        }
-
-        let mut matched = false;
-        for (prefix, min) in PREFIXES {
-            if bytes[i..].starts_with(prefix.as_bytes()) {
-                let after = i + prefix.len();
-                let len = token_len(&bytes[after..]);
-                if len >= *min {
-                    replace(&mut out, i, after + len, &mut copied, MASK);
-                    i = after + len;
-                    matched = true;
-                    break;
-                }
-            }
-        }
-        if !matched {
-            i += 1;
-        }
+    for span in spans {
+        out.push_str(&text[copied..span.start]);
+        out.push_str(if span.private_key {
+            PRIVATE_KEY_MASK
+        } else {
+            MASK
+        });
+        copied = span.end;
     }
-
-    match out {
-        None => Cow::Borrowed(text),
-        Some(mut buf) => {
-            buf.push_str(&text[copied..]);
-            Cow::Owned(buf)
-        }
-    }
-}
-
-/// End of the private-key block at `start`, to the end of text if unclosed; `None` for other PEM blocks.
-fn private_key_end(text: &str, start: usize) -> Option<usize> {
-    let rest = &text[start..];
-    let header_end = rest[5..].find("-----")? + 5;
-    if !rest[..header_end].contains("PRIVATE KEY") {
-        return None;
-    }
-    match rest[header_end..].find("-----END ") {
-        Some(offset) => {
-            let footer = header_end + offset + "-----END ".len();
-            let close = rest[footer..].find("-----").map(|p| footer + p + 5);
-            Some(start + close.unwrap_or(rest.len()))
-        }
-        None => Some(text.len()),
-    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
 }
 
 /// Masks every string value in place.

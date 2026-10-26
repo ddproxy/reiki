@@ -300,6 +300,7 @@ impl Interceptor {
             });
         let served = hyper::server::conn::http1::Builder::new()
             .timer(hyper_util::rt::TokioTimer::new())
+            .preserve_header_case(true)
             .header_read_timeout(HEADER_TIMEOUT)
             .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
             .await;

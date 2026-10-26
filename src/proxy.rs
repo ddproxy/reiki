@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
 use crate::plugins::{PluginChain, RequestMeta};
 use crate::rewrite::rewrite_body;
-use crate::upstream::UpstreamResponse;
+use crate::upstream::{faithful_request, UpstreamResponse};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -220,6 +220,7 @@ pub struct App {
     client_h2: reqwest::Client,
     /// HTTP/1.1 with Title-Case header names, for upstreams with `title_case_headers`.
     client_title: reqwest::Client,
+    faithful: crate::upstream::Faithful,
     header_timeout: Duration,
     metrics: Metrics,
     state_path: OnceLock<PathBuf>,
@@ -279,6 +280,7 @@ impl App {
         let client = build(true, false);
         let client_h2 = build(false, false);
         let client_title = build(true, true);
+        let faithful = crate::upstream::Faithful::new();
         let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
@@ -287,6 +289,7 @@ impl App {
             client,
             client_h2,
             client_title,
+            faithful,
             header_timeout,
             metrics: Metrics::new(),
             state_path: OnceLock::new(),
@@ -627,6 +630,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         rest,
         parts,
         body,
+        false,
     )
     .await
 }
@@ -697,6 +701,7 @@ pub(crate) async fn handle_intercepted(
         rest,
         parts,
         body,
+        true,
     )
     .await
 }
@@ -745,6 +750,7 @@ async fn dispatch(
     rest: String,
     parts: Parts,
     body: Body,
+    faithful: bool,
 ) -> Response {
     use tracing::Instrument;
     let id = reiki_plugin::new_request_id();
@@ -759,6 +765,7 @@ async fn dispatch(
         parts,
         body,
         &id,
+        faithful,
     )
     .instrument(span)
     .await
@@ -775,6 +782,7 @@ async fn dispatch_inner(
     mut parts: Parts,
     body: Body,
     id: &str,
+    faithful: bool,
 ) -> Response {
     let rest = rest.as_str();
     let Ok(body) = to_bytes(body, MAX_REQUEST_BODY).await else {
@@ -823,6 +831,7 @@ async fn dispatch_inner(
         parts: &parts,
         rest,
         plugin_states,
+        faithful,
     };
     let mut result = if upstream.passthrough {
         forward_passthrough(app, first, rewritten).await
@@ -857,6 +866,7 @@ async fn dispatch_inner(
                     parts: &parts,
                     rest,
                     plugin_states: std::mem::take(&mut spent.plugin_states),
+                    faithful,
                 },
                 body,
             )
@@ -897,6 +907,7 @@ struct Forward<'a> {
     parts: &'a Parts,
     rest: &'a str,
     plugin_states: Vec<Box<dyn Any + Send>>,
+    faithful: bool,
 }
 
 async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, Box<Spent>> {
@@ -908,6 +919,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         parts,
         rest,
         mut plugin_states,
+        faithful,
     } = fwd;
 
     let url = target_url(upstream, rest, parts);
@@ -934,27 +946,39 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             break;
         };
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
-        let headers = upstream_headers(
-            &parts.headers,
-            &upstream.auth_header,
-            &auth_value,
-            upstream.forward_accept_encoding,
-            upstream.send_keep_alive,
-        );
-        let client = app.client_for(upstream);
 
-        let sent = tokio::time::timeout(
-            app.header_timeout,
-            client
-                .request(parts.method.clone(), &url)
-                .headers(headers)
-                .body(body.clone())
-                .send(),
-        )
+        let sent = tokio::time::timeout(app.header_timeout, async {
+            if faithful {
+                let request = faithful_request(
+                    parts,
+                    &url,
+                    Some((&upstream.auth_header, &auth_value)),
+                    body.clone(),
+                )?;
+                app.faithful.send(request).await
+            } else {
+                let headers = upstream_headers(
+                    &parts.headers,
+                    &upstream.auth_header,
+                    &auth_value,
+                    upstream.forward_accept_encoding,
+                    upstream.send_keep_alive,
+                );
+                let client = app.client_for(upstream);
+                client
+                    .request(parts.method.clone(), &url)
+                    .headers(headers)
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .map(UpstreamResponse::from_reqwest)
+                    .map_err(std::io::Error::other)
+            }
+        })
         .await;
 
         let response = match sent {
-            Ok(Ok(response)) => UpstreamResponse::from_reqwest(response),
+            Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
                 app.plugins
                     .on_attempt(&mut plugin_states, &key_name, None, &[]);
@@ -1073,26 +1097,33 @@ async fn forward_passthrough(
         parts,
         rest,
         mut plugin_states,
+        faithful,
         ..
     } = fwd;
     let url = target_url(upstream, rest, parts);
-    let client = app.client_for(upstream);
-    let sent = tokio::time::timeout(
-        app.header_timeout,
-        client
-            .request(parts.method.clone(), &url)
-            .headers(passthrough_headers(
-                &parts.headers,
-                upstream.forward_accept_encoding,
-                upstream.send_keep_alive,
-            ))
-            .body(body)
-            .send(),
-    )
+    let sent = tokio::time::timeout(app.header_timeout, async {
+        if faithful {
+            let request = faithful_request(parts, &url, None, body)?;
+            app.faithful.send(request).await
+        } else {
+            let client = app.client_for(upstream);
+            client
+                .request(parts.method.clone(), &url)
+                .headers(passthrough_headers(
+                    &parts.headers,
+                    upstream.forward_accept_encoding,
+                    upstream.send_keep_alive,
+                ))
+                .body(body)
+                .send()
+                .await
+                .map(UpstreamResponse::from_reqwest)
+                .map_err(std::io::Error::other)
+        }
+    })
     .await;
     match sent {
         Ok(Ok(response)) => {
-            let response = UpstreamResponse::from_reqwest(response);
             let status = response.status;
             tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version, "passed through");
             app.plugins.on_attempt(

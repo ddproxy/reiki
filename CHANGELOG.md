@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+### Added
+
+- `paths` on an intercepted host: path prefixes relayed to the host as the client sent them, for APIs that span several prefixes. Without it only the upstream's base path is relayed, as before.
+
 ## 0.4.0
 
 ### Added

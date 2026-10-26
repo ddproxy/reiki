@@ -620,12 +620,26 @@ pub(crate) async fn handle_intercepted(
     let Some(upstream) = snapshot.config.upstream.get(&target.upstream) else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "unknown upstream");
     };
-    let Some(rest) = path_under_base(&upstream.base_url, parts.uri.path()) else {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "the path is outside the intercepted API",
-        );
+    let path = parts.uri.path();
+    let sent;
+    let (upstream, rest) = if target.paths.is_empty() {
+        let Some(rest) = path_under_base(&upstream.base_url, path) else {
+            return outside_api();
+        };
+        (upstream, rest)
+    } else {
+        if !target.paths.iter().any(|prefix| has_prefix(path, prefix)) {
+            return outside_api();
+        }
+        let Ok(url) = reqwest::Url::parse(&upstream.base_url) else {
+            return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "bad upstream URL");
+        };
+        // The base URL only names the host and credential format; the path goes upstream as sent.
+        sent = crate::config::Upstream {
+            base_url: url.origin().ascii_serialization(),
+            ..upstream.clone()
+        };
+        (&sent, path.to_owned())
     };
     let stream = match (&target.stream, upstream.passthrough) {
         (Some(name), false) => name.as_str(),
@@ -648,6 +662,23 @@ pub(crate) async fn handle_intercepted(
         body,
     )
     .await
+}
+
+fn outside_api() -> Response {
+    json_error(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "the path is outside the intercepted API",
+    )
+}
+
+/// True when `path` is `prefix` or lies below it, on whole segments.
+fn has_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The part of `path` below the upstream's base path, or `None` when it is not under it.
@@ -1278,6 +1309,14 @@ mod tests {
             let parsed: String = serde_json::from_str(&wrapped).unwrap();
             assert_eq!(parsed, text, "{wrapped}");
         }
+    }
+
+    #[test]
+    fn prefixes_match_on_whole_segments() {
+        assert!(has_prefix("/inference/openai/v1/x", "/inference"));
+        assert!(has_prefix("/inference", "/inference/"));
+        assert!(!has_prefix("/inference2/x", "/inference"));
+        assert!(!has_prefix("/other", "/inference"));
     }
 
     #[test]

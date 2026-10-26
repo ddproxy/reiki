@@ -59,6 +59,7 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - The client uses the upstream's real URL, so no base URL has to change and the client can hold a placeholder instead of a real key. Reiki replaces the credential, as it does for a route.
 - Each intercepted host must be allowed by `allow` on port 443 and map to an upstream on that same host.
 - Only requests under the upstream's base path are relayed. Others get 403, and a `Host` header that differs from the tunnel destination gets 421.
+- When an API spans several path prefixes on one host, list them with `paths = ["/v1", "/other"]`. Matching prefixes (whole segments) are sent to the host exactly as the client sent them, and the upstream's `base_url` then supplies only the host and the credential format.
 - Only HTTP/1.1 is offered to the client. Reiki can still use HTTP/2 toward the upstream (`http2 = true`).
 - Hosts that are allowed but not listed under `hosts` stay opaque.
 - Interception needs a restart to change, like the rest of `[tunnel]`. See [security](security.md) for what to protect.

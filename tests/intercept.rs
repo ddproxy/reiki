@@ -81,7 +81,7 @@ struct Setup {
     ca_pem: Vec<u8>,
 }
 
-async fn setup(label: &str, extra: &str) -> Setup {
+async fn setup(label: &str, extra: &str, host_fields: &str) -> Setup {
     let dir = scratch(label);
     init_ca(&dir.join("ca"), &[HOST.to_owned()], 30).unwrap();
     std::fs::write(dir.join("key"), REAL_KEY).unwrap();
@@ -102,7 +102,7 @@ async fn setup(label: &str, extra: &str) -> Setup {
         [tunnel.intercept]
         ca_cert = "{ca}/ca.pem"
         ca_key = "{ca}/ca.key"
-        hosts = [{{ host = "{HOST}", upstream = "api", stream = "s" }}]
+        hosts = [{{ host = "{HOST}", upstream = "api", stream = "s"{host_fields} }}]
         {extra}
         "#,
         key = dir.join("key").display(),
@@ -186,7 +186,7 @@ async fn request(
 
 #[tokio::test]
 async fn a_request_gets_the_real_key_and_the_plugins() {
-    let s = setup("key", "[plugins.tag]").await;
+    let s = setup("key", "[plugins.tag]", "").await;
     let (status, body) = request(&s, HOST, "POST", "/v1/chat/completions", "{\"a\":1}").await;
     assert_eq!(status, 200, "{body}");
     // With a plugin configured the response is chunked, so only the payload is compared.
@@ -197,7 +197,7 @@ async fn a_request_gets_the_real_key_and_the_plugins() {
 
 #[tokio::test]
 async fn a_path_outside_the_upstream_base_is_refused() {
-    let s = setup("path", "").await;
+    let s = setup("path", "", "").await;
     for path in ["/other", "/v10/x", "/"] {
         let (status, _) = request(&s, HOST, "GET", path, "").await;
         assert_eq!(status, StatusCode::FORBIDDEN.as_u16(), "{path}");
@@ -206,14 +206,14 @@ async fn a_path_outside_the_upstream_base_is_refused() {
 
 #[tokio::test]
 async fn a_host_header_for_another_name_is_refused() {
-    let s = setup("host", "").await;
+    let s = setup("host", "", "").await;
     let (status, _) = request(&s, "elsewhere.test.example", "GET", "/v1/x", "").await;
     assert_eq!(status, StatusCode::MISDIRECTED_REQUEST.as_u16());
 }
 
 #[tokio::test]
 async fn a_client_that_does_not_trust_the_ca_cannot_connect() {
-    let s = setup("trust", "").await;
+    let s = setup("trust", "", "").await;
     let other = scratch("other-ca");
     init_ca(&other, &[HOST.to_owned()], 30).unwrap();
     let wrong = std::fs::read(other.join("ca.pem")).unwrap();
@@ -231,4 +231,19 @@ async fn the_ca_refuses_names_outside_its_constraint() {
         init_ca(&dir.join("ok"), &[HOST.to_owned()], 30).is_err(),
         "an existing CA is not overwritten"
     );
+}
+
+#[tokio::test]
+async fn listed_paths_reach_the_host_as_sent() {
+    let s = setup("paths", "", r#", paths = ["/inference"]"#).await;
+    let (status, body) = request(&s, HOST, "POST", "/inference/openai/v1/chat", "{}").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        format!("/inference/openai/v1/chat|Bearer {REAL_KEY}|-|{{}}")
+    );
+    for path in ["/v1/chat", "/inference2/x", "/"] {
+        let (status, _) = request(&s, HOST, "GET", path, "").await;
+        assert_eq!(status, 403, "{path}");
+    }
 }

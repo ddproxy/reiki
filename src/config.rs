@@ -173,7 +173,7 @@ fn default_listen() -> String {
     "127.0.0.1:4097".to_owned()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
     pub base_url: String,
@@ -202,7 +202,7 @@ pub struct Upstream {
 }
 
 /// One hop to another upstream, used only when the chain has no usable key left here.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Fallback {
     pub upstream: String,
@@ -298,6 +298,10 @@ pub struct InterceptHost {
     /// The stream whose key chain serves these requests. Omit it for a `passthrough` upstream.
     #[serde(default)]
     pub stream: Option<String>,
+    /// Path prefixes relayed as the client sent them, to the upstream's host. Empty keeps only
+    /// the upstream's base path, rewritten onto its base URL.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +412,13 @@ impl Config {
                     "upstream `{}` does not live at `{host}`",
                     entry.upstream
                 ));
+            }
+            if let Some(bad) = entry
+                .paths
+                .iter()
+                .find(|p| !p.starts_with('/') || p.contains('?'))
+            {
+                return Some(format!("`{bad}` must be a path prefix starting with `/`"));
             }
             match (&entry.stream, upstream.passthrough) {
                 (Some(_), true) => {

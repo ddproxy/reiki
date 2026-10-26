@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::metrics::{FailureKind, Metrics, StatusClass};
 use crate::plugins::{PluginChain, RequestMeta};
 use crate::rewrite::rewrite_body;
+use crate::upstream::UpstreamResponse;
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -953,7 +954,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         .await;
 
         let response = match sent {
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => UpstreamResponse::from_reqwest(response),
             Ok(Err(_)) | Err(_) => {
                 app.plugins
                     .on_attempt(&mut plugin_states, &key_name, None, &[]);
@@ -970,14 +971,14 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             }
         };
 
-        let status = response.status();
+        let status = response.status;
         tracing::info!(
             stream = %stream,
             key = %key_name,
             method = %parts.method,
             path = %parts.uri.path(),
             status = status.as_u16(),
-            version = ?response.version(),
+            version = ?response.version,
             "forwarded"
         );
         if status.is_success() || status.is_redirection() {
@@ -1004,11 +1005,11 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         }
 
         let retry_after = response
-            .headers()
+            .headers
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let response_headers = response.headers().clone();
+        let response_headers = response.headers.clone();
         let snippet = read_limited(response).await;
         app.plugins.on_attempt(
             &mut plugin_states,
@@ -1091,8 +1092,9 @@ async fn forward_passthrough(
     .await;
     match sent {
         Ok(Ok(response)) => {
-            let status = response.status();
-            tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version(), "passed through");
+            let response = UpstreamResponse::from_reqwest(response);
+            let status = response.status;
+            tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version, "passed through");
             app.plugins.on_attempt(
                 &mut plugin_states,
                 PASSTHROUGH_KEY,
@@ -1226,9 +1228,9 @@ fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Res
     response
 }
 
-async fn read_limited(mut response: reqwest::Response) -> Bytes {
+async fn read_limited(mut response: UpstreamResponse) -> Bytes {
     let mut collected = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
+    while let Some(Ok(chunk)) = response.chunk().await {
         let room = MAX_ERROR_BODY.saturating_sub(collected.len());
         collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
         if collected.len() >= MAX_ERROR_BODY {
@@ -1250,18 +1252,18 @@ fn stream_response(
     app: &App,
     plugin_states: Vec<Box<dyn Any + Send>>,
     key: &str,
-    response: reqwest::Response,
+    response: UpstreamResponse,
     is_head: bool,
 ) -> Response {
-    let mut status = response.status();
+    let mut status = response.status;
     let mut headers = HeaderMap::new();
-    copy_response_headers(response.headers(), &mut headers);
+    copy_response_headers(&response.headers, &mut headers);
     // Pass the length through when the upstream gave one, so non-chunked bodies stay non-chunked.
-    if let Some(length) = response.headers().get(header::CONTENT_LENGTH) {
+    if let Some(length) = response.headers.get(header::CONTENT_LENGTH) {
         headers.insert(header::CONTENT_LENGTH, length.clone());
     }
     let body = if app.plugins.is_empty() {
-        Body::from_stream(response.bytes_stream())
+        Body::from_stream(response.into_stream())
     } else {
         let mut states = plugin_states;
         // A plugin that changes the body length must drop content-length here.
@@ -1278,7 +1280,7 @@ fn stream_response(
         Body::from_stream(PluginBody {
             chain: Arc::clone(&app.plugins),
             states,
-            inner: Box::pin(response.bytes_stream()),
+            inner: response.into_stream(),
             done: false,
         })
     };
@@ -1316,7 +1318,7 @@ fn finish_buffered(
 struct PluginBody {
     chain: Arc<PluginChain>,
     states: Vec<Box<dyn Any + Send>>,
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     done: bool,
 }
 
@@ -1349,7 +1351,7 @@ impl Stream for PluginBody {
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     this.chain

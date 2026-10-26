@@ -258,6 +258,12 @@ pub struct Upstream {
     /// Reiki decodes compressed responses itself so errors can still be read.
     #[serde(default)]
     pub forward_accept_encoding: bool,
+    /// Send header names in Title-Case (`Content-Type`) on HTTP/1.1. Ignored with `http2`.
+    #[serde(default)]
+    pub title_case_headers: bool,
+    /// Send `Connection: keep-alive` explicitly; HTTP/1.1 connections persist without it.
+    #[serde(default)]
+    pub send_keep_alive: bool,
     /// Where a request goes when every key of this upstream is unavailable.
     #[serde(default)]
     pub fallback: Option<Fallback>,

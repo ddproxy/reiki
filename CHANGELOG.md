@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.3
+
+### Added
+
+- Upstream `title_case_headers` sends header names in Title-Case on HTTP/1.1, and `send_keep_alive` adds `Connection: keep-alive`. Both are off by default. See [docs/providers.md](docs/providers.md).
+
+### Changed
+
+- The upstream credential header is now sent first, ahead of the client's own headers. A client header with the same name as the credential header is still replaced.
+
 ## 0.4.2
 
 ### Added

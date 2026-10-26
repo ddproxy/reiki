@@ -39,6 +39,8 @@ base_url = "https://api.example.com/v1"   # must be https
 # drop_params = ["stream_options"]        # remove these top-level keys
 # http2 = true                            # negotiate HTTP/2 (default: HTTP/1.1)
 # forward_accept_encoding = true          # send the client's Accept-Encoding (default: identity)
+# title_case_headers = true               # send Content-Type rather than content-type (HTTP/1.1)
+# send_keep_alive = true                  # add Connection: keep-alive
 
 [keys.example-a]
 upstream = "example"

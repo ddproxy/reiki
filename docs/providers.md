@@ -29,10 +29,13 @@ Reiki rewrites the body once before it picks a key, so a failover to the next ke
 
 ## Transport options
 
-By default Reiki talks to every upstream over HTTP/1.1 and asks for uncompressed responses. Two optional upstream settings make the relay behave more like a plain pass-through:
+By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Four optional upstream settings make the relay behave more like a plain pass-through:
 
 - `http2 = true` negotiates HTTP/2 with that upstream when it offers it over TLS. Without TLS there is nothing to negotiate and the connection stays HTTP/1.1.
 - `forward_accept_encoding = true` sends the client's own `Accept-Encoding` header upstream instead of `identity`. A client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself, so error bodies are still read for key failover and logging, and the client receives plain bytes without a `Content-Encoding` header.
+
+- `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
+- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection.
 
 ```toml
 [upstream.zen]
@@ -40,6 +43,8 @@ base_url = "https://opencode.ai/zen/v1"
 http2 = true
 forward_accept_encoding = true
 ```
+
+The credential header is always sent first, ahead of the client's own headers.
 
 These change how Reiki connects, nothing more. Reiki does not add, rewrite or invent client-identifying headers, and the settings do not change which requests an upstream accepts.
 

@@ -217,6 +217,8 @@ pub struct App {
     client: reqwest::Client,
     /// Negotiates HTTP/2 where the upstream offers it, for upstreams with `http2`.
     client_h2: reqwest::Client,
+    /// HTTP/1.1 with Title-Case header names, for upstreams with `title_case_headers`.
+    client_title: reqwest::Client,
     header_timeout: Duration,
     metrics: Metrics,
     state_path: OnceLock<PathBuf>,
@@ -257,7 +259,7 @@ impl App {
         header_timeout: Duration,
         plugins: PluginChain,
     ) -> Arc<Self> {
-        let build = |http1_only: bool| {
+        let build = |http1_only: bool, title_case: bool| {
             let builder = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
@@ -266,10 +268,16 @@ impl App {
             } else {
                 builder
             };
+            let builder = if title_case {
+                builder.http1_title_case_headers()
+            } else {
+                builder
+            };
             builder.build().unwrap_or_else(|_| reqwest::Client::new())
         };
-        let client = build(true);
-        let client_h2 = build(false);
+        let client = build(true, false);
+        let client_h2 = build(false, false);
+        let client_title = build(true, true);
         let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
@@ -277,6 +285,7 @@ impl App {
             policy,
             client,
             client_h2,
+            client_title,
             header_timeout,
             metrics: Metrics::new(),
             state_path: OnceLock::new(),
@@ -286,6 +295,17 @@ impl App {
             plugins: Arc::new(plugins),
             plugin_tables,
         })
+    }
+
+    /// The HTTP client whose transport settings match the upstream.
+    fn client_for(&self, upstream: &crate::config::Upstream) -> &reqwest::Client {
+        if upstream.http2 {
+            &self.client_h2
+        } else if upstream.title_case_headers {
+            &self.client_title
+        } else {
+            &self.client
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
@@ -511,13 +531,21 @@ fn upstream_headers(
     auth_header: &str,
     auth_value: &str,
     forward_accept_encoding: bool,
+    send_keep_alive: bool,
 ) -> HeaderMap {
     let mut out = HeaderMap::new();
+    // The credential goes first, where most clients put it.
+    let auth_name = HeaderName::from_bytes(auth_header.as_bytes()).ok();
+    if let (Some(name), Ok(mut value)) = (&auth_name, HeaderValue::from_str(auth_value)) {
+        value.set_sensitive(true);
+        out.insert(name.clone(), value);
+    }
     for (name, value) in inbound {
         let keep_encoding = forward_accept_encoding && name == header::ACCEPT_ENCODING;
-        if keep_encoding || !skip_header(name) {
-            out.append(name.clone(), value.clone());
+        if auth_name.as_ref() == Some(name) || !(keep_encoding || !skip_header(name)) {
+            continue;
         }
+        out.append(name.clone(), value.clone());
     }
     // Unless the client's own value is forwarded (the client sent none, or the upstream
     // is set to pass it on), ask for plain responses so error bodies can be classified.
@@ -527,12 +555,8 @@ fn upstream_headers(
             HeaderValue::from_static("identity"),
         );
     }
-    if let (Ok(name), Ok(mut value)) = (
-        HeaderName::from_bytes(auth_header.as_bytes()),
-        HeaderValue::from_str(auth_value),
-    ) {
-        value.set_sensitive(true);
-        out.insert(name, value);
+    if send_keep_alive {
+        out.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     }
     out
 }
@@ -914,12 +938,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             &upstream.auth_header,
             &auth_value,
             upstream.forward_accept_encoding,
+            upstream.send_keep_alive,
         );
-        let client = if upstream.http2 {
-            &app.client_h2
-        } else {
-            &app.client
-        };
+        let client = app.client_for(upstream);
 
         let sent = tokio::time::timeout(
             app.header_timeout,
@@ -1054,11 +1075,7 @@ async fn forward_passthrough(
         ..
     } = fwd;
     let url = target_url(upstream, rest, parts);
-    let client = if upstream.http2 {
-        &app.client_h2
-    } else {
-        &app.client
-    };
+    let client = app.client_for(upstream);
     let sent = tokio::time::timeout(
         app.header_timeout,
         client
@@ -1066,6 +1083,7 @@ async fn forward_passthrough(
             .headers(passthrough_headers(
                 &parts.headers,
                 upstream.forward_accept_encoding,
+                upstream.send_keep_alive,
             ))
             .body(body)
             .send(),
@@ -1121,7 +1139,11 @@ fn target_url(upstream: &crate::config::Upstream, rest: &str, parts: &Parts) -> 
 }
 
 /// Every end-to-end header as the client sent it, credentials included.
-fn passthrough_headers(inbound: &HeaderMap, forward_accept_encoding: bool) -> HeaderMap {
+fn passthrough_headers(
+    inbound: &HeaderMap,
+    forward_accept_encoding: bool,
+    send_keep_alive: bool,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in inbound {
         let keep = matches!(
@@ -1137,6 +1159,9 @@ fn passthrough_headers(inbound: &HeaderMap, forward_accept_encoding: bool) -> He
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
         );
+    }
+    if send_keep_alive {
+        out.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     }
     out
 }
@@ -1417,6 +1442,30 @@ mod tests {
     }
 
     #[test]
+    fn the_credential_leads_and_a_colliding_client_header_is_replaced() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("user-agent", HeaderValue::from_static("c/1"));
+        inbound.insert("x-token", HeaderValue::from_static("client-value"));
+        let out = upstream_headers(&inbound, "x-token", "upstream-value", false, false);
+        let names: Vec<_> = out.keys().map(HeaderName::as_str).collect();
+        assert_eq!(names.first(), Some(&"x-token"));
+        assert_eq!(out["x-token"], "upstream-value");
+        assert_eq!(out.get_all("x-token").iter().count(), 1);
+    }
+
+    #[test]
+    fn keep_alive_is_sent_only_when_asked_for() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("connection", HeaderValue::from_static("close"));
+        let without = upstream_headers(&inbound, "authorization", "Bearer k", false, false);
+        assert!(without.get("connection").is_none());
+        let with = upstream_headers(&inbound, "authorization", "Bearer k", false, true);
+        assert_eq!(with["connection"], "keep-alive");
+        let passthrough = passthrough_headers(&inbound, false, true);
+        assert_eq!(passthrough["connection"], "keep-alive");
+    }
+
+    #[test]
     fn caller_credentials_are_not_forwarded_and_the_upstream_key_is_set() {
         let mut inbound = HeaderMap::new();
         inbound.insert(
@@ -1433,7 +1482,13 @@ mod tests {
             "accept-encoding",
             HeaderValue::from_static("gzip, deflate, br, zstd"),
         );
-        let out = upstream_headers(&inbound, "authorization", "Bearer upstream-key", false);
+        let out = upstream_headers(
+            &inbound,
+            "authorization",
+            "Bearer upstream-key",
+            false,
+            false,
+        );
         assert_eq!(out["accept-encoding"], "identity");
         assert_eq!(out["authorization"], "Bearer upstream-key");
         assert_eq!(out["user-agent"], "opencode/1.0");
@@ -1454,15 +1509,15 @@ mod tests {
             "accept-encoding",
             HeaderValue::from_static("gzip, deflate, br, zstd"),
         );
-        let out = upstream_headers(&inbound, "authorization", "Bearer k", true);
+        let out = upstream_headers(&inbound, "authorization", "Bearer k", true, false);
         assert_eq!(out["accept-encoding"], "gzip, deflate, br, zstd");
         assert_eq!(out.get_all("accept-encoding").iter().count(), 1);
 
         // A client that sent none still gets plain responses, never a library default.
-        let out = upstream_headers(&HeaderMap::new(), "authorization", "Bearer k", true);
+        let out = upstream_headers(&HeaderMap::new(), "authorization", "Bearer k", true, false);
         assert_eq!(out["accept-encoding"], "identity");
 
-        let out = upstream_headers(&inbound, "authorization", "Bearer k", false);
+        let out = upstream_headers(&inbound, "authorization", "Bearer k", false, false);
         assert_eq!(out["accept-encoding"], "identity");
     }
 

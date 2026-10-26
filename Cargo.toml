@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.99"
 description = "Key-failover relay for LLM APIs"
@@ -40,7 +40,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "json"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
@@ -51,6 +51,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 time = "0.3"
+x509-parser = { version = "0.18", default-features = false }
 
 [features]
 default = ["plugin-placeholders", "plugin-requestlog"]

@@ -40,6 +40,17 @@ pub enum ResponseMode {
     Body,
 }
 
+/// How an event-stream response body is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseMode {
+    /// An array of the parsed `data:` events.
+    Events,
+    /// The text, finish reason and usage of the streamed completion.
+    Assembled,
+    /// The stream's raw text.
+    Raw,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub file: Option<PathBuf>,
@@ -53,6 +64,13 @@ pub struct Config {
     pub redact: bool,
     pub queue: usize,
     pub dry_run: bool,
+    /// Top-level keys or JSON pointers dropped from logged JSON bodies.
+    pub exclude: Vec<String>,
+    /// Paths replaced by a short description (tool names, a count) in logged JSON bodies.
+    pub summarize: Vec<String>,
+    /// Longest string kept in a logged JSON body; 0 keeps them whole.
+    pub max_string_bytes: usize,
+    pub sse: SseMode,
 }
 
 impl Config {
@@ -68,6 +86,10 @@ impl Config {
             "response",
             "redact",
             "queue",
+            "exclude",
+            "summarize",
+            "max_string_bytes",
+            "sse",
         ];
         for key in table.keys() {
             if !KNOWN.contains(&key.as_str()) && !HOST_KEYS.contains(&key.as_str()) {
@@ -122,6 +144,20 @@ impl Config {
         let queue = integer(table, "queue", DEFAULT_QUEUE as u64, 16, 65_536)? as usize;
 
         let headers = headers(table)?;
+        let exclude = paths(table, "exclude")?;
+        let summarize = paths(table, "summarize")?;
+        let max_string_bytes =
+            integer(table, "max_string_bytes", 0, 0, MAX_BODY_BYTES_LIMIT as u64)? as usize;
+        let sse = match string(table, "sse")?.as_deref() {
+            None | Some("events") => SseMode::Events,
+            Some("assembled") => SseMode::Assembled,
+            Some("raw") => SseMode::Raw,
+            Some(other) => {
+                return Err(format!(
+                    "`sse` must be \"events\", \"assembled\" or \"raw\", got \"{other}\""
+                ))
+            }
+        };
         let dry_run = match table.get("dry_run") {
             None => false,
             Some(Value::Boolean(value)) => *value,
@@ -155,6 +191,10 @@ impl Config {
             redact,
             queue,
             dry_run,
+            exclude,
+            summarize,
+            max_string_bytes,
+            sse,
         })
     }
 }
@@ -193,6 +233,28 @@ fn integer(table: &Table, key: &str, default: u64, min: u64, max: u64) -> Result
             other.type_str()
         )),
     }
+}
+
+/// A list of top-level keys or JSON pointers.
+fn paths(table: &Table, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = table.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err(format!(
+            "`{key}` must be an array of strings, got {}",
+            value.type_str()
+        ));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(path) if !path.is_empty() && path != "/" => Ok(path.clone()),
+            _ => Err(format!(
+                "`{key}` must hold non-empty strings: a key like \"tools\" or a pointer like \"/messages/0\""
+            )),
+        })
+        .collect()
 }
 
 fn headers(table: &Table) -> Result<Vec<String>, String> {
@@ -241,6 +303,24 @@ mod tests {
         assert_eq!(config.file_keep, 5);
         assert_eq!(config.max_body_bytes, 65_536);
         assert!(config.headers.is_empty() && config.socket.is_none());
+    }
+
+    #[test]
+    fn shaping_options_parse_and_default_to_off() {
+        let config = parse("file = \"/var/log/reiki/req.jsonl\"").unwrap();
+        assert!(config.exclude.is_empty() && config.summarize.is_empty());
+        assert_eq!((config.max_string_bytes, config.sse), (0, SseMode::Events));
+        let config = parse(
+            "file = \"/var/log/reiki/req.jsonl\"\nexclude = [\"tools\", \"/messages/0\"]\nsummarize = [\"tools\"]\nmax_string_bytes = 2000\nsse = \"assembled\"",
+        )
+        .unwrap();
+        assert_eq!(config.exclude, ["tools", "/messages/0"]);
+        assert_eq!(
+            (config.max_string_bytes, config.sse),
+            (2000, SseMode::Assembled)
+        );
+        assert!(parse("file = \"/a/b\"\nexclude = [\"\"]").is_err());
+        assert!(parse("file = \"/a/b\"\nsse = \"xml\"").is_err());
     }
 
     #[test]

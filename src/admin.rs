@@ -36,6 +36,18 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         build_status(&snapshot, &health, now)
     };
+    let body = match app.ca_not_after() {
+        Some(not_after) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            let days_left = (not_after - now).div_euclid(86_400);
+            let mut body = body;
+            body.pop();
+            format!("{body},\"intercept\":{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}}}")
+        }
+        None => body,
+    };
     text_response(StatusCode::OK, "application/json", body)
 }
 

@@ -66,7 +66,7 @@ fn at(offset: Duration, future: bool) -> time::OffsetDateTime {
 }
 
 /// Name-constrained to `hosts`, so a stolen key cannot impersonate anything else.
-pub fn init_ca(dir: &Path, hosts: &[String], days: u64) -> Result<(), String> {
+pub fn init_ca(dir: &Path, hosts: &[String], days: u64, replace: bool) -> Result<(), String> {
     if hosts.is_empty() {
         return Err("name at least one host".to_owned());
     }
@@ -79,10 +79,17 @@ pub fn init_ca(dir: &Path, hosts: &[String], days: u64) -> Result<(), String> {
     let cert_path = dir.join("ca.pem");
     let key_path = dir.join("ca.key");
     if cert_path.exists() || key_path.exists() {
-        return Err(format!(
-            "{} already holds a CA; remove it first",
-            dir.display()
-        ));
+        if !replace {
+            return Err(format!(
+                "{} already holds a CA; pass --replace to overwrite it",
+                dir.display()
+            ));
+        }
+        for path in [&cert_path, &key_path] {
+            if path.exists() {
+                std::fs::remove_file(path).map_err(err)?;
+            }
+        }
     }
 
     let key = KeyPair::generate().map_err(err)?;
@@ -124,6 +131,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 struct Authority {
     issuer: Issuer<'static, KeyPair>,
+    /// Unix seconds at which the CA certificate expires.
+    not_after: i64,
 }
 
 impl Authority {
@@ -135,7 +144,14 @@ impl Authority {
         let key = KeyPair::from_pem(&key_pem).map_err(|e| format!("bad CA key: {e}"))?;
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, key)
             .map_err(|e| format!("bad CA certificate: {e}"))?;
-        Ok(Self { issuer })
+        let not_after = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+            .map_err(|e| format!("bad CA certificate: {e}"))
+            .and_then(|(_, pem)| {
+                pem.parse_x509()
+                    .map(|cert| cert.validity().not_after.timestamp())
+                    .map_err(|e| format!("bad CA certificate: {e}"))
+            })?;
+        Ok(Self { issuer, not_after })
     }
 
     fn server_config(
@@ -171,10 +187,21 @@ impl Authority {
     }
 }
 
-/// Loads the CA without starting anything, for `reiki check`.
-pub fn check_ca(config: &InterceptConfig) -> Result<(), String> {
-    Authority::load(&config.ca_cert, &config.ca_key).map(|_| ())
+/// Days left on a CA that expires at `not_after` (Unix seconds); negative once expired.
+pub fn days_left(not_after: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    (not_after - now).div_euclid(86_400)
 }
+
+/// Loads the CA without starting anything, for `reiki check`; returns the days it has left.
+pub fn check_ca(config: &InterceptConfig) -> Result<i64, String> {
+    Authority::load(&config.ca_cert, &config.ca_key).map(|a| days_left(a.not_after))
+}
+
+/// Days of validity at or below which startup warns.
+const CA_WARN_DAYS: i64 = 30;
 
 /// Serves intercepted CONNECT tunnels.
 pub struct Interceptor {
@@ -187,9 +214,22 @@ pub struct Interceptor {
 
 impl Interceptor {
     pub fn new(app: Arc<App>, config: &InterceptConfig) -> Result<Self, String> {
+        let authority = Authority::load(&config.ca_cert, &config.ca_key)?;
+        let left = days_left(authority.not_after);
+        app.set_ca_not_after(authority.not_after);
+        if left < 0 {
+            tracing::error!(
+                days_overdue = -left,
+                "the interception CA has expired; clients will refuse its certificates"
+            );
+        } else if left <= CA_WARN_DAYS {
+            tracing::warn!(days_left = left, "the interception CA expires soon");
+        } else {
+            tracing::info!(days_left = left, "interception CA loaded");
+        }
         Ok(Self {
             app,
-            authority: Authority::load(&config.ca_cert, &config.ca_key)?,
+            authority,
             hosts: config
                 .hosts
                 .iter()

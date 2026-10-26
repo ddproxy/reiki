@@ -7,10 +7,26 @@
 //! [`Plugin::new_state`].
 
 use std::any::Any;
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
+
+/// A fresh 16-hex-digit request id, unique enough to follow one request through logs.
+pub fn new_request_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    hasher.write_u128(nanos);
+    format!("{:016x}", hasher.finish())
+}
 
 /// Hooks into the request and response path. `Send + Sync` so a single
 /// instance can serve concurrent requests.
@@ -67,6 +83,8 @@ impl std::error::Error for PluginError {}
 /// [`Plugin::new_state`], downcast it with `Any::downcast_mut`.
 #[non_exhaustive]
 pub struct RequestCtx<'a> {
+    /// The id Reiki gives this request in its own logs; empty when the host set none.
+    pub id: &'a str,
     pub stream: &'a str,
     pub upstream: &'a str,
     pub method: &'a Method,
@@ -124,6 +142,7 @@ impl<'a> RequestCtx<'a> {
         state: &'a mut (dyn Any + Send),
     ) -> Self {
         Self {
+            id: "",
             stream,
             upstream,
             method,
@@ -132,6 +151,13 @@ impl<'a> RequestCtx<'a> {
             body,
             state,
         }
+    }
+
+    /// Sets the request id the host logs this request under.
+    #[must_use]
+    pub fn with_id(mut self, id: &'a str) -> Self {
+        self.id = id;
+        self
     }
 }
 

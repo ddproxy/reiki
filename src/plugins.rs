@@ -50,6 +50,8 @@ struct Entry {
 
 /// Who is asking and for what, as the request hooks see it.
 pub struct RequestMeta<'a> {
+    /// The id this request carries in Reiki's logs.
+    pub id: &'a str,
     pub stream: &'a str,
     pub upstream: &'a str,
     pub method: &'a Method,
@@ -138,7 +140,8 @@ impl PluginChain {
                 &mut *headers,
                 &mut *body,
                 &mut **state,
-            );
+            )
+            .with_id(meta.id);
             let result = guard(entry.plugin.name(), "on_request", || {
                 entry.plugin.on_request(&mut ctx)
             })
@@ -413,6 +416,7 @@ mod tests {
         chain.on_request(
             states,
             &RequestMeta {
+                id: "test",
                 stream: "default",
                 upstream: "zen",
                 method: &Method::POST,

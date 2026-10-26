@@ -4,6 +4,7 @@ pub mod chain;
 pub mod classify;
 pub mod config;
 pub mod intercept;
+pub mod logging;
 pub mod metrics;
 pub mod plugins;
 pub mod proxy;

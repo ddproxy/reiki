@@ -6,13 +6,12 @@
 
 mod config;
 mod redact;
+mod shape;
 mod sink;
 mod timefmt;
 mod writer;
 
 use std::any::Any;
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use std::time::{Instant, SystemTime};
 
 use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
-pub use config::{BodyMode, Config, ResponseMode, DENIED_HEADERS};
+pub use config::{BodyMode, Config, ResponseMode, SseMode, DENIED_HEADERS};
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
@@ -83,17 +82,6 @@ impl Drop for RequestState {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
-
-fn new_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    hasher.write_u128(nanos);
-    format!("{:016x}", hasher.finish())
 }
 
 impl RequestLog {
@@ -180,7 +168,7 @@ impl Plugin for RequestLog {
             return Box::new(());
         };
         Box::new(RequestState {
-            id: new_id(),
+            id: reiki_plugin::new_request_id(),
             started: Instant::now(),
             status: None,
             bytes: 0,
@@ -201,6 +189,9 @@ impl Plugin for RequestLog {
             return Ok(());
         };
         state.requested = true;
+        if !ctx.id.is_empty() {
+            state.id = ctx.id.to_owned();
+        }
         let id = state.id.clone();
         let headers = self
             .config

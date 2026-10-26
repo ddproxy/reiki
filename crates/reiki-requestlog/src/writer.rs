@@ -7,8 +7,9 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
-use crate::config::{BodyMode, Config};
+use crate::config::{BodyMode, Config, SseMode};
 use crate::redact;
+use crate::shape;
 use crate::sink::FileSink;
 #[cfg(unix)]
 use crate::sink::SocketHub;
@@ -142,7 +143,7 @@ fn render_response(config: &Config, response: ResponseEvent) -> String {
                 entry.insert("key".into(), json!(a.key));
                 entry.insert("status".into(), json!(a.status));
                 if let Some(body) = a.body.as_deref().filter(|b| !b.is_empty()) {
-                    entry.insert("body".into(), full_body(config, body).0);
+                    entry.insert("body".into(), full_body(config, body).value);
                 }
                 Value::Object(entry)
             })
@@ -150,10 +151,21 @@ fn render_response(config: &Config, response: ResponseEvent) -> String {
         record.insert("attempts".into(), Value::Array(attempts));
     }
     if let Some(body) = response.body.filter(|b| !b.is_empty()) {
-        let (value, cut) = full_body(config, &body);
-        record.insert("body".into(), value);
-        if cut || response.body_truncated {
-            record.insert("body_truncated".into(), json!(true));
+        if let Some(events) = sse_body(config, &body, response.body_truncated) {
+            record.insert("body".into(), events);
+            record.insert("body_format".into(), json!("sse"));
+            if response.body_truncated {
+                record.insert("body_truncated".into(), json!(true));
+            }
+        } else {
+            let shaped = full_body(config, &body);
+            record.insert("body".into(), shaped.value);
+            if !shaped.excluded.is_empty() {
+                record.insert("body_excluded".into(), json!(shaped.excluded));
+            }
+            if shaped.truncated || response.body_truncated {
+                record.insert("body_truncated".into(), json!(true));
+            }
         }
     }
     Value::Object(record).to_string()
@@ -197,9 +209,12 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
                 }
             }
             BodyMode::Full => {
-                let (value, truncated) = full_body(config, &body);
-                record.insert("body".into(), value);
-                if truncated {
+                let shaped = full_body(config, &body);
+                record.insert("body".into(), shaped.value);
+                if !shaped.excluded.is_empty() {
+                    record.insert("body_excluded".into(), json!(shaped.excluded));
+                }
+                if shaped.truncated {
                     record.insert("body_truncated".into(), json!(true));
                 }
             }
@@ -208,7 +223,15 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
     Value::Object(record).to_string()
 }
 
-fn full_body(config: &Config, body: &[u8]) -> (Value, bool) {
+/// A body ready to log: parsed and trimmed when it is JSON, masked text otherwise.
+struct Shaped {
+    value: Value,
+    truncated: bool,
+    /// Paths dropped by `exclude`.
+    excluded: Vec<String>,
+}
+
+fn full_body(config: &Config, body: &[u8]) -> Shaped {
     let masked = |text: &str| {
         if config.redact {
             redact::secrets(text).into_owned()
@@ -218,25 +241,62 @@ fn full_body(config: &Config, body: &[u8]) -> (Value, bool) {
     };
     match serde_json::from_slice::<Value>(body) {
         Ok(mut value) => {
+            let excluded = shape::apply(&mut value, &config.exclude, &config.summarize);
             if config.redact {
                 redact::json(&mut value);
             }
+            if config.max_string_bytes > 0 {
+                shape::truncate_strings(&mut value, config.max_string_bytes);
+            }
             let text = value.to_string();
             if text.len() <= config.max_body_bytes {
-                (value, false)
+                Shaped {
+                    value,
+                    truncated: false,
+                    excluded,
+                }
             } else {
-                (Value::String(truncate(&text, config.max_body_bytes)), true)
+                Shaped {
+                    value: Value::String(truncate(&text, config.max_body_bytes)),
+                    truncated: true,
+                    excluded,
+                }
             }
         }
         Err(_) => {
             let text = masked(&String::from_utf8_lossy(body));
-            let truncated = text.len() > config.max_body_bytes;
-            (
-                Value::String(truncate(&text, config.max_body_bytes)),
-                truncated,
-            )
+            Shaped {
+                truncated: text.len() > config.max_body_bytes,
+                value: Value::String(truncate(&text, config.max_body_bytes)),
+                excluded: Vec::new(),
+            }
         }
     }
+}
+
+/// An event-stream response as parsed events or one assembled completion; `None` when the body
+/// is not an event stream or the log is set to keep it raw.
+fn sse_body(config: &Config, body: &[u8], cut: bool) -> Option<Value> {
+    if config.sse == SseMode::Raw || serde_json::from_slice::<Value>(body).is_ok() {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    if cut {
+        // The capture stopped mid-line, so the last event is incomplete.
+        text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
+    }
+    let events = shape::sse_events(&text)?;
+    let mut value = match config.sse {
+        SseMode::Assembled => shape::assemble(&events),
+        _ => Value::Array(events),
+    };
+    if config.redact {
+        redact::json(&mut value);
+    }
+    if config.max_string_bytes > 0 {
+        shape::truncate_strings(&mut value, config.max_string_bytes);
+    }
+    Some(value)
 }
 
 fn summarize(body: &[u8]) -> Option<Value> {
@@ -485,7 +545,7 @@ mod tests {
 
         let sse = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
         let record: Value = serde_json::from_str(&render(
-            &config(""),
+            &config("sse = \"raw\""),
             Event::Response(response_with(Some(sse), true)),
         ))
         .unwrap();
@@ -498,5 +558,56 @@ mod tests {
         ))
         .unwrap();
         assert!(record.get("body").is_none());
+    }
+
+    #[test]
+    fn excluded_and_summarized_paths_leave_a_smaller_json_body() {
+        let body = r#"{"model":"m","tools":[{"function":{"name":"bash"}}],"system":"abcdefghij"}"#;
+        let config = config("exclude = [\"system\"]\nsummarize = [\"tools\"]");
+        let record = parsed(&config, request(body));
+        assert_eq!(record["body"], json!({"model": "m", "tools": ["bash"]}));
+        assert_eq!(record["body_excluded"], json!(["system"]));
+        assert_eq!(record["body_bytes"], body.len());
+        assert!(record.get("body_truncated").is_none());
+    }
+
+    #[test]
+    fn long_strings_are_cut_before_the_size_cap_so_the_body_stays_json() {
+        let long = "x".repeat(5000);
+        let body = format!(r#"{{"a":"{long}","b":"{long}"}}"#);
+        let config = config("max_body_bytes = 2000\nmax_string_bytes = 100");
+        let record = parsed(&config, request(&body));
+        assert!(record["body"].is_object(), "{record}");
+        assert!(record["body"]["a"]
+            .as_str()
+            .unwrap()
+            .contains("…[+4900 bytes]"));
+        assert!(record.get("body_truncated").is_none());
+    }
+
+    #[test]
+    fn an_event_stream_is_logged_as_parsed_events() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let record: Value = serde_json::from_str(&render(
+            &config(""),
+            Event::Response(response_with(Some(sse), false)),
+        ))
+        .unwrap();
+        assert_eq!(record["body_format"], "sse");
+        assert_eq!(record["body"][0]["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(record["body"][1], "[DONE]");
+    }
+
+    #[test]
+    fn an_assembled_stream_keeps_text_and_drops_a_cut_final_event() {
+        let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con";
+        let record: Value = serde_json::from_str(&render(
+            &config("sse = \"assembled\""),
+            Event::Response(response_with(Some(sse), true)),
+        ))
+        .unwrap();
+        assert_eq!(record["body"]["text"], "po");
+        assert_eq!(record["body"]["events"], 1);
+        assert_eq!(record["body_truncated"], true);
     }
 }

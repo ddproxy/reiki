@@ -83,7 +83,7 @@ struct Setup {
 
 async fn setup(label: &str, extra: &str, host_fields: &str) -> Setup {
     let dir = scratch(label);
-    init_ca(&dir.join("ca"), &[HOST.to_owned()], 30).unwrap();
+    init_ca(&dir.join("ca"), &[HOST.to_owned()], 30, false).unwrap();
     std::fs::write(dir.join("key"), REAL_KEY).unwrap();
     let port = upstream().await;
     let text = format!(
@@ -215,7 +215,7 @@ async fn a_host_header_for_another_name_is_refused() {
 async fn a_client_that_does_not_trust_the_ca_cannot_connect() {
     let s = setup("trust", "", "").await;
     let other = scratch("other-ca");
-    init_ca(&other, &[HOST.to_owned()], 30).unwrap();
+    init_ca(&other, &[HOST.to_owned()], 30, false).unwrap();
     let wrong = std::fs::read(other.join("ca.pem")).unwrap();
     assert!(connect(&s, &wrong).await.is_err());
 }
@@ -223,12 +223,12 @@ async fn a_client_that_does_not_trust_the_ca_cannot_connect() {
 #[tokio::test]
 async fn the_ca_refuses_names_outside_its_constraint() {
     let dir = scratch("constraint");
-    let result = init_ca(&dir, &["*.example.com".to_owned()], 30);
+    let result = init_ca(&dir, &["*.example.com".to_owned()], 30, false);
     assert!(result.is_err());
-    let again = init_ca(&dir.join("ok"), &[HOST.to_owned()], 30);
+    let again = init_ca(&dir.join("ok"), &[HOST.to_owned()], 30, false);
     assert!(again.is_ok());
     assert!(
-        init_ca(&dir.join("ok"), &[HOST.to_owned()], 30).is_err(),
+        init_ca(&dir.join("ok"), &[HOST.to_owned()], 30, false).is_err(),
         "an existing CA is not overwritten"
     );
 }

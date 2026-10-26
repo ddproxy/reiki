@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.2
+
+### Added
+
+- `[log]`: Reiki's own log can also go to a rotating file (`file`, `file_max_bytes`, `file_keep`), as text or JSON, with a `level` that is a plain level or a per-module filter. SIGHUP applies a changed level and reopens the file. `stderr = false` stops duplicating a service manager's journal. `RUST_LOG` still overrides the level at startup. See [docs/troubleshooting.md](docs/troubleshooting.md).
+- Log lines made while a request is handled carry its id, which matches the `id` on that request's request-log records. Plugins can read it as `RequestCtx::id`.
+- The key-failure warning reports `cooling_secs`, the cooldown the key entered.
+- Intercepted requests refused for a `Host` mismatch or a path outside the API are logged at `warn`.
+- Request log body shaping: `exclude`, `summarize` and `max_string_bytes` trim a JSON body before the size cap is applied, so a large request such as one carrying a long tool list stays parsed JSON instead of cut, escaped text. `body_excluded` names what was dropped.
+- Event-stream response bodies are logged as parsed events or one assembled completion (`sse = "events" | "assembled" | "raw"`).
+- `reiki ca-init --replace`; `reiki check`, startup and `GET /status` report how long the interception CA has left.
+
+### Changed
+
+- Event-stream response bodies in the request log are now an array of parsed events by default. Set `sse = "raw"` for the previous raw text.
+- A 429 body that says "free usage limit" counts as quota exhaustion.
+
 ## 0.4.1
 
 ### Added

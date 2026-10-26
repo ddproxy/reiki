@@ -170,7 +170,13 @@ pub fn classify_at(
         429 => {
             if contains_any(
                 &body,
-                &["usage exceeded", "quota", "subscribe to go", "insufficient"],
+                &[
+                    "usage exceeded",
+                    "quota",
+                    "subscribe to go",
+                    "free usage limit",
+                    "insufficient",
+                ],
             ) {
                 Outcome::KeyFailure(FailureClass::QuotaExhausted)
             } else {
@@ -279,6 +285,16 @@ mod tests {
         assert_eq!(
             classify(429, None, ""),
             Outcome::KeyFailure(FailureClass::RateLimited(None))
+        );
+    }
+
+    #[test]
+    fn a_free_usage_limit_is_quota_not_rate_limit() {
+        let body =
+            r#"{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}"#;
+        assert_eq!(
+            classify(429, Some("60"), body),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
         );
     }
 

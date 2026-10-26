@@ -38,6 +38,9 @@ enum Command {
         /// How long the CA is valid.
         #[arg(long, default_value_t = 365)]
         days: u64,
+        /// Overwrite an existing CA; clients then need the new `ca.pem`.
+        #[arg(long)]
+        replace: bool,
     },
 }
 
@@ -62,7 +65,7 @@ fn effective_listen(flag: Option<&str>, env: Option<&str>, config: &str) -> Resu
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
+fn spawn_sighup_reload(app: Arc<App>, config: PathBuf, logging: Arc<reiki::logging::Logging>) {
     let _handle = tokio::spawn(async move {
         let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -74,18 +77,19 @@ fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
         };
         while hangup.recv().await.is_some() {
             app.reload_on_hangup(&config);
+            match std::fs::read_to_string(&config)
+                .map_err(|e| e.to_string())
+                .and_then(|text| Config::parse(&text).map_err(|e| e.to_string()))
+            {
+                Ok(parsed) => logging.reload(&parsed.log),
+                Err(error) => tracing::warn!(%error, "log settings not reloaded"),
+            }
         }
     });
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
     let cli = Cli::parse();
 
     if let Some(Command::HashToken) = cli.command {
@@ -97,8 +101,14 @@ async fn main() {
         return;
     }
 
-    if let Some(Command::CaInit { dir, hosts, days }) = &cli.command {
-        match reiki::intercept::init_ca(dir, hosts, *days) {
+    if let Some(Command::CaInit {
+        dir,
+        hosts,
+        days,
+        replace,
+    }) = &cli.command
+    {
+        match reiki::intercept::init_ca(dir, hosts, *days, *replace) {
             Ok(()) => println!(
                 "wrote {} and {}; give ca.pem to clients, keep ca.key private",
                 dir.join("ca.pem").display(),
@@ -112,8 +122,10 @@ async fn main() {
     let text = std::fs::read_to_string(&cli.config)
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
     let mut config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
-    let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let checking = matches!(cli.command, Some(Command::Check));
+    let logging =
+        Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
+    let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let plugin_tables = if checking {
         with_dry_run(&config.plugins)
     } else {
@@ -131,8 +143,9 @@ async fn main() {
 
     if let Some(Command::Check) = cli.command {
         if let Some(intercept) = config.tunnel.as_ref().and_then(|t| t.intercept.as_ref()) {
-            if let Err(e) = reiki::intercept::check_ca(intercept) {
-                fail(&format!("intercept: {e}"));
+            match reiki::intercept::check_ca(intercept) {
+                Ok(days) => println!("intercept CA valid for {days} more day(s)"),
+                Err(e) => fail(&format!("intercept: {e}")),
             }
         }
         let admin = admin_listen
@@ -162,7 +175,7 @@ async fn main() {
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.load_persisted_state();
     #[cfg(unix)]
-    spawn_sighup_reload(Arc::clone(&app), cli.config.clone());
+    spawn_sighup_reload(Arc::clone(&app), cli.config.clone(), Arc::clone(&logging));
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot bind {listen}: {e}")));

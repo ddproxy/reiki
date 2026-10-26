@@ -28,11 +28,28 @@ A 503 carries `Retry-After` (at least 1 second) when some key will recover. It c
 
 ## Logs
 
-Reiki logs to stderr. Set the level with `RUST_LOG`; the default is `info`.
+Reiki's own log is separate from the [request log](requestlog.md). By default it goes to stderr at `info`. The `[log]` table changes that:
 
-- `info`: one line per forwarded request with the stream, key name, method, path and upstream status.
-- `warn`: a key failed, with its failure class and whether it is now cooling or out of rotation.
-- `debug`: the first 160 characters of upstream error bodies. Some providers echo part of the rejected key in these, so keep `debug` off in shared logs.
+```toml
+[log]
+level = "info,reiki::tunnel=debug"   # a level, or a filter per module
+file = "/var/log/reiki.log"          # also write here; the service user must be able to write it
+format = "text"                      # the file's layout: "text" or "json"
+stderr = true                        # keep stderr too; false stops duplicating a service manager's journal
+file_max_bytes = 52428800            # rotate when the next line would pass this; 0 never rotates
+file_keep = 5                        # rotated files kept as <file>.1 (newest) to <file>.N
+```
+
+- `RUST_LOG`, when set, overrides `level` at startup.
+- SIGHUP applies a changed `level` without a restart and reopens the file, so an external rotation tool can move it. Changing `file`, `format` or `stderr` needs a restart.
+- Every line made while a request is handled carries its `id` in the span prefix (`req{id=…}`). The same `id` is on that request's records in the request log.
+- `reiki check` validates the table without opening the file.
+
+What each level shows:
+
+- `info`: one line per forwarded request with the stream, key name, method, path and upstream status, plus tunnel open and close lines.
+- `warn`: a key failed, with its failure class, whether it is now cooling and for how many seconds (`cooling_secs`), plus refused tunnel destinations and refused intercepted requests (a `Host` header mismatch or a path outside the intercepted API).
+- `debug`: the first 160 characters of upstream error bodies and tunnel I/O errors. Some providers echo part of the rejected key in error bodies, so keep `debug` off in shared logs.
 
 Key values and stream tokens are never logged.
 

@@ -54,6 +54,8 @@ Create the CA, name-constrained to the hosts it may sign for, and give only `ca.
 reiki ca-init --dir /etc/reiki/ca --host api.example.com --days 365
 ```
 
+A CA is limited to the hosts it was created with, so adding a host means creating a new one with `--replace` and giving clients the new `ca.pem`. `reiki check` prints the days the CA has left, startup logs a warning within 30 days of expiry, and `GET /status` reports `intercept.ca_days_left`.
+
 Clients must trust that certificate: add it to the system store, or point the runtime at it with `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS`, whichever the client reads.
 
 - The client uses the upstream's real URL, so no base URL has to change and the client can hold a placeholder instead of a real key. Reiki replaces the credential, as it does for a route.

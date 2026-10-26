@@ -44,6 +44,7 @@ pub enum ConfigError {
     BadAdminTokenHash,
     AdminListenConflict,
     BadTunnel(String),
+    BadLog(String),
     UnknownPlugin {
         name: String,
         known: Vec<String>,
@@ -121,6 +122,7 @@ impl fmt::Display for ConfigError {
                 )
             }
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
+            Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -163,10 +165,74 @@ pub struct Config {
     /// Optional CONNECT-only forward proxy that copies bytes without reading them.
     #[serde(default)]
     pub tunnel: Option<TunnelConfig>,
+    /// Where Reiki's own log lines go and how much it says.
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
     pub plugins: BTreeMap<String, toml::Table>,
+}
+
+/// Reiki's service log, not the request log plugin.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// A level (`info`) or a filter such as `info,reiki::tunnel=debug`. `RUST_LOG`, when set, wins at startup.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Also write lines to this file, which must be writable by the service user.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Layout of the file: `text` or `json`.
+    #[serde(default)]
+    pub format: LogFormat,
+    /// Keep writing to stderr, which a service manager collects.
+    #[serde(default = "default_true")]
+    pub stderr: bool,
+    /// Rotate the file when the next line would pass this size; 0 never rotates.
+    #[serde(default = "default_log_file_max_bytes")]
+    pub file_max_bytes: u64,
+    /// Rotated files kept as `<file>.1` (newest) to `<file>.N`.
+    #[serde(default = "default_log_file_keep")]
+    pub file_keep: u32,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file: None,
+            format: LogFormat::Text,
+            stderr: true,
+            file_max_bytes: default_log_file_max_bytes(),
+            file_keep: default_log_file_keep(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_log_file_max_bytes() -> u64 {
+    50 * 1024 * 1024
+}
+
+fn default_log_file_keep() -> u32 {
+    5
 }
 
 fn default_listen() -> String {
@@ -375,6 +441,23 @@ impl Config {
         Ok(())
     }
 
+    fn log_problem(&self) -> Option<String> {
+        let log = &self.log;
+        if tracing_subscriber::EnvFilter::try_new(&log.level).is_err() {
+            return Some(format!("`{}` is not a valid level or filter", log.level));
+        }
+        if log.file.as_deref().is_some_and(|f| !f.starts_with('/')) {
+            return Some("file must be an absolute path".to_owned());
+        }
+        if log.file.is_none() && !log.stderr {
+            return Some("stderr is off and no file is set, so nothing would be logged".to_owned());
+        }
+        if log.file_keep > 100 {
+            return Some("file_keep must be at most 100".to_owned());
+        }
+        None
+    }
+
     /// What is wrong with an `[tunnel.intercept]` table, if anything.
     fn intercept_problem(
         &self,
@@ -450,6 +533,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(reason) = self.log_problem() {
+            return Err(ConfigError::BadLog(reason));
+        }
         for (name, upstream) in &self.upstream {
             // Loopback http is allowed so tests and local mocks work.
             if !upstream.base_url.starts_with("https://") && !is_loopback_http(&upstream.base_url) {
@@ -598,6 +684,27 @@ fn is_port(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_log_section_defaults_and_validates() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.log.level, "info");
+        assert!(config.log.stderr && config.log.file.is_none());
+        let config = Config::parse(
+            "[log]\nlevel = \"info,reiki::tunnel=debug\"\nfile = \"/var/log/reiki.log\"\nformat = \"json\"",
+        )
+        .unwrap();
+        assert_eq!(config.log.format, LogFormat::Json);
+        for bad in [
+            "[log]\nlevel = \"reiki=loud\"",
+            "[log]\nfile = \"reiki.log\"",
+            "[log]\nstderr = false",
+            "[log]\nfile = \"/x\"\nfile_keep = 101",
+            "[log]\nformat = \"xml\"",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

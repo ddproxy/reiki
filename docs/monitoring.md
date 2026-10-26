@@ -18,6 +18,8 @@ Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A 
 
 ## GET /status
 
+With `[tunnel.intercept]` configured, the document also has `intercept.ca_not_after` (Unix seconds) and `intercept.ca_days_left`, so an expiring CA can be alerted on.
+
 JSON with a `keys` array and a `streams` array.
 
 Each key:

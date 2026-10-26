@@ -224,6 +224,8 @@ pub struct App {
     persist_lock: Mutex<()>,
     /// Overrides the wall clock for tests; production reads the system clock.
     wall_clock: OnceLock<SystemTime>,
+    /// When the interception CA expires, as Unix seconds; unset without interception.
+    ca_not_after: OnceLock<i64>,
     plugins: Arc<PluginChain>,
     /// The plugin tables the running chain was built from, which a reload cannot change.
     plugin_tables: std::collections::BTreeMap<String, toml::Table>,
@@ -280,6 +282,7 @@ impl App {
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
+            ca_not_after: OnceLock::new(),
             plugins: Arc::new(plugins),
             plugin_tables,
         })
@@ -305,6 +308,14 @@ impl App {
 
     /// Fix the wall clock, so reset schedules can be tested against a known
     /// instant. Unset in production, where the system clock is read.
+    pub fn set_ca_not_after(&self, unix_seconds: i64) {
+        let _ = self.ca_not_after.set(unix_seconds);
+    }
+
+    pub(crate) fn ca_not_after(&self) -> Option<i64> {
+        self.ca_not_after.get().copied()
+    }
+
     pub fn set_wall_clock(&self, now: SystemTime) {
         let _ = self.wall_clock.set(now);
     }
@@ -609,6 +620,7 @@ pub(crate) async fn handle_intercepted(
         .and_then(|v| v.to_str().ok())
         .map(|h| h.trim().to_ascii_lowercase());
     if named.as_deref() != Some(host) && named.as_deref() != Some(&format!("{host}:443")) {
+        tracing::warn!(%host, header = ?named, "intercepted request refused: Host header differs from the tunnel destination");
         return json_error(
             StatusCode::MISDIRECTED_REQUEST,
             "misdirected",
@@ -624,12 +636,12 @@ pub(crate) async fn handle_intercepted(
     let sent;
     let (upstream, rest) = if target.paths.is_empty() {
         let Some(rest) = path_under_base(&upstream.base_url, path) else {
-            return outside_api();
+            return outside_api(host, path);
         };
         (upstream, rest)
     } else {
         if !target.paths.iter().any(|prefix| has_prefix(path, prefix)) {
-            return outside_api();
+            return outside_api(host, path);
         }
         let Ok(url) = reqwest::Url::parse(&upstream.base_url) else {
             return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "bad upstream URL");
@@ -664,7 +676,8 @@ pub(crate) async fn handle_intercepted(
     .await
 }
 
-fn outside_api() -> Response {
+fn outside_api(host: &str, path: &str) -> Response {
+    tracing::warn!(%host, %path, "intercepted request refused: path is outside the intercepted API");
     json_error(
         StatusCode::FORBIDDEN,
         "forbidden",
@@ -705,8 +718,38 @@ async fn dispatch(
     upstream_name: &str,
     upstream: &crate::config::Upstream,
     rest: String,
+    parts: Parts,
+    body: Body,
+) -> Response {
+    use tracing::Instrument;
+    let id = reiki_plugin::new_request_id();
+    let span = tracing::info_span!("req", id = %id);
+    dispatch_inner(
+        app,
+        snapshot,
+        stream,
+        upstream_name,
+        upstream,
+        rest,
+        parts,
+        body,
+        &id,
+    )
+    .instrument(span)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_inner(
+    app: &App,
+    snapshot: &Snapshot,
+    stream: &str,
+    upstream_name: &str,
+    upstream: &crate::config::Upstream,
+    rest: String,
     mut parts: Parts,
     body: Body,
+    id: &str,
 ) -> Response {
     let rest = rest.as_str();
     let Ok(body) = to_bytes(body, MAX_REQUEST_BODY).await else {
@@ -722,6 +765,7 @@ async fn dispatch(
     // the same transformed request.
     let mut plugin_states = app.plugins.states();
     let meta = RequestMeta {
+        id,
         stream,
         upstream: upstream_name,
         method: &parts.method,
@@ -1112,7 +1156,18 @@ fn record(
         if cooled {
             app.metrics.record_cooldown(key, FailureKind::from(class));
         }
-        tracing::warn!(stream, key, ?class, ?status, cooled, "upstream key failed");
+        let cooling_secs = health
+            .cooling_remaining(key, Instant::now())
+            .map(|d| d.as_secs());
+        tracing::warn!(
+            stream,
+            key,
+            ?class,
+            ?status,
+            cooled,
+            ?cooling_secs,
+            "upstream key failed"
+        );
     }
     app.persist_state();
 }

@@ -293,7 +293,7 @@ async fn body_mode_records_the_response_body_and_never_a_key() {
 async fn a_streamed_response_body_is_kept_up_to_the_cap_and_marked_cut() {
     let rig = Rig::start(
         "respcap",
-        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"\nmax_body_bytes = 20",
+        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"\nmax_body_bytes = 20\nsse = \"raw\"",
     )
     .await;
     let path = rig.dir.join("req.jsonl");

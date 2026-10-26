@@ -261,10 +261,43 @@ pub struct TunnelConfig {
     /// Lets the tunnel reach loopback addresses. For tests and local development only.
     #[serde(default)]
     pub allow_loopback: bool,
+    /// Terminates TLS for listed hosts so plugins and key handling apply to tunnelled traffic.
+    #[serde(default)]
+    pub intercept: Option<InterceptConfig>,
 }
 
 fn default_connect_timeout() -> u64 {
     10
+}
+
+/// TLS interception for the tunnel: Reiki answers as the listed hosts using certificates
+/// signed by a CA the client trusts, then relays each request like any other.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterceptConfig {
+    /// PEM certificate of the signing CA.
+    pub ca_cert: String,
+    /// PEM private key of the signing CA.
+    pub ca_key: String,
+    /// How long a minted certificate is valid.
+    #[serde(default = "default_leaf_ttl_hours")]
+    pub leaf_ttl_hours: u64,
+    pub hosts: Vec<InterceptHost>,
+}
+
+fn default_leaf_ttl_hours() -> u64 {
+    24
+}
+
+/// One intercepted host and the upstream its requests are relayed to.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct InterceptHost {
+    pub host: String,
+    pub upstream: String,
+    /// The stream whose key chain serves these requests. Omit it for a `passthrough` upstream.
+    #[serde(default)]
+    pub stream: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -329,8 +362,80 @@ impl Config {
             if let Some(reason) = reason {
                 return Err(ConfigError::BadTunnel(reason));
             }
+            if let Some(intercept) = &tunnel.intercept {
+                if let Some(reason) = self.intercept_problem(tunnel, intercept) {
+                    return Err(ConfigError::BadTunnel(format!("intercept: {reason}")));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// What is wrong with an `[tunnel.intercept]` table, if anything.
+    fn intercept_problem(
+        &self,
+        tunnel: &TunnelConfig,
+        intercept: &InterceptConfig,
+    ) -> Option<String> {
+        if intercept.hosts.is_empty() {
+            return Some("hosts lists no hosts".to_owned());
+        }
+        if intercept.leaf_ttl_hours == 0 || intercept.leaf_ttl_hours > 720 {
+            return Some("leaf_ttl_hours must be between 1 and 720".to_owned());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &intercept.hosts {
+            let host = &entry.host;
+            if !crate::intercept::valid_host(host) {
+                return Some(format!("`{host}` must be a plain lowercase DNS name"));
+            }
+            if !seen.insert(host.as_str()) {
+                return Some(format!("`{host}` is listed twice"));
+            }
+            if !crate::tunnel::allowed(&tunnel.allow, host, 443) {
+                return Some(format!("`{host}` is not covered by the tunnel allow list"));
+            }
+            let Some(upstream) = self.upstream.get(&entry.upstream) else {
+                return Some(format!(
+                    "`{host}` names an unknown upstream `{}`",
+                    entry.upstream
+                ));
+            };
+            if upstream.base_url.starts_with("https://")
+                && crate::intercept::base_host(&upstream.base_url).as_deref() != Some(host.as_str())
+            {
+                return Some(format!(
+                    "upstream `{}` does not live at `{host}`",
+                    entry.upstream
+                ));
+            }
+            match (&entry.stream, upstream.passthrough) {
+                (Some(_), true) => {
+                    return Some(format!(
+                        "`{host}` uses a passthrough upstream, so it takes no stream"
+                    ));
+                }
+                (None, false) => return Some(format!("`{host}` needs a stream")),
+                (Some(name), false) => {
+                    let Some(stream) = self.streams.get(name) else {
+                        return Some(format!("`{host}` names an unknown stream `{name}`"));
+                    };
+                    let serves = stream.chain.iter().any(|key| {
+                        self.keys
+                            .get(key)
+                            .is_some_and(|k| k.upstream == entry.upstream)
+                    });
+                    if !serves {
+                        return Some(format!(
+                            "stream `{name}` has no key for upstream `{}`",
+                            entry.upstream
+                        ));
+                    }
+                }
+                (None, true) => {}
+            }
+        }
+        None
     }
 
     fn validate(&self) -> Result<(), ConfigError> {

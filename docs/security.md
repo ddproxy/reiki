@@ -15,6 +15,18 @@ Reiki listens on `listen`, default `127.0.0.1:4097`. It serves plain HTTP and ha
 
 Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length`, the client credential headers and `accept-encoding`. It asks the upstream for `identity` encoding so error bodies can be classified. Redirects from the upstream are not followed.
 
+## Interception
+
+`[tunnel.intercept]` lets Reiki read the traffic of the hosts it lists, so treat the CA as a secret and the clients that trust it as covered by it.
+
+- The CA created by `reiki ca-init` is name-constrained to the hosts you give it. A client that trusts it still rejects a certificate for any other name, so a stolen CA key cannot impersonate other sites.
+- The CA key must be readable only by the Reiki service user. Use one CA per machine, never share one across hosts, and install only `ca.pem` in clients.
+- Certificates are minted for one exact host and live `leaf_ttl_hours` (default 24). Wildcards and addresses are refused.
+- A request is relayed only if its `Host` header matches the tunnel destination and its path lies under the upstream's base path; anything else is refused. This keeps one tunnel from reaching other hosts or other parts of the API.
+- Reiki verifies the upstream's certificate on its own TLS connection, as it does for every other route.
+- Plugins see decrypted requests and responses on intercepted hosts. Enable `requestlog` bodies there only when you intend to record them.
+- Other tunnel destinations stay opaque and are not read.
+
 ## Logging
 
 Key values and stream tokens are not logged. Request and response bodies are not logged, except the first 160 characters of upstream error bodies at `debug` level.

@@ -31,6 +31,7 @@ async fn tunnel(allow: &[String], allow_loopback: bool) -> String {
         allow: allow.to_vec(),
         connect_timeout_secs: 5,
         allow_loopback,
+        intercept: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();

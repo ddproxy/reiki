@@ -22,7 +22,7 @@ tar xzf reiki-$VERSION-$TARGET.tar.gz
 install -m 0755 reiki-$VERSION-$TARGET/reiki /usr/local/bin/
 ```
 
-To build from source instead, install Rust 1.99 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`.
+To build from source instead, install Rust 1.99 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`. Plugin selection and order are build arguments; see [docs/plugins.md](docs/plugins.md#choose-and-order-plugins-at-build-time).
 
 ## Configure
 
@@ -31,27 +31,27 @@ Reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to chang
 ```toml
 listen = "127.0.0.1:4097"
 
-[upstream.zen]
-base_url = "https://opencode.ai/zen/v1"   # must be https
+[upstream.example]
+base_url = "https://api.example.com/v1"   # must be https
 # auth_header = "authorization"           # defaults
 # auth_format = "Bearer {key}"
-# model_aliases = { "gpt-4o" = "opencode/gpt-4o" }  # rewrite the top-level `model`
+# model_aliases = { "small" = "vendor/small-v2" }  # rewrite the top-level `model`
 # drop_params = ["stream_options"]        # remove these top-level keys
 # http2 = true                            # negotiate HTTP/2 (default: HTTP/1.1)
 # forward_accept_encoding = true          # send the client's Accept-Encoding (default: identity)
 
-[keys.zen-a]
-upstream = "zen"
-file = "/etc/reiki/keys/zen-a"            # file holding the key
+[keys.example-a]
+upstream = "example"
+file = "/etc/reiki/keys/example-a"            # file holding the key
 # quota_resets = "daily 00:00 UTC"        # end a quota cooldown at the next reset
 
-[keys.zen-b]
-upstream = "zen"
-file = "/etc/reiki/keys/zen-b"
+[keys.example-b]
+upstream = "example"
+file = "/etc/reiki/keys/example-b"
 
 [streams.laptop]
 token_sha256 = "<sha256 of the client token>"
-chain = ["zen-a", "zen-b"]                # tried in order
+chain = ["example-a", "example-b"]                # tried in order
 strategy = "sticky"                       # or "round_robin"
 # rate_limit_per_minute = 60              # optional; off unless set
 
@@ -66,7 +66,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
 - `http2` lets Reiki negotiate HTTP/2 with that upstream over TLS, and `forward_accept_encoding` sends the client's own `Accept-Encoding` upstream instead of `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself, so error bodies are still read for key failover, and sends the client plain bytes. Both are off by default; see [docs/providers.md](docs/providers.md).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
-- `[tunnel]` adds a CONNECT-only forward proxy with a destination allowlist, so a client's own TLS session reaches the destination untouched. See [docs/tunnel.md](docs/tunnel.md).
+- `[tunnel]` adds a CONNECT forward proxy with a destination allowlist. Destinations pass through untouched by default; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic too. See [docs/tunnel.md](docs/tunnel.md).
 - `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
 - `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
 - Keys live in files, never in the config. Keep them mode 0600.
@@ -75,9 +75,9 @@ token_sha256 = "<sha256 of the admin token>"
 
 ## Use
 
-Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/zen/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
+Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/example/chat/completions` goes to `https://api.example.com/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
 
-Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, in that order of preference. Setup for OpenAI, OpenCode Zen, Anthropic, Gemini and other providers is in [docs/providers.md](docs/providers.md).
+Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, in that order of preference. Provider-specific setup is in [docs/providers.md](docs/providers.md).
 
 `GET /__reiki/healthz` returns 200 and `ok` when Reiki is up. It needs no token.
 

@@ -540,7 +540,7 @@ fn split_upstream(path: &str) -> Option<(&str, &str)> {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     if parts.uri.path() == HEALTH_PATH && parts.method == Method::GET {
         return Response::new(Body::from("ok"));
     }
@@ -581,6 +581,103 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return json_error(StatusCode::NOT_FOUND, "not_found", "unknown upstream");
     };
 
+    let (upstream_name, rest) = (upstream_name.to_owned(), rest.to_owned());
+    dispatch(
+        &app,
+        &snapshot,
+        &stream,
+        &upstream_name,
+        upstream,
+        rest,
+        parts,
+        body,
+    )
+    .await
+}
+
+/// What `[tunnel.intercept]` maps one host to.
+pub(crate) async fn handle_intercepted(
+    app: &Arc<App>,
+    host: &str,
+    target: &crate::config::InterceptHost,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let named = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.trim().to_ascii_lowercase());
+    if named.as_deref() != Some(host) && named.as_deref() != Some(&format!("{host}:443")) {
+        return json_error(
+            StatusCode::MISDIRECTED_REQUEST,
+            "misdirected",
+            "the Host header does not match the tunnel destination",
+        );
+    }
+
+    let snapshot = app.snapshot();
+    let Some(upstream) = snapshot.config.upstream.get(&target.upstream) else {
+        return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "unknown upstream");
+    };
+    let Some(rest) = path_under_base(&upstream.base_url, parts.uri.path()) else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the path is outside the intercepted API",
+        );
+    };
+    let stream = match (&target.stream, upstream.passthrough) {
+        (Some(name), false) => name.as_str(),
+        _ => PASSTHROUGH_STREAM,
+    };
+    if !upstream.passthrough {
+        if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
+            app.metrics.record_rate_limit_rejection(stream);
+            return rate_limited_response(wait);
+        }
+    }
+    dispatch(
+        app,
+        &snapshot,
+        stream,
+        &target.upstream,
+        upstream,
+        rest,
+        parts,
+        body,
+    )
+    .await
+}
+
+/// The part of `path` below the upstream's base path, or `None` when it is not under it.
+fn path_under_base(base_url: &str, path: &str) -> Option<String> {
+    let base = reqwest::Url::parse(base_url)
+        .ok()?
+        .path()
+        .trim_end_matches('/')
+        .to_owned();
+    if base.is_empty() {
+        return Some(path.to_owned());
+    }
+    match path.strip_prefix(base.as_str()) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => Some(rest.to_owned()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
+    app: &App,
+    snapshot: &Snapshot,
+    stream: &str,
+    upstream_name: &str,
+    upstream: &crate::config::Upstream,
+    rest: String,
+    mut parts: Parts,
+    body: Body,
+) -> Response {
+    let rest = rest.as_str();
     let Ok(body) = to_bytes(body, MAX_REQUEST_BODY).await else {
         return json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -594,7 +691,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     // the same transformed request.
     let mut plugin_states = app.plugins.states();
     let meta = RequestMeta {
-        stream: &stream,
+        stream,
         upstream: upstream_name,
         method: &parts.method,
         path: parts.uri.path(),
@@ -619,8 +716,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
 
     let mut used = upstream_name;
     let first = Forward {
-        snapshot: &snapshot,
-        stream: &stream,
+        snapshot,
+        stream,
         upstream_name,
         upstream,
         parts: &parts,
@@ -628,9 +725,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         plugin_states,
     };
     let mut result = if upstream.passthrough {
-        forward_passthrough(&app, first, rewritten).await
+        forward_passthrough(app, first, rewritten).await
     } else {
-        forward(&app, first, rewritten).await
+        forward(app, first, rewritten).await
     };
 
     // One hop only: when nothing is left to try here, hand the request to the
@@ -643,7 +740,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
                 .as_ref()
                 .map_or(StatusCode::SERVICE_UNAVAILABLE, |r| r.1);
             app.metrics.record_request(
-                &stream,
+                stream,
                 upstream_name,
                 StatusClass::from_status(failed.as_u16()),
             );
@@ -651,10 +748,10 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
             used = fallback.upstream.as_str();
             result = forward(
-                &app,
+                app,
                 Forward {
-                    snapshot: &snapshot,
-                    stream: &stream,
+                    snapshot,
+                    stream,
                     upstream_name: used,
                     upstream: target,
                     parts: &parts,
@@ -673,11 +770,11 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
                 let mut states = spent.plugin_states;
                 finish_buffered(&app.plugins, &mut states, &key, status, &headers, body)
             }
-            None => exhausted(&snapshot, &app.health, &stream),
+            None => exhausted(snapshot, &app.health, stream),
         },
     };
     app.metrics.record_request(
-        &stream,
+        stream,
         used,
         StatusClass::from_status(response.status().as_u16()),
     );

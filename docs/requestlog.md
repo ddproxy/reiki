@@ -11,7 +11,7 @@ It is a bundled plugin, compiled in by the default `plugin-requestlog` feature a
 file = "/var/lib/reiki/requests.jsonl"     # JSON lines, rotated by size
 socket = "/run/reiki/requests.sock"        # live feed, one JSON line per record
 body = "full"                              # "full", "summary" or "none"
-headers = ["user-agent", "x-opencode-session"]
+headers = ["user-agent", "x-session-id"]
 ```
 
 At least one of `file` and `socket` is required, both as absolute paths. At startup, a bad value, an unknown key or an unwritable path stops Reiki from starting.
@@ -38,8 +38,8 @@ Stopping Reiki with a signal leaves the socket file behind; the next start repla
 Every record is one line with `"v":1`. A request produces two records that share an `id`.
 
 ```json
-{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"ct","upstream":"zen","method":"POST","headers":{"user-agent":"opencode/1.18.35"},"body_bytes":75,"body":{"model":"big-pickle","messages":[{"role":"user","content":"hello there"}]}}
-{"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2025-01-01T12:00:00.000Z","status":200,"duration_ms":249,"bytes":11,"key":"zen-primary","attempts":[{"key":"zen-primary","status":200}]}
+{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"ct","upstream":"example","method":"POST","headers":{"user-agent":"client/1.0"},"body_bytes":75,"body":{"model":"small","messages":[{"role":"user","content":"hello there"}]}}
+{"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2025-01-01T12:00:00.000Z","status":200,"duration_ms":249,"bytes":11,"key":"example-primary","attempts":[{"key":"example-primary","status":200}]}
 ```
 
 - `stream` is the Reiki stream (client) and `upstream` the provider name from the config.

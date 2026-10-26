@@ -2,7 +2,7 @@
 
 Plugins add behaviour to the request path without changing Reiki itself, for example rewriting a body or recording requests. They are compiled into the binary; Reiki never loads code at runtime.
 
-Release binaries include the plugins listed in [Bundled plugins](#bundled-plugins). Building from source lets you choose which are compiled in.
+Release binaries include the plugins listed in [Bundled plugins](#bundled-plugins). Building from source lets you choose which are compiled in, and in what order.
 
 ## Use a plugin
 
@@ -18,7 +18,7 @@ file = "/var/lib/reiki/requests.jsonl"
 - `on_error` is `"pass_through"` (default) or `"reject"`. It decides what happens when a plugin reports that it could not apply (a skip): `pass_through` logs it and carries on, `reject` answers the client with 503. A plugin that deliberately rejects a request always rejects, whatever `on_error` says.
 - `reiki check` adds `dry_run = true` to every plugin table. A plugin should then validate its settings only, and not open files, sockets or threads, so the check has no side effects and works while Reiki is running.
 - Plugin settings are read at startup. A SIGHUP reload checks the plugin tables (an unknown plugin name or a bad setting keeps the old config) and logs a warning when they changed, but does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
-- Plugins run in the order they are registered in `src/plugins.rs`, not in the order of the config file. Request hooks run in that order; response hooks run in the reverse order, so the plugin that changed the request first sees the response last and can undo its change before the client gets it.
+- Plugins run in the order they are registered at build time (see below), not in the order of the config file. Request hooks run in that order; response hooks run in the reverse order, so the plugin that changed the request first sees the response last and can undo its change before the client gets it.
 
 ## Bundled plugins
 
@@ -26,6 +26,20 @@ file = "/var/lib/reiki/requests.jsonl"
 | --- | --- | --- |
 | `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
+
+## Choose and order plugins at build time
+
+Cargo features only switch a plugin's code on, and they carry no order. Order comes from `REIKI_PLUGINS`, an ordered, comma-separated list read by `build.rs`:
+
+```sh
+# only these two, in this order
+REIKI_PLUGINS=placeholders,requestlog cargo build --release --no-default-features \
+  --features plugin-placeholders,plugin-requestlog
+```
+
+- Unset, every plugin whose feature is enabled is registered in the order of the catalog in `Cargo.toml` (`[[package.metadata.reiki.plugin]]`).
+- A name that is not in the catalog, a repeated name, or a plugin whose feature is off fails the build with a message saying what to change.
+- A plugin left out of the list is not registered, so naming it in `[plugins.*]` is a startup error.
 
 ## What a plugin can see and do
 
@@ -70,7 +84,14 @@ To compile it in:
 
 1. Add the crate to the workspace and as an optional dependency of `reiki`.
 2. Add a feature of the same name that enables it, for example `plugin-tag = ["dep:reiki-tag"]`.
-3. Register it in `builtin()` in `src/plugins.rs`, behind that feature, with its name and its `build` function.
+3. Add it to the catalog in `Cargo.toml`, in default chain order. The crate must export `NAME` and `build`:
+
+   ```toml
+   [[package.metadata.reiki.plugin]]
+   name = "tag"
+   feature = "plugin-tag"
+   crate = "reiki_tag"
+   ```
 
 Per-request data goes in the value returned by `Plugin::new_state`, which every hook for that request receives. One plugin instance serves many requests at once, so keep shared data behind its own synchronisation.
 

@@ -27,6 +27,18 @@ enum Command {
     HashToken,
     /// Check the configuration and key files, then exit.
     Check,
+    /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
+    CaInit {
+        /// Directory that receives `ca.pem` and `ca.key`.
+        #[arg(long)]
+        dir: PathBuf,
+        /// A host the CA may sign for; repeat for several.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<String>,
+        /// How long the CA is valid.
+        #[arg(long, default_value_t = 365)]
+        days: u64,
+    },
 }
 
 fn fail(message: &str) -> ! {
@@ -85,6 +97,18 @@ async fn main() {
         return;
     }
 
+    if let Some(Command::CaInit { dir, hosts, days }) = &cli.command {
+        match reiki::intercept::init_ca(dir, hosts, *days) {
+            Ok(()) => println!(
+                "wrote {} and {}; give ca.pem to clients, keep ca.key private",
+                dir.join("ca.pem").display(),
+                dir.join("ca.key").display()
+            ),
+            Err(e) => fail(&e),
+        }
+        return;
+    }
+
     let text = std::fs::read_to_string(&cli.config)
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
     let mut config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
@@ -106,6 +130,11 @@ async fn main() {
     }
 
     if let Some(Command::Check) = cli.command {
+        if let Some(intercept) = config.tunnel.as_ref().and_then(|t| t.intercept.as_ref()) {
+            if let Err(e) = reiki::intercept::check_ca(intercept) {
+                fail(&format!("intercept: {e}"));
+            }
+        }
         let admin = admin_listen
             .as_ref()
             .map_or(String::new(), |addr| format!(", admin on {addr}"));
@@ -154,10 +183,14 @@ async fn main() {
             .await
             .unwrap_or_else(|e| fail(&format!("cannot bind tunnel {}: {e}", tunnel.listen)));
         tracing::info!(addr = %tunnel.listen, destinations = tunnel.allow.len(), "reiki tunnel listening");
-        tokio::spawn(reiki::tunnel::serve(
-            tunnel_listener,
-            Arc::new(reiki::tunnel::Tunnel::new(tunnel)),
-        ));
+        let mut built = reiki::tunnel::Tunnel::new(tunnel);
+        if let Some(intercept) = &tunnel.intercept {
+            let interceptor = reiki::intercept::Interceptor::new(Arc::clone(&app), intercept)
+                .unwrap_or_else(|e| fail(&format!("intercept: {e}")));
+            tracing::info!(hosts = intercept.hosts.len(), "reiki tunnel intercepting");
+            built = built.with_interceptor(Arc::new(interceptor));
+        }
+        tokio::spawn(reiki::tunnel::serve(tunnel_listener, Arc::new(built)));
     }
     tracing::info!(%listen, "reiki listening");
     let served = axum::serve(listener, router(app))

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Key-failover relay for LLM APIs"
@@ -14,6 +14,22 @@ repository = "https://github.com/ddproxy/reiki"
 keywords = ["proxy", "api-key", "failover", "llm"]
 categories = ["web-programming::http-server", "command-line-utilities"]
 publish = false
+build = "build.rs"
+
+[[package.metadata.reiki.plugin]]
+# Default chain order: placeholders must mask before the request log sees the request and,
+# because responses run in reverse, restore only after the log has seen the response.
+name = "placeholders"
+feature = "plugin-placeholders"
+crate = "reiki_placeholders"
+
+[[package.metadata.reiki.plugin]]
+name = "requestlog"
+feature = "plugin-requestlog"
+crate = "reiki_requestlog"
+
+[build-dependencies]
+toml = "0.8"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +45,12 @@ reiki-plugin = { path = "crates/reiki-plugin" }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 futures-core = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+time = "0.3"
 
 [features]
 default = ["plugin-placeholders", "plugin-requestlog"]

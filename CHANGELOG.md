@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+
+- `[tunnel.intercept]`: Reiki terminates TLS for chosen tunnel destinations with certificates signed by a CA the client trusts, then relays each request through the normal route, so plugins, key handling, failover and rate limits apply to traffic that used to be opaque. Each host maps to an upstream and, unless that upstream is `passthrough`, a stream. See [docs/tunnel.md](docs/tunnel.md).
+- `reiki ca-init`: creates a CA that is name-constrained to the hosts you list. `reiki check` loads the configured CA.
+- `REIKI_PLUGINS` build argument: an ordered list that picks which plugins are registered and in what order, replacing the hard-coded list in `src/plugins.rs`. The plugin catalog now lives in `Cargo.toml`. See [docs/plugins.md](docs/plugins.md).
+
+### Changed
+
+- The tunnel configuration gains an optional `intercept` table; existing `[tunnel]` configs are unchanged.
+- Provider names and setup moved out of the general docs into [docs/providers.md](docs/providers.md).
+
 ## 0.3.0
 
 ### Added

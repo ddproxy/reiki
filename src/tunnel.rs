@@ -9,6 +9,7 @@ use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 
 use crate::config::TunnelConfig;
+use crate::intercept::{Interceptor, Prefixed};
 
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,10 +62,19 @@ pub fn valid_rule(text: &str) -> bool {
     Rule::parse(text).is_some()
 }
 
+/// True when the allowlist `entries` permit `host:port`.
+pub fn allowed(entries: &[String], host: &str, port: u16) -> bool {
+    entries
+        .iter()
+        .filter_map(|e| Rule::parse(e))
+        .any(|r| r.allows(host, port))
+}
+
 pub struct Tunnel {
     rules: Vec<Rule>,
     connect_timeout: Duration,
     allow_loopback: bool,
+    interceptor: Option<Arc<Interceptor>>,
 }
 
 impl Tunnel {
@@ -73,7 +83,15 @@ impl Tunnel {
             rules: config.allow.iter().filter_map(|r| Rule::parse(r)).collect(),
             connect_timeout: Duration::from_secs(config.connect_timeout_secs),
             allow_loopback: config.allow_loopback,
+            interceptor: None,
         }
+    }
+
+    /// Answers CONNECT requests for the interceptor's hosts itself instead of copying bytes.
+    #[must_use]
+    pub fn with_interceptor(mut self, interceptor: Arc<Interceptor>) -> Self {
+        self.interceptor = Some(interceptor);
+        self
     }
 
     fn allows(&self, host: &str, port: u16) -> bool {
@@ -158,6 +176,19 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
     if !tunnel.allows(&host, port) {
         tracing::warn!(%host, port, "tunnel refused a destination that is not allowed");
         return respond(&mut client, "403 Forbidden", "destination not allowed").await;
+    }
+
+    if let Some(interceptor) = tunnel
+        .interceptor
+        .as_ref()
+        .filter(|i| port == 443 && i.handles(&host))
+    {
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        tracing::info!(%host, "tunnel intercepting");
+        interceptor.serve(&host, Prefixed::new(rest, client)).await;
+        return Ok(());
     }
 
     let started = Instant::now();
@@ -275,6 +306,7 @@ mod tests {
             rules: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
             connect_timeout: Duration::from_secs(5),
             allow_loopback: false,
+            interceptor: None,
         }
     }
 

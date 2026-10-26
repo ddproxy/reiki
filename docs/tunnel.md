@@ -62,6 +62,9 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - Each intercepted host must be allowed by `allow` on port 443 and map to an upstream on that same host.
 - Only requests under the upstream's base path are relayed. Others get 403, and a `Host` header that differs from the tunnel destination gets 421.
 - When an API spans several path prefixes on one host, list them with `paths = ["/v1", "/other"]`. Matching prefixes (whole segments) are sent to the host exactly as the client sent them, and the upstream's `base_url` then supplies only the host and the credential format.
-- Only HTTP/1.1 is offered to the client. Reiki can still use HTTP/2 toward the upstream (`http2 = true`).
+- An intercepted request is relayed the way the client sent it. The upstream receives the client's header names in their original case and order, its `Accept-Encoding`, and `Connection: keep-alive`, over HTTP/1.1. Reiki changes only the credential (replaced in place), `Host` (set to the upstream's), and the hop-by-hop headers (`Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, `Proxy-*`, and a `Connection` other than `keep-alive`). `Content-Length` is recomputed from the body.
+- Encoded responses (gzip, deflate, brotli, zstd) are decoded so plugins and failover can read them; the client receives plain bytes without `Content-Encoding`. An unknown encoding passes through untouched.
+- The per-upstream transport settings (`http2`, `forward_accept_encoding`, `title_case_headers`, `send_keep_alive`) apply to the reverse-proxy routes only, not to intercepted traffic.
+- What Reiki cannot reproduce is the client's TLS handshake: the upstream sees Reiki's own TLS client. Only the opaque tunnel keeps the client's handshake, and it cannot swap a key.
 - Hosts that are allowed but not listed under `hosts` stay opaque.
 - Interception needs a restart to change, like the rest of `[tunnel]`. See [security](security.md) for what to protect.

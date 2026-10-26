@@ -44,7 +44,7 @@ http2 = true
 forward_accept_encoding = true
 ```
 
-The credential header is always sent first, ahead of the client's own headers.
+The credential header is always sent first, ahead of the client's own headers. These settings apply to the reverse-proxy routes. Traffic through an intercepted tunnel is relayed as the client sent it; see [tunnel](tunnel.md).
 
 These change how Reiki connects, nothing more. Reiki does not add, rewrite or invent client-identifying headers, and the settings do not change which requests an upstream accepts.
 

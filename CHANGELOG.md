@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+### Changed
+
+- Requests through `[tunnel.intercept]` are relayed with a hyper client that keeps the client's request as sent: header names keep their case and order, `Accept-Encoding` and `Connection: keep-alive` are forwarded, and only the credential, `Host` and hop-by-hop headers are edited. Previously they were rebuilt by reqwest, which lowercased and reordered headers and replaced `Accept-Encoding` with `identity`. See [docs/tunnel.md](docs/tunnel.md).
+- Encoded responses on that path (gzip, deflate, brotli, zstd) are decoded before plugins and failover see them, and the client receives plain bytes.
+- The per-upstream `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` settings apply to the reverse-proxy routes only.
+- Reiki's TLS handshake toward the upstream is still its own; only the opaque tunnel keeps the client's.
+
 ## 0.4.3
 
 ### Added

@@ -2,20 +2,27 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use axum::body::Bytes;
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version};
+use axum::http::{
+    header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Version,
+};
 use futures_core::Stream;
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use tokio::io::BufReader;
+use tokio_util::io::{ReaderStream, StreamReader};
+
+type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 pub struct UpstreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub version: Version,
-    body: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    body: ByteStream,
 }
 
 impl UpstreamResponse {
@@ -35,12 +42,39 @@ impl UpstreamResponse {
     }
 
     pub fn from_hyper(response: hyper::Response<hyper::body::Incoming>) -> Self {
+        Self::from_hyper_inner(response, false)
+    }
+
+    /// A HEAD response carries no body to decode, whatever its headers claim.
+    pub fn from_hyper_head(response: hyper::Response<hyper::body::Incoming>) -> Self {
+        Self::from_hyper_inner(response, true)
+    }
+
+    fn from_hyper_inner(response: hyper::Response<hyper::body::Incoming>, is_head: bool) -> Self {
         let status = response.status();
-        let headers = response.headers().clone();
+        let mut headers = response.headers().clone();
         let version = response.version();
-        let body = Box::pin(ErrMap {
-            inner: Box::pin(response.into_body().into_data_stream()),
-        });
+        let bodyless =
+            is_head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+        let encoding = if bodyless {
+            None
+        } else {
+            content_encoding(&headers)
+        };
+        let incoming = response.into_body();
+        let body = match encoding {
+            Some(Encoding::Gzip) => decode(incoming, GzipDecoder::new),
+            Some(Encoding::Deflate) => decode(incoming, ZlibDecoder::new),
+            Some(Encoding::Brotli) => decode(incoming, BrotliDecoder::new),
+            Some(Encoding::Zstd) => decode(incoming, ZstdDecoder::new),
+            None => Box::pin(ErrMap {
+                inner: Box::pin(incoming.into_data_stream()),
+            }),
+        };
+        if encoding.is_some() {
+            headers.remove(header::CONTENT_ENCODING);
+            headers.remove(header::CONTENT_LENGTH);
+        }
         Self {
             status,
             headers,
@@ -56,6 +90,44 @@ impl UpstreamResponse {
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         self.body
     }
+}
+
+#[derive(Clone, Copy)]
+enum Encoding {
+    Gzip,
+    Deflate,
+    Brotli,
+    Zstd,
+}
+
+/// Returns `None` for anything we cannot safely decode ourselves, so the client
+/// receives exactly the bytes and headers the upstream chose.
+fn content_encoding(headers: &HeaderMap) -> Option<Encoding> {
+    let mut values = headers.get_all(header::CONTENT_ENCODING).iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() || value.contains(',') {
+        return None;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => Some(Encoding::Gzip),
+        "deflate" => Some(Encoding::Deflate),
+        "br" => Some(Encoding::Brotli),
+        "zstd" => Some(Encoding::Zstd),
+        _ => None,
+    }
+}
+
+fn decode<D, F>(body: hyper::body::Incoming, make: F) -> ByteStream
+where
+    D: tokio::io::AsyncRead + Send + 'static,
+    F: FnOnce(BufReader<StreamReader<ByteStream, Bytes>>) -> D,
+{
+    let source: ByteStream = Box::pin(ErrMap {
+        inner: Box::pin(body.into_data_stream()),
+    });
+    Box::pin(ReaderStream::new(make(BufReader::new(StreamReader::new(
+        source,
+    )))))
 }
 
 pub struct Faithful {
@@ -80,12 +152,17 @@ impl Faithful {
         &self,
         request: Request<Full<Bytes>>,
     ) -> Result<UpstreamResponse, std::io::Error> {
+        let is_head = request.method() == Method::HEAD;
         let response = self
             .client
             .request(request)
             .await
             .map_err(std::io::Error::other)?;
-        Ok(UpstreamResponse::from_hyper(response))
+        Ok(if is_head {
+            UpstreamResponse::from_hyper_head(response)
+        } else {
+            UpstreamResponse::from_hyper(response)
+        })
     }
 }
 

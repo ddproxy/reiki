@@ -26,6 +26,7 @@ file = "/var/lib/reiki/requests.jsonl"
 | --- | --- | --- |
 | `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
+| `metrics` | `plugin-metrics` | Serves Prometheus metrics at `GET /metrics` on the admin listener. See [monitoring](monitoring.md). |
 
 ## Choose and order plugins at build time
 
@@ -52,7 +53,10 @@ A plugin is trusted code that runs inside the Reiki process.
 - `on_response_head` receives the name of the key that produced the response, the upstream status and the headers. `on_response_chunk` receives each body chunk and may rewrite it.
 - Hooks are synchronous and run on the request's task. A hook that blocks is not interrupted, and there is no timeout. Do slow work, such as file writes, on a thread of your own.
 - A panic in a hook is caught and logged with the plugin and hook name, and the request carries on. Changes the hook made before it panicked are kept, and the plugin's own state may be left half-updated. A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or is answered with 503. Rust's default panic handler also prints the panic message and location to stderr, outside the log settings, so do not `unwrap` or `expect` on request data.
-- While any plugin is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. HEAD, 204 and 304 responses keep theirs, as they have no body. When the body ends normally the final `on_response_chunk` call, with `is_last` set, follows the last chunk. It does not happen after an upstream read error or when the client disconnects, so use the per-request state being dropped as the end-of-response signal.
+- `on_event` receives facts about the relay rather than one request: a finished request (stream, upstream, final status), a failover from one key to the next, a key going on cooldown, and a stream rate-limit rejection. It is not tied to a request's state and carries key names, never secrets.
+- `admin_paths` and `on_admin` let a plugin answer a GET on the admin listener, after the caller has been authenticated. Two plugins claiming one path, or a plugin claiming `/status`, is a startup error. The hook receives the current count of available, cooling and out-of-rotation keys.
+- A plugin that never touches bodies returns `false` from `uses_bodies`, so configuring it does not change how responses are streamed.
+- While a plugin that uses bodies is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. HEAD, 204 and 304 responses keep theirs, as they have no body. When the body ends normally the final `on_response_chunk` call, with `is_last` set, follows the last chunk. It does not happen after an upstream read error or when the client disconnects, so use the per-request state being dropped as the end-of-response signal.
 - The request body is limited to 8 MB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
 
 ## Write a plugin

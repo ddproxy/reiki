@@ -55,6 +55,98 @@ pub trait Plugin: Send + Sync {
     /// Called for each response body chunk. `is_last` marks a final, possibly
     /// empty, call after which the plugin must release anything it held back.
     fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {}
+
+    /// False for a plugin that never touches bodies, so its presence keeps `content-length` on responses.
+    fn uses_bodies(&self) -> bool {
+        true
+    }
+
+    /// Called for relay-level facts, not tied to one request's state.
+    fn on_event(&self, _event: &Event<'_>) {}
+
+    /// Paths this plugin answers on the admin listener; two plugins claiming one path is a startup error.
+    fn admin_paths(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Answers a GET for one of [`Plugin::admin_paths`], after the caller is authenticated.
+    fn on_admin(&self, _ctx: &AdminCtx<'_>) -> Option<AdminReply> {
+        None
+    }
+}
+
+/// Why a key left rotation, as a stable label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailureKind {
+    RateLimited,
+    QuotaExhausted,
+    AccessDisabled,
+    Unauthorized,
+    Transient,
+}
+
+impl FailureKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::AccessDisabled => "access_disabled",
+            Self::Unauthorized => "unauthorized",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+/// Something the relay did; key names come from the config, never secrets.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum Event<'a> {
+    /// A request finished with the status the client received.
+    RequestDone {
+        stream: &'a str,
+        upstream: &'a str,
+        status: u16,
+    },
+    /// A request moved from a failed key to the next.
+    Failover {
+        stream: &'a str,
+        key: &'a str,
+        kind: FailureKind,
+    },
+    /// A key went on cooldown.
+    Cooldown { key: &'a str, kind: FailureKind },
+    /// A stream's rate limit turned a request away before any key was picked.
+    RateLimited { stream: &'a str },
+}
+
+/// Key counts when an admin path is asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyCounts {
+    pub available: u64,
+    pub cooling: u64,
+    pub out_of_rotation: u64,
+}
+
+/// An admin request for one of a plugin's paths.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AdminCtx<'a> {
+    pub path: &'a str,
+    pub keys: KeyCounts,
+}
+
+impl<'a> AdminCtx<'a> {
+    pub fn new(path: &'a str, keys: KeyCounts) -> Self {
+        Self { path, keys }
+    }
+}
+
+/// A plugin's answer to an admin request.
+#[derive(Debug)]
+pub struct AdminReply {
+    pub content_type: &'static str,
+    pub body: String,
 }
 
 /// A hook declined or failed. The relay decides what to do with it.

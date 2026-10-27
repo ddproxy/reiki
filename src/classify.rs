@@ -11,6 +11,18 @@ pub enum FailureClass {
     Transient,
 }
 
+impl From<FailureClass> for reiki_plugin::FailureKind {
+    fn from(class: FailureClass) -> Self {
+        match class {
+            FailureClass::RateLimited(_) => Self::RateLimited,
+            FailureClass::QuotaExhausted => Self::QuotaExhausted,
+            FailureClass::AccessDisabled => Self::AccessDisabled,
+            FailureClass::Unauthorized => Self::Unauthorized,
+            FailureClass::Transient => Self::Transient,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Success,

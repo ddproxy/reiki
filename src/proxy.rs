@@ -18,10 +18,10 @@ use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
-use crate::metrics::{FailureKind, Metrics, StatusClass};
 use crate::plugins::{PluginChain, RequestMeta};
 use crate::rewrite::rewrite_body;
-use crate::upstream::{faithful_request, UpstreamResponse};
+use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
+use reiki_plugin::{Event, FailureKind};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -214,15 +214,9 @@ pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
     policy: Policy,
-    /// HTTP/1.1 only, for upstreams without `http2`.
-    client: reqwest::Client,
-    /// Negotiates HTTP/2 where the upstream offers it, for upstreams with `http2`.
-    client_h2: reqwest::Client,
-    /// HTTP/1.1 with Title-Case header names, for upstreams with `title_case_headers`.
-    client_title: reqwest::Client,
-    faithful: crate::upstream::Faithful,
+    standard: Standard,
+    faithful: Faithful,
     header_timeout: Duration,
-    metrics: Metrics,
     state_path: OnceLock<PathBuf>,
     /// Held across snapshot and write, so a stale snapshot cannot land after a newer one.
     persist_lock: Mutex<()>,
@@ -261,37 +255,14 @@ impl App {
         header_timeout: Duration,
         plugins: PluginChain,
     ) -> Arc<Self> {
-        let build = |http1_only: bool, title_case: bool| {
-            let builder = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none());
-            let builder = if http1_only {
-                builder.http1_only()
-            } else {
-                builder
-            };
-            let builder = if title_case {
-                builder.http1_title_case_headers()
-            } else {
-                builder
-            };
-            builder.build().unwrap_or_else(|_| reqwest::Client::new())
-        };
-        let client = build(true, false);
-        let client_h2 = build(false, false);
-        let client_title = build(true, true);
-        let faithful = crate::upstream::Faithful::new();
         let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             policy,
-            client,
-            client_h2,
-            client_title,
-            faithful,
+            standard: Standard::new(),
+            faithful: Faithful::new(),
             header_timeout,
-            metrics: Metrics::new(),
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
@@ -301,14 +272,12 @@ impl App {
         })
     }
 
-    /// The HTTP client whose transport settings match the upstream.
-    fn client_for(&self, upstream: &crate::config::Upstream) -> &reqwest::Client {
-        if upstream.http2 {
-            &self.client_h2
-        } else if upstream.title_case_headers {
-            &self.client_title
+    /// The faithful transport relays the request as the client sent it; the standard one rebuilds it.
+    fn transport(&self, faithful: bool) -> &dyn Transport {
+        if faithful {
+            &self.faithful
         } else {
-            &self.client
+            &self.standard
         }
     }
 
@@ -317,12 +286,12 @@ impl App {
         Arc::clone(&guard)
     }
 
-    pub(crate) fn health(&self) -> &Mutex<KeyState> {
-        &self.health
+    pub(crate) fn plugins(&self) -> &PluginChain {
+        &self.plugins
     }
 
-    pub(crate) fn metrics(&self) -> &Metrics {
-        &self.metrics
+    pub(crate) fn health(&self) -> &Mutex<KeyState> {
+        &self.health
     }
 
     /// Point the app at the file it persists key health in. Set once at startup.
@@ -530,7 +499,7 @@ fn skip_header(name: &HeaderName) -> bool {
     )
 }
 
-fn upstream_headers(
+pub(crate) fn upstream_headers(
     inbound: &HeaderMap,
     auth_header: &str,
     auth_value: &str,
@@ -607,7 +576,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         // rejected request never reaches the upstream or touches key health.
         if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
             tracing::warn!(stream = %stream, "stream rate limit exceeded");
-            app.metrics.record_rate_limit_rejection(&stream);
+            app.plugins
+                .on_event(&Event::RateLimited { stream: &stream });
             return rate_limited_response(wait);
         }
         stream
@@ -688,7 +658,7 @@ pub(crate) async fn handle_intercepted(
     };
     if !upstream.passthrough {
         if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
-            app.metrics.record_rate_limit_rejection(stream);
+            app.plugins.on_event(&Event::RateLimited { stream });
             return rate_limited_response(wait);
         }
     }
@@ -848,11 +818,11 @@ async fn dispatch_inner(
                 .refusal
                 .as_ref()
                 .map_or(StatusCode::SERVICE_UNAVAILABLE, |r| r.1);
-            app.metrics.record_request(
+            app.plugins.on_event(&Event::RequestDone {
                 stream,
-                upstream_name,
-                StatusClass::from_status(failed.as_u16()),
-            );
+                upstream: upstream_name,
+                status: failed.as_u16(),
+            });
             let body = rewrite_body(body, &fallback.model_aliases, &[]);
             let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
             used = fallback.upstream.as_str();
@@ -883,11 +853,11 @@ async fn dispatch_inner(
             None => exhausted(snapshot, &app.health, stream),
         },
     };
-    app.metrics.record_request(
+    app.plugins.on_event(&Event::RequestDone {
         stream,
-        used,
-        StatusClass::from_status(response.status().as_u16()),
-    );
+        upstream: used,
+        status: response.status().as_u16(),
+    });
     response
 }
 
@@ -940,7 +910,11 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         // Only count a failover once the next key is actually in hand, so a dead
         // end does not inflate the counter.
         if let Some((failed_key, kind)) = pending_failover.take() {
-            app.metrics.record_failover(stream, &failed_key, kind);
+            app.plugins.on_event(&Event::Failover {
+                stream,
+                key: &failed_key,
+                kind,
+            });
         }
         let Some(secret) = snapshot.keys.get(&key_name) else {
             break;
@@ -948,32 +922,15 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
 
         let sent = tokio::time::timeout(app.header_timeout, async {
-            if faithful {
-                let request = faithful_request(
+            app.transport(faithful)
+                .send(Call {
                     parts,
-                    &url,
-                    Some((&upstream.auth_header, &auth_value)),
-                    body.clone(),
-                )?;
-                app.faithful.send(request).await
-            } else {
-                let headers = upstream_headers(
-                    &parts.headers,
-                    &upstream.auth_header,
-                    &auth_value,
-                    upstream.forward_accept_encoding,
-                    upstream.send_keep_alive,
-                );
-                let client = app.client_for(upstream);
-                client
-                    .request(parts.method.clone(), &url)
-                    .headers(headers)
-                    .body(body.clone())
-                    .send()
-                    .await
-                    .map(UpstreamResponse::from_reqwest)
-                    .map_err(std::io::Error::other)
-            }
+                    url: &url,
+                    credential: Some((&upstream.auth_header, &auth_value)),
+                    body: body.clone(),
+                    upstream,
+                })
+                .await
         })
         .await;
 
@@ -1102,24 +1059,15 @@ async fn forward_passthrough(
     } = fwd;
     let url = target_url(upstream, rest, parts);
     let sent = tokio::time::timeout(app.header_timeout, async {
-        if faithful {
-            let request = faithful_request(parts, &url, None, body)?;
-            app.faithful.send(request).await
-        } else {
-            let client = app.client_for(upstream);
-            client
-                .request(parts.method.clone(), &url)
-                .headers(passthrough_headers(
-                    &parts.headers,
-                    upstream.forward_accept_encoding,
-                    upstream.send_keep_alive,
-                ))
-                .body(body)
-                .send()
-                .await
-                .map(UpstreamResponse::from_reqwest)
-                .map_err(std::io::Error::other)
-        }
+        app.transport(faithful)
+            .send(Call {
+                parts,
+                url: &url,
+                credential: None,
+                body,
+                upstream,
+            })
+            .await
     })
     .await;
     match sent {
@@ -1172,7 +1120,7 @@ fn target_url(upstream: &crate::config::Upstream, rest: &str, parts: &Parts) -> 
 }
 
 /// Every end-to-end header as the client sent it, credentials included.
-fn passthrough_headers(
+pub(crate) fn passthrough_headers(
     inbound: &HeaderMap,
     forward_accept_encoding: bool,
     send_keep_alive: bool,
@@ -1212,7 +1160,10 @@ fn record(
         let cooled =
             health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
         if cooled {
-            app.metrics.record_cooldown(key, FailureKind::from(class));
+            app.plugins.on_event(&Event::Cooldown {
+                key,
+                kind: FailureKind::from(class),
+            });
         }
         let cooling_secs = health
             .cooling_remaining(key, Instant::now())

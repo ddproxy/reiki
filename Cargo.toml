@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
+members = ["crates/reiki-metrics", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
 resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Key-failover relay for LLM APIs"
@@ -28,6 +28,11 @@ name = "requestlog"
 feature = "plugin-requestlog"
 crate = "reiki_requestlog"
 
+[[package.metadata.reiki.plugin]]
+name = "metrics"
+feature = "plugin-metrics"
+crate = "reiki_metrics"
+
 [build-dependencies]
 toml = "0.8"
 
@@ -44,6 +49,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 reiki-plugin = { path = "crates/reiki-plugin" }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
+reiki-metrics = { path = "crates/reiki-metrics", optional = true }
 futures-core = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
@@ -58,10 +64,11 @@ time = "0.3"
 x509-parser = { version = "0.18", default-features = false }
 
 [features]
-default = ["plugin-placeholders", "plugin-requestlog"]
+default = ["plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
+plugin-metrics = ["dep:reiki-metrics"]
 
 [dev-dependencies]
 futures-util = "0.3"

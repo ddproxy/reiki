@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+### Changed
+
+- Metrics are now the `metrics` plugin. `GET /metrics` on the admin listener needs `[plugins.metrics]` in the config (an empty table is enough) and returns 404 without it. A build that leaves the plugin out has no metrics code. Metric names and labels are unchanged. See [docs/monitoring.md](docs/monitoring.md).
+- Upstream requests go through a `Transport` trait with two implementations, the reqwest one and the hyper one that keeps the client's request as sent. Behaviour on the wire is unchanged.
+
+### Added
+
+- Plugin API: `Plugin::on_event` receives request, failover, cooldown and rate-limit events; `Plugin::admin_paths` and `Plugin::on_admin` serve paths on the admin listener; `Plugin::uses_bodies` lets a plugin that never touches bodies leave response streaming (and `content-length`) alone. See [docs/plugins.md](docs/plugins.md).
+
 ## 0.5.0
 
 ### Changed

@@ -1,8 +1,68 @@
+//! Prometheus metrics for the relay, served on the admin listener at `/metrics`.
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
-use crate::classify::FailureClass;
+use reiki_plugin::{AdminCtx, AdminReply, Event, FailureKind, KeyCounts, Plugin};
+
+/// The `[plugins.metrics]` table this plugin reads.
+pub const NAME: &str = "metrics";
+
+const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
+
+/// Builds the plugin from its config table, which takes no settings of its own.
+pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
+    if let Some(key) = table.keys().find(|k| !HOST_KEYS.contains(&k.as_str())) {
+        return Err(format!("{NAME}: unknown setting `{key}`"));
+    }
+    Ok(Box::new(MetricsPlugin::default()))
+}
+
+/// Counts events and renders them for the admin `/metrics` path.
+#[derive(Debug, Default)]
+pub struct MetricsPlugin {
+    metrics: Metrics,
+}
+
+impl Plugin for MetricsPlugin {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn uses_bodies(&self) -> bool {
+        false
+    }
+
+    fn on_event(&self, event: &Event<'_>) {
+        match *event {
+            Event::RequestDone {
+                stream,
+                upstream,
+                status,
+            } => self
+                .metrics
+                .record_request(stream, upstream, StatusClass::from_status(status)),
+            Event::Failover { stream, key, kind } => {
+                self.metrics.record_failover(stream, key, kind);
+            }
+            Event::Cooldown { key, kind } => self.metrics.record_cooldown(key, kind),
+            Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
+            _ => {}
+        }
+    }
+
+    fn admin_paths(&self) -> Vec<&'static str> {
+        vec!["/metrics"]
+    }
+
+    fn on_admin(&self, ctx: &AdminCtx<'_>) -> Option<AdminReply> {
+        Some(AdminReply {
+            content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body: self.metrics.render(ctx.keys),
+        })
+    }
+}
 
 /// Response class recorded for the `reiki_requests_total` counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,48 +88,6 @@ impl StatusClass {
             Self::ServerError => "server_error",
         }
     }
-}
-
-/// Why a key left rotation, as a stable metric label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureKind {
-    RateLimited,
-    QuotaExhausted,
-    AccessDisabled,
-    Unauthorized,
-    Transient,
-}
-
-impl FailureKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::RateLimited => "rate_limited",
-            Self::QuotaExhausted => "quota_exhausted",
-            Self::AccessDisabled => "access_disabled",
-            Self::Unauthorized => "unauthorized",
-            Self::Transient => "transient",
-        }
-    }
-}
-
-impl From<FailureClass> for FailureKind {
-    fn from(class: FailureClass) -> Self {
-        match class {
-            FailureClass::RateLimited(_) => Self::RateLimited,
-            FailureClass::QuotaExhausted => Self::QuotaExhausted,
-            FailureClass::AccessDisabled => Self::AccessDisabled,
-            FailureClass::Unauthorized => Self::Unauthorized,
-            FailureClass::Transient => Self::Transient,
-        }
-    }
-}
-
-/// Current key totals, derived from key health at scrape time.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KeyGauge {
-    pub available: u64,
-    pub cooling: u64,
-    pub out_of_rotation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -138,7 +156,7 @@ impl Metrics {
 
     /// Render the Prometheus text exposition. `keys` is the current gauge,
     /// sampled by the caller so it reflects the same instant as the scrape.
-    pub fn render(&self, keys: KeyGauge) -> String {
+    pub fn render(&self, keys: KeyCounts) -> String {
         let inner = self
             .inner
             .lock()
@@ -239,30 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn failure_classes_map_to_stable_labels() {
-        assert_eq!(
-            FailureKind::from(FailureClass::RateLimited(None)).label(),
-            "rate_limited"
-        );
-        assert_eq!(
-            FailureKind::from(FailureClass::QuotaExhausted).label(),
-            "quota_exhausted"
-        );
-        assert_eq!(
-            FailureKind::from(FailureClass::AccessDisabled).label(),
-            "access_disabled"
-        );
-        assert_eq!(
-            FailureKind::from(FailureClass::Unauthorized).label(),
-            "unauthorized"
-        );
-        assert_eq!(
-            FailureKind::from(FailureClass::Transient).label(),
-            "transient"
-        );
-    }
-
-    #[test]
     fn label_escaping_covers_backslash_quote_and_newline() {
         assert_eq!(escape_label("a\"b"), "a\\\"b");
         assert_eq!(escape_label("a\\b"), "a\\\\b");
@@ -279,7 +273,7 @@ mod tests {
         metrics.record_cooldown("zen-a", FailureKind::QuotaExhausted);
         metrics.record_rate_limit_rejection("client");
 
-        let text = metrics.render(KeyGauge {
+        let text = metrics.render(KeyCounts {
             available: 1,
             cooling: 2,
             out_of_rotation: 0,
@@ -301,7 +295,7 @@ mod tests {
 
     #[test]
     fn render_always_emits_type_lines_and_the_full_gauge() {
-        let text = Metrics::new().render(KeyGauge::default());
+        let text = Metrics::new().render(KeyCounts::default());
         for family in [
             "reiki_requests_total",
             "reiki_failovers_total",
@@ -318,9 +312,45 @@ mod tests {
     fn labels_are_escaped_in_the_exposition() {
         let metrics = Metrics::new();
         metrics.record_request("a\"b", "c\\d", StatusClass::ServerError);
-        let text = metrics.render(KeyGauge::default());
+        let text = metrics.render(KeyCounts::default());
         assert!(text.contains(
             "reiki_requests_total{stream=\"a\\\"b\",upstream=\"c\\\\d\",status=\"server_error\"} 1"
         ));
+    }
+
+    #[test]
+    fn events_drive_the_counters_the_admin_path_renders() {
+        let plugin = build(&toml::Table::new()).unwrap();
+        plugin.on_event(&Event::RequestDone {
+            stream: "s",
+            upstream: "u",
+            status: 503,
+        });
+        plugin.on_event(&Event::Cooldown {
+            key: "k",
+            kind: FailureKind::RateLimited,
+        });
+        let keys = KeyCounts {
+            available: 4,
+            ..KeyCounts::default()
+        };
+        let reply = plugin.on_admin(&AdminCtx::new("/metrics", keys)).unwrap();
+        assert!(reply.body.contains(
+            "reiki_requests_total{stream=\"s\",upstream=\"u\",status=\"server_error\"} 1"
+        ));
+        assert!(reply
+            .body
+            .contains("reiki_cooldowns_total{key=\"k\",class=\"rate_limited\"} 1"));
+        assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
+        assert_eq!(plugin.admin_paths(), ["/metrics"]);
+        assert!(!plugin.uses_bodies());
+    }
+
+    #[test]
+    fn a_setting_the_plugin_does_not_have_is_refused() {
+        let table: toml::Table = "path = \"/m\"".parse().unwrap();
+        assert!(build(&table).is_err());
+        let host: toml::Table = "enabled = true\non_error = \"reject\"".parse().unwrap();
+        assert!(build(&host).is_ok());
     }
 }

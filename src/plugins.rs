@@ -13,9 +13,14 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
 use toml::Value;
 
-use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
+use reiki_plugin::{
+    AdminCtx, AdminReply, AttemptCtx, ChunkCtx, Event, KeyCounts, Plugin, PluginError, RequestCtx,
+    ResponseHeadCtx,
+};
 
 use crate::config::ConfigError;
+
+const RESERVED_ADMIN_PATHS: [&str; 1] = ["/status"];
 
 /// What to do when a plugin declines a request with [`PluginError::Skip`].
 /// [`PluginError::Reject`] always rejects regardless of this setting.
@@ -103,13 +108,57 @@ impl PluginChain {
             })?;
             entries.push(Entry { plugin, on_error });
         }
+        Self::check_admin_paths(&entries)?;
         Ok(Self { entries })
     }
 
-    /// True when no plugin is configured, so the body path can skip the
-    /// per-request work entirely.
+    fn check_admin_paths(entries: &[Entry]) -> Result<(), ConfigError> {
+        let mut claimed: Vec<(&'static str, &str)> = Vec::new();
+        for entry in entries {
+            for path in entry.plugin.admin_paths() {
+                if let Some((_, other)) = claimed.iter().find(|(p, _)| *p == path) {
+                    return Err(ConfigError::PluginConfig {
+                        name: entry.plugin.name().to_owned(),
+                        message: format!("admin path {path} is already served by {other}"),
+                    });
+                }
+                if RESERVED_ADMIN_PATHS.contains(&path) {
+                    return Err(ConfigError::PluginConfig {
+                        name: entry.plugin.name().to_owned(),
+                        message: format!("admin path {path} is served by reiki itself"),
+                    });
+                }
+                claimed.push((path, entry.plugin.name()));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when no plugin touches bodies, so the body path skips the per-request work.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        !self.entries.iter().any(|e| e.plugin.uses_bodies())
+    }
+
+    /// Delivers a relay-level event to every plugin; a panicking hook is logged and skipped.
+    pub fn on_event(&self, event: &Event<'_>) {
+        for entry in &self.entries {
+            let _ = guard(entry.plugin.name(), "on_event", || {
+                entry.plugin.on_event(event);
+            });
+        }
+    }
+
+    /// Answers an admin GET from the plugin that claimed `path`.
+    pub fn on_admin(&self, path: &str, keys: KeyCounts) -> Option<AdminReply> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.plugin.admin_paths().contains(&path))?;
+        let ctx = AdminCtx::new(path, keys);
+        guard(entry.plugin.name(), "on_admin", || {
+            entry.plugin.on_admin(&ctx)
+        })
+        .flatten()
     }
 
     /// Names of the active plugins, for startup logging.
@@ -571,5 +620,82 @@ mod tests {
             tables["append"].get("dry_run").is_none(),
             "the input must not change"
         );
+    }
+
+    struct Admin {
+        name: &'static str,
+        paths: Vec<&'static str>,
+        events: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Plugin for Admin {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn uses_bodies(&self) -> bool {
+            false
+        }
+        fn on_event(&self, _event: &Event<'_>) {
+            self.events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn admin_paths(&self) -> Vec<&'static str> {
+            self.paths.clone()
+        }
+        fn on_admin(&self, ctx: &AdminCtx<'_>) -> Option<AdminReply> {
+            Some(AdminReply {
+                content_type: "text/plain",
+                body: format!("{}:{}", self.name, ctx.keys.available),
+            })
+        }
+    }
+
+    fn admin_chain(entries: Vec<Admin>) -> Result<PluginChain, ConfigError> {
+        let mut chain = PluginChain::default();
+        for plugin in entries {
+            chain.entries.push(Entry {
+                plugin: Box::new(plugin),
+                on_error: OnError::PassThrough,
+            });
+        }
+        PluginChain::check_admin_paths(&chain.entries)?;
+        Ok(chain)
+    }
+
+    fn admin(name: &'static str, paths: Vec<&'static str>) -> Admin {
+        Admin {
+            name,
+            paths,
+            events: std::sync::Arc::default(),
+        }
+    }
+
+    #[test]
+    fn events_reach_every_plugin_and_admin_paths_go_to_their_owner() {
+        let first = admin("first", vec!["/a"]);
+        let second = admin("second", vec!["/b"]);
+        let seen = std::sync::Arc::clone(&first.events);
+        let chain = admin_chain(vec![first, second]).unwrap();
+        chain.on_event(&Event::RateLimited { stream: "s" });
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let keys = KeyCounts {
+            available: 3,
+            ..KeyCounts::default()
+        };
+        assert_eq!(chain.on_admin("/b", keys).unwrap().body, "second:3");
+        assert!(chain.on_admin("/missing", keys).is_none());
+    }
+
+    #[test]
+    fn two_plugins_cannot_claim_one_admin_path_or_reiki_s_own() {
+        let clash = admin_chain(vec![admin("a", vec!["/m"]), admin("b", vec!["/m"])]);
+        assert!(matches!(clash, Err(ConfigError::PluginConfig { name, .. }) if name == "b"));
+        let reserved = admin_chain(vec![admin("a", vec!["/status"])]);
+        assert!(matches!(reserved, Err(ConfigError::PluginConfig { .. })));
+    }
+
+    #[test]
+    fn a_plugin_that_skips_bodies_does_not_make_the_chain_a_body_chain() {
+        let chain = admin_chain(vec![admin("quiet", vec![])]).unwrap();
+        assert!(chain.is_empty());
     }
 }

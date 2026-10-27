@@ -1,6 +1,6 @@
 # Monitoring
 
-Reiki can serve a small admin listener with `GET /status` and `GET /metrics`. It is off unless you add an `[admin]` table, and it always listens on its own socket, never the client one.
+Reiki can serve a small admin listener with `GET /status`, plus any paths a plugin adds such as `GET /metrics` from the `metrics` plugin. It is off unless you add an `[admin]` table, and it always listens on its own socket, never the client one.
 
 ## Configure
 
@@ -14,7 +14,7 @@ Both fields are required. The admin address is bound at startup, so adding, remo
 
 ## Authenticate
 
-Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body. The token is hashed and compared in constant time. Anything other than `/status` and `/metrics` returns 404. The listener serves plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front of it.
+Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body. The token is hashed and compared in constant time. Anything other than `/status` and a path a configured plugin serves returns 404. The listener serves plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front of it.
 
 ## GET /status
 
@@ -38,6 +38,12 @@ Each stream:
 The response carries no key values, token hashes or file paths.
 
 ## GET /metrics
+
+Served by the `metrics` plugin, so it exists only when the binary includes the plugin and the config has a `[plugins.metrics]` table (an empty table is enough). Without that table the path returns 404.
+
+```toml
+[plugins.metrics]
+```
 
 Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts.
 

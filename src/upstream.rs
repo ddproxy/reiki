@@ -1,4 +1,4 @@
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -15,6 +15,9 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
+
+use crate::config::Upstream;
+use crate::proxy::{passthrough_headers, upstream_headers};
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
@@ -128,6 +131,118 @@ where
     Box::pin(ReaderStream::new(make(BufReader::new(StreamReader::new(
         source,
     )))))
+}
+
+type SendFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<UpstreamResponse, std::io::Error>> + Send + 'a>>;
+
+/// One request to an upstream. `credential` is the auth header name and value to set,
+/// or `None` to send the client's own credentials untouched.
+pub struct Call<'a> {
+    pub parts: &'a Parts,
+    pub url: &'a str,
+    pub credential: Option<(&'a str, &'a str)>,
+    pub body: Bytes,
+    pub upstream: &'a Upstream,
+}
+
+/// Sends a [`Call`] to an upstream and returns its response head and body stream.
+pub trait Transport: Send + Sync {
+    fn send<'a>(&'a self, call: Call<'a>) -> SendFuture<'a>;
+}
+
+/// The reqwest transport: rebuilds the headers from the upstream's settings.
+pub struct Standard {
+    http1: reqwest::Client,
+    http2: reqwest::Client,
+    title_case: reqwest::Client,
+}
+
+impl Standard {
+    pub fn new() -> Self {
+        let build = |http1_only: bool, title_case: bool| {
+            let builder = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none());
+            let builder = if http1_only {
+                builder.http1_only()
+            } else {
+                builder
+            };
+            let builder = if title_case {
+                builder.http1_title_case_headers()
+            } else {
+                builder
+            };
+            builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        };
+        Self {
+            http1: build(true, false),
+            http2: build(false, false),
+            title_case: build(true, true),
+        }
+    }
+
+    fn client_for(&self, upstream: &Upstream) -> &reqwest::Client {
+        if upstream.http2 {
+            &self.http2
+        } else if upstream.title_case_headers {
+            &self.title_case
+        } else {
+            &self.http1
+        }
+    }
+}
+
+impl Default for Standard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for Standard {
+    fn send<'a>(&'a self, call: Call<'a>) -> SendFuture<'a> {
+        Box::pin(async move {
+            let Call {
+                parts,
+                url,
+                credential,
+                body,
+                upstream,
+            } = call;
+            let headers = match credential {
+                Some((name, value)) => upstream_headers(
+                    &parts.headers,
+                    name,
+                    value,
+                    upstream.forward_accept_encoding,
+                    upstream.send_keep_alive,
+                ),
+                None => passthrough_headers(
+                    &parts.headers,
+                    upstream.forward_accept_encoding,
+                    upstream.send_keep_alive,
+                ),
+            };
+            self.client_for(upstream)
+                .request(parts.method.clone(), url)
+                .headers(headers)
+                .body(body)
+                .send()
+                .await
+                .map(UpstreamResponse::from_reqwest)
+                .map_err(std::io::Error::other)
+        })
+    }
+}
+
+impl Transport for Faithful {
+    fn send<'a>(&'a self, call: Call<'a>) -> SendFuture<'a> {
+        Box::pin(async move {
+            let request = faithful_request(call.parts, call.url, call.credential, call.body)?;
+            Faithful::send(self, request).await
+        })
+    }
 }
 
 pub struct Faithful {

@@ -1,0 +1,18 @@
+[package]
+name = "reiki-metrics"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Reiki plugin that serves Prometheus metrics on the admin listener"
+license = "MIT"
+publish = false
+
+[dependencies]
+reiki-plugin = { path = "../reiki-plugin" }
+toml = "0.8"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

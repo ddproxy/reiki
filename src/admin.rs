@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
@@ -11,15 +11,15 @@ use axum::Router;
 use crate::auth::{constant_time_eq, sha256_hex};
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::StrategyConfig;
-use crate::metrics::KeyGauge;
 use crate::proxy::{App, Snapshot};
+use reiki_plugin::KeyCounts;
 
 /// The admin listener's routes. Mounted on its own socket, never on the client
 /// listener, so it is only reachable where the operator exposes it.
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/status", get(status))
-        .route("/metrics", get(metrics))
+        .fallback(get(plugin_route))
         .with_state(app)
 }
 
@@ -51,32 +51,31 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     text_response(StatusCode::OK, "application/json", body)
 }
 
-async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
     if !access_allowed(&app, &headers) {
         return unauthorized();
     }
     let snapshot = app.snapshot();
     let now = Instant::now();
-    let gauge = {
+    let keys = {
         let health = app
             .health()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut gauge = KeyGauge::default();
+        let mut counts = KeyCounts::default();
         for name in snapshot.config.keys.keys() {
             match health.status(name, now) {
-                KeyStatus::Available => gauge.available += 1,
-                KeyStatus::Cooling(_) => gauge.cooling += 1,
-                KeyStatus::OutOfRotation => gauge.out_of_rotation += 1,
+                KeyStatus::Available => counts.available += 1,
+                KeyStatus::Cooling(_) => counts.cooling += 1,
+                KeyStatus::OutOfRotation => counts.out_of_rotation += 1,
             }
         }
-        gauge
+        counts
     };
-    text_response(
-        StatusCode::OK,
-        "text/plain; version=0.0.4; charset=utf-8",
-        app.metrics().render(gauge),
-    )
+    match app.plugins().on_admin(uri.path(), keys) {
+        Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
+        None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
+    }
 }
 
 /// Constant-time check of the `Authorization: Bearer <token>` header against the

@@ -288,6 +288,15 @@ async fn harness_with_admin(
     admin_token: &str,
     policy: Policy,
 ) -> Harness {
+    harness_with_admin_opts(streams, admin_token, policy, true).await
+}
+
+async fn harness_with_admin_opts(
+    streams: &[(&str, &str, &[&str])],
+    admin_token: &str,
+    policy: Policy,
+    metrics: bool,
+) -> Harness {
     let mock = Arc::new(Mock::default());
     let mock_url = serve(
         Router::new()
@@ -320,8 +329,13 @@ async fn harness_with_admin(
         "[admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n",
         sha(admin_token)
     ));
+    if metrics {
+        text.push_str("[plugins.metrics]\n");
+    }
     let config = Config::parse(&text).unwrap();
-    let app = App::with_header_timeout(config, key_map, policy, Duration::from_secs(120));
+    let plugins =
+        reiki::plugins::PluginChain::build(&config.plugins, &reiki::plugins::builtin()).unwrap();
+    let app = App::with_plugins(config, key_map, policy, Duration::from_secs(120), plugins);
     let relay = serve(router(Arc::clone(&app))).await;
     let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
     Harness {
@@ -1133,6 +1147,41 @@ async fn admin_endpoints_require_the_bearer_token() {
             .unwrap();
         assert_eq!(ok.status(), 200, "{path} with the token");
     }
+}
+
+#[tokio::test]
+async fn metrics_is_absent_unless_the_plugin_is_configured() {
+    let h = harness_with_admin_opts(&one_stream(), "admin-secret", Policy::default(), false).await;
+    let admin = h.admin.as_ref().unwrap();
+    let get = |token: Option<&'static str>| {
+        let mut req = h.client.get(format!("{admin}/metrics"));
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    };
+    assert_eq!(get(None).await.unwrap().status(), 401);
+    assert_eq!(get(Some("admin-secret")).await.unwrap().status(), 404);
+    let status = h
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), 200);
+}
+
+#[tokio::test]
+async fn the_metrics_plugin_leaves_content_length_on_responses() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        res.headers().contains_key("content-length"),
+        "{:?}",
+        res.headers()
+    );
 }
 
 #[tokio::test]

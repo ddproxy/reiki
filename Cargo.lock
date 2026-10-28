@@ -1204,6 +1204,12 @@ dependencies = [
 [[package]]
 name = "reiki-detect"
 version = "0.1.0"
+dependencies = [
+ "http",
+ "reiki-plugin",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "reiki-finance"

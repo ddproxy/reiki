@@ -7,167 +7,47 @@
 mod columnar;
 mod detect;
 
-use std::collections::BTreeMap;
-
-use http::header::CONTENT_ENCODING;
-use http::StatusCode;
-use reiki_plugin::{Plugin, PluginError, RequestCtx};
-use toml::Value;
+use reiki_detect::guard::{self, Spec};
+use reiki_plugin::Plugin;
 
 pub use detect::{scan, Hit, Kind};
 
 /// The `[plugins.finance]` table this plugin reads.
 pub const NAME: &str = "finance";
 
-const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
+impl guard::Kind for Kind {
+    fn label(self) -> &'static str {
+        Kind::label(self)
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Block,
-    Report,
-}
+    fn parse(label: &str) -> Option<Self> {
+        Kind::parse(label)
+    }
 
-struct Finance {
-    mode: Mode,
-    kinds: Vec<Kind>,
-    /// Upstreams to check; empty means all of them.
-    upstreams: Vec<String>,
+    fn defaults() -> &'static [Self] {
+        &Kind::DEFAULT
+    }
 }
 
 /// Builds the plugin from its config table.
 pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
-    for key in table.keys() {
-        if !["mode", "kinds", "upstreams"].contains(&key.as_str())
-            && !HOST_KEYS.contains(&key.as_str())
-        {
-            return Err(format!("{NAME}: unknown setting `{key}`"));
-        }
-    }
-    let mode = match table.get("mode") {
-        Some(Value::String(m)) if m == "block" => Mode::Block,
-        Some(Value::String(m)) if m == "report" => Mode::Report,
-        Some(other) => {
-            return Err(format!(
-                "{NAME}: `mode` must be \"block\" or \"report\", got {other}"
-            ))
-        }
-        None => return Err(format!("{NAME}: set `mode` to \"block\" or \"report\"")),
-    };
-    let kinds = match strings(table, "kinds")? {
-        None => Kind::DEFAULT.to_vec(),
-        Some(labels) => {
-            let kinds = labels
-                .iter()
-                .map(|l| Kind::parse(l).ok_or_else(|| format!("{NAME}: unknown kind `{l}`")))
-                .collect::<Result<Vec<_>, _>>()?;
-            if kinds.is_empty() {
-                return Err(format!("{NAME}: `kinds` must not be empty"));
-            }
-            kinds
-        }
-    };
-    let upstreams = strings(table, "upstreams")?.unwrap_or_default();
-    Ok(Box::new(Finance {
-        mode,
-        kinds,
-        upstreams,
-    }))
-}
-
-fn strings(table: &toml::Table, key: &str) -> Result<Option<Vec<String>>, String> {
-    match table.get(key) {
-        None => Ok(None),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => Ok(s.clone()),
-                other => Err(format!(
-                    "{NAME}: `{key}` must hold strings, got {}",
-                    other.type_str()
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Some(other) => Err(format!(
-            "{NAME}: `{key}` must be an array of strings, got {}",
-            other.type_str()
-        )),
-    }
-}
-
-fn counts(hits: &[Hit]) -> BTreeMap<Kind, usize> {
-    let mut counts: BTreeMap<Kind, usize> = BTreeMap::new();
-    for hit in hits {
-        *counts.entry(hit.kind).or_default() += 1;
-    }
-    counts
-}
-
-fn summary(hits: &[Hit]) -> String {
-    counts(hits)
-        .iter()
-        .map(|(kind, n)| format!("{} x{n}", kind.label()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-impl Plugin for Finance {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn uses_bodies(&self) -> bool {
-        false
-    }
-
-    fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
-        if ctx.body.is_empty()
-            || (!self.upstreams.is_empty() && !self.upstreams.iter().any(|u| u == ctx.upstream))
-        {
-            return Ok(());
-        }
-        // An encoded body cannot be read, so block mode fails closed rather than let it through.
-        if ctx.headers.contains_key(CONTENT_ENCODING) {
-            return match self.mode {
-                Mode::Block => Err(PluginError::Reject(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    format!("{NAME}: the request body is encoded, so it cannot be checked"),
-                )),
-                Mode::Report => {
-                    tracing::warn!(
-                        request = ctx.id,
-                        stream = ctx.stream,
-                        upstream = ctx.upstream,
-                        "finance: encoded request body not checked"
-                    );
-                    Ok(())
-                }
-            };
-        }
-        let hits = scan(&String::from_utf8_lossy(ctx.body), &self.kinds);
-        if hits.is_empty() {
-            return Ok(());
-        }
-        let found = summary(&hits);
-        for (kind, n) in counts(&hits) {
-            ctx.report(kind.label(), n, self.mode == Mode::Block);
-        }
-        tracing::warn!(request = ctx.id, stream = ctx.stream, upstream = ctx.upstream, found = %found, "finance: possible financial data in an outbound request");
-        match self.mode {
-            Mode::Block => Err(PluginError::Reject(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("{NAME}: request blocked, it contains {found}"),
-            )),
-            Mode::Report => Ok(()),
-        }
-    }
+    guard::build(
+        Spec {
+            name: NAME,
+            finding: "possible financial data",
+            scan,
+        },
+        table,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use http::StatusCode;
     use http::{HeaderMap, HeaderValue, Method};
+    use reiki_plugin::{PluginError, RequestCtx};
 
     fn plugin(text: &str) -> Result<Box<dyn Plugin>, String> {
         build(&text.parse().unwrap())

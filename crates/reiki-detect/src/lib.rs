@@ -2,7 +2,9 @@
 //!
 //! A plugin keeps its own `Kind` and its own rules. This crate holds the byte-level pieces that
 //! more than one plugin needs: word boundaries, keyword proximity, digit runs, a Luhn checksum and
-//! the hit type.
+//! the hit type. The `guard` module is the plugin shell the detection plugins share.
+
+pub mod guard;
 
 /// A byte range of the scanned text that looks like an identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

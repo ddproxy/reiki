@@ -399,3 +399,106 @@ async fn the_watcher_does_nothing_while_watch_is_off() {
     tokio::time::sleep(Duration::from_millis(3500)).await;
     assert_eq!(rig.send(SSN_BODY).await, 200, "no reload happened");
 }
+
+#[tokio::test]
+async fn a_preview_reports_the_change_but_applies_and_records_nothing() {
+    let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
+    let log = rig.dir.join("preview.jsonl");
+    rig.rewrite(&format!(
+        "[plugins.phi]\nmode = \"block\"\n[plugins.requestlog]\nfile = \"{}\"\n",
+        log.display()
+    ));
+    let answer = rig
+        .client
+        .post(format!("{}/reload?dry_run=true", rig.admin))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200);
+    let body = answer.text().await.unwrap();
+    assert!(body.contains("\"dry_run\":true"), "{body}");
+    assert!(body.contains("\"generation\":0"), "{body}");
+    assert!(body.contains("plugins phi,requestlog"), "{body}");
+
+    assert_eq!(
+        rig.send(SSN_BODY).await,
+        200,
+        "the running mode is untouched"
+    );
+    assert!(!log.exists(), "a preview must not open the log file");
+    let status = rig.admin_get("/status").await;
+    assert!(
+        status.contains("\"generation\":0") && status.contains("\"last_reload\":null"),
+        "{status}"
+    );
+
+    let failing = rig
+        .client
+        .post(format!("{}/reload?dry_run=1", rig.admin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failing.status(), 401, "a preview needs the token too");
+}
+
+fn reiki_reload(args: &[&str], env_token: Option<&str>) -> (i32, String, String) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_reiki"));
+    command
+        .arg("reload")
+        .args(args)
+        .env_remove("REIKI_ADMIN_TOKEN");
+    if let Some(token) = env_token {
+        command.env("REIKI_ADMIN_TOKEN", token);
+    }
+    let out = command.output().unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn reiki_reload_calls_the_running_instance() {
+    let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
+    rig.rewrite("[plugins.phi]\nmode = \"block\"\n");
+    let token_file = rig.dir.join("admin.token");
+    std::fs::write(&token_file, format!("{ADMIN_TOKEN}\n")).unwrap();
+    let (url, file) = (rig.admin.clone(), token_file.display().to_string());
+
+    let (u, f) = (url.clone(), file.clone());
+    let (code, out, _) = tokio::task::spawn_blocking(move || {
+        reiki_reload(&["--dry-run", "--url", &u, "--token-file", &f], None)
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("\"dry_run\":true") && out.contains("plugins phi"),
+        "{out}"
+    );
+    assert_eq!(rig.send(SSN_BODY).await, 200, "the preview applied nothing");
+
+    let (u, f) = (url.clone(), file.clone());
+    let (code, out, _) =
+        tokio::task::spawn_blocking(move || reiki_reload(&["--url", &u, "--token-file", &f], None))
+            .await
+            .unwrap();
+    assert_eq!(code, 0);
+    assert!(out.contains("\"generation\":1"), "{out}");
+    assert_eq!(rig.send(SSN_BODY).await, 422, "the real reload applied it");
+
+    let u = url.clone();
+    let (code, _, _) =
+        tokio::task::spawn_blocking(move || reiki_reload(&["--url", &u], Some("the-wrong-token")))
+            .await
+            .unwrap();
+    assert_eq!(code, 1, "the instance refused the token");
+
+    let (code, _, err) = tokio::task::spawn_blocking(move || reiki_reload(&["--url", &url], None))
+        .await
+        .unwrap();
+    assert_eq!(code, 2);
+    assert!(err.contains("admin token"), "{err}");
+}

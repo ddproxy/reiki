@@ -47,7 +47,7 @@ Applies a changed config like `SIGHUP`, with the same bearer token as `/status`,
 {"ok":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
+`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart. Add `?dry_run=true` to preview: the answer has `"dry_run":true` and says what a reload would change, and nothing is applied, built or recorded in `/status`. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
 
 ## GET /metrics
 

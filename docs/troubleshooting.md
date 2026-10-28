@@ -58,6 +58,8 @@ Key values and stream tokens are never logged.
 
 Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config and key files, build and check the whole new state first, and swap it in only if every part is valid. A bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
 
+To see what a reload would do first, run `reiki reload --dry-run`. It calls the admin listener (taking the address from the config's `[admin] listen` and the token from `--token-file` or `REIKI_ADMIN_TOKEN`) and prints the JSON answer, so `reiki reload --dry-run | jq .changed` lists the changes. Without `--dry-run` it applies the reload. It exits 0 on success, 1 when the instance refused or the config failed, and 2 when it could not reach the instance.
+
 To reload without a signal, turn on the watcher:
 
 ```toml

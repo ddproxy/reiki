@@ -58,12 +58,23 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 }
 
 /// Re-reads the config and applies what can change live, like SIGHUP, and returns what changed.
-async fn reload(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+async fn reload(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
     if !access_allowed(&app, &headers) {
         return unauthorized();
     }
+    let dry_run = uri.query().is_some_and(|q| {
+        q.split('&')
+            .any(|p| matches!(p, "dry_run" | "dry_run=1" | "dry_run=true"))
+    });
     let worker = Arc::clone(&app);
-    let outcome = tokio::task::spawn_blocking(move || worker.reload_now()).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        if dry_run {
+            worker.preview_reload()
+        } else {
+            worker.reload_now()
+        }
+    })
+    .await;
     match outcome {
         Ok(Ok(report)) => text_response(StatusCode::OK, "application/json", report.to_json()),
         Ok(Err(error)) => text_response(

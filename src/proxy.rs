@@ -474,7 +474,7 @@ impl App {
     /// upstreams, plugin settings, the tunnel policy and the intercept host table. Everything is
     /// built and checked first, so a failure at any step leaves the running state untouched.
     pub fn reload_from_file(&self, path: &Path) -> Result<crate::reload::ReloadReport, String> {
-        let result = self.try_reload(path);
+        let result = self.try_reload(path, true);
         let mut state = self
             .reload_state
             .lock()
@@ -486,7 +486,15 @@ impl App {
         result
     }
 
-    fn try_reload(&self, path: &Path) -> Result<crate::reload::ReloadReport, String> {
+    /// What a reload from the configured path would change, without applying or recording anything.
+    pub fn preview_reload(&self) -> Result<crate::reload::ReloadReport, String> {
+        let Some(path) = self.config_path.get() else {
+            return Err("the config path is not known to this instance".to_owned());
+        };
+        self.try_reload(path, false)
+    }
+
+    fn try_reload(&self, path: &Path, apply: bool) -> Result<crate::reload::ReloadReport, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let config = Config::parse(&text).map_err(|e| format!("config: {e}"))?;
@@ -496,10 +504,12 @@ impl App {
         crate::plugins::PluginChain::build(&dry, &crate::plugins::builtin())
             .map_err(|e| format!("config: {e}"))?;
         let registry = crate::plugins::builtin();
-        let rebuilt = self
-            .plugins()
-            .rebuild(&config.plugins, &registry)
-            .map_err(|e| format!("config: {e}"))?;
+        let rebuilt = if apply {
+            self.plugins().rebuild(&config.plugins, &registry)
+        } else {
+            self.plugins().plan(&config.plugins, &registry)
+        }
+        .map_err(|e| format!("config: {e}"))?;
         let tunnel_plan = match (self.tunnel.get(), &config.tunnel) {
             (Some(tunnel), Some(wanted)) => Some(
                 tunnel
@@ -544,13 +554,24 @@ impl App {
         }
         drop(current);
 
-        // Nothing below can fail, so the new state lands whole or not at all.
         let (key_count, stream_count) = (keys.len(), config.streams.len());
-        let generation = self
+        let next_generation = self
             .reload_state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .next_generation();
+        if !apply {
+            return Ok(crate::reload::ReloadReport {
+                generation: next_generation - 1,
+                changed,
+                restart_needed,
+                keys: key_count,
+                streams: stream_count,
+                dry_run: true,
+            });
+        }
+        let generation = next_generation;
+        // Nothing below can fail, so the new state lands whole or not at all.
         self.reload(config, keys);
         *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
         if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
@@ -562,6 +583,7 @@ impl App {
             restart_needed,
             keys: key_count,
             streams: stream_count,
+            dry_run: false,
         })
     }
 }

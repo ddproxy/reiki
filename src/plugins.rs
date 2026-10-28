@@ -178,6 +178,25 @@ impl PluginChain {
         configured: &BTreeMap<String, toml::Table>,
         registry: &[Registration],
     ) -> Result<Rebuilt, ConfigError> {
+        self.rebuild_with(configured, registry, true)
+    }
+
+    /// What [`PluginChain::rebuild`] would change, without building anything: no plugin is
+    /// constructed, so nothing opens a file or a socket. The returned chain is empty.
+    pub fn plan(
+        &self,
+        configured: &BTreeMap<String, toml::Table>,
+        registry: &[Registration],
+    ) -> Result<Rebuilt, ConfigError> {
+        self.rebuild_with(configured, registry, false)
+    }
+
+    fn rebuild_with(
+        &self,
+        configured: &BTreeMap<String, toml::Table>,
+        registry: &[Registration],
+        build: bool,
+    ) -> Result<Rebuilt, ConfigError> {
         for name in configured.keys() {
             if !registry.iter().any(|r| r.name == name) {
                 return Err(ConfigError::UnknownPlugin {
@@ -207,23 +226,27 @@ impl PluginChain {
                 }
                 (_, Some(table)) => {
                     let on_error = on_error(reg.name, table)?;
-                    let plugin =
-                        (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
-                            name: reg.name.to_string(),
-                            message,
-                        })?;
                     changed.push(reg.name.to_owned());
-                    let plugin: Arc<dyn Plugin> = Arc::from(plugin);
-                    entries.push(Entry {
-                        stamps: stamps_of(plugin.as_ref()),
-                        plugin,
-                        on_error,
-                        table: table.clone(),
-                    });
+                    if build {
+                        let plugin =
+                            (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
+                                name: reg.name.to_string(),
+                                message,
+                            })?;
+                        let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+                        entries.push(Entry {
+                            stamps: stamps_of(plugin.as_ref()),
+                            plugin,
+                            on_error,
+                            table: table.clone(),
+                        });
+                    }
                 }
             }
         }
-        Self::check_admin_paths(&entries)?;
+        if build {
+            Self::check_admin_paths(&entries)?;
+        }
         Ok(Rebuilt {
             chain: Self { entries },
             changed,
@@ -821,6 +844,32 @@ mod tests {
         let gone = edited.chain.rebuild(&table, &registry).unwrap();
         assert_eq!(gone.changed, ["watcher"], "a deleted file is a change too");
         let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_plan_names_the_changes_without_building_any_plugin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        let registry = vec![Registration {
+            name: "append",
+            build: |_| {
+                BUILDS.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Append("-tail")) as Box<dyn Plugin>)
+            },
+        }];
+        let first = PluginChain::build(&configured("[append]\nn = 1\n"), &registry).unwrap();
+        assert_eq!(BUILDS.load(Ordering::SeqCst), 1);
+
+        let planned = first
+            .plan(&configured("[append]\nn = 2\n"), &registry)
+            .unwrap();
+        assert_eq!(planned.changed, ["append"]);
+        assert_eq!(
+            BUILDS.load(Ordering::SeqCst),
+            1,
+            "a plan constructs nothing"
+        );
+        assert!(first.plan(&configured("[nope]\n"), &registry).is_err());
     }
 
     #[test]

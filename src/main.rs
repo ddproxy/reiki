@@ -51,6 +51,21 @@ enum Command {
         /// Files to scan; stdin when none are given.
         files: Vec<PathBuf>,
     },
+    /// Ask the running Reiki to reload its config, or preview what a reload would change.
+    ///
+    /// Calls `POST /reload` on the admin listener and prints the JSON answer. Exits 0 when the
+    /// reload (or preview) succeeded and 1 when it was refused or failed.
+    Reload {
+        /// Only report what would change; apply nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Admin address, such as `http://127.0.0.1:4098`. Default: the `[admin] listen` in the config.
+        #[arg(long)]
+        url: Option<String>,
+        /// File holding the admin token. Default: the `REIKI_ADMIN_TOKEN` environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -66,6 +81,73 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+}
+
+/// The `reiki reload` command: asks the running instance over its admin listener.
+async fn run_reload(
+    config: &std::path::Path,
+    dry_run: bool,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+) -> i32 {
+    let token = match token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => text.trim().to_owned(),
+            Err(e) => {
+                eprintln!("reiki: cannot read {}: {e}", path.display());
+                return 2;
+            }
+        },
+        None => std::env::var("REIKI_ADMIN_TOKEN").unwrap_or_default(),
+    };
+    if token.is_empty() {
+        eprintln!("reiki: give the admin token with --token-file or REIKI_ADMIN_TOKEN");
+        return 2;
+    }
+    let base = match url {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => {
+            let listen = std::fs::read_to_string(config)
+                .map_err(|e| format!("cannot read {}: {e}", config.display()))
+                .and_then(|text| Config::parse(&text).map_err(|e| e.to_string()))
+                .map(|c| c.admin.map(|a| a.listen));
+            match listen {
+                Ok(Some(listen)) => {
+                    format!("http://{}", listen.replace("0.0.0.0", "127.0.0.1"))
+                }
+                Ok(None) => {
+                    eprintln!("reiki: the config has no [admin] listener; pass --url");
+                    return 2;
+                }
+                Err(e) => {
+                    eprintln!("reiki: {e}; pass --url");
+                    return 2;
+                }
+            }
+        }
+    };
+    let query = if dry_run { "?dry_run=true" } else { "" };
+    let response = reqwest::Client::new()
+        .post(format!("{base}/reload{query}"))
+        .bearer_auth(&token)
+        .send()
+        .await;
+    match response {
+        Ok(response) => {
+            let ok = response.status().is_success();
+            let status = response.status();
+            match response.text().await {
+                Ok(body) if !body.is_empty() => println!("{body}"),
+                Ok(_) => println!("{status}"),
+                Err(e) => eprintln!("reiki: cannot read the answer: {e}"),
+            }
+            i32::from(!ok)
+        }
+        Err(e) => {
+            eprintln!("reiki: cannot reach {base}: {e}");
+            2
+        }
+    }
 }
 
 fn fail(message: &str) -> ! {
@@ -125,6 +207,16 @@ async fn main() {
     }) = &cli.command
     {
         std::process::exit(reiki::scan::run(plugins, kinds, *all, *json, files));
+    }
+    if let Some(Command::Reload {
+        dry_run,
+        url,
+        token_file,
+    }) = &cli.command
+    {
+        std::process::exit(
+            run_reload(&cli.config, *dry_run, url.as_deref(), token_file.as_deref()).await,
+        );
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();

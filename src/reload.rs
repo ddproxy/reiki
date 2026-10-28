@@ -18,12 +18,15 @@ pub struct ReloadReport {
     pub restart_needed: Vec<String>,
     pub keys: usize,
     pub streams: usize,
+    /// True for a preview: the report says what a reload would do, and nothing was applied.
+    pub dry_run: bool,
 }
 
 impl ReloadReport {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"ok\":true,\"generation\":{},\"keys\":{},\"streams\":{},\"changed\":{},\"restart_needed\":{}}}",
+            "{{\"ok\":true,\"dry_run\":{},\"generation\":{},\"keys\":{},\"streams\":{},\"changed\":{},\"restart_needed\":{}}}",
+            self.dry_run,
             self.generation,
             self.keys,
             self.streams,
@@ -240,6 +243,7 @@ mod tests {
             restart_needed: vec!["listen".into()],
             keys: 3,
             streams: 2,
+            dry_run: false,
         }
     }
 
@@ -248,7 +252,7 @@ mod tests {
         let r = report(4);
         assert_eq!(
             r.to_json(),
-            "{\"ok\":true,\"generation\":4,\"keys\":3,\"streams\":2,\"changed\":[\"plugins phi\",\"tunnel allow +2/-0\"],\"restart_needed\":[\"listen\"]}"
+            "{\"ok\":true,\"dry_run\":false,\"generation\":4,\"keys\":3,\"streams\":2,\"changed\":[\"plugins phi\",\"tunnel allow +2/-0\"],\"restart_needed\":[\"listen\"]}"
         );
         assert_eq!(
             r.summary(),

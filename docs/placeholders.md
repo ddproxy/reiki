@@ -2,7 +2,7 @@
 
 The `placeholders` plugin keeps sensitive values out of the requests Reiki sends upstream. It swaps credential-shaped strings and a list of terms you choose for stable placeholders on the way out, and puts the originals back into the response before the client sees it. The request log, which runs after it, only ever records the masked traffic.
 
-It is a bundled plugin, compiled in by the default `plugin-placeholders` feature and inactive until a `[plugins.placeholders]` table exists. Build with `--no-default-features` to leave it out.
+Compiled in by the default `plugin-placeholders` feature; inactive until a `[plugins.placeholders]` table exists.
 
 ## Configure
 
@@ -30,9 +30,11 @@ At least one of `terms`, `terms_file` or `builtin` must leave something to mask.
 
 A masked value becomes `[[REIKI_TERM_9b2e41ff]]` (a term) or `[[REIKI_SECRET_3f9a1c07]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id.
 
-Responses are restored as they stream. JSON and other bodies are held until they end, then restored. For event streams (`text/event-stream`) each event is parsed, and a placeholder that a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41ff]]`, is held back from the first event and completed with the second. Events that contain no `[[` keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
+Responses are restored as they stream. JSON and other bodies are held until they end, then restored. A JSON body that carries tool calls is re-serialised so credential placeholders can stay masked in them; see `restore_tool_args`.
 
-The order of plugins matters and is fixed: `placeholders` is registered before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response, and the original values are restored only after that.
+For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41ff]]`, is held back from the first event and completed with the second. Events without `[[` keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
+
+Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plugins-at-build-time)); the default build registers `placeholders` before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response and the originals are restored only afterwards.
 
 ## Limits
 

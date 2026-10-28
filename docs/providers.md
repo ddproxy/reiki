@@ -32,7 +32,7 @@ Reiki rewrites the body once before it picks a key, so a failover to the next ke
 By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Four optional upstream settings make the relay behave more like a plain pass-through:
 
 - `http2 = true` negotiates HTTP/2 with that upstream when it offers it over TLS. Without TLS there is nothing to negotiate and the connection stays HTTP/1.1.
-- `forward_accept_encoding = true` sends the client's own `Accept-Encoding` header upstream instead of `identity`. A client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself (on reverse routes and intercepted hosts; a forward upstream relays `content-encoding` as-is), so error bodies are still read for key failover and logging, and the client receives plain bytes without a `Content-Encoding` header.
+- `forward_accept_encoding = true` sends the client's own `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses so error bodies can be read for failover and logging, and the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is.
 
 - `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
 - `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection.
@@ -93,7 +93,7 @@ Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Pro
 
 ### What Reiki does with the answer
 
-The status must be 200-599. Unless `streaming` is set, the body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. The response gets the same hop-by-hop cleanup. Nothing reaches the client until the forwarder has finished.
+The status must be 200-599. Unless `streaming` is set, the body is buffered whole: up to 8 MiB, 128 headers and 64 KiB per header value. Chunked responses are joined. Reiki sets `content-length` to the buffered length (HEAD keeps the forwarder's length; 204 and 304 carry none) and relays `content-encoding` without decoding it. `Expect` is not passed on, and hop-by-hop headers are removed. In this mode nothing reaches the client until the forwarder finishes.
 
 ### Streaming
 

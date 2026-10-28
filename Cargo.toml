@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-metrics", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
+members = ["crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
 resolver = "2"
 
 [package]
@@ -15,6 +15,12 @@ keywords = ["proxy", "api-key", "failover", "llm"]
 categories = ["web-programming::http-server", "command-line-utilities"]
 publish = false
 build = "build.rs"
+
+[[package.metadata.reiki.plugin]]
+# Sees the original request, before placeholders swaps anything, and blocks before the log records it.
+name = "phi"
+feature = "plugin-phi"
+crate = "reiki_phi"
 
 [[package.metadata.reiki.plugin]]
 # Default chain order: placeholders must mask before the request log sees the request and,
@@ -47,6 +53,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "json"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
+reiki-phi = { path = "crates/reiki-phi", optional = true }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 reiki-metrics = { path = "crates/reiki-metrics", optional = true }
@@ -65,8 +72,9 @@ time = "0.3"
 x509-parser = { version = "0.18", default-features = false }
 
 [features]
-default = ["plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
+default = ["plugin-phi", "plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
+plugin-phi = ["dep:reiki-phi"]
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]

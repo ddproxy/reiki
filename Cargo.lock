@@ -1170,6 +1170,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "reiki-metrics",
+ "reiki-phi",
  "reiki-placeholders",
  "reiki-plugin",
  "reiki-requestlog",
@@ -1195,6 +1196,17 @@ version = "0.1.0"
 dependencies = [
  "reiki-plugin",
  "toml",
+]
+
+[[package]]
+name = "reiki-phi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "reiki-plugin",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

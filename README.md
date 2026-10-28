@@ -7,7 +7,15 @@
 
 # Reiki
 
-Reiki is a reverse proxy that holds several upstream API keys and switches to the next one when a key hits a rate limit, runs out of quota or is disabled. Clients authenticate with their own token and never see an upstream key.
+Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent harness such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client, and keeps credentials and sensitive terms in the client's prompts away from the provider.
+
+- **Key isolation.** Upstream keys live in files only Reiki reads. The client authenticates with a revocable stream token and never sees a key, even when an upstream echoes one back in an error.
+- **Secret and term masking.** The `placeholders` plugin swaps credentials and a list of sensitive terms in a request for stable placeholders before it reaches the provider, and restores them in the response. Private keys are removed outright, and credentials stay masked inside tool-call arguments by default.
+- **Controlled egress.** Upstreams come only from the config, and the optional CONNECT tunnel allows only listed destinations. Interception can bring chosen hosts under the same rules, with a name-constrained CA.
+- **Auditable traffic.** The `requestlog` plugin records what the client sent and received, with credentials masked, to a file and a live socket. Failed logins are logged and throttled.
+- **Key failover.** A stream's chain of keys, and optionally a fallback upstream, takes over on a rate limit, exhausted quota or disabled key, so the client sees one stable endpoint.
+
+See [docs/security.md](docs/security.md) for what Reiki does and does not protect against.
 
 ## Install
 
@@ -70,7 +78,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
 - `http2` lets Reiki negotiate HTTP/2 with that upstream over TLS, and `forward_accept_encoding` sends the client's own `Accept-Encoding` upstream instead of `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself (on reverse routes and intercepted hosts; a forward upstream relays `content-encoding` as-is), so error bodies are still read for key failover, and sends the client plain bytes. Both are off by default; see [docs/providers.md](docs/providers.md).
-- `[upstream.X.forward]` hands each request to a Unix socket listener or a spawned command, which speaks plain HTTP/1.1 and forwards it onward; the key goes only in the normal credential header. See [docs/providers.md](docs/providers.md#forwarding).
+- `[upstream.X.forward]` hands each request to a Unix socket listener or a spawned command, which speaks plain HTTP/1.1 and forwards it onward; the key goes only in the normal credential header. `streaming = true` relays the answer as it arrives, and a forward upstream may serve an intercepted tunnel host. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
 - `[tunnel]` adds a CONNECT forward proxy with a destination allowlist. Destinations pass through untouched by default; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic too, relaying each request as the client sent it. Intercepted hosts served from a stream need the stream token in `Proxy-Authorization` unless `require_auth = false`. See [docs/tunnel.md](docs/tunnel.md).
 - `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).

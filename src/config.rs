@@ -280,6 +280,10 @@ pub struct Upstream {
     /// Send `Connection: keep-alive` explicitly; HTTP/1.1 connections persist without it.
     #[serde(default)]
     pub send_keep_alive: bool,
+    /// Re-send a quota-exhausted 429 once on the same key, after a short pause, before cooling
+    /// the key. For upstreams that sometimes answer a good key with a spurious quota 429.
+    #[serde(default)]
+    pub confirm_quota: bool,
     /// Where a request goes when every key of this upstream is unavailable.
     #[serde(default)]
     pub fallback: Option<Fallback>,
@@ -306,6 +310,9 @@ pub struct Forward {
     pub expect_uid: Option<u32>,
     /// Most copies of `command` running at once; further requests get a 502. Defaults to 16.
     pub max_concurrent: Option<u32>,
+    /// Relay the forwarder's body as it arrives instead of buffering it whole (8 MiB cap).
+    /// The request timeout then bounds only the wait for the response head.
+    pub streaming: bool,
 }
 
 /// One hop to another upstream, used only when the chain has no usable key left here.
@@ -547,9 +554,6 @@ impl Config {
                 .find(|p| !p.starts_with('/') || p.contains('?'))
             {
                 return Some(format!("`{bad}` must be a path prefix starting with `/`"));
-            }
-            if upstream.forward.is_some() {
-                return Some("an intercepted host cannot use a forward upstream".to_owned());
             }
             match (&entry.stream, upstream.passthrough) {
                 (Some(_), true) => {
@@ -1367,9 +1371,7 @@ token_sha256 = "{HASH_A}"
 chain = ["k"]
 "#
         );
-        let err = Config::parse(&text).unwrap_err();
-        assert!(matches!(err, ConfigError::BadTunnel(_)));
-        assert!(err.to_string().contains("forward upstream"));
+        Config::parse(&text).expect("a forward upstream may serve an intercepted host");
     }
 
     #[test]
@@ -1474,7 +1476,7 @@ chain = ["k"]
     }
 
     #[test]
-    fn a_passthrough_forward_upstream_is_refused_on_an_intercepted_host_too() {
+    fn a_passthrough_forward_upstream_may_serve_an_intercepted_host() {
         let text = r#"
 [tunnel]
 listen = "127.0.0.1:8443"
@@ -1492,9 +1494,7 @@ passthrough = true
 [upstream.zen.forward]
 socket = "/run/forwarder.sock"
 "#;
-        let err = Config::parse(text).unwrap_err();
-        assert!(matches!(err, ConfigError::BadTunnel(_)), "{err}");
-        assert!(err.to_string().contains("forward upstream"));
+        Config::parse(text).expect("a passthrough forward upstream may serve an intercepted host");
     }
 
     #[test]

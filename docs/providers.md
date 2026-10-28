@@ -69,7 +69,7 @@ args = ["--config", "/etc/forward.toml"]
 pass_env = ["FORWARD_TARGET"]
 ```
 
-Set exactly one of `socket` or `command`.
+Set exactly one of `socket` or `command`. Add `streaming = true` to relay the answer as it arrives (see below).
 
 ### What the forwarder receives
 
@@ -93,7 +93,25 @@ Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Pro
 
 ### What Reiki does with the answer
 
-The status must be 200-599. The body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. The response gets the same hop-by-hop cleanup. Nothing reaches the client until the forwarder has finished.
+The status must be 200-599. Unless `streaming` is set, the body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. The response gets the same hop-by-hop cleanup. Nothing reaches the client until the forwarder has finished.
+
+### Streaming
+
+`streaming = true` on `[upstream.X.forward]` (socket or command) hands the client the answer as the forwarder produces it, which an event stream such as a chat completion needs:
+
+```toml
+[upstream.zen.forward]
+command = "/usr/local/bin/bun"
+args = ["/usr/local/lib/reiki/bun-forward.ts", "--allow", "opencode.ai"]
+streaming = true
+```
+
+- The response is returned as soon as its head is in. The forwarder's body then flows through unbuffered, so the 8 MiB cap does not apply.
+- The 120-second request timeout bounds only the wait for the response head, not the body.
+- A `content-length` the forwarder reports is kept; otherwise the client gets a chunked body. `transfer-encoding` and the other hop-by-hop headers are still removed, and `content-encoding` is still relayed as-is.
+- A forwarder that fails after the head has gone out cannot be retried or fall back: the client sees the body end early with an error. A failure before the head is handled as for a buffered answer.
+- A `command` keeps its concurrency slot, and its process, until the body ends or the client disconnects. A client that disconnects ends the child after the usual 1-second grace.
+- Error statuses are still read whole for key classification, so a streaming forwarder's 401 or 429 fails over as before.
 
 A forwarder's own error status (for example 401, 402, 429 or 5xx) is treated exactly like an upstream returning it, so normal key classification and failover apply. A forwarder can acknowledge and queue work by answering at once with 202; no special mode is needed.
 
@@ -124,9 +142,9 @@ Any failure of the link to the forwarder answers the client with 502. That cover
 ### Limits and restrictions
 
 - `args`, `pass_env` and `max_concurrent` are valid only with `command`. `expect_uid` is valid only with `socket`.
-- A forward upstream cannot be combined with `http2`, `title_case_headers` or an intercepted tunnel host. Startup rejects these.
-- The 120-second request timeout bounds the whole exchange: connect, send and the full response.
-- A client that disconnects does not necessarily stop the request; it ends when the forwarder answers or the timeout fires.
+- A forward upstream cannot be combined with `http2` or `title_case_headers`. Startup rejects these. It can serve an intercepted tunnel host: Reiki still terminates the client's TLS and swaps the key, then hands the request to the forwarder.
+- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head.
+- A buffered request does not necessarily stop when the client disconnects; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
 
@@ -147,6 +165,8 @@ base_url = "https://opencode.ai/zen/v1"
 ```
 
 Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.opencode.options.baseURL` to that URL and `apiKey` to the stream token.
+
+Zen sometimes answers a usable key with a quota 429 (`FreeUsageLimitError`) and accepts the very next request. Set `confirm_quota = true` on the upstream to send such a 429 once more on the same key, after a 3-second pause, before cooling it; only a repeated quota 429 takes the key out of rotation. It costs a genuinely exhausted key one extra request and 3 seconds per request.
 
 Zen's free models only accept requests that carry OpenCode's own headers. Reiki forwards every header except the credential, so the free tier keeps working.
 

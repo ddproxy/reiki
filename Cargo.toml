@@ -4,10 +4,10 @@ resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.99"
-description = "Key-failover relay for LLM APIs"
+description = "Security proxy that isolates LLM harnesses from keys and secrets"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/ddproxy/reiki"

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.1
+
+### Added
+
+- `streaming = true` on `[upstream.X.forward]` relays a forwarder's answer as it arrives instead of buffering it (8 MiB cap), for socket and command forwarders alike. The request timeout then bounds only the wait for the response head.
+- A forward upstream may serve an intercepted tunnel host, so intercepted traffic can leave through a forwarder such as a Bun or Node HTTP client.
+
+- `confirm_quota = true` on an upstream re-sends a quota 429 once on the same key, after 3 seconds, before cooling the key.
+
+### Security
+
+- Credential placeholders stay masked inside tool-call arguments unless `restore_tool_args` is set.
+- A failure from a request that started before a key rotation no longer disables the rotated key.
+- Decoded response bodies are capped at 512 MiB.
+- Failed logins are logged with the peer address, and an address with 10 failures in a minute gets 429 until the window passes.
+- The request log masks credential query parameters and path tokens, whole credential header values, and JSON object keys.
+
+### Changed
+
+- Docs describe Reiki as an isolation proxy between an LLM harness and its providers, with key failover as one of its jobs.
+- Term masking folds the body once instead of once per term.
+
 ## 0.7.0
 
 ### Added

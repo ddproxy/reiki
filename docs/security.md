@@ -1,10 +1,20 @@
 # Security
 
+Reiki sits between a client (an agent harness such as opencode or Claude Code, or an application) and the providers it calls, and isolates each side from what the other should not hold. It does not make either side trustworthy: a client that can read a secret on its own machine can still send it somewhere else, which is why masking is a second layer and not a replacement for keeping secrets out of reach.
+
+| Reiki keeps | From | Through |
+| --- | --- | --- |
+| Upstream API keys | The client | Key files read only by Reiki; credential headers replaced per request |
+| Credentials and listed terms in prompts | The provider | The `placeholders` plugin ([placeholders](placeholders.md)) swaps them for placeholders before the request leaves and restores them in the response |
+| Arbitrary destinations | The client | Config-only upstreams and the tunnel allowlist |
+| A record of what was sent | Nobody; it is for you | The `requestlog` plugin ([requestlog](requestlog.md)), with credentials masked |
+
 ## Clients and keys
 
 - Clients never see upstream keys, unless an upstream echoes the key back in an error body that Reiki does not recognise (the exact key and its formatted credential are replaced, other encodings are not). Reiki removes the client's credential headers (`authorization`, `x-api-key`, `x-goog-api-key`) and any `key` query parameter, then sets the upstream's header from the key file.
 - The key travels to whoever accepts on an `[upstream.X.forward]` socket or runs as its `command`, in the normal credential header only, with no second copy. A command gets a cleared environment plus `pass_env`. Keep the socket in a directory only the Reiki user and the listener can enter, and set `expect_uid`, which makes Reiki compare the uid of the process that accepted the connection (peer credentials, not the owner of the socket file) and refuse a mismatch. It is optional, so without it whoever binds the path receives the keys. A failed link to the forwarder answers 502 and never cools the key.
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
+- A failed token check is logged with the peer address and path. An address with 10 failures in 60 seconds gets 429 with `Retry-After` until the window passes, and a good login clears its count. The throttle covers the client listener; a refused CONNECT is logged but not counted.
 - Upstreams come only from the config. A request cannot choose its own destination, so Reiki is not an open proxy.
 - Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions, so create them with mode 0600.
 
@@ -30,7 +40,7 @@ Reiki forwards every request header except hop-by-hop headers (`connection`, `ke
 
 ## Logging
 
-Key values and stream tokens are not logged. Request and response bodies are not logged, except the first 160 characters of upstream error bodies at `debug` level.
+Key values and stream tokens are not logged. Request and response bodies are not logged, except the first 160 characters of upstream error bodies at `debug` level, and whatever the `requestlog` plugin is configured to record, which masks credentials in paths, query parameters, credential headers and JSON keys and values.
 
 ## Plugins
 
@@ -53,6 +63,8 @@ Plugins are compiled into the binary and run inside the Reiki process, so a plug
 
 - The upstream key and the formatted credential are replaced by `[redacted]` in error bodies and headers relayed to a client.
 - Account-identifying response headers (`openai-organization`, `openai-project`, `anthropic-organization-id`, `set-cookie`, `set-cookie2`) are not relayed.
+- A response body decoded from gzip, deflate, brotli or zstd is cut off with an error past 512 MiB, so a small compressed body cannot expand without bound.
+- The `placeholders` plugin keeps credential placeholders masked inside tool-call arguments unless `restore_tool_args` is set.
 - Request paths with dot segments or encoded separators are refused.
 - The client and admin listeners close a connection that does not finish its headers within 30 seconds, cap open connections (1024 client, 64 admin), and a request body must arrive within the 120-second request timeout (408).
 - The admin token must differ from every stream token, and the stream name `passthrough` is reserved.

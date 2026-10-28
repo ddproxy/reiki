@@ -1508,3 +1508,154 @@ async fn too_many_copies_of_a_command_are_refused() {
     first.abort();
     let _ = std::fs::remove_file(&pid_path);
 }
+
+/// A forwarder that sends one chunk, waits for `release`, then the rest.
+async fn staged_socket(release: Arc<tokio::sync::Notify>) -> PathBuf {
+    let sock = unique_sock_path();
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(200), async {
+                    while let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                let _ = AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nfirst \r\n",
+                )
+                .await;
+                release.notified().await;
+                let _ = AsyncWriteExt::write_all(&mut stream, b"6\r\nsecond\r\n0\r\n\r\n").await;
+                let _ = AsyncWriteExt::shutdown(&mut stream).await;
+            });
+        }
+    });
+    sock
+}
+
+async fn staged_app(sock: &std::path::Path, streaming: bool) -> String {
+    let text = format!(
+        "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+         [upstream.zen.forward]\nsocket = \"{}\"\nstreaming = {streaming}\n\
+         [keys.k]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+         [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+        sock.display(),
+        reiki::auth::sha256_hex("tok")
+    );
+    let app = App::new(
+        Config::parse(&text).unwrap(),
+        HashMap::from([("k".to_string(), Secret::new("key123"))]),
+        Policy::default(),
+        PluginChain::default(),
+    );
+    serve_app(app).await
+}
+
+#[tokio::test]
+async fn forward_socket_streaming_relays_the_first_chunk_before_the_reply_ends() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sock = staged_socket(Arc::clone(&release)).await;
+    let base = staged_app(&sock, true).await;
+    let mut resp = reqwest::Client::new()
+        .post(format!("{base}/zen/chat"))
+        .bearer_auth("tok")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let first = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+        .await
+        .expect("the first chunk arrives while the forwarder is still working")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&first[..], b"first ");
+    release.notify_one();
+    let mut rest = Vec::new();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!(rest, b"second");
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test]
+async fn forward_socket_without_streaming_waits_for_the_whole_reply() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sock = staged_socket(Arc::clone(&release)).await;
+    let base = staged_app(&sock, false).await;
+    let pending = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("{base}/zen/chat"))
+            .bearer_auth("tok")
+            .body("{}")
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !pending.is_finished(),
+        "nothing is relayed until the reply is complete"
+    );
+    release.notify_one();
+    let resp = pending.await.unwrap().unwrap();
+    assert_eq!(resp.text().await.unwrap(), "first second");
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test]
+async fn forward_command_streaming_relays_before_exit_and_reaps_the_child() {
+    let script = r#"
+import sys, time
+head = b""
+while b"\r\n\r\n" not in head:
+    head += sys.stdin.buffer.read1(4096)
+out = sys.stdout.buffer
+out.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nfirst \r\n")
+out.flush()
+time.sleep(1.5)
+out.write(b"6\r\nsecond\r\n0\r\n\r\n")
+out.flush()
+"#;
+    let text = format!(
+        "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+         [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"-c\", {script:?}]\nstreaming = true\n\
+         [keys.k]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+         [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+        python(),
+        reiki::auth::sha256_hex("tok")
+    );
+    let app = App::new(
+        Config::parse(&text).unwrap(),
+        HashMap::from([("k".to_string(), Secret::new("key123"))]),
+        Policy::default(),
+        PluginChain::default(),
+    );
+    let base = serve_app(app).await;
+    let started = Instant::now();
+    let mut resp = reqwest::Client::new()
+        .post(format!("{base}/zen/chat"))
+        .bearer_auth("tok")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let first = resp.chunk().await.unwrap().unwrap();
+    assert_eq!(&first[..], b"first ");
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "relayed before the child finished"
+    );
+    let mut rest = Vec::new();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!(rest, b"second");
+}

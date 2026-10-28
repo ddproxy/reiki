@@ -63,7 +63,9 @@ pub async fn serve_with(
             let service =
                 hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let mut router = router.clone();
-                    async move { router.call(req.map(Body::new)).await }
+                    let mut req = req.map(Body::new);
+                    req.extensions_mut().insert(crate::auth::Peer(peer.ip()));
+                    async move { router.call(req).await }
                 });
             let connection = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())

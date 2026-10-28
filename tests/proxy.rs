@@ -1563,3 +1563,48 @@ async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_s
     assert_eq!(h.mock.keys_called(), ["up-a", "up-a-rotated"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn confirm_quota_sends_a_quota_429_again_on_the_same_key_before_cooling_it() {
+    let quota = || Reply::Status(429, "Free usage exceeded, subscribe to Go", None);
+    let h = harness_with_upstream(&one_stream(), "confirm_quota = true\n", Policy::default()).await;
+    h.mock.script("up-a", vec![quota()]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a", "up-a"],
+        "one more try on the same key"
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h.mock.keys_called()[2], "up-a", "the key was never cooled");
+
+    let h = harness_with_upstream(&one_stream(), "confirm_quota = true\n", Policy::default()).await;
+    h.mock.script("up-a", vec![quota(), quota()]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a", "up-a", "up-b"],
+        "a repeated quota 429 cools the key and moves on"
+    );
+}

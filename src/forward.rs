@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::Forward;
 use crate::proxy::{passthrough_headers, upstream_headers};
-use crate::upstream::{strip_hop_by_hop, Call, SendFuture, Transport, UpstreamResponse};
+use crate::upstream::{strip_hop_by_hop, Call, ErrMap, SendFuture, Transport, UpstreamResponse};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 128;
@@ -78,7 +78,9 @@ impl Transport for Forwarder {
                 .ok_or_else(|| fail("forward transport used without [upstream.forward]"))?;
             let request = build_request(&call).map_err(fail)?;
             match (&spec.socket, &spec.command) {
-                (Some(path), _) => exchange_socket(path, spec.expect_uid, request).await,
+                (Some(path), _) => {
+                    exchange_socket(path, spec.expect_uid, request, spec.streaming).await
+                }
                 (None, Some(_)) => {
                     let permit = self.permit(spec)?;
                     exchange_command(spec, request, permit).await
@@ -156,6 +158,7 @@ async fn exchange_socket(
     path: &std::path::Path,
     expect_uid: Option<u32>,
     request: Request<Full<Bytes>>,
+    streaming: bool,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let stream = tokio::net::UnixStream::connect(path)
         .await
@@ -172,7 +175,7 @@ async fn exchange_socket(
             )));
         }
     }
-    exchange(stream, request).await
+    exchange(stream, request, streaming, None).await
 }
 
 #[cfg(not(unix))]
@@ -180,6 +183,7 @@ async fn exchange_socket(
     _path: &std::path::Path,
     _expect_uid: Option<u32>,
     _request: Request<Full<Bytes>>,
+    _streaming: bool,
 ) -> Result<UpstreamResponse, std::io::Error> {
     Err(fail("socket forwarding needs a Unix platform"))
 }
@@ -211,40 +215,144 @@ async fn exchange_command(
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(fail("forward command stdio was not piped"));
     };
-    let result = exchange(tokio::io::join(stdout, stdin), request).await;
-    // Reap off the request path: the answer is already complete, and a child that
-    // lingers is stopped after a grace period instead of being left running.
-    let failed = result.is_err();
-    tokio::spawn(async move {
-        let _permit = permit;
-        if failed
-            || tokio::time::timeout(CHILD_EXIT_GRACE, child.wait())
-                .await
-                .is_err()
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    });
-    result
+    let guard = ChildGuard {
+        child: Some(child),
+        permit: Some(permit),
+        kill_now: false,
+    };
+    exchange(
+        tokio::io::join(stdout, stdin),
+        request,
+        spec.streaming,
+        Some(guard),
+    )
+    .await
 }
 
-/// One request and its fully buffered response over `io`; every failure is a [`ForwarderError`].
+/// Owns a forward command and its concurrency slot. Dropping it reaps the child off the request
+/// path: one that lingers past a grace period, or whose exchange failed, is killed.
+struct ChildGuard {
+    child: Option<tokio::process::Child>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    kill_now: bool,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let (Some(mut child), permit, kill_now) =
+            (self.child.take(), self.permit.take(), self.kill_now)
+        else {
+            return;
+        };
+        // Without a runtime (shutdown) `kill_on_drop` stops the child instead.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let _permit = permit;
+            if kill_now
+                || tokio::time::timeout(CHILD_EXIT_GRACE, child.wait())
+                    .await
+                    .is_err()
+            {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        });
+    }
+}
+
+/// A relayed body that keeps its forwarder alive until the body ends or is dropped.
+struct Guarded<S> {
+    inner: S,
+    _guard: Option<ChildGuard>,
+}
+
+impl<S> futures_core::Stream for Guarded<S>
+where
+    S: futures_core::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+/// One request and its response over `io`; every failure is a [`ForwarderError`].
+///
+/// The body is buffered whole unless `streaming` is set, in which case the response is returned
+/// as soon as its head is in and the body is relayed as it arrives. `guard` keeps a forward
+/// command alive for as long as its body is still being read.
 async fn exchange<T>(
     io: T,
     request: Request<Full<Bytes>>,
+    streaming: bool,
+    mut guard: Option<ChildGuard>,
 ) -> Result<UpstreamResponse, std::io::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let is_head = request.method() == Method::HEAD;
+    let result = exchange_inner(io, request, streaming, is_head).await;
+    match result {
+        Ok((Relayed::Buffered(response), _)) => Ok(response),
+        Ok((Relayed::Streaming(parts, body), connection)) => {
+            // The connection has to keep running for the body to make progress.
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut headers = parts.headers;
+            strip_hop_by_hop(&mut headers, false);
+            let stream = Guarded {
+                inner: ErrMap {
+                    inner: Box::pin(body.into_data_stream()),
+                },
+                _guard: guard.take(),
+            };
+            Ok(UpstreamResponse::from_stream(
+                parts.status,
+                headers,
+                Version::HTTP_11,
+                stream,
+            ))
+        }
+        Err(error) => {
+            if let Some(guard) = guard.as_mut() {
+                guard.kill_now = true;
+            }
+            Err(error)
+        }
+    }
+}
+
+type Connection<T> =
+    std::pin::Pin<Box<hyper::client::conn::http1::Connection<TokioIo<T>, Full<Bytes>>>>;
+
+enum Relayed {
+    Buffered(UpstreamResponse),
+    Streaming(axum::http::response::Parts, hyper::body::Incoming),
+}
+
+async fn exchange_inner<T>(
+    io: T,
+    request: Request<Full<Bytes>>,
+    streaming: bool,
+    is_head: bool,
+) -> Result<(Relayed, Connection<T>), std::io::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
         .max_headers(MAX_RESPONSE_HEADERS)
         .max_buf_size(MAX_HEAD_BYTES)
         .handshake(TokioIo::new(io))
         .await
         .map_err(|e| fail(format!("handshake failed: {e}")))?;
-    tokio::pin!(connection);
+    let mut connection: Connection<T> = Box::pin(connection);
 
     let work = async {
         let response = sender
@@ -263,6 +371,9 @@ where
         {
             return Err(fail("a response header value is over 64 KiB"));
         }
+        if streaming {
+            return Ok(Relayed::Streaming(parts, body));
+        }
         let body = Limited::new(body, MAX_RESPONSE_BYTES)
             .collect()
             .await
@@ -280,35 +391,37 @@ where
         } else if status != StatusCode::NO_CONTENT && status != StatusCode::NOT_MODIFIED {
             headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
         }
-        Ok(UpstreamResponse::from_bytes(
+        Ok(Relayed::Buffered(UpstreamResponse::from_bytes(
             status,
             headers,
             Version::HTTP_11,
             body,
-        ))
+        )))
     };
     tokio::pin!(work);
 
     let mut connection_done = false;
-    loop {
+    let finished = loop {
         tokio::select! {
             biased;
-            result = &mut work => return result,
+            result = &mut work => break result?,
             ended = &mut connection, if !connection_done => {
                 connection_done = true;
                 if let Err(e) = ended {
                     // A reset that arrives with an already complete answer must not discard it.
-                    return tokio::select! {
+                    break tokio::select! {
                         biased;
-                        result = &mut work => result,
-                        () = std::future::ready(()) => Err(fail(format!("connection failed: {e}"))),
+                        result = &mut work => result?,
+                        () = std::future::ready(()) => {
+                            return Err(fail(format!("connection failed: {e}")));
+                        }
                     };
                 }
             }
         }
-    }
+    };
+    Ok((finished, connection))
 }
-
 #[cfg(unix)]
 pub fn socket_warnings(config: &crate::config::Config) -> Vec<String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};

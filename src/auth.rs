@@ -1,5 +1,62 @@
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
+
+/// Failed logins one address may make inside `FAIL_WINDOW` before it is refused.
+const MAX_FAILURES: u32 = 10;
+const FAIL_WINDOW: Duration = Duration::from_secs(60);
+/// Addresses tracked at once; past this, expired entries go first and a new address is not tracked.
+const MAX_TRACKED: usize = 4096;
+
+/// The peer address of the connection a request arrived on, set by the listener.
+#[derive(Debug, Clone, Copy)]
+pub struct Peer(pub IpAddr);
+
+/// Counts failed token checks per address so token guessing is slowed and visible.
+#[derive(Default)]
+pub struct LoginThrottle {
+    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl LoginThrottle {
+    /// How long `ip` must wait, or `None` when it may try.
+    pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let (count, since) = seen.get(&ip)?;
+        let elapsed = now.saturating_duration_since(*since);
+        if elapsed >= FAIL_WINDOW {
+            return None;
+        }
+        (*count >= MAX_FAILURES).then(|| FAIL_WINDOW - elapsed)
+    }
+
+    /// Records a failure and returns how many the address has inside the window.
+    pub fn fail(&self, ip: IpAddr, now: Instant) -> u32 {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
+            seen.retain(|_, (_, since)| now.saturating_duration_since(*since) < FAIL_WINDOW);
+            if seen.len() >= MAX_TRACKED {
+                return 0;
+            }
+        }
+        let entry = seen.entry(ip).or_insert((0, now));
+        if now.saturating_duration_since(entry.1) >= FAIL_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        entry.0
+    }
+
+    /// A good login clears the address's count.
+    pub fn succeed(&self, ip: IpAddr) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.remove(&ip);
+    }
+}
 
 pub fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
@@ -107,6 +164,24 @@ pub fn strip_query_key(query: &str) -> Option<String> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn repeated_failures_block_an_address_until_the_window_passes() {
+        let throttle = LoginThrottle::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let other: IpAddr = "192.0.2.2".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..MAX_FAILURES - 1 {
+            throttle.fail(ip, t0);
+        }
+        assert!(throttle.blocked(ip, t0).is_none());
+        throttle.fail(ip, t0);
+        assert!(throttle.blocked(ip, t0).is_some());
+        assert!(throttle.blocked(other, t0).is_none());
+        assert!(throttle.blocked(ip, t0 + FAIL_WINDOW).is_none());
+        throttle.succeed(ip);
+        assert!(throttle.blocked(ip, t0).is_none());
+    }
 
     #[test]
     fn hashes_match_the_known_vector() {

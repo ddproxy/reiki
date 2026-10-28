@@ -20,6 +20,7 @@ These come from Reiki itself. Any other status is the upstream's answer, passed 
 | 404 | `not_found`: `unknown upstream` | The prefix does not match an `[upstream.*]` table |
 | 413 | `too_large`: `request body too large` | The body is over 8 MB |
 | 429 | `rate_limited`: `stream request rate limit exceeded` | The stream is over its `rate_limit_per_minute` |
+| 429 | Too many failed logins | The client address sent 10 bad tokens in a minute; wait for `Retry-After` |
 | 503 | `reiki_exhausted` | Every key in the stream's chain is cooling or out of rotation |
 
 A 429 from Reiki comes from a stream's `rate_limit_per_minute`, carries `Retry-After` in whole seconds, and is decided before any key is picked, so no key enters cooldown. The counter lives in memory and resets on reload.
@@ -65,4 +66,4 @@ Key values and stream tokens are never logged.
 
 **A request fails after two minutes.** Reiki waits 120 s for upstream response headers, then counts a transient failure and tries again.
 
-**429 from Reiki.** The stream hit its `rate_limit_per_minute`. Wait for `Retry-After`, or raise the limit. Reloading config resets the counter.
+**429 from Reiki.** Either the stream hit its `rate_limit_per_minute`, or the client address sent 10 wrong tokens in a minute (look for `failed login` in the log). Wait for `Retry-After`, or raise the limit. Reloading config resets the counter.

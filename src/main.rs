@@ -9,7 +9,10 @@ use reiki::plugins::{builtin, with_dry_run, PluginChain};
 use reiki::proxy::{load_keys, router, App};
 
 #[derive(Parser)]
-#[command(version, about = "Key-failover relay for LLM APIs")]
+#[command(
+    version,
+    about = "Security proxy that isolates LLM harnesses from keys and secrets"
+)]
 struct Cli {
     /// Path to the configuration file.
     #[arg(long, default_value = "/etc/reiki/reiki.toml", global = true)]

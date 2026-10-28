@@ -21,6 +21,47 @@ use crate::proxy::{passthrough_headers, upstream_headers};
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
+/// Most bytes a decoded response body may reach, so a small compressed body cannot expand without bound.
+const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Fails the stream once more than `left` bytes have passed through.
+struct Capped {
+    inner: ByteStream,
+    left: u64,
+}
+
+impl Stream for Capped {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => match this.left.checked_sub(chunk.len() as u64) {
+                Some(left) => {
+                    this.left = left;
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+                None => {
+                    this.left = 0;
+                    this.inner = Box::pin(OnceBody(None));
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "decoded response body exceeds the size limit",
+                    ))))
+                }
+            },
+            other => other,
+        }
+    }
+}
+
+fn capped(inner: ByteStream) -> ByteStream {
+    Box::pin(Capped {
+        inner,
+        left: MAX_DECODED_BYTES,
+    })
+}
+
 pub struct UpstreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -33,9 +74,9 @@ impl UpstreamResponse {
         let status = response.status();
         let headers = response.headers().clone();
         let version = response.version();
-        let body = Box::pin(ErrMap {
+        let body = capped(Box::pin(ErrMap {
             inner: Box::pin(response.bytes_stream()),
-        });
+        }));
         Self {
             status,
             headers,
@@ -92,6 +133,21 @@ impl UpstreamResponse {
 
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         self.body
+    }
+
+    /// A body relayed as the forwarder produces it.
+    pub fn from_stream(
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        body: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    ) -> Self {
+        Self {
+            status,
+            headers,
+            version,
+            body: Box::pin(body),
+        }
     }
 
     pub fn from_bytes(
@@ -152,8 +208,8 @@ where
     let source: ByteStream = Box::pin(ErrMap {
         inner: Box::pin(body.into_data_stream()),
     });
-    Box::pin(ReaderStream::new(make(BufReader::new(StreamReader::new(
-        source,
+    capped(Box::pin(ReaderStream::new(make(BufReader::new(
+        StreamReader::new(source),
     )))))
 }
 
@@ -397,8 +453,8 @@ pub fn faithful_request(
 }
 
 /// Keeps the reqwest body stream usable without pulling in `futures-util`.
-struct ErrMap<S> {
-    inner: Pin<Box<S>>,
+pub(crate) struct ErrMap<S> {
+    pub(crate) inner: Pin<Box<S>>,
 }
 
 impl<S, E> Stream for ErrMap<S>
@@ -432,5 +488,24 @@ mod tests {
         let chunk = response.chunk().await.unwrap().unwrap();
         assert_eq!(&chunk[..], b"hi");
         assert!(response.chunk().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_decoded_cap_fails_then_ends() {
+        let parts: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"defg")),
+            Ok(Bytes::from_static(b"more")),
+        ];
+        let mut capped = Capped {
+            inner: Box::pin(futures_util::stream::iter(parts)),
+            left: 5,
+        };
+        let first = poll_fn(|cx| Pin::new(&mut capped).poll_next(cx)).await;
+        assert_eq!(&first.unwrap().unwrap()[..], b"abc");
+        let second = poll_fn(|cx| Pin::new(&mut capped).poll_next(cx)).await;
+        assert!(second.unwrap().is_err());
+        let third = poll_fn(|cx| Pin::new(&mut capped).poll_next(cx)).await;
+        assert!(third.is_none());
     }
 }

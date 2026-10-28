@@ -14,7 +14,9 @@ use axum::response::Response;
 use axum::Router;
 use futures_core::Stream;
 
-use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
+use crate::auth::{
+    constant_time_eq, extract_token, sha256_hex, strip_query_key, LoginThrottle, Peer,
+};
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
@@ -213,6 +215,9 @@ impl Snapshot {
     }
 }
 
+/// Pause before a quota 429 is sent again on the same key when `confirm_quota` is set.
+const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
+
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
@@ -228,6 +233,7 @@ pub struct App {
     wall_clock: OnceLock<SystemTime>,
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: OnceLock<i64>,
+    logins: LoginThrottle,
     plugins: Arc<PluginChain>,
     /// The plugin tables the running chain was built from, which a reload cannot change.
     plugin_tables: std::collections::BTreeMap<String, toml::Table>,
@@ -272,6 +278,7 @@ impl App {
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
             ca_not_after: OnceLock::new(),
+            logins: LoginThrottle::default(),
             plugins: Arc::new(plugins),
             plugin_tables,
         })
@@ -368,6 +375,9 @@ impl App {
     /// with. Plugins are built at startup and are not rebuilt here.
     pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
         let next = Arc::new(Snapshot::new(config, keys));
+        // Health first, then the snapshot: `record` takes them in the same order, so a
+        // failure from a request on the old snapshot cannot land after the re-enable.
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
         let mut current = self
             .snapshot
             .write()
@@ -396,13 +406,11 @@ impl App {
                 "admin listener changed; restart reiki to apply it"
             );
         }
-        if let Ok(mut health) = self.health.lock() {
-            health.retain_keys(|name| next.keys.contains_key(name));
-            for (name, secret) in &next.keys {
-                let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
-                if !unchanged {
-                    health.enable(name);
-                }
+        health.retain_keys(|name| next.keys.contains_key(name));
+        for (name, secret) in &next.keys {
+            let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
+            if !unchanged {
+                health.enable(name);
             }
         }
         *current = next;
@@ -583,12 +591,25 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let stream = if passthrough {
         PASSTHROUGH_STREAM.to_owned()
     } else {
+        let peer = parts.extensions.get::<Peer>().map(|p| p.0);
+        if let Some(wait) = peer.and_then(|ip| app.logins.blocked(ip, Instant::now())) {
+            tracing::warn!(?peer, "too many failed logins, refusing");
+            return rate_limited_response(wait);
+        }
+        let fail = |reason: &str| {
+            let failures = peer.map(|ip| app.logins.fail(ip, Instant::now()));
+            tracing::warn!(?peer, reason, ?failures, path = %parts.uri.path(), "failed login");
+            json_error(StatusCode::UNAUTHORIZED, "unauthorized", reason)
+        };
         let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
-            return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
+            return fail("missing token");
         };
         let Some(stream) = snapshot.authenticate(&token) else {
-            return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
+            return fail("unknown token");
         };
+        if let Some(ip) = peer {
+            app.logins.succeed(ip);
+        }
         let stream = stream.to_owned();
 
         // A stream's own rate limit is checked before any key is picked, so a
@@ -961,6 +982,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     let mut last_refusal: Option<(String, StatusCode, HeaderMap, Bytes)> = None;
     let mut pending_failover: Option<(String, FailureKind)> = None;
     let mut disabled_one = false;
+    let mut confirmed: Vec<String> = Vec::new();
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
             break;
@@ -1092,6 +1114,16 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
+            }
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+                if upstream.confirm_quota
+                    && status == StatusCode::TOO_MANY_REQUESTS
+                    && !confirmed.contains(&key_name) =>
+            {
+                // The key stays in rotation: the next pass picks it again and only a repeat is recorded.
+                tracing::warn!(stream = %stream, key = %key_name, "quota 429, sending it once more before cooling the key");
+                confirmed.push(key_name);
+                tokio::time::sleep(QUOTA_CONFIRM_DELAY).await;
             }
             Outcome::KeyFailure(FailureClass::Unauthorized) if disabled_one => {
                 // A second key refusing the same request points at the request, not at the keys.
@@ -1258,6 +1290,14 @@ fn record(
 ) {
     let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now());
     if let Ok(mut health) = app.health.lock() {
+        // A reload that rotated this key's secret already reset its health; the old
+        // secret's failure must not disable the new one.
+        let rotated =
+            app.snapshot().keys.get(key).map(|s| &s.0) != snapshot.keys.get(key).map(|s| &s.0);
+        if rotated {
+            tracing::debug!(stream, key, ?class, "ignoring failure from a rotated key");
+            return;
+        }
         let cooled =
             health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
         if cooled {

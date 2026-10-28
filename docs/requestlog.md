@@ -69,7 +69,7 @@ At most 32 subscribers connect at once. Each has its own bounded queue and is di
 Request bodies are prompts, so treat the file and socket as sensitive. Both are readable by their owner only.
 
 - **Credential headers are never logged.** `authorization`, `proxy-authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, `set-cookie` and `x-auth-token` are refused in `headers`, so Reiki will not start with one listed. Upstream keys are never visible to a plugin.
-- **Credential-shaped text is masked** with `[REDACTED]` in bodies and in the headers you do list: `sk-…`, `oc_sk_…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_` tokens, `glpat-`, `AKIA`/`ASIA` access keys, `AIza…`, `xox[bpas]-` tokens, JWT-shaped `eyJ…` strings, `Bearer <token>`, and PEM private key blocks.
+- **Credential-shaped text is masked** with `[REDACTED]` in bodies and in the headers you do list: `sk-…`, `oc_sk_…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_` tokens, `glpat-`, `AKIA`/`ASIA` access keys, `AIza…`, `xox[bpas]-` tokens, JWT-shaped `eyJ…` strings, `Bearer <token>`, and PEM private key blocks. Headers that carry credentials (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-goog-api-key`) are masked whole whatever their shape. The logged path has credential query parameters (`key`, `token`, `api_key`, `access_token` and similar) and credential-shaped segments masked, and JSON object keys are masked as well as values.
 - Masking is pattern based and applies to the text of JSON strings. It will not catch a secret in an unrecognised format, a password in prose, or personal data. Set `body = "summary"` or `"none"` where that matters.
 
 ## Where it sits in the chain

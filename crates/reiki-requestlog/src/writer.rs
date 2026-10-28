@@ -180,7 +180,12 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
     record.insert("stream".into(), json!(request.stream));
     record.insert("upstream".into(), json!(request.upstream));
     record.insert("method".into(), json!(request.method));
-    record.insert("path".into(), json!(request.path));
+    let path = if config.redact {
+        redact::path(&request.path)
+    } else {
+        request.path
+    };
+    record.insert("path".into(), json!(path));
 
     if !request.headers.is_empty() {
         let headers: Map<String, Value> = request
@@ -188,7 +193,7 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
             .iter()
             .map(|(name, value)| {
                 let value = if config.redact {
-                    redact::secrets(value).into_owned()
+                    redact::header(name, value).into_owned()
                 } else {
                     value.clone()
                 };

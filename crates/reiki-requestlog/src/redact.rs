@@ -26,7 +26,60 @@ pub fn secrets(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Masks every string value in place.
+/// Headers whose whole value is a credential, whatever shape it takes.
+const SECRET_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-goog-api-key",
+];
+
+/// Query parameters whose value is a credential.
+const SECRET_PARAMS: &[&str] = &[
+    "key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "auth",
+    "password",
+    "secret",
+];
+
+/// A header value, masked whole when the header carries credentials.
+pub fn header<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
+    if SECRET_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+        return Cow::Borrowed(MASK);
+    }
+    secrets(value)
+}
+
+/// A request path with credential query parameters and credential-shaped segments masked.
+pub fn path(path: &str) -> String {
+    let (base, query) = match path.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (path, None),
+    };
+    let mut out = secrets(base).into_owned();
+    if let Some(query) = query {
+        let masked: Vec<String> = query
+            .split('&')
+            .map(|part| match part.split_once('=') {
+                Some((name, _)) if SECRET_PARAMS.contains(&name.to_ascii_lowercase().as_str()) => {
+                    format!("{name}={MASK}")
+                }
+                _ => secrets(part).into_owned(),
+            })
+            .collect();
+        out.push('?');
+        out.push_str(&masked.join("&"));
+    }
+    out
+}
+
+/// Masks every string value and object key in place.
 pub fn json(value: &mut Value) {
     match value {
         Value::String(text) => {
@@ -35,7 +88,15 @@ pub fn json(value: &mut Value) {
             }
         }
         Value::Array(items) => items.iter_mut().for_each(json),
-        Value::Object(map) => map.values_mut().for_each(json),
+        Value::Object(map) => {
+            if map.keys().any(|k| matches!(secrets(k), Cow::Owned(_))) {
+                let old = std::mem::take(map);
+                for (key, item) in old {
+                    map.insert(secrets(&key).into_owned(), item);
+                }
+            }
+            map.values_mut().for_each(json);
+        }
         _ => {}
     }
 }
@@ -142,5 +203,31 @@ mod tests {
         assert!(!text.contains("sk-0123"), "{text}");
         assert!(text.contains("[REDACTED]"));
         assert!(text.contains("\"n\":3"));
+    }
+
+    #[test]
+    fn credential_headers_are_masked_whole() {
+        assert_eq!(header("Authorization", "Basic dXNlcjpwYXNz"), MASK);
+        assert_eq!(header("cookie", "sid=abc"), MASK);
+        assert_eq!(header("user-agent", "curl/8"), "curl/8");
+    }
+
+    #[test]
+    fn query_credentials_and_path_tokens_are_masked() {
+        assert_eq!(
+            path("/zen/v1/models?key=abc&alt=sse&Token=x"),
+            "/zen/v1/models?key=[REDACTED]&alt=sse&Token=[REDACTED]"
+        );
+        let token = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
+        assert_eq!(path(&format!("/x/{token}/y")), "/x/[REDACTED]/y");
+        assert_eq!(path("/plain"), "/plain");
+    }
+
+    #[test]
+    fn json_keys_are_masked_too() {
+        let key = fake("sk-", "0123456789abcdef0123456789");
+        let mut value: Value = serde_json::from_str(&format!("{{\"{key}\":1}}")).unwrap();
+        json(&mut value);
+        assert!(value.get("[REDACTED]").is_some(), "{value}");
     }
 }

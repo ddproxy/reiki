@@ -148,6 +148,9 @@ async fn main() {
                 Err(e) => fail(&format!("intercept: {e}")),
             }
         }
+        for text in reiki::forward::socket_warnings(&config) {
+            println!("warning: {text}");
+        }
         let admin = admin_listen
             .as_ref()
             .map_or(String::new(), |addr| format!(", admin on {addr}"));
@@ -171,6 +174,9 @@ async fn main() {
     }
 
     let tunnel_config = config.tunnel.take();
+    for text in reiki::forward::socket_warnings(&config) {
+        tracing::warn!("{text}");
+    }
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.load_persisted_state();

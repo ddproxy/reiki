@@ -32,6 +32,10 @@ pub enum ConfigError {
         upstream: String,
         reason: String,
     },
+    BadForward {
+        upstream: String,
+        reason: String,
+    },
     PassthroughKey {
         key: String,
         upstream: String,
@@ -98,6 +102,9 @@ impl fmt::Display for ConfigError {
             }
             Self::BadFallback { upstream, reason } => {
                 write!(f, "upstream `{upstream}` has an invalid fallback: {reason}")
+            }
+            Self::BadForward { upstream, reason } => {
+                write!(f, "upstream `{upstream}` has an invalid forward: {reason}")
             }
             Self::FallbackWithoutKeys {
                 stream,
@@ -271,6 +278,23 @@ pub struct Upstream {
     /// no Reiki token is needed and no key from the chain is used.
     #[serde(default)]
     pub passthrough: bool,
+    /// Run this command for each request instead of Reiki's HTTP clients.
+    /// The API token and outbound headers are written to the process stdin, never argv.
+    #[serde(default)]
+    pub forward: Option<Forward>,
+}
+
+/// A per-request child process that performs the upstream call.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Forward {
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    pub socket: Option<std::path::PathBuf>,
+    pub expect_uid: Option<u32>,
 }
 
 /// One hop to another upstream, used only when the chain has no usable key left here.
@@ -509,6 +533,9 @@ impl Config {
             {
                 return Some(format!("`{bad}` must be a path prefix starting with `/`"));
             }
+            if upstream.forward.is_some() {
+                return Some("an intercepted host cannot use a forward upstream".to_owned());
+            }
             match (&entry.stream, upstream.passthrough) {
                 (Some(_), true) => {
                     return Some(format!(
@@ -554,6 +581,70 @@ impl Config {
             }
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
+            }
+            if let Some(forward) = &upstream.forward {
+                let has_command = forward.command.is_some();
+                let has_socket = forward.socket.is_some();
+                if has_command == has_socket {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "set exactly one of `command` or `socket`".to_owned(),
+                    });
+                }
+                if let Some(command) = &forward.command {
+                    if command.trim().is_empty() {
+                        return Err(ConfigError::BadForward {
+                            upstream: name.clone(),
+                            reason: "command must not be empty".to_owned(),
+                        });
+                    }
+                }
+                if !has_command && (!forward.args.is_empty() || !forward.pass_env.is_empty()) {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "`args` and `pass_env` apply only to `command`".to_owned(),
+                    });
+                }
+                if has_command && forward.expect_uid.is_some() {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "`expect_uid` applies only to `socket`".to_owned(),
+                    });
+                }
+                if let Some(socket) = &forward.socket {
+                    if !socket.is_absolute() {
+                        return Err(ConfigError::BadForward {
+                            upstream: name.clone(),
+                            reason: "socket must be an absolute path".to_owned(),
+                        });
+                    }
+                    let len = socket.as_os_str().len();
+                    if len > 103 {
+                        return Err(ConfigError::BadForward {
+                            upstream: name.clone(),
+                            reason: "socket path must be at most 103 bytes".to_owned(),
+                        });
+                    }
+                    if cfg!(not(unix)) {
+                        return Err(ConfigError::BadForward {
+                            upstream: name.clone(),
+                            reason: "socket forwarding needs a Unix platform".to_owned(),
+                        });
+                    }
+                }
+                if upstream.http2 {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "http2 does not apply to a forward upstream".to_owned(),
+                    });
+                }
+                if upstream.title_case_headers {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "title_case_headers does not apply to a forward upstream"
+                            .to_owned(),
+                    });
+                }
             }
             if upstream.passthrough && upstream.fallback.is_some() {
                 return Err(ConfigError::BadFallback {
@@ -1116,6 +1207,273 @@ chain = ["zen-a"]
         assert_eq!(
             table.get("path").and_then(toml::Value::as_str),
             Some("/etc/reiki/secrets.toml")
+        );
+    }
+
+    #[test]
+    fn a_forward_command_is_kept_on_the_upstream() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"python3\"\nargs = [\"tests/external_child.py\"]\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        let config = Config::parse(&text).unwrap();
+        let fwd = config.upstream["zen"].forward.as_ref().unwrap();
+        assert_eq!(fwd.command.as_deref(), Some("python3"));
+        assert_eq!(fwd.args, ["tests/external_child.py"]);
+    }
+
+    #[test]
+    fn a_forward_empty_or_whitespace_command_is_rejected() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "command must not be empty".into(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "upstream `zen` has an invalid forward: command must not be empty"
+        );
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"  \"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "command must not be empty".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_rejects_incompatible_options() {
+        let text = format!(
+            r#"
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+http2 = true
+forward = {{command = "python3"}}
+
+[keys.zen-a]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-a"
+
+[streams.s]
+token_sha256 = "{HASH_A}"
+chain = ["zen-a"]
+"#
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "http2 does not apply to a forward upstream".into(),
+            }
+        );
+        let text = format!(
+            r#"
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+title_case_headers = true
+forward = {{command = "python3"}}
+
+[keys.zen-a]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-a"
+
+[streams.s]
+token_sha256 = "{HASH_A}"
+chain = ["zen-a"]
+"#
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "title_case_headers does not apply to a forward upstream".into(),
+            }
+        );
+        // forward on an intercept host
+        let text = format!(
+            r#"
+[tunnel]
+listen = "127.0.0.1:8443"
+allow = ["example.com"]
+connect_timeout_secs = 10
+[tunnel.intercept]
+ca_cert = "/x/ca.crt"
+ca_key = "/x/ca.key"
+hosts = [{{host="example.com", upstream="zen", stream="s"}}]
+
+[upstream.zen]
+base_url = "https://example.com"
+forward = {{command = "python3"}}
+
+[keys.k]
+upstream = "zen"
+file = "/x"
+
+[streams.s]
+token_sha256 = "{HASH_A}"
+chain = ["k"]
+"#
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(matches!(err, ConfigError::BadTunnel(_)));
+        assert!(err.to_string().contains("forward upstream"));
+    }
+
+    #[test]
+    fn forward_validates_exactly_one_of_command_or_socket() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "set exactly one of `command` or `socket`".into(),
+            }
+        );
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"python3\"\nsocket = \"/tmp/sock\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "set exactly one of `command` or `socket`".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_args_pass_env_apply_only_to_command() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"/tmp/sock\"\nargs = [\"x\"]\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "`args` and `pass_env` apply only to `command`".into(),
+            }
+        );
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"/tmp/sock\"\npass_env = [\"X\"]\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "`args` and `pass_env` apply only to `command`".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_expect_uid_applies_only_to_socket() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"python3\"\nexpect_uid = 1000\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "`expect_uid` applies only to `socket`".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn forward_socket_must_be_absolute_and_short_enough() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"tmp/sock\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "socket must be an absolute path".into(),
+            }
+        );
+        let edge = format!("/{}", "a".repeat(102));
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"{edge}\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert!(Config::parse(&text).is_ok(), "103 bytes is allowed");
+        let long = format!("/{}", "a".repeat(103));
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"{}\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n",
+            long
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "socket path must be at most 103 bytes".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_passthrough_forward_upstream_is_refused_on_an_intercepted_host_too() {
+        let text = r#"
+[tunnel]
+listen = "127.0.0.1:8443"
+allow = ["example.com"]
+connect_timeout_secs = 10
+[tunnel.intercept]
+ca_cert = "/x/ca.crt"
+ca_key = "/x/ca.key"
+hosts = [{host="example.com", upstream="zen"}]
+
+[upstream.zen]
+base_url = "https://example.com"
+passthrough = true
+
+[upstream.zen.forward]
+socket = "/run/forwarder.sock"
+"#;
+        let err = Config::parse(text).unwrap_err();
+        assert!(matches!(err, ConfigError::BadTunnel(_)), "{err}");
+        assert!(err.to_string().contains("forward upstream"));
+    }
+
+    #[test]
+    fn forward_socket_needs_unix() {
+        if cfg!(unix) {
+            return;
+        }
+        let text = base(&format!(
+            "[upstream.zen.forward]\nsocket = \"/tmp/sock\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward {
+                upstream: "zen".into(),
+                reason: "socket forwarding needs a Unix platform".into(),
+            }
         );
     }
 }

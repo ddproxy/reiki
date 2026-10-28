@@ -93,6 +93,30 @@ impl UpstreamResponse {
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         self.body
     }
+
+    pub fn from_bytes(
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        body: Bytes,
+    ) -> Self {
+        Self {
+            status,
+            headers,
+            version,
+            body: Box::pin(OnceBody(Some(body))),
+        }
+    }
+}
+
+struct OnceBody(Option<Bytes>);
+
+impl Stream for OnceBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.take().map(Ok))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -133,11 +157,11 @@ where
     )))))
 }
 
-type SendFuture<'a> =
+pub type SendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<UpstreamResponse, std::io::Error>> + Send + 'a>>;
 
-/// One request to an upstream. `credential` is the auth header name and value to set,
-/// or `None` to send the client's own credentials untouched.
+/// One request to an upstream. `credential` is the auth header name and formatted
+/// value to set, or `None` to send the client's own credentials untouched.
 pub struct Call<'a> {
     pub parts: &'a Parts,
     pub url: &'a str,
@@ -367,5 +391,23 @@ where
             .as_mut()
             .poll_next(cx)
             .map(|item| item.map(|result| result.map_err(std::io::Error::other)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn from_bytes_yields_the_body_once() {
+        let mut response = UpstreamResponse::from_bytes(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Version::HTTP_11,
+            Bytes::from_static(b"hi"),
+        );
+        let chunk = response.chunk().await.unwrap().unwrap();
+        assert_eq!(&chunk[..], b"hi");
+        assert!(response.chunk().await.is_none());
     }
 }

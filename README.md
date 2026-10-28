@@ -41,6 +41,9 @@ base_url = "https://api.example.com/v1"   # must be https
 # forward_accept_encoding = true          # send the client's Accept-Encoding (default: identity)
 # title_case_headers = true               # send Content-Type rather than content-type (HTTP/1.1)
 # send_keep_alive = true                  # add Connection: keep-alive
+# [upstream.example.forward]              # optional: hand requests to a listener or command
+# socket = "/run/forwarder.sock"          # or `command` with optional `args` and `pass_env`
+# # expect_uid = 1000                     # socket only
 
 [keys.example-a]
 upstream = "example"
@@ -67,6 +70,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
 - `http2` lets Reiki negotiate HTTP/2 with that upstream over TLS, and `forward_accept_encoding` sends the client's own `Accept-Encoding` upstream instead of `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself, so error bodies are still read for key failover, and sends the client plain bytes. Both are off by default; see [docs/providers.md](docs/providers.md).
+- `[upstream.X.forward]` hands each request to a Unix socket listener or a spawned command, which speaks plain HTTP/1.1 and forwards it onward; the key goes only in the normal credential header. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
 - `[tunnel]` adds a CONNECT forward proxy with a destination allowlist. Destinations pass through untouched by default; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic too, relaying each request as the client sent it. See [docs/tunnel.md](docs/tunnel.md).
 - `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).

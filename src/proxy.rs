@@ -18,12 +18,15 @@ use crate::auth::{constant_time_eq, extract_token, sha256_hex, strip_query_key};
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
+use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, RequestMeta};
 use crate::rewrite::rewrite_body;
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use reiki_plugin::{Event, FailureKind};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+const FORWARDER_FAILED_BODY: &[u8] =
+    b"{\"error\":{\"type\":\"bad_gateway\",\"message\":\"the upstream could not be reached\"}}";
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Stands in for the stream name when a request needs none.
@@ -216,6 +219,7 @@ pub struct App {
     policy: Policy,
     standard: Standard,
     faithful: Faithful,
+    forwarder: Forwarder,
     header_timeout: Duration,
     state_path: OnceLock<PathBuf>,
     /// Held across snapshot and write, so a stale snapshot cannot land after a newer one.
@@ -262,6 +266,7 @@ impl App {
             policy,
             standard: Standard::new(),
             faithful: Faithful::new(),
+            forwarder: Forwarder,
             header_timeout,
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
@@ -272,9 +277,11 @@ impl App {
         })
     }
 
-    /// The faithful transport relays the request as the client sent it; the standard one rebuilds it.
-    fn transport(&self, faithful: bool) -> &dyn Transport {
-        if faithful {
+    /// Forward wins when configured; otherwise faithful keeps the client request, standard rebuilds it.
+    fn transport(&self, faithful: bool, upstream: &crate::config::Upstream) -> &dyn Transport {
+        if upstream.forward.is_some() {
+            &self.forwarder
+        } else if faithful {
             &self.faithful
         } else {
             &self.standard
@@ -812,7 +819,12 @@ async fn dispatch_inner(
     // One hop only: when nothing is left to try here, hand the request to the
     // fallback upstream, re-mapped for it, instead of failing the client.
     if let (Err(spent), Some(fallback)) = (&mut result, &upstream.fallback) {
-        if let Some(target) = snapshot.config.upstream.get(&fallback.upstream) {
+        if let Some(target) = snapshot
+            .config
+            .upstream
+            .get(&fallback.upstream)
+            .filter(|_| !spent.link_failed)
+        {
             tracing::warn!(stream = %stream, from = upstream_name, to = %fallback.upstream, "falling back");
             let failed = spent
                 .refusal
@@ -865,6 +877,21 @@ async fn dispatch_inner(
 struct Spent {
     refusal: Option<(String, StatusCode, HeaderMap, Bytes)>,
     plugin_states: Vec<Box<dyn Any + Send>>,
+    /// The forwarder link failed, which is final: no fallback upstream is tried.
+    link_failed: bool,
+}
+
+fn forwarder_failed(key: String, plugin_states: Vec<Box<dyn Any + Send>>) -> Box<Spent> {
+    Box::new(Spent {
+        refusal: Some((
+            key,
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            Bytes::from_static(FORWARDER_FAILED_BODY),
+        )),
+        plugin_states,
+        link_failed: true,
+    })
 }
 
 /// Everything one in-flight request needs, kept together so `forward` stays
@@ -921,8 +948,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         };
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
 
+        // For a forward upstream this bounds the whole exchange, not only response headers.
         let sent = tokio::time::timeout(app.header_timeout, async {
-            app.transport(faithful)
+            app.transport(faithful, upstream)
                 .send(Call {
                     parts,
                     url: &url,
@@ -936,7 +964,17 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
 
         let response = match sent {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) | Err(_) => {
+            failed => {
+                if upstream.forward.is_some() {
+                    let reason = match &failed {
+                        Ok(Err(err)) => err.to_string(),
+                        _ => "timed out".to_owned(),
+                    };
+                    tracing::error!(error = %reason, "forwarder failed");
+                    app.plugins
+                        .on_attempt(&mut plugin_states, &key_name, None, &[]);
+                    return Err(forwarder_failed(key_name, plugin_states));
+                }
                 app.plugins
                     .on_attempt(&mut plugin_states, &key_name, None, &[]);
                 record(
@@ -1040,6 +1078,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     Err(Box::new(Spent {
         refusal: last_refusal,
         plugin_states,
+        link_failed: false,
     }))
 }
 
@@ -1058,8 +1097,9 @@ async fn forward_passthrough(
         ..
     } = fwd;
     let url = target_url(upstream, rest, parts);
+    // For a forward upstream this bounds the whole exchange, not only response headers.
     let sent = tokio::time::timeout(app.header_timeout, async {
-        app.transport(faithful)
+        app.transport(faithful, upstream)
             .send(Call {
                 parts,
                 url: &url,
@@ -1088,10 +1128,20 @@ async fn forward_passthrough(
                 parts.method == Method::HEAD,
             ))
         }
-        Ok(Err(error)) => {
+        Ok(Err(err)) => {
+            if upstream.forward.is_some() {
+                tracing::error!(error = %err, "forwarder failed");
+                app.plugins
+                    .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+                return Ok(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_gateway",
+                    "the upstream could not be reached",
+                ));
+            }
             app.plugins
                 .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
-            tracing::warn!(%error, "passthrough request failed");
+            tracing::warn!(%err, "passthrough request failed");
             Ok(json_error(
                 StatusCode::BAD_GATEWAY,
                 "bad_gateway",
@@ -1099,6 +1149,16 @@ async fn forward_passthrough(
             ))
         }
         Err(_) => {
+            if upstream.forward.is_some() {
+                tracing::error!(error = "timed out", "forwarder failed");
+                app.plugins
+                    .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+                return Ok(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_gateway",
+                    "the upstream could not be reached",
+                ));
+            }
             app.plugins
                 .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
             Ok(json_error(

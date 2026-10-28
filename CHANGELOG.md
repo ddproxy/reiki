@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+
+- Per-upstream `[upstream.X.forward]` table hands each request to a `socket` listener or a `command`, both speaking plain HTTP/1.1. See [docs/providers.md](docs/providers.md#forwarding).
+- `expect_uid` on a socket makes Reiki check the peer's uid before writing the key.
+- `pass_env` for a command; otherwise its environment is cleared except `PATH`, `HOME`, `LANG` and `LC_ALL`.
+- A failed link to a forwarder answers 502 without cooling the key, retrying, or using a fallback upstream.
+- `reiki check` and startup warn about a missing or non-socket path, or a writable socket directory without `expect_uid`.
+
 ## 0.6.0
 
 ### Changed

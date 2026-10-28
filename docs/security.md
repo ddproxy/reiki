@@ -3,6 +3,7 @@
 ## Clients and keys
 
 - Clients never see upstream keys. Reiki removes the client's credential headers (`authorization`, `x-api-key`, `x-goog-api-key`) and any `key` query parameter, then sets the upstream's header from the key file.
+- The key travels to whoever accepts on an `[upstream.X.forward]` socket or runs as its `command`, in the normal credential header only, with no second copy. A command gets a cleared environment plus `pass_env`. Keep the socket in a directory only the Reiki user and the listener can enter, and set `expect_uid` so Reiki refuses a socket owned by another uid. A failed link to the forwarder answers 502 and never cools the key.
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
 - Upstreams come only from the config. A request cannot choose its own destination, so Reiki is not an open proxy.
 - Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions, so create them with mode 0600.
@@ -11,7 +12,7 @@
 
 Reiki listens on `listen`, default `127.0.0.1:4097`. It serves plain HTTP and has no TLS. Keep it on loopback, or put a TLS-terminating proxy in front of it before exposing it. Upstream URLs must be `https`, except loopback addresses used in tests.
 
-## Forwarding
+## Header handling
 
 Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length`, the client credential headers and `accept-encoding`. It asks the upstream for `identity` encoding so error bodies can be classified. Redirects from the upstream are not followed.
 

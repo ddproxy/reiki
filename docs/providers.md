@@ -48,6 +48,81 @@ The credential header is always sent first, ahead of the client's own headers. T
 
 These change how Reiki connects, nothing more. Reiki does not add, rewrite or invent client-identifying headers, and the settings do not change which requests an upstream accepts.
 
+## Forwarding
+
+A forward upstream hands each request to a listener or a program instead of sending it over the network itself. The listener or program can pass it on to another process, a queue, another harness or a proxy.
+
+Socket target, an already-running listener:
+
+```toml
+[upstream.example.forward]
+socket = "/run/forwarder.sock"
+expect_uid = 1000
+```
+
+Command target, a program started per request:
+
+```toml
+[upstream.example.forward]
+command = "/usr/local/bin/forward-request"
+args = ["--config", "/etc/forward.toml"]
+pass_env = ["FORWARD_TARGET"]
+```
+
+Set exactly one of `socket` or `command`.
+
+### What the forwarder receives
+
+Reiki is the HTTP client and speaks plain HTTP/1.1 with nothing custom. The request line uses the path and query of the upstream URL, and `Host` is the upstream host:
+
+```http
+POST /v1/chat?x=1 HTTP/1.1
+Host: example.com
+X-Forwarded-Proto: https
+Connection: close
+Content-Length: 2
+Authorization: Bearer <key>
+Content-Type: application/json
+
+{}
+```
+
+The client's other headers pass through as for a normal upstream. The key is sent only in the upstream's credential header, with no second copy and no Reiki-specific header. On a `passthrough` upstream the client's own credential is forwarded unchanged.
+
+### What Reiki does with the answer
+
+The status must be 200-599. The body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. Nothing reaches the client until the forwarder has finished.
+
+A forwarder's own error status (for example 401, 402, 429 or 5xx) is treated exactly like an upstream returning it, so normal key classification and failover apply. A forwarder can acknowledge and queue work by answering at once with 202; no special mode is needed.
+
+### Failures
+
+Any failure of the link to the forwarder answers the client with 502. That covers a failure to connect or start, a wrong uid, a connection closed without a response, a malformed or oversized response, a bad status and a timeout. Reiki logs it at error level without key material. It does not cool the key, does not retry on the same or another key, and does not use a configured `fallback` upstream.
+
+### Command specifics
+
+- Reiki spawns the program once per request and speaks HTTP over its stdin and stdout.
+- The environment is cleared except `PATH`, `HOME`, `LANG`, `LC_ALL` and the names in `pass_env`.
+- `stderr` is discarded.
+- The response is returned as soon as it is complete. The program then has 1 second to exit before it is killed.
+- A program still running when the request times out is killed. Processes it started are not.
+
+### Socket specifics
+
+- Reiki connects to an existing listener. It never creates, chmods or deletes the socket.
+- The path must be absolute and at most 103 bytes. Unix only.
+- With `expect_uid`, Reiki reads the peer's uid after connecting and before writing anything, and refuses with 502 if it differs.
+- Keep the socket in a directory that only the Reiki user and the listener can enter, and set `expect_uid`. See [security](security.md). Inside a rootless container or user namespace, the uid is the mapped one.
+- `reiki check` and startup warn when the socket does not exist yet, is not a socket, or sits in a group- or world-writable directory without `expect_uid`.
+- Test a listener with `curl --unix-socket PATH http://localhost/...`.
+
+### Limits and restrictions
+
+- `args` and `pass_env` are valid only with `command`. `expect_uid` is valid only with `socket`.
+- A forward upstream cannot be combined with `http2`, `title_case_headers` or an intercepted tunnel host. Startup rejects these.
+- `header_timeout` (default 120 seconds) bounds the whole exchange: connect, send and the full response.
+- A client that disconnects does not cancel the request.
+
 ## OpenAI
 
 ```toml

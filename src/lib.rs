@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chain;
 pub mod classify;
 pub mod config;
+pub mod forward;
 pub mod intercept;
 pub mod logging;
 pub mod plugins;

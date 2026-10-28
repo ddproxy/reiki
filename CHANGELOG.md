@@ -1,11 +1,25 @@
 # Changelog
 
-## 0.7.3
+## 0.7.4
 
 ### Added
 
 - A `gov` plugin that blocks or reports CUI, classification and dissemination markings, plus label-bound EIN, ITIN, CAGE, UEI, EDIPI and ECCN values, in outbound request bodies. See [docs/gov.md](docs/gov.md).
 - A `finance` plugin that blocks or reports financial identifiers (IBAN, SWIFT/BIC, Bitcoin and Ethereum addresses, CUSIP, ISIN, card data next to CVV or track data, and header-bound account and SEDOL values) in outbound request bodies. See [docs/finance.md](docs/finance.md).
+- A `reiki-detect` crate holds the scanning helpers the detection plugins share.
+
+### Fixed
+
+- The `phi` plugin scanned large tables and bodies of unclosed `INSERT` statements in time that grew with the square of their size, so one large request could hold the proxy for minutes in block mode. Scan time is now linear.
+
+### Changed
+
+- A bare CUSIP is reported only next to a `cusip` label or in a `cusip` column, because a random nine-character token passes the check digit one time in ten.
+
+## 0.7.3
+
+### Added
+
 - The `phi` plugin reads tables: it maps header names and SQL column lists to identifier kinds and checks the cells under them, in CSV, TSV, pipe-delimited and Markdown text, SQL `INSERT` and `COPY` blocks. A new default-on `column` kind covers name, address, phone, zip and diagnosis columns.
 - `pass_errors = true` on an upstream relays every error status as it is, so a 403 from a git server cannot take the key out of rotation.
 

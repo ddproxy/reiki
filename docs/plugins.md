@@ -17,7 +17,7 @@ file = "/var/lib/reiki/requests.jsonl"
 - `enabled = false` turns a configured plugin off.
 - `on_error` is `"pass_through"` (default) or `"reject"`. It decides what happens when a plugin reports that it could not apply (a skip): `pass_through` logs it and carries on, `reject` answers the client with 503. A plugin that deliberately rejects a request always rejects, whatever `on_error` says.
 - `reiki check` adds `dry_run = true` to every plugin table. A plugin should then validate its settings only, and not open files, sockets or threads, so the check has no side effects and works while Reiki is running.
-- Plugin settings are read at startup. A SIGHUP reload checks the plugin tables (an unknown plugin name or a bad setting keeps the old config) and logs a warning when they changed, but does not rebuild plugins, so changing a `[plugins.*]` table needs a restart.
+- A reload rebuilds only the plugins whose table changed and keeps the rest running, with their counters and files. An unknown plugin name or a bad setting keeps the old config. A plugin that holds a file or socket, such as `requestlog`, keeps running and is reported as needing a restart. See [reload](troubleshooting.md#reload).
 - Plugins run in the order they are registered at build time (see below), not in the order of the config file. Request hooks run in that order; response hooks run in the reverse order, so the plugin that changed the request first sees the response last and can undo its change before the client gets it.
 
 ## Bundled plugins

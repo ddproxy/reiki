@@ -1058,7 +1058,7 @@ async fn reload_with_an_invalid_config_keeps_the_old_snapshot_serving() {
     let h = harness(&one_stream(), Policy::default()).await;
     let path = std::env::temp_dir().join(format!("reiki-bad-{}.toml", std::process::id()));
     std::fs::write(&path, "listen = 5\nthis is not toml").unwrap();
-    h.app.reload_from_file(&path);
+    assert!(h.app.reload_from_file(&path).is_err());
     let _ = std::fs::remove_file(&path);
     let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
     assert_eq!(res.status(), 200);

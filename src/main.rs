@@ -189,7 +189,22 @@ async fn main() {
             .as_ref()
             .map_or(String::new(), |addr| format!(", admin on {addr}"));
         let admin = match &config.tunnel {
-            Some(tunnel) => format!("{admin}, tunnel on {}", tunnel.listen),
+            Some(tunnel) => {
+                let intercepted = tunnel
+                    .intercept
+                    .as_ref()
+                    .map_or(0, |intercept| intercept.hosts.len());
+                let private = if tunnel.deny_private {
+                    ", private ranges denied"
+                } else {
+                    ""
+                };
+                format!(
+                    "{admin}, tunnel on {} ({} allowed, {intercepted} intercepted{private})",
+                    tunnel.listen,
+                    tunnel.allow.len()
+                )
+            }
             None => admin,
         };
         let names = plugins.names().collect::<Vec<_>>();
@@ -213,6 +228,7 @@ async fn main() {
     }
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
+    app.set_config_path(cli.config.clone());
     app.load_persisted_state();
     #[cfg(unix)]
     spawn_sighup_reload(Arc::clone(&app), cli.config.clone(), Arc::clone(&logging));
@@ -241,7 +257,9 @@ async fn main() {
             tracing::info!(hosts = intercept.hosts.len(), "reiki tunnel intercepting");
             built = built.with_interceptor(Arc::new(interceptor));
         }
-        tokio::spawn(reiki::tunnel::serve(tunnel_listener, Arc::new(built)));
+        let built = Arc::new(built);
+        app.set_tunnel(Arc::clone(&built));
+        tokio::spawn(reiki::tunnel::serve(tunnel_listener, built));
     }
     tracing::info!(%listen, "reiki listening");
     reiki::serve::serve(listener, router(app), 1024, async {

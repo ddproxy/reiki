@@ -9,6 +9,7 @@ pub mod logging;
 pub mod plugins;
 pub mod proxy;
 pub mod quota;
+pub mod reload;
 pub mod rewrite;
 pub mod scan;
 pub mod serve;

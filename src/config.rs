@@ -416,7 +416,7 @@ fn default_leaf_ttl_hours() -> u64 {
 }
 
 /// One intercepted host and the upstream its requests are relayed to.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptHost {
     pub host: String,

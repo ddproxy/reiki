@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -21,7 +20,7 @@ use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::Config;
 use crate::forward::Forwarder;
-use crate::plugins::{PluginChain, RequestMeta};
+use crate::plugins::{PluginChain, PluginSession, RequestMeta};
 use crate::rewrite::rewrite_body;
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use reiki_plugin::{Event, FailureKind};
@@ -234,9 +233,13 @@ pub struct App {
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: OnceLock<i64>,
     logins: LoginThrottle,
-    plugins: Arc<PluginChain>,
-    /// The plugin tables the running chain was built from, which a reload cannot change.
-    plugin_tables: std::collections::BTreeMap<String, toml::Table>,
+    /// Replaced by a reload; a request holds the chain it started with through its [`PluginSession`].
+    plugins: RwLock<Arc<PluginChain>>,
+    /// The tunnel, once started, so a reload can change its policy.
+    tunnel: OnceLock<Arc<crate::tunnel::Tunnel>>,
+    /// Where the config was read from, for a reload that is not tied to a file argument.
+    config_path: OnceLock<PathBuf>,
+    reload_state: Mutex<crate::reload::ReloadState>,
 }
 
 impl App {
@@ -265,7 +268,6 @@ impl App {
         header_timeout: Duration,
         plugins: PluginChain,
     ) -> Arc<Self> {
-        let plugin_tables = config.plugins.clone();
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
@@ -279,8 +281,10 @@ impl App {
             wall_clock: OnceLock::new(),
             ca_not_after: OnceLock::new(),
             logins: LoginThrottle::default(),
-            plugins: Arc::new(plugins),
-            plugin_tables,
+            plugins: RwLock::new(Arc::new(plugins)),
+            tunnel: OnceLock::new(),
+            config_path: OnceLock::new(),
+            reload_state: Mutex::new(crate::reload::ReloadState::new()),
         })
     }
 
@@ -300,8 +304,15 @@ impl App {
         Arc::clone(&guard)
     }
 
-    pub(crate) fn plugins(&self) -> &PluginChain {
-        &self.plugins
+    /// The chain new requests start on.
+    pub(crate) fn plugins(&self) -> Arc<PluginChain> {
+        let guard = self.plugins.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Starts a request's plugin session on the current chain.
+    pub(crate) fn session(&self) -> PluginSession {
+        self.plugins().session()
     }
 
     pub(crate) fn health(&self) -> &Mutex<KeyState> {
@@ -382,30 +393,6 @@ impl App {
             .snapshot
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if current.config.listen != next.config.listen {
-            tracing::warn!(
-                from = %current.config.listen,
-                to = %next.config.listen,
-                "listen changed; restart reiki to change the listen address"
-            );
-        }
-        let admin_listen = |snapshot: &Snapshot| {
-            snapshot
-                .config
-                .admin
-                .as_ref()
-                .map(|admin| admin.listen.clone())
-        };
-        if self.plugin_tables != next.config.plugins {
-            tracing::warn!("plugin settings changed; restart reiki to apply them");
-        }
-        if admin_listen(&current) != admin_listen(&next) {
-            tracing::warn!(
-                from = ?admin_listen(&current),
-                to = ?admin_listen(&next),
-                "admin listener changed; restart reiki to apply it"
-            );
-        }
         health.retain_keys(|name| next.keys.contains_key(name));
         for (name, secret) in &next.keys {
             let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
@@ -416,32 +403,150 @@ impl App {
         *current = next;
     }
 
+    /// Hands the app the running tunnel so a reload can change its policy.
+    pub fn set_tunnel(&self, tunnel: Arc<crate::tunnel::Tunnel>) {
+        let _ = self.tunnel.set(tunnel);
+    }
+
+    /// Records the config path that `POST /reload` re-reads.
+    pub fn set_config_path(&self, path: PathBuf) {
+        let _ = self.config_path.set(path);
+    }
+
+    /// The `config` object of `/status`: the reload generation, when it loaded and how the last reload went.
+    pub fn reload_status_json(&self) -> String {
+        self.reload_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .status_json()
+    }
+
     /// The SIGHUP action. Live health is authoritative once running, so the state
     /// file is deliberately not replayed here: it would revive the disabled flag
     /// of a key whose secret was just rotated.
     pub fn reload_on_hangup(&self, path: &Path) {
-        self.reload_from_file(path);
+        match self.reload_from_file(path) {
+            Ok(report) => tracing::info!(
+                generation = report.generation,
+                "reloaded: {}",
+                report.summary()
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "reload failed; keeping the current config");
+            }
+        }
     }
 
-    /// Re-read the config and key files, keeping the current snapshot on any error.
-    pub fn reload_from_file(&self, path: &Path) {
-        let loaded = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))
-            .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")))
-            .and_then(|config| {
-                let keys = load_keys(&config).map_err(|e| e.to_string())?;
-                let dry = crate::plugins::with_dry_run(&config.plugins);
-                crate::plugins::PluginChain::build(&dry, &crate::plugins::builtin())
-                    .map_err(|e| format!("config: {e}"))?;
-                Ok((config, keys))
-            });
-        match loaded {
-            Ok((config, keys)) => {
-                self.reload(config, keys);
-                tracing::info!("reloaded config and keys");
-            }
-            Err(e) => tracing::warn!(error = %e, "reload failed; keeping the current config"),
+    /// Reloads from the path given to [`App::set_config_path`].
+    pub fn reload_now(&self) -> Result<crate::reload::ReloadReport, String> {
+        let Some(path) = self.config_path.get() else {
+            return Err("the config path is not known to this instance".to_owned());
+        };
+        let result = self.reload_from_file(path);
+        match &result {
+            Ok(report) => tracing::info!(
+                generation = report.generation,
+                "reloaded: {}",
+                report.summary()
+            ),
+            Err(error) => tracing::warn!(%error, "reload failed; keeping the current config"),
         }
+        result
+    }
+
+    /// Re-reads the config and key files and applies what can change live: keys, streams,
+    /// upstreams, plugin settings, the tunnel policy and the intercept host table. Everything is
+    /// built and checked first, so a failure at any step leaves the running state untouched.
+    pub fn reload_from_file(&self, path: &Path) -> Result<crate::reload::ReloadReport, String> {
+        let result = self.try_reload(path);
+        let mut state = self
+            .reload_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &result {
+            Ok(report) => state.record_ok(report),
+            Err(error) => state.record_error(error),
+        }
+        result
+    }
+
+    fn try_reload(&self, path: &Path) -> Result<crate::reload::ReloadReport, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let config = Config::parse(&text).map_err(|e| format!("config: {e}"))?;
+        let keys = load_keys(&config).map_err(|e| e.to_string())?;
+        // Dry-run the plugin settings first: the real build below opens files and sockets.
+        let dry = crate::plugins::with_dry_run(&config.plugins);
+        crate::plugins::PluginChain::build(&dry, &crate::plugins::builtin())
+            .map_err(|e| format!("config: {e}"))?;
+        let registry = crate::plugins::builtin();
+        let rebuilt = self
+            .plugins()
+            .rebuild(&config.plugins, &registry)
+            .map_err(|e| format!("config: {e}"))?;
+        let tunnel_plan = match (self.tunnel.get(), &config.tunnel) {
+            (Some(tunnel), Some(wanted)) => Some(
+                tunnel
+                    .plan_reload(wanted)
+                    .map_err(|e| format!("config: {e}"))?,
+            ),
+            _ => None,
+        };
+
+        let mut changed = Vec::new();
+        let mut restart_needed: Vec<String> = rebuilt
+            .restart_needed
+            .iter()
+            .map(|name| format!("plugins.{name}"))
+            .collect();
+        if !rebuilt.changed.is_empty() {
+            changed.push(format!("plugins {}", rebuilt.changed.join(",")));
+        }
+        let current = self.snapshot();
+        if current.config.listen != config.listen {
+            restart_needed.push("listen".to_owned());
+        }
+        let admin_listen = |c: &Config| c.admin.as_ref().map(|a| a.listen.clone());
+        if admin_listen(&current.config) != admin_listen(&config) {
+            restart_needed.push("admin.listen".to_owned());
+        }
+        let tunnel_listen = |c: &Config| c.tunnel.as_ref().map(|t| t.listen.clone());
+        if tunnel_listen(&current.config) != tunnel_listen(&config) {
+            restart_needed.push("tunnel.listen".to_owned());
+        }
+        if current.config.log.file != config.log.file {
+            restart_needed.push("log.file".to_owned());
+        }
+        match (self.tunnel.get(), &config.tunnel) {
+            (Some(_), None) => restart_needed.push("tunnel removed".to_owned()),
+            (None, Some(_)) => restart_needed.push("tunnel added".to_owned()),
+            _ => {}
+        }
+        if let Some(plan) = &tunnel_plan {
+            changed.extend(plan.changed.iter().cloned());
+            restart_needed.extend(plan.restart_needed.iter().cloned());
+        }
+        drop(current);
+
+        // Nothing below can fail, so the new state lands whole or not at all.
+        let (key_count, stream_count) = (keys.len(), config.streams.len());
+        let generation = self
+            .reload_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .next_generation();
+        self.reload(config, keys);
+        *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
+        if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
+            tunnel.apply_reload(plan);
+        }
+        Ok(crate::reload::ReloadReport {
+            generation,
+            changed,
+            restart_needed,
+            keys: key_count,
+            streams: stream_count,
+        })
     }
 }
 
@@ -476,7 +581,7 @@ fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
 }
 
 /// Escapes text for use inside a JSON string literal.
-fn json_escape(text: &str) -> String {
+pub(crate) fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -616,7 +721,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         // rejected request never reaches the upstream or touches key health.
         if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
             tracing::warn!(stream = %stream, "stream rate limit exceeded");
-            app.plugins
+            app.plugins()
                 .on_event(&Event::RateLimited { stream: &stream });
             return rate_limited_response(wait);
         }
@@ -698,7 +803,7 @@ pub(crate) async fn handle_intercepted(
     };
     if !upstream.passthrough {
         if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
-            app.plugins.on_event(&Event::RateLimited { stream });
+            app.plugins().on_event(&Event::RateLimited { stream });
             return rate_limited_response(wait);
         }
     }
@@ -824,7 +929,7 @@ async fn dispatch_inner(
 
     // Run request hooks once, before the failover loop, so every attempt sees
     // the same transformed request.
-    let mut plugin_states = app.plugins.states();
+    let mut plugin_states = app.session();
     let meta = RequestMeta {
         id,
         stream,
@@ -832,10 +937,7 @@ async fn dispatch_inner(
         method: &parts.method,
         path: parts.uri.path(),
     };
-    if let Err(blocked) =
-        app.plugins
-            .on_request(&mut plugin_states, &meta, &mut parts.headers, &mut body)
-    {
+    if let Err(blocked) = plugin_states.on_request(&meta, &mut parts.headers, &mut body) {
         return json_error(blocked.status, "blocked", &blocked.message);
     }
     if body.len() > MAX_REQUEST_BODY {
@@ -881,7 +983,7 @@ async fn dispatch_inner(
                 .refusal
                 .as_ref()
                 .map_or(StatusCode::SERVICE_UNAVAILABLE, |r| r.1);
-            app.plugins.on_event(&Event::RequestDone {
+            app.plugins().on_event(&Event::RequestDone {
                 stream,
                 upstream: upstream_name,
                 status: failed.as_u16(),
@@ -910,13 +1012,13 @@ async fn dispatch_inner(
         Ok(response) => response,
         Err(spent) => match spent.refusal {
             Some((key, status, headers, body)) => {
-                let mut states = spent.plugin_states;
-                finish_buffered(&app.plugins, &mut states, &key, status, &headers, body)
+                let mut session = spent.plugin_states;
+                finish_buffered(&mut session, &key, status, &headers, body)
             }
             None => exhausted(snapshot, &app.health, stream),
         },
     };
-    app.plugins.on_event(&Event::RequestDone {
+    app.plugins().on_event(&Event::RequestDone {
         stream,
         upstream: used,
         status: response.status().as_u16(),
@@ -927,12 +1029,12 @@ async fn dispatch_inner(
 /// A request whose chain ran dry; the plugin state lets a fallback continue it.
 struct Spent {
     refusal: Option<(String, StatusCode, HeaderMap, Bytes)>,
-    plugin_states: Vec<Box<dyn Any + Send>>,
+    plugin_states: PluginSession,
     /// The forwarder link failed, which is final: no fallback upstream is tried.
     link_failed: bool,
 }
 
-fn forwarder_failed(key: String, plugin_states: Vec<Box<dyn Any + Send>>) -> Box<Spent> {
+fn forwarder_failed(key: String, plugin_states: PluginSession) -> Box<Spent> {
     Box::new(Spent {
         refusal: Some((
             key,
@@ -954,7 +1056,7 @@ struct Forward<'a> {
     upstream: &'a crate::config::Upstream,
     parts: &'a Parts,
     rest: &'a str,
-    plugin_states: Vec<Box<dyn Any + Send>>,
+    plugin_states: PluginSession,
     faithful: bool,
 }
 
@@ -990,7 +1092,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         // Only count a failover once the next key is actually in hand, so a dead
         // end does not inflate the counter.
         if let Some((failed_key, kind)) = pending_failover.take() {
-            app.plugins.on_event(&Event::Failover {
+            app.plugins().on_event(&Event::Failover {
                 stream,
                 key: &failed_key,
                 kind,
@@ -1024,12 +1126,10 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                         _ => "timed out".to_owned(),
                     };
                     tracing::error!(error = %reason, "forwarder failed");
-                    app.plugins
-                        .on_attempt(&mut plugin_states, &key_name, None, &[]);
+                    plugin_states.on_attempt(&key_name, None, &[]);
                     return Err(forwarder_failed(key_name, plugin_states));
                 }
-                app.plugins
-                    .on_attempt(&mut plugin_states, &key_name, None, &[]);
+                plugin_states.on_attempt(&key_name, None, &[]);
                 record(
                     app,
                     snapshot,
@@ -1054,8 +1154,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             "forwarded"
         );
         if status.is_success() || status.is_redirection() {
-            app.plugins
-                .on_attempt(&mut plugin_states, &key_name, Some(status.as_u16()), &[]);
+            plugin_states.on_attempt(&key_name, Some(status.as_u16()), &[]);
             let had_failures = if let Ok(mut health) = app.health.lock() {
                 let had = health.consecutive_failures(&key_name) > 0;
                 health.record_success(&key_name);
@@ -1068,7 +1167,6 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 app.persist_state();
             }
             return Ok(stream_response(
-                app,
                 plugin_states,
                 &key_name,
                 response,
@@ -1085,12 +1183,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         let secrets = [secret.0.as_str(), auth_value.as_str()];
         let snippet = scrub(read_limited(response).await, &secrets);
         let response_headers = scrub_headers(response_headers, &secrets);
-        app.plugins.on_attempt(
-            &mut plugin_states,
-            &key_name,
-            Some(status.as_u16()),
-            &snippet,
-        );
+        plugin_states.on_attempt(&key_name, Some(status.as_u16()), &snippet);
         let text = String::from_utf8_lossy(&snippet);
 
         let outcome = if upstream.pass_errors {
@@ -1101,7 +1194,6 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         match outcome {
             Outcome::Success | Outcome::PassThrough => {
                 return Ok(finish_buffered(
-                    &app.plugins,
                     &mut plugin_states,
                     &key_name,
                     status,
@@ -1192,14 +1284,8 @@ async fn forward_passthrough(
         Ok(Ok(response)) => {
             let status = response.status;
             tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version, "passed through");
-            app.plugins.on_attempt(
-                &mut plugin_states,
-                PASSTHROUGH_KEY,
-                Some(status.as_u16()),
-                &[],
-            );
+            plugin_states.on_attempt(PASSTHROUGH_KEY, Some(status.as_u16()), &[]);
             Ok(stream_response(
-                app,
                 plugin_states,
                 PASSTHROUGH_KEY,
                 response,
@@ -1209,16 +1295,14 @@ async fn forward_passthrough(
         Ok(Err(err)) => {
             if upstream.forward.is_some() {
                 tracing::error!(error = %err, "forwarder failed");
-                app.plugins
-                    .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+                plugin_states.on_attempt(PASSTHROUGH_KEY, None, &[]);
                 return Ok(json_error(
                     StatusCode::BAD_GATEWAY,
                     "bad_gateway",
                     "the upstream could not be reached",
                 ));
             }
-            app.plugins
-                .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+            plugin_states.on_attempt(PASSTHROUGH_KEY, None, &[]);
             tracing::warn!(%err, "passthrough request failed");
             Ok(json_error(
                 StatusCode::BAD_GATEWAY,
@@ -1229,16 +1313,14 @@ async fn forward_passthrough(
         Err(_) => {
             if upstream.forward.is_some() {
                 tracing::error!(error = "timed out", "forwarder failed");
-                app.plugins
-                    .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+                plugin_states.on_attempt(PASSTHROUGH_KEY, None, &[]);
                 return Ok(json_error(
                     StatusCode::BAD_GATEWAY,
                     "bad_gateway",
                     "the upstream could not be reached",
                 ));
             }
-            app.plugins
-                .on_attempt(&mut plugin_states, PASSTHROUGH_KEY, None, &[]);
+            plugin_states.on_attempt(PASSTHROUGH_KEY, None, &[]);
             Ok(json_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",
@@ -1306,7 +1388,7 @@ fn record(
         let cooled =
             health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
         if cooled {
-            app.plugins.on_event(&Event::Cooldown {
+            app.plugins().on_event(&Event::Cooldown {
                 key,
                 kind: FailureKind::from(class),
             });
@@ -1426,8 +1508,7 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
 }
 
 fn stream_response(
-    app: &App,
-    plugin_states: Vec<Box<dyn Any + Send>>,
+    plugin_states: PluginSession,
     key: &str,
     response: UpstreamResponse,
     is_head: bool,
@@ -1439,13 +1520,12 @@ fn stream_response(
     if let Some(length) = response.headers.get(header::CONTENT_LENGTH) {
         headers.insert(header::CONTENT_LENGTH, length.clone());
     }
-    let body = if app.plugins.is_empty() {
+    let body = if plugin_states.is_empty() {
         Body::from_stream(response.into_stream())
     } else {
-        let mut states = plugin_states;
+        let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
-        app.plugins
-            .on_response_head(&mut states, key, &mut status, &mut headers);
+        session.on_response_head(key, &mut status, &mut headers);
         // A plugin may change the body length, and a known length would also stop
         // the final `is_last` call from being made. These responses carry no body, so
         // their length is only metadata.
@@ -1455,8 +1535,7 @@ fn stream_response(
             headers.remove(header::CONTENT_LENGTH);
         }
         Body::from_stream(PluginBody {
-            chain: Arc::clone(&app.plugins),
-            states,
+            session,
             inner: response.into_stream(),
             done: false,
         })
@@ -1469,21 +1548,20 @@ fn stream_response(
 
 /// Runs the response hooks over a body that arrived in one piece.
 fn finish_buffered(
-    chain: &PluginChain,
-    states: &mut [Box<dyn Any + Send>],
+    session: &mut PluginSession,
     key: &str,
     status: StatusCode,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    if chain.is_empty() {
+    if session.is_empty() {
         return buffered_response(status, headers, body);
     }
     let mut status = status;
     let mut headers = headers.clone();
-    chain.on_response_head(states, key, &mut status, &mut headers);
+    session.on_response_head(key, &mut status, &mut headers);
     let mut body = body;
-    chain.on_response_chunk(states, &mut body, true);
+    session.on_response_chunk(&mut body, true);
     buffered_response(status, &headers, body)
 }
 
@@ -1493,8 +1571,7 @@ fn finish_buffered(
 /// split across chunks only delays the chunks it spans. The final empty poll
 /// gives plugins the `is_last` call to release anything they held back.
 struct PluginBody {
-    chain: Arc<PluginChain>,
-    states: Vec<Box<dyn Any + Send>>,
+    session: PluginSession,
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     done: bool,
 }
@@ -1518,8 +1595,7 @@ impl Stream for PluginBody {
                 Poll::Ready(None) => {
                     this.done = true;
                     let mut tail = Bytes::new();
-                    this.chain
-                        .on_response_chunk(&mut this.states, &mut tail, true);
+                    this.session.on_response_chunk(&mut tail, true);
                     return if tail.is_empty() {
                         Poll::Ready(None)
                     } else {
@@ -1531,8 +1607,7 @@ impl Stream for PluginBody {
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
-                    this.chain
-                        .on_response_chunk(&mut this.states, &mut chunk, false);
+                    this.session.on_response_chunk(&mut chunk, false);
                     if chunk.is_empty() {
                         continue;
                     }

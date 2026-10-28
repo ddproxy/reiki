@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -49,8 +50,30 @@ pub struct Registration {
 }
 
 struct Entry {
-    plugin: Box<dyn Plugin>,
+    plugin: Arc<dyn Plugin>,
     on_error: OnError,
+    /// The `[plugins.<name>]` table the instance was built from, to tell on a reload whether it changed.
+    table: toml::Table,
+}
+
+impl Entry {
+    /// The same plugin instance, for the next chain.
+    fn share(&self) -> Self {
+        Self {
+            plugin: Arc::clone(&self.plugin),
+            on_error: self.on_error,
+            table: self.table.clone(),
+        }
+    }
+}
+
+/// A rebuilt chain and what the rebuild changed.
+pub struct Rebuilt {
+    pub chain: PluginChain,
+    /// Plugins that were added, removed or rebuilt with new settings.
+    pub changed: Vec<String>,
+    /// Plugins whose settings changed but cannot be applied to a running instance.
+    pub restart_needed: Vec<String>,
 }
 
 /// Who is asking and for what, as the request hooks see it.
@@ -106,10 +129,80 @@ impl PluginChain {
                 name: reg.name.to_string(),
                 message,
             })?;
-            entries.push(Entry { plugin, on_error });
+            entries.push(Entry {
+                plugin: Arc::from(plugin),
+                on_error,
+                table: table.clone(),
+            });
         }
         Self::check_admin_paths(&entries)?;
         Ok(Self { entries })
+    }
+
+    /// Builds the next chain for a reload. A plugin whose table did not change keeps its running
+    /// instance, so open files, sockets and counters survive. A changed plugin is built again,
+    /// unless it reports `live_reload() == false`: then it keeps running and is listed in
+    /// `restart_needed`. Requests already in flight keep the chain they started with.
+    pub fn rebuild(
+        &self,
+        configured: &BTreeMap<String, toml::Table>,
+        registry: &[Registration],
+    ) -> Result<Rebuilt, ConfigError> {
+        for name in configured.keys() {
+            if !registry.iter().any(|r| r.name == name) {
+                return Err(ConfigError::UnknownPlugin {
+                    name: name.clone(),
+                    known: registry.iter().map(|r| r.name.to_string()).collect(),
+                });
+            }
+        }
+        let mut entries = Vec::new();
+        let mut changed = Vec::new();
+        let mut restart_needed = Vec::new();
+        for reg in registry {
+            let old = self.entries.iter().find(|e| e.plugin.name() == reg.name);
+            let wanted = match configured.get(reg.name) {
+                Some(table) if enabled(reg.name, table)? => Some(table),
+                _ => None,
+            };
+            match (old, wanted) {
+                (None, None) => {}
+                (Some(_), None) => changed.push(reg.name.to_owned()),
+                (Some(old), Some(table)) if old.table == *table => entries.push(old.share()),
+                (Some(old), Some(_)) if !old.plugin.live_reload() => {
+                    restart_needed.push(reg.name.to_owned());
+                    entries.push(old.share());
+                }
+                (_, Some(table)) => {
+                    let on_error = on_error(reg.name, table)?;
+                    let plugin =
+                        (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
+                            name: reg.name.to_string(),
+                            message,
+                        })?;
+                    changed.push(reg.name.to_owned());
+                    entries.push(Entry {
+                        plugin: Arc::from(plugin),
+                        on_error,
+                        table: table.clone(),
+                    });
+                }
+            }
+        }
+        Self::check_admin_paths(&entries)?;
+        Ok(Rebuilt {
+            chain: Self { entries },
+            changed,
+            restart_needed,
+        })
+    }
+
+    /// Starts a request's plugin session: this chain and fresh per-request state for each plugin.
+    pub fn session(self: &Arc<Self>) -> PluginSession {
+        PluginSession {
+            chain: Arc::clone(self),
+            states: self.states(),
+        }
     }
 
     fn check_admin_paths(entries: &[Entry]) -> Result<(), ConfigError> {
@@ -298,6 +391,62 @@ impl PluginChain {
     }
 }
 
+/// One request's plugin chain and per-plugin state. It owns the chain it started with, so a reload
+/// that swaps the chain mid-request cannot pair the request's state with the wrong plugins.
+pub struct PluginSession {
+    chain: Arc<PluginChain>,
+    states: Vec<Box<dyn Any + Send>>,
+}
+
+impl Default for PluginSession {
+    fn default() -> Self {
+        Self {
+            chain: Arc::new(PluginChain::default()),
+            states: Vec::new(),
+        }
+    }
+}
+
+impl PluginSession {
+    /// True when no plugin in this session touches bodies.
+    pub fn is_empty(&self) -> bool {
+        self.chain.is_empty()
+    }
+
+    /// The chain this session runs.
+    pub fn chain(&self) -> &Arc<PluginChain> {
+        &self.chain
+    }
+
+    pub fn on_request(
+        &mut self,
+        meta: &RequestMeta<'_>,
+        headers: &mut HeaderMap,
+        body: &mut Bytes,
+    ) -> Result<(), Blocked> {
+        self.chain.on_request(&mut self.states, meta, headers, body)
+    }
+
+    pub fn on_attempt(&mut self, key: &str, status: Option<u16>, body: &[u8]) {
+        self.chain.on_attempt(&mut self.states, key, status, body);
+    }
+
+    pub fn on_response_head(
+        &mut self,
+        key: &str,
+        status: &mut StatusCode,
+        headers: &mut HeaderMap,
+    ) {
+        self.chain
+            .on_response_head(&mut self.states, key, status, headers);
+    }
+
+    pub fn on_response_chunk(&mut self, chunk: &mut Bytes, is_last: bool) {
+        self.chain
+            .on_response_chunk(&mut self.states, chunk, is_last);
+    }
+}
+
 /// Runs a plugin hook, turning a panic into a logged `None` so one faulty plugin cannot take the request task down.
 fn guard<T>(plugin: &str, hook: &str, run: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
@@ -483,6 +632,145 @@ mod tests {
             &mut headers,
             body,
         )
+    }
+
+    struct Sticky;
+    impl Plugin for Sticky {
+        fn name(&self) -> &str {
+            "sticky"
+        }
+        fn live_reload(&self) -> bool {
+            false
+        }
+    }
+
+    fn rebuild_registry() -> Vec<Registration> {
+        vec![
+            Registration {
+                name: "append",
+                build: |_| Ok(Box::new(Append("-tail")) as Box<dyn Plugin>),
+            },
+            Registration {
+                name: "sticky",
+                build: |_| Ok(Box::new(Sticky) as Box<dyn Plugin>),
+            },
+        ]
+    }
+
+    fn same_instance(a: &PluginChain, b: &PluginChain, name: &str) -> bool {
+        let find = |c: &PluginChain| {
+            c.entries
+                .iter()
+                .find(|e| e.plugin.name() == name)
+                .map(|e| Arc::clone(&e.plugin))
+        };
+        match (find(a), find(b)) {
+            (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_rebuild_reuses_unchanged_plugins_and_rebuilds_changed_ones() {
+        let registry = rebuild_registry();
+        let first =
+            PluginChain::build(&configured("[append]\nn = 1\n[sticky]\n"), &registry).unwrap();
+
+        let same = first
+            .rebuild(&configured("[append]\nn = 1\n[sticky]\n"), &registry)
+            .unwrap();
+        assert!(same.changed.is_empty() && same.restart_needed.is_empty());
+        assert!(same_instance(&first, &same.chain, "append"));
+        assert!(same_instance(&first, &same.chain, "sticky"));
+
+        let edited = first
+            .rebuild(&configured("[append]\nn = 2\n[sticky]\n"), &registry)
+            .unwrap();
+        assert_eq!(edited.changed, ["append"]);
+        assert!(!same_instance(&first, &edited.chain, "append"), "rebuilt");
+        assert!(same_instance(&first, &edited.chain, "sticky"), "untouched");
+
+        let dropped = first.rebuild(&configured("[sticky]\n"), &registry).unwrap();
+        assert_eq!(dropped.changed, ["append"]);
+        assert_eq!(dropped.chain.names().collect::<Vec<_>>(), ["sticky"]);
+
+        let disabled = first
+            .rebuild(
+                &configured("[append]\nenabled = false\n[sticky]\n"),
+                &registry,
+            )
+            .unwrap();
+        assert_eq!(disabled.changed, ["append"]);
+
+        let added = dropped
+            .chain
+            .rebuild(&configured("[append]\n[sticky]\n"), &registry)
+            .unwrap();
+        assert_eq!(added.changed, ["append"]);
+        assert_eq!(
+            added.chain.names().collect::<Vec<_>>(),
+            ["append", "sticky"]
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_cannot_reload_live_keeps_running_and_asks_for_a_restart() {
+        let registry = rebuild_registry();
+        let first = PluginChain::build(&configured("[sticky]\nsize = 1\n"), &registry).unwrap();
+        let next = first
+            .rebuild(&configured("[sticky]\nsize = 2\n"), &registry)
+            .unwrap();
+        assert_eq!(next.restart_needed, ["sticky"]);
+        assert!(next.changed.is_empty());
+        assert!(
+            same_instance(&first, &next.chain, "sticky"),
+            "the running instance stays"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_with_an_unknown_plugin_or_a_bad_table_changes_nothing() {
+        let registry = rebuild_registry();
+        let first = PluginChain::build(&configured("[append]\n"), &registry).unwrap();
+        assert!(first.rebuild(&configured("[nope]\n"), &registry).is_err());
+        assert!(first
+            .rebuild(
+                &configured("[append]\non_error = \"sideways\"\n"),
+                &registry
+            )
+            .is_err());
+        assert_eq!(first.names().collect::<Vec<_>>(), ["append"]);
+    }
+
+    #[test]
+    fn a_session_keeps_the_chain_it_started_with_across_a_rebuild() {
+        let registry = rebuild_registry();
+        let chain =
+            Arc::new(PluginChain::build(&configured("[append]\n[sticky]\n"), &registry).unwrap());
+        let mut session = chain.session();
+        let next = chain
+            .rebuild(&configured("[sticky]\n"), &registry)
+            .unwrap()
+            .chain;
+        assert_eq!(next.names().count(), 1);
+
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream: "s",
+            upstream: "u",
+            method: &method,
+            path: "/x",
+        };
+        let mut headers = HeaderMap::new();
+        let mut body = Bytes::from_static(b"body");
+        session.on_request(&meta, &mut headers, &mut body).unwrap();
+        assert_eq!(
+            &body[..],
+            b"body-tail",
+            "the in-flight request still runs `append`"
+        );
+        assert!(Arc::ptr_eq(session.chain(), &chain));
     }
 
     #[test]
@@ -727,8 +1015,9 @@ mod tests {
         let mut chain = PluginChain::default();
         for plugin in entries {
             chain.entries.push(Entry {
-                plugin: Box::new(plugin),
+                plugin: Arc::new(plugin),
                 on_error: OnError::PassThrough,
+                table: toml::Table::new(),
             });
         }
         PluginChain::check_admin_paths(&chain.entries)?;

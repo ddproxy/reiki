@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::auth::{constant_time_eq, sha256_hex};
@@ -19,6 +19,7 @@ use reiki_plugin::KeyCounts;
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/reload", post(reload))
         .fallback(get(plugin_route))
         .with_state(app)
 }
@@ -36,6 +37,11 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         build_status(&snapshot, &health, now)
     };
+    let body = {
+        let mut body = body;
+        body.pop();
+        format!("{body},\"config\":{}}}", app.reload_status_json())
+    };
     let body = match app.ca_not_after() {
         Some(not_after) => {
             let now = std::time::SystemTime::now()
@@ -49,6 +55,28 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         None => body,
     };
     text_response(StatusCode::OK, "application/json", body)
+}
+
+/// Re-reads the config and applies what can change live, like SIGHUP, and returns what changed.
+async fn reload(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if !access_allowed(&app, &headers) {
+        return unauthorized();
+    }
+    let worker = Arc::clone(&app);
+    let outcome = tokio::task::spawn_blocking(move || worker.reload_now()).await;
+    match outcome {
+        Ok(Ok(report)) => text_response(StatusCode::OK, "application/json", report.to_json()),
+        Ok(Err(error)) => text_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "application/json",
+            crate::reload::error_json(&error),
+        ),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            crate::reload::error_json("the reload task failed"),
+        ),
+    }
 }
 
 async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {

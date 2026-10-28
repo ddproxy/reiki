@@ -2,14 +2,14 @@
 //! so the client's own TLS session reaches the destination untouched.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 
 use crate::config::TunnelConfig;
-use crate::intercept::{Interceptor, Prefixed};
+use crate::intercept::{InterceptPlan, Interceptor, Prefixed};
 
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,21 +74,47 @@ pub fn allowed(entries: &[String], host: &str, port: u16) -> bool {
         .any(|r| r.allows(host, port))
 }
 
-pub struct Tunnel {
+/// The part of the tunnel policy a reload can replace while connections are open.
+struct Policy {
     rules: Vec<Rule>,
+    /// The `allow` entries as written, to describe what a reload changed.
+    allow: Vec<String>,
     connect_timeout: Duration,
     allow_loopback: bool,
     deny_private: bool,
+}
+
+impl Policy {
+    fn from_config(config: &TunnelConfig) -> Self {
+        Self {
+            rules: config.allow.iter().filter_map(|r| Rule::parse(r)).collect(),
+            allow: config.allow.clone(),
+            connect_timeout: Duration::from_secs(config.connect_timeout_secs),
+            allow_loopback: config.allow_loopback,
+            deny_private: config.deny_private,
+        }
+    }
+}
+
+pub struct Tunnel {
+    policy: RwLock<Arc<Policy>>,
     interceptor: Option<Arc<Interceptor>>,
+}
+
+/// A validated change to the tunnel, ready to apply without any further failure.
+pub struct TunnelPlan {
+    policy: Arc<Policy>,
+    intercept: Option<InterceptPlan>,
+    /// What changes, such as `tunnel allow +2/-0`.
+    pub changed: Vec<String>,
+    /// Settings that differ from the running tunnel but cannot be applied live.
+    pub restart_needed: Vec<String>,
 }
 
 impl Tunnel {
     pub fn new(config: &TunnelConfig) -> Self {
         Self {
-            rules: config.allow.iter().filter_map(|r| Rule::parse(r)).collect(),
-            connect_timeout: Duration::from_secs(config.connect_timeout_secs),
-            allow_loopback: config.allow_loopback,
-            deny_private: config.deny_private,
+            policy: RwLock::new(Arc::new(Policy::from_config(config))),
             interceptor: None,
         }
     }
@@ -100,16 +126,84 @@ impl Tunnel {
         self
     }
 
+    fn policy(&self) -> Arc<Policy> {
+        let guard = self.policy.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Checks `config` against the running tunnel and describes what a reload would change. The
+    /// CA files and the listen address are not reloadable: a CA path change refuses the whole
+    /// reload, and adding or removing interception is reported as needing a restart.
+    pub fn plan_reload(&self, config: &TunnelConfig) -> Result<TunnelPlan, String> {
+        let current = self.policy();
+        let next = Arc::new(Policy::from_config(config));
+        let mut changed = Vec::new();
+        let added = next
+            .allow
+            .iter()
+            .filter(|a| !current.allow.contains(a))
+            .count();
+        let removed = current
+            .allow
+            .iter()
+            .filter(|a| !next.allow.contains(a))
+            .count();
+        if added + removed > 0 {
+            changed.push(format!("tunnel allow +{added}/-{removed}"));
+        }
+        if current.deny_private != next.deny_private {
+            changed.push(format!("tunnel deny_private {}", next.deny_private));
+        }
+        if current.allow_loopback != next.allow_loopback {
+            changed.push(format!("tunnel allow_loopback {}", next.allow_loopback));
+        }
+        if current.connect_timeout != next.connect_timeout {
+            changed.push("tunnel connect_timeout_secs".to_owned());
+        }
+        let mut restart_needed = Vec::new();
+        let intercept = match (&self.interceptor, &config.intercept) {
+            (Some(running), Some(wanted)) => {
+                let plan = running.plan_reload(wanted)?;
+                changed.extend(plan.changed.iter().cloned());
+                Some(plan)
+            }
+            (None, None) => None,
+            (Some(_), None) => {
+                restart_needed.push("tunnel.intercept removed".to_owned());
+                None
+            }
+            (None, Some(_)) => {
+                restart_needed.push("tunnel.intercept added".to_owned());
+                None
+            }
+        };
+        Ok(TunnelPlan {
+            policy: next,
+            intercept,
+            changed,
+            restart_needed,
+        })
+    }
+
+    /// Swaps in a plan from [`Tunnel::plan_reload`]. Open tunnels keep running.
+    pub fn apply_reload(&self, plan: TunnelPlan) {
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = plan.policy;
+        if let (Some(interceptor), Some(plan)) = (&self.interceptor, plan.intercept) {
+            interceptor.apply_reload(plan);
+        }
+    }
+
     fn allows(&self, host: &str, port: u16) -> bool {
-        self.rules.iter().any(|r| r.allows(host, port))
+        self.policy().rules.iter().any(|r| r.allows(host, port))
     }
 
     /// Keeps an allowed name from being pointed back at this machine's own services.
     fn reachable(&self, addr: &SocketAddr) -> bool {
-        if self.deny_private && private_ip(addr.ip()) {
+        let policy = self.policy();
+        if policy.deny_private && private_ip(addr.ip()) {
             return false;
         }
-        if self.allow_loopback {
+        if policy.allow_loopback {
             return true;
         }
         let local = match addr.ip() {
@@ -296,7 +390,11 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
     }
 
     let started = Instant::now();
-    let upstream = tokio::time::timeout(tunnel.connect_timeout, connect(tunnel, &host, port)).await;
+    let upstream = tokio::time::timeout(
+        tunnel.policy().connect_timeout,
+        connect(tunnel, &host, port),
+    )
+    .await;
     let mut upstream = match upstream {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -426,11 +524,18 @@ mod tests {
     use super::*;
 
     fn tunnel(allow: &[&str]) -> Tunnel {
+        tunnel_with(allow, false)
+    }
+
+    fn tunnel_with(allow: &[&str], deny_private: bool) -> Tunnel {
         Tunnel {
-            rules: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
-            connect_timeout: Duration::from_secs(5),
-            allow_loopback: false,
-            deny_private: false,
+            policy: RwLock::new(Arc::new(Policy {
+                rules: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
+                allow: allow.iter().map(|r| (*r).to_owned()).collect(),
+                connect_timeout: Duration::from_secs(5),
+                allow_loopback: false,
+                deny_private,
+            })),
             interceptor: None,
         }
     }
@@ -513,7 +618,8 @@ mod tests {
 
     #[test]
     fn deny_private_refuses_the_local_network_but_not_the_internet() {
-        let mut t = tunnel(&["*"]);
+        let open = tunnel(&["*"]);
+        let closed = tunnel_with(&["*"], true);
         let private = [
             "10.0.0.5:443",
             "172.16.1.1:443",
@@ -524,13 +630,12 @@ mod tests {
         ];
         for addr in private {
             assert!(
-                t.reachable(&addr.parse().unwrap()),
+                open.reachable(&addr.parse().unwrap()),
                 "open by default: {addr}"
             );
         }
-        t.deny_private = true;
         for addr in private {
-            assert!(!t.reachable(&addr.parse().unwrap()), "{addr}");
+            assert!(!closed.reachable(&addr.parse().unwrap()), "{addr}");
         }
         for addr in [
             "93.184.216.34:443",
@@ -538,7 +643,7 @@ mod tests {
             "172.32.0.1:443",
             "100.128.0.1:443",
         ] {
-            assert!(t.reachable(&addr.parse().unwrap()), "{addr}");
+            assert!(closed.reachable(&addr.parse().unwrap()), "{addr}");
         }
     }
 }

@@ -54,6 +54,25 @@ What each level shows:
 
 Key values and stream tokens are never logged.
 
+## Reload
+
+Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config and key files, build and check the whole new state first, and swap it in only if every part is valid. A bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
+
+Applied live:
+
+- keys, streams, upstreams and the admin token hash
+- plugin settings: a plugin whose `[plugins.<name>]` table did not change keeps running, so its counters and open files survive. A changed table builds that plugin again, and adding or removing a table adds or removes the plugin. The `requestlog` plugin holds a file and a socket, so a changed `requestlog` table is reported as needing a restart and the running log is kept.
+- the tunnel `allow` list, `deny_private`, `allow_loopback` and `connect_timeout_secs`
+- the intercept host table, `require_auth` and `leaf_ttl_hours`
+
+Needs a restart, and is reported in the result as `restart_needed`:
+
+- every `listen` address (client, admin and tunnel) and the `[log]` file path
+- adding or removing `[tunnel]` or `[tunnel.intercept]`
+- the CA files: a changed `ca_cert` or `ca_key` refuses the whole reload
+
+The result lists what changed, and the log carries one line per reload. `GET /status` shows `config.generation` (the number of successful reloads), `config.loaded_at` and `config.last_reload`, with the error when the last attempt failed. See [monitoring](monitoring.md#post-reload).
+
 ## Key health
 
 Key health is saved next to the config, as `<config>.state`, and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as; otherwise Reiki logs a warning and runs without persistence. A reload keeps the live health of keys whose files did not change and resets the keys whose files did, and does not read the state file again. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy (rotation is detected from the file's modification time, so a copy that preserves the old time, such as `cp -p` or `mv` of an old file, is not seen); a missing or unreadable state file is ignored with a warning.

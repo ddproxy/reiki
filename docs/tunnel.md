@@ -29,7 +29,7 @@ HTTPS_PROXY=http://127.0.0.1:4099 NO_PROXY=127.0.0.1,localhost some-client
 - The filter also refuses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`. The host's other interface addresses are not filtered, so avoid a broad allowlist such as `*`.
 - Each closed tunnel is logged at `info` with the destination host and port, bytes in each direction and the duration. Nothing inside an opaque tunnel is visible, so there is no request log, no placeholders, no key injection and no failover for it.
 - At most 512 tunnels run at once and 64 from one peer address; more get 503. The CONNECT request head must arrive within 10 seconds, and an opaque tunnel is closed after one hour.
-- Changes to `[tunnel]` need a restart; a SIGHUP reload does not rebuild the listener.
+- A reload changes `allow`, `deny_private`, `allow_loopback` and `connect_timeout_secs` without a restart; open tunnels keep running. A new `listen` address needs a restart. See [reload](troubleshooting.md#reload).
 
 ## Interception
 
@@ -76,4 +76,4 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - An intercepted host may use an upstream with an `[upstream.X.forward]` table. Reiki still terminates the client's TLS, authenticates the stream and swaps the key; the request then goes to the forwarder instead of Reiki's own TLS client, so the upstream sees the forwarder's handshake. Add `streaming = true` there so event streams are not held until they finish. See [providers](providers.md#forwarding).
 - What Reiki cannot reproduce is the client's TLS handshake: the upstream sees Reiki's own TLS client. Only the opaque tunnel keeps the client's handshake, and it cannot swap a key.
 - Hosts that are allowed but not listed under `hosts` stay opaque.
-- Interception needs a restart to change, like the rest of `[tunnel]`. See [security](security.md) for what to protect.
+- A reload changes the intercept hosts, `require_auth` and `leaf_ttl_hours`. The CA files cannot change live: a different `ca_cert` or `ca_key` refuses the reload, and adding or removing `[tunnel.intercept]` needs a restart. See [security](security.md) for what to protect.

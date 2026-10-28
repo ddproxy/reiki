@@ -117,7 +117,7 @@ A failed request replays on the next key as long as no response bytes have reach
 
 Key health persists across restarts in `<config>.state`. See [docs/troubleshooting.md](docs/troubleshooting.md#key-health).
 
-Limits: request bodies up to 8 MiB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
+Limits: request bodies up to 8 MiB, 120 s to receive upstream response headers. Send `kill -HUP <pid>` or `POST /reload` after changing the config or a key file to apply it without a restart. Plugin settings, the tunnel allowlist and the intercept hosts reload too; listen addresses and the CA need a restart. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).
 
 See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, [docs/security.md](docs/security.md) for the security model, and [docs/monitoring.md](docs/monitoring.md) for the optional admin listener.
 

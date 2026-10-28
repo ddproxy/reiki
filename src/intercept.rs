@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -207,10 +207,38 @@ const CA_WARN_DAYS: i64 = 30;
 pub struct Interceptor {
     app: Arc<App>,
     authority: Authority,
+    /// The CA paths it loaded, so a reload can refuse a change it cannot apply.
+    ca_cert: String,
+    ca_key: String,
+    settings: RwLock<Arc<Settings>>,
+    configs: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
+}
+
+/// What a reload can replace while tunnels are open.
+struct Settings {
     hosts: HashMap<String, InterceptHost>,
     ttl: Duration,
     require_auth: bool,
-    configs: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
+}
+
+impl Settings {
+    fn from_config(config: &InterceptConfig) -> Self {
+        Self {
+            hosts: config
+                .hosts
+                .iter()
+                .map(|h| (h.host.clone(), h.clone()))
+                .collect(),
+            ttl: Duration::from_secs(config.leaf_ttl_hours * 3600),
+            require_auth: config.require_auth,
+        }
+    }
+}
+
+/// A validated interception change, ready to apply.
+pub struct InterceptPlan {
+    settings: Arc<Settings>,
+    pub changed: Vec<String>,
 }
 
 impl Interceptor {
@@ -236,28 +264,88 @@ impl Interceptor {
         Ok(Self {
             app,
             authority,
-            hosts: config
-                .hosts
-                .iter()
-                .map(|h| (h.host.clone(), h.clone()))
-                .collect(),
-            ttl: Duration::from_secs(config.leaf_ttl_hours * 3600),
-            require_auth: config.require_auth,
+            ca_cert: config.ca_cert.clone(),
+            ca_key: config.ca_key.clone(),
+            settings: RwLock::new(Arc::new(Settings::from_config(config))),
             configs: Mutex::new(HashMap::new()),
         })
     }
 
+    fn settings(&self) -> Arc<Settings> {
+        let guard = self.settings.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Checks `config` against the loaded CA and describes the change. The CA files cannot be
+    /// swapped live, so a different path refuses the reload.
+    pub fn plan_reload(&self, config: &InterceptConfig) -> Result<InterceptPlan, String> {
+        if config.ca_cert != self.ca_cert || config.ca_key != self.ca_key {
+            return Err(
+                "tunnel.intercept ca_cert or ca_key changed; the CA is loaded at startup, restart reiki to use another"
+                    .to_owned(),
+            );
+        }
+        let current = self.settings();
+        let next = Arc::new(Settings::from_config(config));
+        let mut changed = Vec::new();
+        let added = next
+            .hosts
+            .keys()
+            .filter(|h| !current.hosts.contains_key(*h))
+            .count();
+        let removed = current
+            .hosts
+            .keys()
+            .filter(|h| !next.hosts.contains_key(*h))
+            .count();
+        let edited = next
+            .hosts
+            .iter()
+            .filter(|(h, v)| current.hosts.get(*h).is_some_and(|old| old != *v))
+            .count();
+        if added + removed + edited > 0 {
+            changed.push(format!(
+                "intercept hosts +{added}/-{removed}, {edited} edited"
+            ));
+        }
+        if current.require_auth != next.require_auth {
+            changed.push(format!("intercept require_auth {}", next.require_auth));
+        }
+        if current.ttl != next.ttl {
+            changed.push("intercept leaf_ttl_hours".to_owned());
+        }
+        Ok(InterceptPlan {
+            settings: next,
+            changed,
+        })
+    }
+
+    /// Swaps in a plan from [`Interceptor::plan_reload`]. Certificates already minted stay cached
+    /// until they age out, and open tunnels finish on the settings they started with.
+    pub fn apply_reload(&self, plan: InterceptPlan) {
+        if !plan.settings.require_auth {
+            tracing::warn!(
+                "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
+            );
+        }
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = plan.settings;
+    }
+
     pub fn handles(&self, host: &str) -> bool {
-        self.hosts.contains_key(host)
+        self.settings().hosts.contains_key(host)
     }
 
     /// True when a CONNECT to `host` may be intercepted. A host served from a stream spends that
     /// stream's keys, so the client must present the stream's token; a passthrough host spends none.
     pub fn authorize(&self, host: &str, proxy_authorization: Option<&str>) -> bool {
-        let Some(entry) = self.hosts.get(host) else {
+        let settings = self.settings();
+        let Some(entry) = settings.hosts.get(host) else {
             return false;
         };
-        let Some(stream) = entry.stream.as_deref().filter(|_| self.require_auth) else {
+        let Some(stream) = entry.stream.as_deref().filter(|_| settings.require_auth) else {
             return true;
         };
         let Some(token) = proxy_authorization.and_then(crate::auth::proxy_token) else {
@@ -268,13 +356,14 @@ impl Interceptor {
 
     /// Reuses a certificate until half its life is gone.
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+        let ttl = self.settings().ttl;
         let mut cache = self.configs.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((made, config)) = cache.get(host) {
-            if made.elapsed() < self.ttl / 2 {
+            if made.elapsed() < ttl / 2 {
                 return Ok(Arc::clone(config));
             }
         }
-        let config = self.authority.server_config(host, self.ttl)?;
+        let config = self.authority.server_config(host, ttl)?;
         cache.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
         Ok(config)
     }
@@ -284,7 +373,7 @@ impl Interceptor {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Some(target) = self.hosts.get(host).cloned() else {
+        let Some(target) = self.settings().hosts.get(host).cloned() else {
             return;
         };
         let config = match self.config_for(host) {

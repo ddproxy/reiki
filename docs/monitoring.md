@@ -35,7 +35,19 @@ Each stream:
 - `current_key`: the key the stream would prefer next, or `null`
 - `rate_limit_per_minute`: the stream's limit, or `null`
 
+- `config`: `generation` (successful reloads since start), `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and, after a failure, `error`
+
 The response carries no key values, token hashes or file paths.
+
+## POST /reload
+
+Applies a changed config like `SIGHUP`, with the same bearer token as `/status`, and returns the result as JSON. A successful reload answers `200`:
+
+```json
+{"ok":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
+```
+
+`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
 
 ## GET /metrics
 

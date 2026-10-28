@@ -163,6 +163,10 @@ impl Plugin for RequestLog {
         NAME
     }
 
+    fn live_reload(&self) -> bool {
+        false
+    }
+
     fn new_state(&self) -> Box<dyn Any + Send> {
         let Some(tx) = self.tx.clone() else {
             return Box::new(());

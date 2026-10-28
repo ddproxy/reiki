@@ -57,23 +57,24 @@ impl Kind {
         }
     }
 
+    /// Every kind, including the ones that are off by default.
+    pub const ALL: [Kind; 12] = [
+        Kind::Ssn,
+        Kind::Card,
+        Kind::Routing,
+        Kind::Account,
+        Kind::Dob,
+        Kind::MedicalId,
+        Kind::Npi,
+        Kind::Icd10,
+        Kind::Column,
+        Kind::Field,
+        Kind::Email,
+        Kind::Phone,
+    ];
+
     pub fn parse(label: &str) -> Option<Kind> {
-        [
-            Kind::Ssn,
-            Kind::Card,
-            Kind::Routing,
-            Kind::Account,
-            Kind::Dob,
-            Kind::MedicalId,
-            Kind::Npi,
-            Kind::Icd10,
-            Kind::Column,
-            Kind::Field,
-            Kind::Email,
-            Kind::Phone,
-        ]
-        .into_iter()
-        .find(|k| k.label() == label)
+        Kind::ALL.into_iter().find(|k| k.label() == label)
     }
 }
 

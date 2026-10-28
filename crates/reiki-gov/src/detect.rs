@@ -38,20 +38,21 @@ impl Kind {
         }
     }
 
+    /// Every kind, including the ones that are off by default.
+    pub const ALL: [Kind; 9] = [
+        Kind::Cui,
+        Kind::Classification,
+        Kind::Dissemination,
+        Kind::Ein,
+        Kind::Itin,
+        Kind::Cage,
+        Kind::Uei,
+        Kind::Edipi,
+        Kind::Eccn,
+    ];
+
     pub fn parse(label: &str) -> Option<Kind> {
-        [
-            Kind::Cui,
-            Kind::Classification,
-            Kind::Dissemination,
-            Kind::Ein,
-            Kind::Itin,
-            Kind::Cage,
-            Kind::Uei,
-            Kind::Edipi,
-            Kind::Eccn,
-        ]
-        .into_iter()
-        .find(|k| k.label() == label)
+        Kind::ALL.into_iter().find(|k| k.label() == label)
     }
 }
 

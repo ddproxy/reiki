@@ -45,19 +45,20 @@ impl Kind {
         }
     }
 
+    /// Every kind, including the ones that are off by default.
+    pub const ALL: [Kind; 8] = [
+        Kind::Iban,
+        Kind::Swift,
+        Kind::Crypto,
+        Kind::Cusip,
+        Kind::Isin,
+        Kind::PanSad,
+        Kind::Account,
+        Kind::Sedol,
+    ];
+
     pub fn parse(label: &str) -> Option<Kind> {
-        [
-            Kind::Iban,
-            Kind::Swift,
-            Kind::Crypto,
-            Kind::Cusip,
-            Kind::Isin,
-            Kind::PanSad,
-            Kind::Account,
-            Kind::Sedol,
-        ]
-        .into_iter()
-        .find(|k| k.label() == label)
+        Kind::ALL.into_iter().find(|k| k.label() == label)
     }
 }
 

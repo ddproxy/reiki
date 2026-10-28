@@ -39,6 +39,8 @@ Start in `report`, read the log for false positives, then switch to `block`.
 
 The keyword-bound kinds are off by default because their shapes alone collide with ordinary numbers and codes. Turn them on for a corpus that carries contracts or export paperwork.
 
+Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data to see what this plugin flags before you choose a mode.
+
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `cui x1, dissemination x1`, and never a value.

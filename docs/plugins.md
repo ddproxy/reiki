@@ -31,6 +31,22 @@ file = "/var/lib/reiki/requests.jsonl"
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
 | `metrics` | `plugin-metrics` | Serves Prometheus metrics at `GET /metrics` on the admin listener. See [monitoring](monitoring.md). |
 
+## Tune a detector with `reiki scan`
+
+`reiki scan` runs the `phi`, `finance` and `gov` detectors over files or stdin without the proxy, so you can see what a plugin would flag before you switch it from `report` to `block`.
+
+```bash
+reiki scan export.csv                       # each plugin's default kinds
+cat prompt.json | reiki scan --plugin phi   # one plugin, from stdin
+reiki scan --kinds ssn,iban dump.sql        # named kinds across plugins
+reiki scan --all --json notes.txt           # every kind, one JSON object per finding
+```
+
+- Each finding prints as `file:line:col plugin kind`. The matched text is never printed, so the output is safe to paste into a ticket. A summary goes to stderr.
+- The exit code is 0 for no findings, 1 for findings and 2 for a usage or read error, so the command also works as a pre-commit or CI check.
+- `--kinds` takes labels from any plugin. `--all` adds the kinds that are off by default.
+- It reads bytes as UTF-8 text with lossy conversion, the same way the plugins read a request body.
+
 ## Choose and order plugins at build time
 
 Cargo features only switch a plugin's code on, and they carry no order. Order comes from `REIKI_PLUGINS`, an ordered, comma-separated list read by `build.rs`:

@@ -30,6 +30,27 @@ enum Command {
     HashToken,
     /// Check the configuration and key files, then exit.
     Check,
+    /// Scan files or stdin with the detection plugins and print where they find identifiers.
+    ///
+    /// Prints `file:line:col plugin kind` for each finding and never the matched text. Exits 1 when
+    /// there are findings, 2 on a usage or read error. Use it to tune `kinds` before switching a
+    /// plugin from `report` to `block`.
+    Scan {
+        /// Plugin to run (phi, finance, gov); repeat for several. Default: every compiled-in one.
+        #[arg(long = "plugin")]
+        plugins: Vec<String>,
+        /// Kinds to look for, comma separated. Default: each plugin's default set.
+        #[arg(long, value_delimiter = ',', conflicts_with = "all")]
+        kinds: Vec<String>,
+        /// Look for every kind, including the ones that are off by default.
+        #[arg(long)]
+        all: bool,
+        /// Print one JSON object per finding.
+        #[arg(long)]
+        json: bool,
+        /// Files to scan; stdin when none are given.
+        files: Vec<PathBuf>,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -95,6 +116,16 @@ fn spawn_sighup_reload(app: Arc<App>, config: PathBuf, logging: Arc<reiki::loggi
 async fn main() {
     let cli = Cli::parse();
 
+    if let Some(Command::Scan {
+        plugins,
+        kinds,
+        all,
+        json,
+        files,
+    }) = &cli.command
+    {
+        std::process::exit(reiki::scan::run(plugins, kinds, *all, *json, files));
+    }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();
         if std::io::stdin().read_to_string(&mut token).is_err() {

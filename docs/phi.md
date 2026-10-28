@@ -50,6 +50,8 @@ A header names a column, so the plugin checks every cell under it as that kind o
 
 A table without a recognised header, or an `INSERT` without a column list, is checked only by the keyword and shape rules above. A cell that holds a type name, `null` or a placeholder is not reported.
 
+Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data to see what this plugin flags before you choose a mode.
+
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `ssn x1, card x2`, and never a value.

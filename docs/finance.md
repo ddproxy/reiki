@@ -40,6 +40,8 @@ Start in `report`, read the log for false positives, then switch to `block`.
 
 A header names a column, so every cell under it is checked as that kind: `iban`, `swift`, `bic`, `cusip`, `isin`, `wallet`, `account`, `sedol` and their common synonyms. This covers delimited text with a header row, Markdown tables, SQL `INSERT INTO t (a, b) VALUES (...)` with a column list and SQL `COPY t (a, b) FROM stdin` blocks. A table without a recognised header, or an `INSERT` without a column list, is checked only by the rules above.
 
+Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data to see what this plugin flags before you choose a mode.
+
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `iban x1, crypto x2`, and never a value.

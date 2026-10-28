@@ -8,6 +8,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+reiki-detect = { path = "../reiki-detect" }
 reiki-plugin = { path = "../reiki-plugin" }
 http = "1"
 toml = "0.8"

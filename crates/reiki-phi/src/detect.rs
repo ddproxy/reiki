@@ -5,6 +5,10 @@
 //! ones that look like any other number are only reported next to a keyword. Free-text names
 //! and addresses are not detected. A hit never carries the matched text, only its position.
 
+use reiki_detect::{digit_run, keyword_before, word_at, word_before};
+
+pub(crate) use reiki_detect::luhn;
+
 /// What a hit is an identifier of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
@@ -74,12 +78,7 @@ impl Kind {
 }
 
 /// A byte range of the scanned text that looks like an identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Hit {
-    pub kind: Kind,
-    pub start: usize,
-    pub end: usize,
-}
+pub type Hit = reiki_detect::Hit<Kind>;
 
 const SSN_WORDS: &[&str] = &[
     "ssn",
@@ -290,29 +289,6 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     hits
 }
 
-fn word_before(bytes: &[u8], i: usize) -> bool {
-    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
-}
-
-fn word_at(bytes: &[u8], i: usize) -> bool {
-    i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-}
-
-/// True when one of `words` ends within `window` bytes before `at`.
-fn keyword_before(lower: &[u8], at: usize, words: &[&str], window: usize) -> bool {
-    let from = at.saturating_sub(window);
-    let slice = &lower[from..at];
-    words.iter().any(|w| {
-        let w = w.as_bytes();
-        slice.windows(w.len()).any(|c| c == w)
-    })
-}
-
-/// The run of ASCII digits starting at `i`.
-fn digit_run(bytes: &[u8], i: usize) -> usize {
-    bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count()
-}
-
 fn plain_runs(bytes: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut i = 0;
     std::iter::from_fn(move || {
@@ -387,28 +363,6 @@ fn ssn(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
         }
         i += n;
     }
-}
-
-pub(crate) fn luhn(digits: &[u8]) -> bool {
-    let sum: u32 = digits
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, d)| {
-            let d = u32::from(*d - b'0');
-            if i % 2 == 1 {
-                let x = d * 2;
-                if x > 9 {
-                    x - 9
-                } else {
-                    x
-                }
-            } else {
-                d
-            }
-        })
-        .sum();
-    sum.is_multiple_of(10)
 }
 
 /// Payment card numbers: 13 to 19 digits in groups split by single spaces or dashes, a plausible

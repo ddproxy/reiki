@@ -195,6 +195,15 @@ impl PluginChain {
                 entry.plugin.on_request(&mut ctx)
             })
             .unwrap_or_else(|| Err(PluginError::Skip("plugin panicked".to_owned())));
+            for found in std::mem::take(&mut ctx.reported) {
+                self.on_event(&Event::Finding {
+                    stream: meta.stream,
+                    plugin: entry.plugin.name(),
+                    kind: found.kind,
+                    count: found.count as u64,
+                    blocked: found.blocked,
+                });
+            }
             match result {
                 Ok(()) => {}
                 Err(PluginError::Reject(status, message)) => {
@@ -474,6 +483,71 @@ mod tests {
             &mut headers,
             body,
         )
+    }
+
+    #[test]
+    fn a_plugins_findings_reach_every_plugin_as_events() {
+        use std::sync::Mutex;
+
+        // Registrations hold plain function pointers, so the listener records into a static.
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        struct Reporter;
+        impl Plugin for Reporter {
+            fn name(&self) -> &str {
+                "reporter"
+            }
+            fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+                ctx.report("ssn", 2, false);
+                Ok(())
+            }
+        }
+        struct Listener;
+        impl Plugin for Listener {
+            fn name(&self) -> &str {
+                "listener"
+            }
+            fn on_event(&self, event: &Event<'_>) {
+                if let Event::Finding {
+                    plugin,
+                    kind,
+                    count,
+                    blocked,
+                    ..
+                } = event
+                {
+                    SEEN.lock()
+                        .unwrap()
+                        .push(format!("{plugin} {kind} {count} {blocked}"));
+                }
+            }
+        }
+        let registry = vec![
+            Registration {
+                name: "reporter",
+                build: |_| Ok(Box::new(Reporter) as Box<dyn Plugin>),
+            },
+            Registration {
+                name: "listener",
+                build: |_| Ok(Box::new(Listener) as Box<dyn Plugin>),
+            },
+        ];
+        let chain = PluginChain::build(&configured("[reporter]\n[listener]\n"), &registry).unwrap();
+        let mut states = chain.states();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream: "s",
+            upstream: "u",
+            method: &method,
+            path: "/x",
+        };
+        let mut headers = HeaderMap::new();
+        let mut body = Bytes::new();
+        chain
+            .on_request(&mut states, &meta, &mut headers, &mut body)
+            .unwrap();
+        assert_eq!(*SEEN.lock().unwrap(), ["reporter ssn 2 false"]);
     }
 
     #[test]

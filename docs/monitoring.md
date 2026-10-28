@@ -53,7 +53,10 @@ Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape t
 | `reiki_failovers_total` | counter | `stream`, `key`, `class` |
 | `reiki_cooldowns_total` | counter | `key`, `class` |
 | `reiki_rate_limit_rejections_total` | counter | `stream` |
+| `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
 | `reiki_keys` | gauge | `state` |
+
+`reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `gov`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value.
 
 `status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. The `reiki_keys` gauge always reports all three states, even at zero.
 

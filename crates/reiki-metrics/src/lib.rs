@@ -48,6 +48,15 @@ impl Plugin for MetricsPlugin {
             }
             Event::Cooldown { key, kind } => self.metrics.record_cooldown(key, kind),
             Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
+            Event::Finding {
+                stream,
+                plugin,
+                kind,
+                count,
+                blocked,
+            } => self
+                .metrics
+                .record_finding(stream, plugin, kind, count, blocked),
             _ => {}
         }
     }
@@ -96,6 +105,7 @@ struct Inner {
     failovers: BTreeMap<(String, String, &'static str), u64>,
     cooldowns: BTreeMap<(String, &'static str), u64>,
     rate_limit_rejections: BTreeMap<String, u64>,
+    findings: BTreeMap<(String, String, String, &'static str), u64>,
 }
 
 /// In-memory counters for the admin `/metrics` endpoint. Bounded by the number
@@ -142,6 +152,30 @@ impl Metrics {
                 .cooldowns
                 .entry((key.to_owned(), class.label()))
                 .or_insert(0) += 1;
+        });
+    }
+
+    /// Counts identifiers a detection plugin found. Labels are bounded by the configured streams
+    /// and the plugins' fixed kinds, never by request volume.
+    pub fn record_finding(
+        &self,
+        stream: &str,
+        plugin: &str,
+        kind: &str,
+        count: u64,
+        blocked: bool,
+    ) {
+        let action = if blocked { "blocked" } else { "reported" };
+        self.with(|inner| {
+            *inner
+                .findings
+                .entry((
+                    stream.to_owned(),
+                    plugin.to_owned(),
+                    kind.to_owned(),
+                    action,
+                ))
+                .or_insert(0) += count;
         });
     }
 
@@ -212,6 +246,22 @@ impl Metrics {
                 out,
                 "reiki_rate_limit_rejections_total{{stream=\"{}\"}} {}",
                 escape_label(stream),
+                count
+            );
+        }
+
+        out.push_str(
+            "# HELP reiki_findings_total Identifiers found in request bodies by a detection plugin.\n",
+        );
+        out.push_str("# TYPE reiki_findings_total counter\n");
+        for ((stream, plugin, kind, action), count) in &inner.findings {
+            let _ = writeln!(
+                out,
+                "reiki_findings_total{{stream=\"{}\",plugin=\"{}\",kind=\"{}\",action=\"{}\"}} {}",
+                escape_label(stream),
+                escape_label(plugin),
+                escape_label(kind),
+                action,
                 count
             );
         }
@@ -301,11 +351,37 @@ mod tests {
             "reiki_failovers_total",
             "reiki_cooldowns_total",
             "reiki_rate_limit_rejections_total",
+            "reiki_findings_total",
             "reiki_keys",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }
         assert!(text.contains("reiki_keys{state=\"available\"} 0"));
+    }
+
+    #[test]
+    fn findings_are_counted_by_stream_plugin_kind_and_action() {
+        let plugin = build(&toml::Table::new()).unwrap();
+        let finding = |count, blocked| Event::Finding {
+            stream: "s",
+            plugin: "phi",
+            kind: "ssn",
+            count,
+            blocked,
+        };
+        plugin.on_event(&finding(2, false));
+        plugin.on_event(&finding(1, false));
+        plugin.on_event(&finding(3, true));
+        let metrics = Metrics::new();
+        metrics.record_finding("s", "phi", "ssn", 2, false);
+        metrics.record_finding("s", "phi", "ssn", 3, true);
+        let text = metrics.render(KeyCounts::default());
+        assert!(text.contains(
+            "reiki_findings_total{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"} 2"
+        ));
+        assert!(text.contains(
+            "reiki_findings_total{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"blocked\"} 3"
+        ));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 ### Added
 
+- `reiki_findings_total{stream,plugin,kind,action}` counts what the detection plugins find, by kind and whether the request was blocked. Plugins report through a new `RequestCtx::report`, and the chain forwards each report to every plugin as `Event::Finding`.
 - `reiki scan` runs the `phi`, `finance` and `gov` detectors over files or stdin and prints where they find identifiers, never the matched text. Exit code 1 means findings.
 
 ## 0.7.4

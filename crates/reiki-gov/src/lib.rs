@@ -94,12 +94,16 @@ fn strings(table: &toml::Table, key: &str) -> Result<Option<Vec<String>>, String
     }
 }
 
-fn summary(hits: &[Hit]) -> String {
+fn counts(hits: &[Hit]) -> BTreeMap<Kind, usize> {
     let mut counts: BTreeMap<Kind, usize> = BTreeMap::new();
     for hit in hits {
         *counts.entry(hit.kind).or_default() += 1;
     }
     counts
+}
+
+fn summary(hits: &[Hit]) -> String {
+    counts(hits)
         .iter()
         .map(|(kind, n)| format!("{} x{n}", kind.label()))
         .collect::<Vec<_>>()
@@ -144,6 +148,9 @@ impl Plugin for Gov {
             return Ok(());
         }
         let found = summary(&hits);
+        for (kind, n) in counts(&hits) {
+            ctx.report(kind.label(), n, self.mode == Mode::Block);
+        }
         tracing::warn!(request = ctx.id, stream = ctx.stream, upstream = ctx.upstream, found = %found, "gov: possible government data in an outbound request");
         match self.mode {
             Mode::Block => Err(PluginError::Reject(
@@ -255,5 +262,39 @@ mod tests {
         assert!(plugin("mode = \"block\"\nkinds = []").is_err());
         assert!(plugin("mode = \"block\"\nbogus = 1").is_err());
         assert!(plugin("mode = \"block\"\nupstreams = [1]").is_err());
+    }
+
+    fn reported(p: &dyn Plugin, body: &str) -> Vec<reiki_plugin::Reported> {
+        let mut headers = HeaderMap::new();
+        let mut payload = Bytes::from(body.to_owned());
+        let mut state = ();
+        let mut ctx = RequestCtx::new(
+            "ct",
+            "zen",
+            &Method::POST,
+            "/x",
+            &mut headers,
+            &mut payload,
+            &mut state,
+        );
+        let _ = p.on_request(&mut ctx);
+        ctx.reported
+    }
+
+    #[test]
+    fn findings_are_reported_with_their_kind_count_and_whether_the_request_was_blocked() {
+        let body = "CUI//SP-CTI";
+        let blocked = reported(plugin("mode = \"block\"").unwrap().as_ref(), body);
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(
+            (blocked[0].kind, blocked[0].count, blocked[0].blocked),
+            ("cui", 1, true)
+        );
+        let seen = reported(plugin("mode = \"report\"").unwrap().as_ref(), body);
+        assert_eq!(
+            (seen[0].kind, seen[0].count, seen[0].blocked),
+            ("cui", 1, false)
+        );
+        assert!(reported(plugin("mode = \"block\"").unwrap().as_ref(), "nothing here").is_empty());
     }
 }

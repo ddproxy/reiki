@@ -118,6 +118,15 @@ pub enum Event<'a> {
     Cooldown { key: &'a str, kind: FailureKind },
     /// A stream's rate limit turned a request away before any key was picked.
     RateLimited { stream: &'a str },
+    /// A detection plugin found identifiers in a request body: how many of one kind, and whether
+    /// the request was blocked for it. The event never carries the matched text.
+    Finding {
+        stream: &'a str,
+        plugin: &'a str,
+        kind: &'a str,
+        count: u64,
+        blocked: bool,
+    },
 }
 
 /// Key counts when an admin path is asked for.
@@ -185,6 +194,16 @@ pub struct RequestCtx<'a> {
     pub headers: &'a mut HeaderMap,
     pub body: &'a mut Bytes,
     pub state: &'a mut (dyn Any + Send),
+    /// Findings the plugin reports for this request; the host turns them into events.
+    pub reported: Vec<Reported>,
+}
+
+/// Identifiers of one kind that a detection plugin found in a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reported {
+    pub kind: &'static str,
+    pub count: usize,
+    pub blocked: bool,
 }
 
 /// One upstream attempt. `key` is the name of the key in the config, never its
@@ -242,7 +261,18 @@ impl<'a> RequestCtx<'a> {
             headers,
             body,
             state,
+            reported: Vec::new(),
         }
+    }
+
+    /// Reports `count` identifiers of one `kind` found in this request, and whether the request was
+    /// blocked for them. Never pass the matched text.
+    pub fn report(&mut self, kind: &'static str, count: usize, blocked: bool) {
+        self.reported.push(Reported {
+            kind,
+            count,
+            blocked,
+        });
     }
 
     /// Sets the request id the host logs this request under.

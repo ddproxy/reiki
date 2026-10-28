@@ -25,6 +25,7 @@ file = "/var/lib/reiki/requests.jsonl"
 | Plugin | Feature | What it does |
 | --- | --- | --- |
 | `phi` | `plugin-phi` | Blocks or reports PHI and NPPI identifiers in outbound requests. See [phi](phi.md). |
+| `finance` | `plugin-finance` | Blocks or reports financial identifiers in outbound requests. See [finance](finance.md). |
 | `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
 | `metrics` | `plugin-metrics` | Serves Prometheus metrics at `GET /metrics` on the admin listener. See [monitoring](monitoring.md). |

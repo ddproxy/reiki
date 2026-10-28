@@ -1,0 +1,26 @@
+[package]
+name = "reiki-finance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Reiki plugin that blocks or reports financial identifiers in outbound requests"
+license = "MIT"
+publish = false
+
+[dependencies]
+reiki-detect = { path = "../reiki-detect" }
+reiki-plugin = { path = "../reiki-plugin" }
+http = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+toml = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+bytes = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
 
 ### Added
 
-- A `phi` plugin that blocks or reports PHI and NPPI identifiers (SSNs, card, routing, account, medical and provider numbers, birth dates) in outbound request bodies. See [docs/phi.md](docs/phi.md).
+- A `phi` plugin that blocks or reports PHI and NPPI identifiers (SSNs, card, routing, account, medical and provider numbers, ICD-10 codes, birth dates, and field values such as names and addresses) in outbound request bodies. See [docs/phi.md](docs/phi.md).
 - `deny_private = true` in `[tunnel]` refuses private-range destinations, so a broad allowlist such as `*` reaches the internet and not the local network.
 
 ## 0.7.1

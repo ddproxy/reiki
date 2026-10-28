@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reiki"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.99"
 description = "Security proxy that isolates LLM harnesses from keys and secrets"

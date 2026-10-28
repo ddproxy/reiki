@@ -57,7 +57,7 @@ A plugin is trusted code that runs inside the Reiki process.
 - `admin_paths` and `on_admin` let a plugin answer a GET on the admin listener, after the caller has been authenticated. Two plugins claiming one path, or a plugin claiming `/status`, is a startup error. The hook receives the current count of available, cooling and out-of-rotation keys.
 - A plugin that never touches bodies returns `false` from `uses_bodies`, so configuring it does not change how responses are streamed.
 - While a plugin that uses bodies is configured, Reiki streams responses without a `content-length`, so a plugin may change the length of a body. HEAD, 204 and 304 responses keep theirs, as they have no body. When the body ends normally the final `on_response_chunk` call, with `is_last` set, follows the last chunk. It does not happen after an upstream read error or when the client disconnects, so use the per-request state being dropped as the end-of-response signal.
-- The request body is limited to 8 MB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
+- The request body is limited to 8 MiB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
 
 ## Write a plugin
 

@@ -1,6 +1,8 @@
 # Security
 
-Reiki sits between a client (an agent harness such as opencode or Claude Code, or an application) and the providers it calls, and isolates each side from what the other should not hold. It does not make either side trustworthy: a client that can read a secret on its own machine can still send it somewhere else, which is why masking is a second layer and not a replacement for keeping secrets out of reach.
+Reiki sits between a client (an agent such as opencode or Claude Code, or an application) and the providers it calls. It isolates each side from what the other should not hold.
+
+It does not make either side trustworthy. A client that can read a secret on its own machine can still send it elsewhere, so masking backs up keeping secrets out of reach and does not replace it.
 
 | Reiki keeps | From | Through |
 | --- | --- | --- |
@@ -24,7 +26,7 @@ Reiki listens on `listen`, default `127.0.0.1:4097`. It serves plain HTTP and ha
 
 ## Header handling
 
-Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length`, the client credential headers and `accept-encoding`. It asks the upstream for `identity` encoding so error bodies can be classified. Redirects from the upstream are not followed.
+Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length`, and the client credential headers. `accept-encoding` is replaced with `identity` so error bodies can be classified, unless the upstream sets `forward_accept_encoding` and the client sent one. Redirects from the upstream are not followed.
 
 ## Interception
 
@@ -44,11 +46,7 @@ Key values and stream tokens are not logged. Request and response bodies are not
 
 ## Plugins
 
-Plugins are compiled into the binary and run inside the Reiki process, so a plugin is as trusted as Reiki itself. See [plugins](plugins.md) for the hooks.
-
-- A plugin sees each request's headers, including the client token, and the whole request and response bodies. It never receives an upstream key; the key is attached after the plugin hooks have run, and on a keyed upstream an `authorization` header set by a plugin is dropped (on a `passthrough` upstream the client's credentials, including one a plugin sets, are forwarded).
-- Hooks are synchronous and have no timeout, so a plugin that blocks stalls its own request. A panic in a hook is caught and logged and does not end the request task, but Rust's default panic handler also writes the panic message to stderr, so plugins must not panic on request content. Only compile in plugins you have read.
-- Plugin settings are read at startup. A reload checks them and warns when they changed, but does not rebuild plugins.
+Plugins are compiled into the binary and run inside the Reiki process, so a plugin is as trusted as Reiki. A plugin sees request headers (including the client token) and bodies but never an upstream key, which is attached after the hooks run. Only compile in plugins you have read. [Plugins](plugins.md#what-a-plugin-can-see-and-do) covers the hooks, timeouts and panic handling.
 
 ## Limits
 

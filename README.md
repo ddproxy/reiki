@@ -7,9 +7,9 @@
 
 # Reiki
 
-Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent harness such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client, and keeps credentials and sensitive terms in the client's prompts away from the provider.
+Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client, and keeps credentials and sensitive terms in the client's prompts away from the provider.
 
-- **Key isolation.** Upstream keys live in files only Reiki reads. The client authenticates with a revocable stream token and never sees a key, even when an upstream echoes one back in an error.
+- **Key isolation.** Upstream keys live in files only Reiki reads. The client authenticates with a revocable stream token and never sees a key. Reiki redacts a key that an upstream echoes back in an error; [security](docs/security.md#clients-and-keys) lists the exception.
 - **Secret and term masking.** The `placeholders` plugin swaps credentials and a list of sensitive terms in a request for stable placeholders before it reaches the provider, and restores them in the response. Private keys are removed outright, and credentials stay masked inside tool-call arguments by default.
 - **Controlled egress.** Upstreams come only from the config, and the optional CONNECT tunnel allows only listed destinations. Interception can bring chosen hosts under the same rules, with a name-constrained CA.
 - **Auditable traffic.** The `requestlog` plugin records what the client sent and received, with credentials masked, to a file and a live socket. Failed logins are logged and throttled.
@@ -22,7 +22,7 @@ See [docs/security.md](docs/security.md) for what Reiki does and does not protec
 Download the archive for your platform from the [releases page](https://github.com/ddproxy/reiki/releases). Builds cover Linux (static musl) and macOS, on x86_64 and aarch64.
 
 ```bash
-VERSION=v0.3.0
+VERSION=v0.7.1
 TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
 curl -fsSLO https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz
 curl -fsSL https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz.sha256 | shasum -a 256 -c
@@ -76,11 +76,11 @@ token_sha256 = "<sha256 of the admin token>"
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
 - `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
-- `model_aliases` rewrites the top-level `model` field of a JSON body when it exactly matches a key, and `drop_params` removes the listed top-level keys. Both apply once before a request is sent, so every key replay sends the same body. Non-JSON bodies and bodies without a match pass through unchanged. See [docs/providers.md](docs/providers.md).
-- `http2` lets Reiki negotiate HTTP/2 with that upstream over TLS, and `forward_accept_encoding` sends the client's own `Accept-Encoding` upstream instead of `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself (on reverse routes and intercepted hosts; a forward upstream relays `content-encoding` as-is), so error bodies are still read for key failover, and sends the client plain bytes. Both are off by default; see [docs/providers.md](docs/providers.md).
-- `[upstream.X.forward]` hands each request to a Unix socket listener or a spawned command, which speaks plain HTTP/1.1 and forwards it onward; the key goes only in the normal credential header. `streaming = true` relays the answer as it arrives, and a forward upstream may serve an intercepted tunnel host. See [docs/providers.md](docs/providers.md#forwarding).
+- `model_aliases` rewrites the top-level `model` of a JSON body and `drop_params` removes top-level keys, once before the first attempt so every key replay sends the same body. See [docs/providers.md](docs/providers.md#rewriting-the-request-body).
+- `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` tune the transport per upstream. See [docs/providers.md](docs/providers.md#transport-options).
+- `[upstream.X.forward]` hands each request to a Unix socket or a spawned command that speaks HTTP/1.1; `streaming = true` relays the answer as it arrives. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
-- `[tunnel]` adds a CONNECT forward proxy with a destination allowlist. Destinations pass through untouched by default; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic too, relaying each request as the client sent it. Intercepted hosts served from a stream need the stream token in `Proxy-Authorization` unless `require_auth = false`. See [docs/tunnel.md](docs/tunnel.md).
+- `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
 - `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).
 - `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
 - `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
@@ -114,11 +114,9 @@ A failed request replays on the next key as long as no response bytes have reach
 
 `Retry-After` is read as delta-seconds or as an HTTP-date (IMF-fixdate, such as `Sun, 06 Nov 1994 08:49:37 GMT`); a cooldown taken from it is capped at 24 h.
 
-Key health is saved next to the config, as `<config>.state`, and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as; otherwise Reiki logs a warning and runs without persistence. A reload keeps the live health of keys whose files did not change and resets the keys whose files did, and does not read the state file again. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy (rotation is detected from the file's modification time, so a copy that preserves the old time, such as `cp -p` or `mv` of an old file, is not seen); a missing or unreadable state file is ignored with a warning.
+Key health persists across restarts in `<config>.state`. See [docs/troubleshooting.md](docs/troubleshooting.md#key-health).
 
-Limits: request bodies up to 8 MB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
-
-Behaviour can be extended with compiled-in plugins; see [docs/plugins.md](docs/plugins.md).
+Limits: request bodies up to 8 MiB, 120 s to receive upstream response headers. Reiki reads the config and key files at startup and again on SIGHUP, so send `kill -HUP <pid>` after changing a key file or the config. In-flight requests keep running on the version they started with. A changed `listen` is ignored until you restart Reiki.
 
 See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, [docs/security.md](docs/security.md) for the security model, and [docs/monitoring.md](docs/monitoring.md) for the optional admin listener.
 

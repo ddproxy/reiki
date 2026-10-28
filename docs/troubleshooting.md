@@ -18,7 +18,7 @@ These come from Reiki itself. Any other status is the upstream's answer, passed 
 | 401 | `unauthorized`: `unknown token` | No stream has a matching `token_sha256` |
 | 404 | `not_found`: `no upstream in path` | The path has no upstream prefix |
 | 404 | `not_found`: `unknown upstream` | The prefix does not match an `[upstream.*]` table |
-| 413 | `too_large`: `request body too large` | The body is over 8 MB |
+| 413 | `too_large`: `request body too large` | The body is over 8 MiB |
 | 429 | `rate_limited`: `stream request rate limit exceeded` | The stream is over its `rate_limit_per_minute` |
 | 429 | Too many failed logins | The client address sent 10 bad tokens in a minute; wait for `Retry-After` |
 | 503 | `reiki_exhausted` | Every key in the stream's chain is cooling or out of rotation |
@@ -53,6 +53,10 @@ What each level shows:
 - `debug`: the first 160 characters of upstream error bodies and tunnel I/O errors. Some providers echo part of the rejected key in error bodies, so keep `debug` off in shared logs.
 
 Key values and stream tokens are never logged.
+
+## Key health
+
+Key health is saved next to the config, as `<config>.state`, and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as; otherwise Reiki logs a warning and runs without persistence. A reload keeps the live health of keys whose files did not change and resets the keys whose files did, and does not read the state file again. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy (rotation is detected from the file's modification time, so a copy that preserves the old time, such as `cp -p` or `mv` of an old file, is not seen); a missing or unreadable state file is ignored with a warning.
 
 ## Common problems
 

@@ -4,6 +4,7 @@
 
 ### Added
 
+- A `gov` plugin that blocks or reports CUI, classification and dissemination markings, plus label-bound EIN, ITIN, CAGE, UEI, EDIPI and ECCN values, in outbound request bodies. See [docs/gov.md](docs/gov.md).
 - A `finance` plugin that blocks or reports financial identifiers (IBAN, SWIFT/BIC, Bitcoin and Ethereum addresses, CUSIP, ISIN, card data next to CVV or track data, and header-bound account and SEDOL values) in outbound request bodies. See [docs/finance.md](docs/finance.md).
 - The `phi` plugin reads tables: it maps header names and SQL column lists to identifier kinds and checks the cells under them, in CSV, TSV, pipe-delimited and Markdown text, SQL `INSERT` and `COPY` blocks. A new default-on `column` kind covers name, address, phone, zip and diagnosis columns.
 - `pass_errors = true` on an upstream relays every error status as it is, so a 403 from a git server cannot take the key out of rotation.

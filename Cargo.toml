@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
+members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-gov", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
 resolver = "2"
 
 [package]
@@ -26,6 +26,11 @@ crate = "reiki_phi"
 name = "finance"
 feature = "plugin-finance"
 crate = "reiki_finance"
+
+[[package.metadata.reiki.plugin]]
+name = "gov"
+feature = "plugin-gov"
+crate = "reiki_gov"
 
 [[package.metadata.reiki.plugin]]
 # Default chain order: placeholders must mask before the request log sees the request and,
@@ -60,6 +65,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 reiki-plugin = { path = "crates/reiki-plugin" }
 reiki-phi = { path = "crates/reiki-phi", optional = true }
 reiki-finance = { path = "crates/reiki-finance", optional = true }
+reiki-gov = { path = "crates/reiki-gov", optional = true }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 reiki-metrics = { path = "crates/reiki-metrics", optional = true }
@@ -78,10 +84,11 @@ time = "0.3"
 x509-parser = { version = "0.18", default-features = false }
 
 [features]
-default = ["plugin-phi", "plugin-finance", "plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
+default = ["plugin-phi", "plugin-finance", "plugin-gov", "plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
 plugin-phi = ["dep:reiki-phi"]
 plugin-finance = ["dep:reiki-finance"]
+plugin-gov = ["dep:reiki-gov"]
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]

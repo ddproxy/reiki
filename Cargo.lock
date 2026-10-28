@@ -1179,6 +1179,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "reiki-finance",
+ "reiki-gov",
  "reiki-metrics",
  "reiki-phi",
  "reiki-placeholders",
@@ -1214,6 +1215,18 @@ dependencies = [
  "reiki-plugin",
  "sha2",
  "sha3",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "reiki-gov"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "reiki-detect",
+ "reiki-plugin",
  "toml",
  "tracing",
 ]

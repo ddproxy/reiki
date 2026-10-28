@@ -19,12 +19,13 @@ HTTPS_PROXY=http://127.0.0.1:4099 NO_PROXY=127.0.0.1,localhost some-client
 | `allow` | required | Destinations a client may open: `host`, `host:port`, `*.host` (subdomains, not the apex) or `*`. A bare host means port 443. A request for anything else gets 403. |
 | `connect_timeout_secs` | 10 | How long to wait for the destination to accept the connection. |
 | `allow_loopback` | false | Lets the tunnel reach loopback addresses. For tests and local development only. |
+| `deny_private` | false | Refuses private-range addresses: RFC 1918, `100.64.0.0/10` and IPv6 unique-local. Turn it on with a broad allowlist such as `*` so the tunnel reaches the internet and not the local network. |
 | `intercept` | none | Reads the traffic of chosen hosts; see below. |
 
 ## What it does and does not do
 
 - Only `CONNECT` is accepted. Any other request gets 400.
-- Reiki resolves names itself and refuses with 502 any name that resolves to a loopback, unspecified, link-local or multicast address, so an allowed name cannot reach Reiki's admin port or other local services. Private ranges such as `10.0.0.0/8` are allowed.
+- Reiki resolves names itself and refuses with 502 any name that resolves to a loopback, unspecified, link-local or multicast address, so an allowed name cannot reach Reiki's admin port or other local services. Private ranges such as `10.0.0.0/8` are allowed unless `deny_private` is set.
 - The filter also refuses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`. The host's other interface addresses are not filtered, so avoid a broad allowlist such as `*`.
 - Each closed tunnel is logged at `info` with the destination host and port, bytes in each direction and the duration. Nothing inside an opaque tunnel is visible, so there is no request log, no placeholders, no key injection and no failover for it.
 - At most 512 tunnels run at once and 64 from one peer address; more get 503. The CONNECT request head must arrive within 10 seconds, and an opaque tunnel is closed after one hour.

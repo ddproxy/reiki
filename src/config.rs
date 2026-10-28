@@ -375,6 +375,10 @@ pub struct TunnelConfig {
     /// Lets the tunnel reach loopback addresses. For tests and local development only.
     #[serde(default)]
     pub allow_loopback: bool,
+    /// Refuses private-range addresses (RFC 1918, shared 100.64.0.0/10, IPv6 unique-local),
+    /// so a broad allowlist reaches the internet and not the local network.
+    #[serde(default)]
+    pub deny_private: bool,
     /// Terminates TLS for listed hosts so plugins and key handling apply to tunnelled traffic.
     #[serde(default)]
     pub intercept: Option<InterceptConfig>,

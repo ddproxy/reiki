@@ -78,6 +78,7 @@ pub struct Tunnel {
     rules: Vec<Rule>,
     connect_timeout: Duration,
     allow_loopback: bool,
+    deny_private: bool,
     interceptor: Option<Arc<Interceptor>>,
 }
 
@@ -87,6 +88,7 @@ impl Tunnel {
             rules: config.allow.iter().filter_map(|r| Rule::parse(r)).collect(),
             connect_timeout: Duration::from_secs(config.connect_timeout_secs),
             allow_loopback: config.allow_loopback,
+            deny_private: config.deny_private,
             interceptor: None,
         }
     }
@@ -104,6 +106,9 @@ impl Tunnel {
 
     /// Keeps an allowed name from being pointed back at this machine's own services.
     fn reachable(&self, addr: &SocketAddr) -> bool {
+        if self.deny_private && private_ip(addr.ip()) {
+            return false;
+        }
         if self.allow_loopback {
             return true;
         }
@@ -129,6 +134,24 @@ impl Tunnel {
             }
         };
         !local
+    }
+}
+
+fn private_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    v4.is_private() || (a == 100 && b & 0xc0 == 64)
+}
+
+/// RFC 1918, shared address space and IPv6 unique-local, including IPv4 forms embedded in IPv6.
+fn private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => private_v4(v4),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = (seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff))
+                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4]);
+            (seg[0] & 0xfe00) == 0xfc00 || (embedded && private_v4(embedded_v4(&seg)))
+        }
     }
 }
 
@@ -407,6 +430,7 @@ mod tests {
             rules: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
             connect_timeout: Duration::from_secs(5),
             allow_loopback: false,
+            deny_private: false,
             interceptor: None,
         }
     }
@@ -485,5 +509,36 @@ mod tests {
         }
         let public = SocketAddr::new("93.184.216.34".parse().unwrap(), 443);
         assert!(t.reachable(&public));
+    }
+
+    #[test]
+    fn deny_private_refuses_the_local_network_but_not_the_internet() {
+        let mut t = tunnel(&["*"]);
+        let private = [
+            "10.0.0.5:443",
+            "172.16.1.1:443",
+            "192.168.1.10:443",
+            "100.64.0.1:443",
+            "[fd12::1]:443",
+            "[::ffff:10.0.0.5]:443",
+        ];
+        for addr in private {
+            assert!(
+                t.reachable(&addr.parse().unwrap()),
+                "open by default: {addr}"
+            );
+        }
+        t.deny_private = true;
+        for addr in private {
+            assert!(!t.reachable(&addr.parse().unwrap()), "{addr}");
+        }
+        for addr in [
+            "93.184.216.34:443",
+            "[2606:4700::1]:443",
+            "172.32.0.1:443",
+            "100.128.0.1:443",
+        ] {
+            assert!(t.reachable(&addr.parse().unwrap()), "{addr}");
+        }
     }
 }

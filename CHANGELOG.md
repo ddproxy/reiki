@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `deny_private = true` in `[tunnel]` refuses private-range destinations, so a broad allowlist such as `*` reaches the internet and not the local network.
+
 ## 0.7.1
 
 ### Added

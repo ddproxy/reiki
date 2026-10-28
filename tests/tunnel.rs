@@ -27,6 +27,7 @@ async fn echo() -> u16 {
 
 async fn tunnel(allow: &[String], allow_loopback: bool) -> String {
     let config = TunnelConfig {
+        deny_private: false,
         listen: String::new(),
         allow: allow.to_vec(),
         connect_timeout_secs: 5,

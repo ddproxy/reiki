@@ -30,7 +30,7 @@ Start in `report`, read the log for false positives, then switch to `block`.
 | `iban` | An IBAN with a registry country, the country's exact length and a valid mod-97 check. Printed spaces between groups are allowed; other punctuation is rejected. |
 | `swift` | An 8- or 11-character BIC with an ISO country, after a `swift` or `bic` label, next to an IBAN, or under a `swift` or `bic` table header. A bare BIC is not reported. |
 | `crypto` | A Bitcoin Base58Check address with a valid checksum, a Bitcoin bech32 or bech32m SegWit address, or an Ethereum `0x` address with 40 hex digits. Mixed-case Ethereum addresses must satisfy EIP-55; all-lowercase and all-uppercase ones are unchecksummed and accepted. |
-| `cusip` | Nine characters with the CUSIP check digit. |
+| `cusip` | Nine characters with the CUSIP check digit, after `cusip` or in a `cusip` column. A bare token passes the check one time in ten, so it needs the label. |
 | `isin` | Twelve characters with an ISO country and the Luhn check over the expanded value. |
 | `pan_sad` | A card number with a valid Luhn checksum next to a `cvv`, `cvc`, `cid`, `cvv2`, `cvc2` or `cav2` label, or a card number at the start of `%B` track data. A bare card number is not reported. |
 | `account` | Six to 17 digits after `account`, `acct`, `beneficiary` or a similar label, or under an `account` table header. Off by default; a bare account number is not reported. |

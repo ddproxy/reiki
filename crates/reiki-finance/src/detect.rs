@@ -86,7 +86,14 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
         crypto(bytes, &mut hits);
     }
     if want(Kind::Cusip) {
-        cusip(bytes, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            CUSIP_WORDS,
+            Kind::Cusip,
+            cusip_value,
+            &mut hits,
+        );
     }
     if want(Kind::Isin) {
         isin(bytes, &mut hits);
@@ -114,11 +121,7 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             &mut hits,
         );
     }
-    for hit in crate::columnar::scan_tables(text, kinds) {
-        if !hits.iter().any(|h| h.start < hit.end && hit.start < h.end) {
-            hits.push(hit);
-        }
-    }
+    reiki_detect::merge_hits(&mut hits, crate::columnar::scan_tables(text, kinds));
     hits
 }
 
@@ -141,6 +144,8 @@ const ACCOUNT_WORDS: &[&str] = &[
     "beneficiary",
 ];
 const SEDOL_WORDS: &[&str] = &["sedol", "sedol code", "sedol number"];
+/// A nine-character token passes the CUSIP check digit one time in ten, so it needs its label.
+const CUSIP_WORDS: &[&str] = &["cusip", "cusip number", "cusip no", "cusip code"];
 const CVV_WORDS: &[&str] = &["cvv", "cvc", "cid", "cvv2", "cvc2", "cav2", "cvn", "cvn2"];
 
 /// True when one of `words` occurs as a whole token in `slice`, offset by `base`.
@@ -402,10 +407,16 @@ fn swift_shape(v: &[u8]) -> bool {
         && v[8..].iter().all(u8::is_ascii_alphanumeric)
 }
 
+/// True when an IBAN sits within 64 bytes of `start..end`. `ibans` is sorted by position.
 fn adjacent_iban(ibans: &[Hit], start: usize, end: usize) -> bool {
-    ibans
+    let next = ibans.partition_point(|h| h.start < end);
+    let after = ibans.get(next).is_some_and(|h| h.start - end <= 64);
+    let before = ibans[..next]
         .iter()
-        .any(|h| (h.start >= end && h.start - end <= 64) || (start >= h.end && start - h.end <= 64))
+        .rev()
+        .find(|h| h.end <= start)
+        .is_some_and(|h| start - h.end <= 64);
+    after || before
 }
 
 fn swift(bytes: &[u8], lower: &[u8], ibans: &[Hit], hits: &mut Vec<Hit>) {
@@ -712,20 +723,12 @@ pub(crate) fn valid_cusip(c: &[u8]) -> bool {
     last < 10 && (10 - sum % 10) % 10 == last
 }
 
-fn cusip(bytes: &[u8], hits: &mut Vec<Hit>) {
-    let mut i = 0;
-    while i + 9 <= bytes.len() {
-        if !word_before(bytes, i) && !word_at(bytes, i + 9) && valid_cusip(&bytes[i..i + 9]) {
-            hits.push(Hit {
-                kind: Kind::Cusip,
-                start: i,
-                end: i + 9,
-            });
-            i += 9;
-        } else {
-            i += 1;
-        }
-    }
+fn cusip_value(bytes: &[u8], at: usize) -> Option<usize> {
+    let n = bytes[at..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric())
+        .count();
+    (n == 9 && !word_at(bytes, at + n) && valid_cusip(&bytes[at..at + n])).then_some(at + n)
 }
 
 pub(crate) fn valid_isin(c: &[u8]) -> bool {
@@ -832,8 +835,9 @@ fn pan_sad(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
         }
         i += 1;
     }
+    let covered = reiki_detect::Covered::new(hits);
     for (start, end) in card_spans(bytes) {
-        if hits.iter().any(|h| h.start < end && start < h.end) {
+        if covered.overlaps(start, end) {
             continue;
         }
         if label_before(lower, start, CVV_WORDS, 64) || label_after(lower, end, CVV_WORDS, 64) {
@@ -1013,10 +1017,14 @@ mod tests {
 
     #[test]
     fn cusip_and_isin_need_their_checksums() {
-        assert_eq!(kinds("037833100"), [Kind::Cusip]);
-        assert_eq!(kinds("17275R102"), [Kind::Cusip]);
-        assert!(kinds("037833101").is_empty(), "CUSIP check digit");
-        assert!(kinds("x037833100").is_empty());
+        assert_eq!(kinds("cusip 037833100"), [Kind::Cusip]);
+        assert_eq!(kinds("CUSIP: 17275R102"), [Kind::Cusip]);
+        assert!(
+            kinds("037833100").is_empty(),
+            "a bare token needs its label"
+        );
+        assert!(kinds("cusip 037833101").is_empty(), "CUSIP check digit");
+        assert!(kinds("cusip x037833100").is_empty());
 
         assert_eq!(kinds("US0378331005"), [Kind::Isin]);
         assert_eq!(kinds("AU0000XVGZA3"), [Kind::Isin]);
@@ -1085,9 +1093,9 @@ mod tests {
 
     #[test]
     fn hits_report_positions_and_never_text() {
-        let text = "x 037833100 y";
+        let text = "x cusip 037833100 y";
         let hit = scan(text, &all())[0];
-        assert_eq!((hit.start, hit.end), (2, 11));
+        assert_eq!((hit.start, hit.end), (8, 17));
     }
 
     #[test]

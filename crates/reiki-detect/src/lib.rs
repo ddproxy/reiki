@@ -62,3 +62,81 @@ pub fn luhn(digits: &[u8]) -> bool {
         .sum();
     sum.is_multiple_of(10)
 }
+
+/// Byte ranges already covered by hits, merged and sorted so an overlap check is a binary search.
+/// Rechecking every earlier hit per candidate would be quadratic on a large table.
+#[derive(Debug, Default)]
+pub struct Covered {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Covered {
+    pub fn new<K>(hits: &[Hit<K>]) -> Self {
+        let mut ranges: Vec<(usize, usize)> = hits.iter().map(|h| (h.start, h.end)).collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start < last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        Self { ranges: merged }
+    }
+
+    /// True when `start..end` overlaps a covered range.
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        let at = self.ranges.partition_point(|&(_, e)| e <= start);
+        self.ranges.get(at).is_some_and(|&(s, _)| s < end)
+    }
+}
+
+/// Adds the hits in `extra` that overlap nothing already in `hits`; exact duplicates count once.
+pub fn merge_hits<K: Copy>(hits: &mut Vec<Hit<K>>, mut extra: Vec<Hit<K>>) {
+    let covered = Covered::new(hits);
+    extra.sort_unstable_by_key(|h| (h.start, h.end));
+    extra.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    hits.extend(
+        extra
+            .into_iter()
+            .filter(|h| !covered.overlaps(h.start, h.end)),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(start: usize, end: usize) -> Hit<u8> {
+        Hit {
+            kind: 0,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn covered_ranges_report_overlap_but_not_adjacency() {
+        let covered = Covered::new(&[hit(10, 20), hit(15, 30), hit(40, 50)]);
+        assert!(covered.overlaps(0, 11) && covered.overlaps(25, 26) && covered.overlaps(49, 60));
+        assert!(!covered.overlaps(0, 10) && !covered.overlaps(30, 40) && !covered.overlaps(50, 60));
+        assert!(!Covered::default().overlaps(0, 5));
+    }
+
+    #[test]
+    fn merging_keeps_existing_hits_and_drops_overlaps_and_duplicates() {
+        let mut hits = vec![hit(0, 5), hit(20, 25)];
+        merge_hits(
+            &mut hits,
+            vec![
+                hit(3, 8),
+                hit(10, 15),
+                hit(10, 15),
+                hit(24, 30),
+                hit(30, 31),
+            ],
+        );
+        let spans: Vec<(usize, usize)> = hits.iter().map(|h| (h.start, h.end)).collect();
+        assert_eq!(spans, [(0, 5), (20, 25), (10, 15), (30, 31)]);
+    }
+}

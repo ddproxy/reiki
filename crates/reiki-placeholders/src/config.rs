@@ -18,6 +18,8 @@ pub struct Config {
     pub builtin: bool,
     /// Put the original values back in responses.
     pub rehydrate: bool,
+    /// Also restore credentials inside tool-call arguments; off keeps them masked there.
+    pub restore_tool_args: bool,
     /// The most response bytes held to restore a body that is not an event stream.
     pub max_response_bytes: usize,
     pub dry_run: bool,
@@ -30,6 +32,7 @@ impl Config {
             "terms_file",
             "builtin",
             "rehydrate",
+            "restore_tool_args",
             "max_response_bytes",
         ];
         for key in table.keys() {
@@ -81,6 +84,7 @@ impl Config {
 
         let builtin = boolean(table, "builtin", true)?;
         let rehydrate = boolean(table, "rehydrate", true)?;
+        let restore_tool_args = boolean(table, "restore_tool_args", false)?;
         let dry_run = boolean(table, "dry_run", false)?;
         let max_response_bytes = match table.get("max_response_bytes") {
             None => DEFAULT_MAX_RESPONSE_BYTES,
@@ -110,6 +114,7 @@ impl Config {
             terms_file,
             builtin,
             rehydrate,
+            restore_tool_args,
             max_response_bytes,
             dry_run,
         })

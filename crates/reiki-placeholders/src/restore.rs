@@ -10,8 +10,19 @@ use crate::mask::{HEAD, TAIL};
 /// Longer than any placeholder this plugin writes, so a stray `[[REIKI_` is not held forever.
 const MAX_PLACEHOLDER: usize = 48;
 
+/// Prefix of the placeholders that stand for credentials rather than configured terms.
+const SECRET_HEAD: &str = "[[REIKI_SECRET_";
+
+/// Field names under which a model's tool call carries its arguments.
+const TOOL_CALL_MARKERS: &[&str] = &["tool_calls", "function_call", "tool_use", "partial_json"];
+
 /// Replaces every complete placeholder that was written for this request.
 pub fn restore_text(text: &str, reverse: &HashMap<String, String>) -> String {
+    restore(text, reverse, true)
+}
+
+/// Like `restore_text`, but credential placeholders stay masked unless `secrets` is set.
+fn restore(text: &str, reverse: &HashMap<String, String>, secrets: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(HEAD) {
@@ -20,7 +31,11 @@ pub fn restore_text(text: &str, reverse: &HashMap<String, String>) -> String {
         match candidate.find(TAIL) {
             Some(end) if end + TAIL.len() <= MAX_PLACEHOLDER => {
                 let token = &candidate[..end + TAIL.len()];
-                out.push_str(reverse.get(token).map_or(token, String::as_str));
+                let keep = !secrets && token.starts_with(SECRET_HEAD);
+                out.push_str(match reverse.get(token) {
+                    Some(original) if !keep => original,
+                    _ => token,
+                });
                 rest = &candidate[token.len()..];
             }
             _ => {
@@ -72,11 +87,19 @@ pub struct Restorer {
     held: HashMap<String, String>,
     cap: usize,
     given_up: bool,
+    /// Whether credentials are restored inside tool-call arguments too.
+    tool_args: bool,
+}
+
+/// True when `path` (or, for a whole body, the text) sits inside a tool call.
+fn in_tool_call(path: &str) -> bool {
+    TOOL_CALL_MARKERS.iter().any(|m| path.contains(m))
 }
 
 impl Restorer {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, tool_args: bool) -> Self {
         Self {
+            tool_args,
             mode: Mode::Idle,
             buf: Vec::new(),
             held: HashMap::new(),
@@ -121,9 +144,24 @@ impl Restorer {
         }
         let all = std::mem::take(&mut self.buf);
         *chunk = match String::from_utf8(all) {
-            Ok(text) => Bytes::from(restore_text(&text, reverse)),
+            Ok(text) => Bytes::from(self.restore_whole(&text, reverse)),
             Err(error) => Bytes::from(error.into_bytes()),
         };
+    }
+
+    /// A credential restored into a tool call would be run or echoed by the client, so a body that
+    /// carries tool calls is walked as JSON and those fields keep their placeholders.
+    fn restore_whole(&mut self, text: &str, reverse: &HashMap<String, String>) -> String {
+        if self.tool_args || !TOOL_CALL_MARKERS.iter().any(|m| text.contains(m)) {
+            return restore_text(text, reverse);
+        }
+        match serde_json::from_str::<Value>(text) {
+            Ok(mut value) => {
+                walk_whole("", &mut value, reverse);
+                value.to_string()
+            }
+            Err(_) => restore(text, reverse, false),
+        }
     }
 
     fn feed_stream(&mut self, chunk: &mut Bytes, is_last: bool, reverse: &HashMap<String, String>) {
@@ -213,7 +251,7 @@ impl Restorer {
     fn text_at(&mut self, path: &str, text: &str, reverse: &HashMap<String, String>) -> String {
         let mut combined = self.held.remove(path).unwrap_or_default();
         combined.push_str(text);
-        let restored = restore_text(&combined, reverse);
+        let restored = restore(&combined, reverse, self.tool_args || !in_tool_call(path));
         let keep = incomplete_start(&restored);
         if keep == restored.len() {
             return restored;
@@ -221,6 +259,23 @@ impl Restorer {
         self.held
             .insert(path.to_owned(), restored[keep..].to_owned());
         restored[..keep].to_owned()
+    }
+}
+
+fn walk_whole(path: &str, value: &mut Value, reverse: &HashMap<String, String>) {
+    match value {
+        Value::String(text) => *text = restore(text, reverse, !in_tool_call(path)),
+        Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                walk_whole(&format!("{path}[{i}]"), item, reverse);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                walk_whole(&format!("{path}.{key}"), item, reverse);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -264,7 +319,7 @@ mod tests {
     }
 
     fn run_stream(chunks: &[&[u8]]) -> Vec<u8> {
-        let mut restorer = Restorer::new(1024);
+        let mut restorer = Restorer::new(1024, true);
         restorer.start(Some("text/event-stream; charset=utf-8"), false);
         let reverse = reverse();
         let mut out = Vec::new();
@@ -350,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_body_that_is_not_a_stream_is_restored_when_it_ends() {
-        let mut restorer = Restorer::new(1024);
+        let mut restorer = Restorer::new(1024, true);
         restorer.start(Some("application/json"), false);
         let reverse = reverse();
         let body = format!("{{\"text\":\"{FALCON} flies\"}}");
@@ -369,7 +424,7 @@ mod tests {
 
     #[test]
     fn a_body_over_the_cap_is_released_unchanged() {
-        let mut restorer = Restorer::new(8);
+        let mut restorer = Restorer::new(8, true);
         restorer.start(Some("application/json"), false);
         let mut chunk = Bytes::from(format!("{FALCON} is long"));
         restorer.feed(&mut chunk, false, &reverse());
@@ -381,7 +436,7 @@ mod tests {
 
     #[test]
     fn a_stream_with_no_event_boundary_stops_buffering_at_the_cap() {
-        let mut restorer = Restorer::new(16);
+        let mut restorer = Restorer::new(16, true);
         restorer.start(Some("text/event-stream"), false);
         let reverse = reverse();
         let mut first = Bytes::from_static(b"data: xxxxxxxxxxxxxxxxxxxxxxxx");
@@ -398,10 +453,60 @@ mod tests {
 
     #[test]
     fn an_encoded_body_is_never_touched() {
-        let mut restorer = Restorer::new(1024);
+        let mut restorer = Restorer::new(1024, true);
         restorer.start(Some("application/json"), true);
         let mut chunk = Bytes::from(FALCON.to_owned());
         restorer.feed(&mut chunk, true, &reverse());
         assert_eq!(&chunk[..], FALCON.as_bytes());
+    }
+
+    const SECRET: &str = "[[REIKI_SECRET_cccccccc]]";
+
+    fn secret_reverse() -> HashMap<String, String> {
+        HashMap::from([
+            (SECRET.to_owned(), "tok-123".to_owned()),
+            (FALCON.to_owned(), "Falcon".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn credentials_stay_masked_in_streamed_tool_call_arguments() {
+        let call = serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"function": {"arguments": format!("curl {SECRET} {FALCON}")}}
+        ]}}]});
+        let text = serde_json::json!({"choices": [{"delta": {"content": SECRET}}]});
+        let stream = format!("data: {call}\n\ndata: {text}\n\n");
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("text/event-stream"), false);
+        let mut chunk = Bytes::from(stream);
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        let out = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(out.contains(&format!("curl {SECRET} Falcon")), "{out}");
+        assert!(out.contains("\"content\":\"tok-123\""), "{out}");
+    }
+
+    #[test]
+    fn credentials_stay_masked_in_whole_body_tool_calls_unless_allowed() {
+        let body = serde_json::json!({"choices": [{"message": {
+            "content": SECRET,
+            "tool_calls": [{"function": {"arguments": SECRET}}]
+        }}]})
+        .to_string();
+        let run = |tool_args| {
+            let mut restorer = Restorer::new(4096, tool_args);
+            restorer.start(Some("application/json"), false);
+            let mut chunk = Bytes::from(body.clone());
+            restorer.feed(&mut chunk, true, &secret_reverse());
+            serde_json::from_slice::<Value>(&chunk).unwrap()
+        };
+        let masked = run(false);
+        let message = &masked["choices"][0]["message"];
+        assert_eq!(message["content"], "tok-123");
+        assert_eq!(message["tool_calls"][0]["function"]["arguments"], SECRET);
+        let open = run(true);
+        assert_eq!(
+            open["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "tok-123"
+        );
     }
 }

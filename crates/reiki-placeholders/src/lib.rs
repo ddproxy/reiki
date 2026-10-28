@@ -75,7 +75,10 @@ impl Plugin for Placeholders {
     fn new_state(&self) -> Box<dyn Any + Send> {
         Box::new(State {
             reverse: HashMap::new(),
-            restorer: Restorer::new(self.config.max_response_bytes),
+            restorer: Restorer::new(
+                self.config.max_response_bytes,
+                self.config.restore_tool_args,
+            ),
             restoring: false,
         })
     }

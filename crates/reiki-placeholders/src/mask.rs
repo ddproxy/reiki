@@ -57,8 +57,10 @@ impl Masker {
                 });
             }
         }
+        let folded = (!self.terms.is_empty()).then(|| fold_indexed(text));
         for needle in &self.terms {
-            for (start, end) in find_folded(text, needle) {
+            let Some(folded) = &folded else { break };
+            for (start, end) in find_folded(folded, needle) {
                 found.push(Found {
                     start,
                     end,
@@ -133,22 +135,26 @@ fn fold(text: &str) -> Vec<char> {
         .collect()
 }
 
-/// Byte ranges of `text` that equal `needle` once case is ignored.
-fn find_folded(text: &str, needle: &[char]) -> Vec<(usize, usize)> {
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let chars: Vec<(usize, usize, char)> = text
-        .char_indices()
+/// Each character of `text` with its byte range, lowercased once for every term to search.
+fn fold_indexed(text: &str) -> Vec<(usize, usize, char)> {
+    text.char_indices()
         .map(|(i, c)| (i, i + c.len_utf8(), c.to_lowercase().next().unwrap_or(c)))
-        .collect();
+        .collect()
+}
+
+/// Byte ranges of the folded text that equal `needle`.
+fn find_folded(chars: &[(usize, usize, char)], needle: &[char]) -> Vec<(usize, usize)> {
+    let Some(&first) = needle.first() else {
+        return Vec::new();
+    };
     let mut hits = Vec::new();
     let mut i = 0;
     while i + needle.len() <= chars.len() {
-        if chars[i..i + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|((_, _, c), n)| c == n)
+        if chars[i].2 == first
+            && chars[i..i + needle.len()]
+                .iter()
+                .zip(needle)
+                .all(|((_, _, c), n)| c == n)
         {
             hits.push((chars[i].0, chars[i + needle.len() - 1].1));
             i += needle.len();

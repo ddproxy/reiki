@@ -209,6 +209,10 @@ base_url = "https://openrouter.ai/api/v1"
 
 Reiki decides whether a key failed from the status code, the `Retry-After` header and a few phrases in the error body. A provider that signals quota or key problems in a different way may need a new rule in `src/classify.rs`. These services have not been tested.
 
+## Relaying errors as they are
+
+Reiki reads a 401, a 403 or a quota phrase as a key failure: it cools or disables the key and tries the next one. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
+
 ## Falling back to another upstream
 
 An upstream can name one other upstream to use when none of its keys is available:

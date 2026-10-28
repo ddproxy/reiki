@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `pass_errors = true` on an upstream relays every error status as it is, so a 403 from a git server cannot take the key out of rotation.
+
 ## 0.7.2
 
 ### Added

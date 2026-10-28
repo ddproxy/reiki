@@ -280,6 +280,10 @@ pub struct Upstream {
     /// Send `Connection: keep-alive` explicitly; HTTP/1.1 connections persist without it.
     #[serde(default)]
     pub send_keep_alive: bool,
+    /// Relay every upstream error status to the client as it is. No key is cooled, disabled or
+    /// replayed, so an authorisation error from a non-LLM upstream cannot take the key out of rotation.
+    #[serde(default)]
+    pub pass_errors: bool,
     /// Re-send a quota-exhausted 429 once on the same key, after a short pause, before cooling
     /// the key. For upstreams that sometimes answer a good key with a spurious quota 429.
     #[serde(default)]

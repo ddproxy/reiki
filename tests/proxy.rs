@@ -1608,3 +1608,35 @@ async fn confirm_quota_sends_a_quota_429_again_on_the_same_key_before_cooling_it
         "a repeated quota 429 cools the key and moves on"
     );
 }
+
+#[tokio::test]
+async fn pass_errors_relays_a_403_without_taking_the_key_out_of_rotation() {
+    let h = harness_with_upstream(&one_stream(), "pass_errors = true\n", Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(403, "forbidden", None)]);
+    let denied = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(
+        denied.status(),
+        403,
+        "the upstream's own answer reaches the client"
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a"], "no replay on another key");
+    let again = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a", "up-a"],
+        "the key stayed in rotation"
+    );
+
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(403, "forbidden", None)]);
+    h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(
+        h.mock.keys_called()[..2],
+        ["up-a", "up-b"],
+        "without the option a 403 still disables the key"
+    );
+}

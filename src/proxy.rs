@@ -1093,7 +1093,12 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         );
         let text = String::from_utf8_lossy(&snippet);
 
-        match classify(status.as_u16(), retry_after.as_deref(), &text) {
+        let outcome = if upstream.pass_errors {
+            Outcome::PassThrough
+        } else {
+            classify(status.as_u16(), retry_after.as_deref(), &text)
+        };
+        match outcome {
             Outcome::Success | Outcome::PassThrough => {
                 return Ok(finish_buffered(
                     &app.plugins,

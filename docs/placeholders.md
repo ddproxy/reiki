@@ -18,13 +18,15 @@ max_response_bytes = 8388608                 # longest non-streaming body held t
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `terms` | none | Literal terms to mask. Case is ignored and the first spelling seen is what comes back. Each must be at least 3 characters and contain no quote, backslash or control character. |
-| `terms_file` | none | Absolute path to a file of terms, one per line. Blank lines and lines starting with `#` are skipped. Read at startup. Keep it mode 0600; client and project names are often as private as the values they stand for. |
+| `terms_file` | none | Absolute path to a file of terms, one per line. Blank lines and lines starting with `#` are skipped. Read at startup and again on a reload that finds the file changed. Keep it mode 0600; client and project names are often as private as the values they stand for. |
 | `builtin` | `true` | Also mask the credential shapes the request log masks: common API key prefixes, `Bearer` tokens, JWTs. A PEM private key block is removed outright and is never restored. |
 | `rehydrate` | `true` | Put the originals back in responses. With `false` the model's placeholders reach the client as written. |
 | `restore_tool_args` | `false` | Also restore credentials inside tool-call arguments. Off, a credential placeholder inside a tool call stays masked in the response. Terms are always restored. |
 | `max_response_bytes` | 8 MiB | A response that is not an event stream is held whole to restore it. A larger one is released unchanged. |
 
 At least one of `terms`, `terms_file` or `builtin` must leave something to mask. At startup a bad value, an unknown key or an unreadable `terms_file` stops Reiki from starting. `reiki check` validates the table without reading the terms file.
+
+A [reload](troubleshooting.md#reload) re-reads `terms_file` when the file changed. The plugin is built again, which gives it a new random salt, so each placeholder id changes once and requests started before the reload finish with the old ids.
 
 ## What it does
 

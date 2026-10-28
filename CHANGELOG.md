@@ -5,6 +5,7 @@
 ### Added
 
 - Live reload. SIGHUP and the new `POST /reload` on the admin listener now apply plugin settings, the tunnel allowlist, `deny_private`, the intercept host table, `require_auth` and `leaf_ttl_hours` without a restart. A plugin whose table did not change keeps running with its counters, and requests already in flight finish on the plugins they started with. Listen addresses, the log file path and the CA files still need a restart and are reported as `restart_needed`. `/status` gains `config.generation`, `config.loaded_at` and `config.last_reload`, and `reiki check` summarises the tunnel policy.
+- A reload also rebuilds a plugin whose watched file changed: the placeholders `terms_file` is re-read when it is edited, without a config change.
 - `reiki_findings_total{stream,plugin,kind,action}` counts what the detection plugins find, by kind and whether the request was blocked. Plugins report through a new `RequestCtx::report`, and the chain forwards each report to every plugin as `Event::Finding`.
 - `reiki scan` runs the `phi`, `finance` and `gov` detectors over files or stdin and prints where they find identifiers, never the matched text. Exit code 1 means findings.
 

@@ -62,6 +62,7 @@ Applied live:
 
 - keys, streams, upstreams and the admin token hash
 - plugin settings: a plugin whose `[plugins.<name>]` table did not change keeps running, so its counters and open files survive. A changed table builds that plugin again, and adding or removing a table adds or removes the plugin. The `requestlog` plugin holds a file and a socket, so a changed `requestlog` table is reported as needing a restart and the running log is kept.
+- files a plugin reads: editing the placeholders `terms_file` and reloading builds that plugin again, even when the config text is the same
 - the tunnel `allow` list, `deny_private`, `allow_loopback` and `connect_timeout_secs`
 - the intercept host table, `require_auth` and `leaf_ttl_hours`
 

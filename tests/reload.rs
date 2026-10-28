@@ -58,7 +58,7 @@ impl Rig {
         let dir = std::env::temp_dir().join(format!("reiki-reload-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("key-a"), "upstream-secret\n").unwrap();
-        let mock_url = serve(Router::new().fallback(any(|| async { "ok" }))).await;
+        let mock_url = serve(Router::new().fallback(any(|body: String| async move { body }))).await;
         let mut rig = Self {
             config: dir.join("reiki.toml"),
             dir,
@@ -293,4 +293,65 @@ async fn post_reload_needs_the_admin_token_and_reports_the_generation() {
         .unwrap();
     assert_eq!(bad.status(), 422);
     assert!(bad.text().await.unwrap().contains("\"ok\":false"));
+}
+
+#[tokio::test]
+async fn a_changed_terms_file_applies_on_reload_without_a_config_change() {
+    let rig = Rig::new("").await;
+    let terms = rig.dir.join("terms.txt");
+    std::fs::write(&terms, "Falcon\n").unwrap();
+    let placeholders = format!(
+        "[plugins.placeholders]\nterms_file = \"{}\"\nbuiltin = false\nrehydrate = false\n",
+        terms.display()
+    );
+    rig.rewrite(&placeholders);
+    let app = Arc::clone(&rig.app);
+    let added = tokio::task::spawn_blocking(move || app.reload_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(added.changed, ["plugins placeholders"]);
+
+    let echo = |text: &str| {
+        let url = format!("{}/zen/chat", rig.relay);
+        let body = text.to_owned();
+        let client = rig.client.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(STREAM_TOKEN)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+    assert!(
+        !echo("Falcon").await.contains("Falcon"),
+        "a listed term is masked"
+    );
+    assert_eq!(echo("Osprey").await, "Osprey", "an unlisted one passes");
+
+    // The config text is untouched; only the terms file grows.
+    std::fs::write(&terms, "Falcon\nOsprey\n").unwrap();
+    let app = Arc::clone(&rig.app);
+    let report = tokio::task::spawn_blocking(move || app.reload_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.changed, ["plugins placeholders"]);
+    assert!(!echo("Osprey").await.contains("Osprey"), "now masked too");
+
+    let app = Arc::clone(&rig.app);
+    let quiet = tokio::task::spawn_blocking(move || app.reload_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        quiet.changed.is_empty(),
+        "no change on disk, no rebuild: {quiet:?}"
+    );
 }

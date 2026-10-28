@@ -63,6 +63,12 @@ pub trait Plugin: Send + Sync {
         true
     }
 
+    /// Files whose contents shape this plugin's behaviour, such as a terms list. A reload builds
+    /// the plugin again when one of them changed, even if its config table did not.
+    fn watched_files(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     /// False for a plugin that never touches bodies, so its presence keeps `content-length` on responses.
     fn uses_bodies(&self) -> bool {
         true

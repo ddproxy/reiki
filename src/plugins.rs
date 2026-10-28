@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -54,15 +55,42 @@ struct Entry {
     on_error: OnError,
     /// The `[plugins.<name>]` table the instance was built from, to tell on a reload whether it changed.
     table: toml::Table,
+    /// The files the plugin reads, as they were when it was built.
+    stamps: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+/// Enough of a file's identity to notice an edit: its modification time and size.
+type FileStamp = (std::time::SystemTime, u64);
+
+fn stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn stamps_of(plugin: &dyn Plugin) -> Vec<(PathBuf, Option<FileStamp>)> {
+    plugin
+        .watched_files()
+        .into_iter()
+        .map(|path| {
+            let seen = stamp(&path);
+            (path, seen)
+        })
+        .collect()
 }
 
 impl Entry {
+    /// True when a file the plugin reads differs from what it saw at build time.
+    fn files_changed(&self) -> bool {
+        self.stamps.iter().any(|(path, seen)| stamp(path) != *seen)
+    }
+
     /// The same plugin instance, for the next chain.
     fn share(&self) -> Self {
         Self {
             plugin: Arc::clone(&self.plugin),
             on_error: self.on_error,
             table: self.table.clone(),
+            stamps: self.stamps.clone(),
         }
     }
 }
@@ -129,8 +157,10 @@ impl PluginChain {
                 name: reg.name.to_string(),
                 message,
             })?;
+            let plugin: Arc<dyn Plugin> = Arc::from(plugin);
             entries.push(Entry {
-                plugin: Arc::from(plugin),
+                stamps: stamps_of(plugin.as_ref()),
+                plugin,
                 on_error,
                 table: table.clone(),
             });
@@ -168,7 +198,9 @@ impl PluginChain {
             match (old, wanted) {
                 (None, None) => {}
                 (Some(_), None) => changed.push(reg.name.to_owned()),
-                (Some(old), Some(table)) if old.table == *table => entries.push(old.share()),
+                (Some(old), Some(table)) if old.table == *table && !old.files_changed() => {
+                    entries.push(old.share());
+                }
                 (Some(old), Some(_)) if !old.plugin.live_reload() => {
                     restart_needed.push(reg.name.to_owned());
                     entries.push(old.share());
@@ -181,8 +213,10 @@ impl PluginChain {
                             message,
                         })?;
                     changed.push(reg.name.to_owned());
+                    let plugin: Arc<dyn Plugin> = Arc::from(plugin);
                     entries.push(Entry {
-                        plugin: Arc::from(plugin),
+                        stamps: stamps_of(plugin.as_ref()),
+                        plugin,
                         on_error,
                         table: table.clone(),
                     });
@@ -742,6 +776,45 @@ mod tests {
         assert_eq!(first.names().collect::<Vec<_>>(), ["append"]);
     }
 
+    struct Watcher(PathBuf);
+    impl Plugin for Watcher {
+        fn name(&self) -> &str {
+            "watcher"
+        }
+        fn watched_files(&self) -> Vec<PathBuf> {
+            vec![self.0.clone()]
+        }
+    }
+
+    #[test]
+    fn a_changed_watched_file_rebuilds_the_plugin_even_when_its_table_is_the_same() {
+        static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let file = FILE.get_or_init(|| {
+            std::env::temp_dir().join(format!("reiki-watch-{}.txt", std::process::id()))
+        });
+        std::fs::write(file, "one").unwrap();
+        let registry = vec![Registration {
+            name: "watcher",
+            build: |_| Ok(Box::new(Watcher(FILE.get().unwrap().clone())) as Box<dyn Plugin>),
+        }];
+        let table = configured("[watcher]\n");
+        let first = PluginChain::build(&table, &registry).unwrap();
+
+        let same = first.rebuild(&table, &registry).unwrap();
+        assert!(same.changed.is_empty(), "nothing changed on disk");
+        assert!(same_instance(&first, &same.chain, "watcher"));
+
+        std::fs::write(file, "one and more").unwrap();
+        let edited = first.rebuild(&table, &registry).unwrap();
+        assert_eq!(edited.changed, ["watcher"]);
+        assert!(!same_instance(&first, &edited.chain, "watcher"));
+
+        std::fs::remove_file(file).unwrap();
+        let gone = edited.chain.rebuild(&table, &registry).unwrap();
+        assert_eq!(gone.changed, ["watcher"], "a deleted file is a change too");
+        let _ = std::fs::remove_file(file);
+    }
+
     #[test]
     fn a_session_keeps_the_chain_it_started_with_across_a_rebuild() {
         let registry = rebuild_registry();
@@ -1018,6 +1091,7 @@ mod tests {
                 plugin: Arc::new(plugin),
                 on_error: OnError::PassThrough,
                 table: toml::Table::new(),
+                stamps: Vec::new(),
             });
         }
         PluginChain::check_admin_paths(&chain.entries)?;

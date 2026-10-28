@@ -72,6 +72,10 @@ impl Plugin for Placeholders {
         NAME
     }
 
+    fn watched_files(&self) -> Vec<std::path::PathBuf> {
+        self.config.terms_file.iter().cloned().collect()
+    }
+
     fn new_state(&self) -> Box<dyn Any + Send> {
         Box::new(State {
             reverse: HashMap::new(),

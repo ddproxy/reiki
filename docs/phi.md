@@ -11,17 +11,17 @@ Compiled in by the default `plugin-phi` feature; inactive until a `[plugins.phi]
 ```toml
 [plugins.phi]
 mode = "report"                      # "block" or "report"; required
-# kinds = ["ssn", "card", "email"]   # default: every kind below except email and phone
+# kinds = ["ssn", "card", "field"]  # default: every kind below except field, email and phone
 # upstreams = ["zen", "openrouter"]  # default: all upstreams
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `mode` | required | `block` rejects a request that holds an identifier. `report` logs it and lets the request through. |
-| `kinds` | all but `email`, `phone` | The kinds to look for. |
+| `kinds` | all but `field`, `email`, `phone` | The kinds to look for. |
 | `upstreams` | all | Check only requests to these upstreams. A request to any other upstream is not checked. |
 
-Start in `report`, read the log for false positives, then switch to `block`.
+Start in `report`, read the log for false positives, then switch to `block`. For an application that handles patient records, add `field` to `kinds`.
 
 ## Kinds
 
@@ -31,9 +31,11 @@ Start in `report`, read the log for false positives, then switch to `block`.
 | `card` | 13 to 19 digits, grouped by single spaces or dashes, with a plausible first digit and a valid Luhn checksum. |
 | `routing` | Nine digits with a valid ABA checksum after `routing` or `aba`. |
 | `account` | Six to 17 digits after `account number`, `account no`, `account #` or `acct`. |
-| `dob` | A date after `dob`, `date of birth`, `birth date` or `born on`. |
-| `medical_id` | A token with at least four digits after `mrn`, `member id`, `subscriber id`, `policy number`, `patient id` or similar. |
+| `dob` | A date after `dob`, `date of birth`, `date_of_birth`, `birth date` or `born on`. |
+| `medical_id` | A token with at least four digits after `mrn`, `member id`, `subscriber id`, `policy number`, `patient id`, `medicare id` or similar, with spaces or underscores. |
 | `npi` | A 10-digit National Provider Identifier with a valid checksum after `npi`. |
+| `icd10` | An ICD-10 diagnosis code such as `C50.911` after `icd`, `icd-10` or `diagnosis code`. |
+| `field` | A field named like an identifying field, with a value that reads as data: `"first_name": "Jane"`, `last_name: Doe`, `zip_code`, `phone_number`, `diagnosis`, `treatment_plan`. Finds names and addresses in JSON, YAML and log lines. Off by default, because source code names these fields too. |
 | `email` | An email address. Off by default, because source code and commit metadata carry many. |
 | `phone` | A US phone number written with separators or parentheses. Off by default. |
 
@@ -46,7 +48,7 @@ Start in `report`, read the log for false positives, then switch to `block`.
 
 ## What it does not cover
 
-- **Names and addresses.** Free-text names, street addresses and diagnoses have no fixed shape, so the plugin does not detect them. Add them as `terms` in the [placeholders](placeholders.md) plugin when you know them.
+- **Names and addresses in prose.** The `field` kind finds them only next to a field name. A name or address written in a sentence has no fixed shape, so the plugin does not detect it. Add known names as `terms` in the [placeholders](placeholders.md) plugin.
 - **Traffic Reiki cannot read.** An opaque tunnel is not visible to any plugin. A tunnel allowlist such as `*` lets data leave without being checked. On a machine that handles protected data, allow only the hosts it needs and intercept the ones that carry prompts.
 - **Encoded or split data.** An identifier that is base64-encoded, split across fields or written out in words is not found.
 - **Images and files.** Pixel and file contents are not read.

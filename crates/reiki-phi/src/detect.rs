@@ -15,13 +15,15 @@ pub enum Kind {
     Dob,
     MedicalId,
     Npi,
+    Icd10,
+    Field,
     Email,
     Phone,
 }
 
 impl Kind {
     /// Kinds that are on unless the config narrows the list.
-    pub const DEFAULT: [Kind; 7] = [
+    pub const DEFAULT: [Kind; 8] = [
         Kind::Ssn,
         Kind::Card,
         Kind::Routing,
@@ -29,6 +31,7 @@ impl Kind {
         Kind::Dob,
         Kind::MedicalId,
         Kind::Npi,
+        Kind::Icd10,
     ];
 
     pub fn label(self) -> &'static str {
@@ -40,6 +43,8 @@ impl Kind {
             Kind::Dob => "dob",
             Kind::MedicalId => "medical_id",
             Kind::Npi => "npi",
+            Kind::Icd10 => "icd10",
+            Kind::Field => "field",
             Kind::Email => "email",
             Kind::Phone => "phone",
         }
@@ -54,6 +59,8 @@ impl Kind {
             Kind::Dob,
             Kind::MedicalId,
             Kind::Npi,
+            Kind::Icd10,
+            Kind::Field,
             Kind::Email,
             Kind::Phone,
         ]
@@ -70,14 +77,28 @@ pub struct Hit {
     pub end: usize,
 }
 
-const SSN_WORDS: &[&str] = &["ssn", "social security", "social sec"];
+const SSN_WORDS: &[&str] = &[
+    "ssn",
+    "social security",
+    "social sec",
+    "social_security_number",
+];
 const ROUTING_WORDS: &[&str] = &["routing", "aba"];
-const ACCOUNT_WORDS: &[&str] = &["account number", "account no", "account #", "acct"];
+const ACCOUNT_WORDS: &[&str] = &[
+    "account number",
+    "account_number",
+    "account no",
+    "account #",
+    "acct",
+];
 const DOB_WORDS: &[&str] = &[
     "dob",
     "d.o.b",
     "date of birth",
+    "date_of_birth",
+    "dateofbirth",
     "birth date",
+    "birth_date",
     "birthdate",
     "born on",
 ];
@@ -85,13 +106,103 @@ const NPI_WORDS: &[&str] = &["npi"];
 const MEDICAL_WORDS: &[&str] = &[
     "mrn",
     "medical record number",
+    "medical_record_number",
     "medical record no",
     "member id",
+    "member_id",
     "subscriber id",
+    "subscriber_id",
     "policy number",
+    "policy_number",
     "patient id",
+    "patient_id",
     "health plan id",
     "beneficiary id",
+    "medicare id",
+    "medicare number",
+    "medicaid id",
+    "mbi",
+    "insurance id",
+];
+const ICD_WORDS: &[&str] = &[
+    "icd-10",
+    "icd10",
+    "icd_10",
+    "icd",
+    "diagnosis code",
+    "diagnosis_code",
+    "dx code",
+];
+
+/// Field names that carry identifying data in JSON, YAML and log lines.
+const FIELD_NAMES: &[&str] = &[
+    "first_name",
+    "firstname",
+    "last_name",
+    "lastname",
+    "middle_name",
+    "full_name",
+    "fullname",
+    "patient_name",
+    "patientname",
+    "address_line_1",
+    "address_line_2",
+    "addressline1",
+    "addressline2",
+    "street_address",
+    "home_address",
+    "mailing_address",
+    "zip_code",
+    "zipcode",
+    "postal_code",
+    "phone_number",
+    "phonenumber",
+    "mobile_phone",
+    "patient_contact_phone",
+    "emergency_contact_phone",
+    "diagnosis",
+    "diagnosis_info",
+    "treatment_plan",
+    "treatmentplan",
+    "cancer_stage",
+    "medications",
+    "raw_transcript",
+];
+
+/// Values that name a type or stand for nothing, so a field holding one is a schema, not data.
+const NON_DATA: &[&str] = &[
+    "str",
+    "string",
+    "int",
+    "integer",
+    "text",
+    "varchar",
+    "char",
+    "date",
+    "datetime",
+    "timestamp",
+    "boolean",
+    "bool",
+    "null",
+    "none",
+    "nil",
+    "true",
+    "false",
+    "number",
+    "object",
+    "array",
+    "uuid",
+    "n/a",
+    "na",
+    "unknown",
+    "redacted",
+    "required",
+    "optional",
+    "any",
+    "list",
+    "dict",
+    "float",
+    "bytes",
 ];
 
 /// Every hit for the wanted `kinds`, in order of position within each kind.
@@ -135,6 +246,12 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             id_value,
             &mut hits,
         );
+    }
+    if want(Kind::Icd10) {
+        keyed(bytes, lower, ICD_WORDS, Kind::Icd10, icd_value, &mut hits);
+    }
+    if want(Kind::Field) {
+        field(bytes, lower, &mut hits);
     }
     if want(Kind::Email) {
         email(bytes, &mut hits);
@@ -213,7 +330,7 @@ fn ssn(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
                     && bytes.get(i + 12).is_some_and(u8::is_ascii_digit));
             if shaped
                 && ssn_valid(number(&s[0..3]), number(&s[4..6]), number(&s[7..11]))
-                && (sep == b'-' || keyword_before(lower, i, SSN_WORDS, 24))
+                && (sep == b'-' || keyword_before(lower, i, SSN_WORDS, 32))
             {
                 hits.push(Hit {
                     kind: Kind::Ssn,
@@ -227,7 +344,7 @@ fn ssn(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
         // nine digits in a row need a keyword
         if n == 9
             && !word_at(bytes, i + 9)
-            && keyword_before(lower, i, SSN_WORDS, 24)
+            && keyword_before(lower, i, SSN_WORDS, 32)
             && ssn_valid(
                 number(&bytes[i..i + 3]),
                 number(&bytes[i + 3..i + 5]),
@@ -427,6 +544,119 @@ fn date_value(bytes: &[u8], at: usize) -> Option<usize> {
         .then_some(end)
 }
 
+/// An ICD-10 code such as C50.911 or E11.9.
+fn icd_value(bytes: &[u8], at: usize) -> Option<usize> {
+    let b = |i: usize| bytes.get(at + i).copied();
+    let first = b(0)?;
+    if !first.is_ascii_uppercase() || first == b'U' || !b(1)?.is_ascii_digit() {
+        return None;
+    }
+    if !(b(2)?.is_ascii_digit() || matches!(b(2)?, b'A' | b'B')) {
+        return None;
+    }
+    let mut end = at + 3;
+    if bytes.get(end) == Some(&b'.') {
+        let tail = bytes[end + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .count();
+        if !(1..=4).contains(&tail) {
+            return None;
+        }
+        end += 1 + tail;
+    }
+    (!word_at(bytes, end)).then_some(end)
+}
+
+/// A sensitive field name followed by a value that looks like data: `"first_name": "Jane"`.
+fn field(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
+    for name in FIELD_NAMES {
+        let name = name.as_bytes();
+        let mut from = 0;
+        while let Some(at) = lower[from..]
+            .windows(name.len())
+            .position(|c| c == name)
+            .map(|p| p + from)
+        {
+            from = at + name.len();
+            // a prefix such as primary_ is fine; a longer word such as first_name_ct is not
+            if (at > 0 && lower[at - 1].is_ascii_alphanumeric()) || word_at(lower, from) {
+                continue;
+            }
+            let mut p = from;
+            if matches!(bytes.get(p), Some(b'"' | b'\'')) {
+                p += 1;
+            }
+            while bytes.get(p) == Some(&b' ') {
+                p += 1;
+            }
+            if !matches!(bytes.get(p), Some(b':' | b'=')) {
+                continue;
+            }
+            p += 1;
+            while bytes.get(p) == Some(&b' ') {
+                p += 1;
+            }
+            if let Some((start, end)) = data_value(bytes, p) {
+                hits.push(Hit {
+                    kind: Kind::Field,
+                    start,
+                    end,
+                });
+            }
+        }
+    }
+}
+
+/// The value at `at` when it reads as real data and not as a type, a call or another identifier.
+fn data_value(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
+    let quote = bytes.get(at).copied().filter(|q| matches!(q, b'"' | b'\''));
+    let (start, len) = match quote {
+        Some(q) => {
+            let inner = at + 1;
+            let len = bytes[inner..]
+                .iter()
+                .take(80)
+                .position(|&c| c == q || c == b'\n')?;
+            if bytes[inner + len] != q {
+                return None;
+            }
+            (inner, len)
+        }
+        None => (
+            at,
+            bytes[at..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == b'-')
+                .count(),
+        ),
+    };
+    let value = &bytes[start..start + len];
+    let allowed = |c: &u8| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b' ' | b'.' | b',' | b'\'' | b'-' | b'#' | b'/' | b'@' | b'+'
+            )
+    };
+    if len < 2 || !value.iter().all(allowed) || !value.iter().any(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    let word = String::from_utf8_lossy(value).to_ascii_lowercase();
+    if NON_DATA.contains(&word.trim()) {
+        return None;
+    }
+    if quote.is_none()
+        && matches!(
+            bytes.get(start + len),
+            Some(b'(' | b'[' | b'.' | b'_' | b'<' | b':')
+        )
+    {
+        return None;
+    }
+    Some((start, start + len))
+}
+
 fn email(bytes: &[u8], hits: &mut Vec<Hit>) {
     let local = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-');
     for at in (0..bytes.len()).filter(|&i| bytes[i] == b'@') {
@@ -604,5 +834,68 @@ mod tests {
             "fn main() { let n = 42; println!(\"{n}\"); } // 2026-10-28 build 1.2.3 port 4097";
         assert!(scan(text, &all()).is_empty());
         assert!(scan("é — 日本語 and 123-45-6789", &all()).len() == 1);
+    }
+
+    #[test]
+    fn underscore_keywords_catch_structured_fields() {
+        assert_eq!(
+            kinds("\"date_of_birth\": \"1980-02-03\"", &all()),
+            [Kind::Dob]
+        );
+        assert_eq!(
+            kinds("{\"member_id\": \"A1234567\"}", &all()),
+            [Kind::MedicalId]
+        );
+        assert_eq!(kinds("medicare id 1EG4TE5MK73", &all()), [Kind::MedicalId]);
+        assert_eq!(
+            kinds("\"social_security_number\": \"123456789\"", &all()),
+            [Kind::Ssn]
+        );
+    }
+
+    #[test]
+    fn icd10_codes_follow_their_keyword() {
+        assert_eq!(kinds("ICD-10: C50.911", &all()), [Kind::Icd10]);
+        assert_eq!(kinds("diagnosis_code = E11.9", &all()), [Kind::Icd10]);
+        assert!(kinds("icd: hello", &all()).is_empty());
+        assert!(kinds("code C50.911 alone", &all()).is_empty());
+    }
+
+    #[test]
+    fn field_values_are_found_by_name_and_only_when_they_read_as_data() {
+        let field = [Kind::Field];
+        assert_eq!(
+            kinds(
+                "{\"first_name\": \"Jane\", \"last_name\": \"O'Neil\"}",
+                &field
+            ),
+            [Kind::Field, Kind::Field]
+        );
+        assert_eq!(kinds("last_name: Doe", &field), [Kind::Field]);
+        assert_eq!(
+            kinds("{\"primary_first_name\": \"Jane\"}", &field),
+            [Kind::Field]
+        );
+        assert_eq!(kinds("{\"zip_code\": \"02139\"}", &field), [Kind::Field]);
+        for clean in [
+            "first_name: str",
+            "first_name = Column(String)",
+            "{\"first_name\": \"string\"}",
+            "first_name: Mapped[str]",
+            "{\"first_name_ct\": \"abcdef\"}",
+            "{\"first_name\": \"\"}",
+            "{\"first_name\": null}",
+            "first_name = request.first_name",
+            "{\"first_name\": \"{{ user }}\"}",
+            "{\"first_name\": \"[[REIKI_TERM_aaaa]]\"}",
+        ] {
+            assert!(kinds(clean, &field).is_empty(), "{clean}");
+        }
+    }
+
+    #[test]
+    fn field_is_off_by_default() {
+        assert!(!Kind::DEFAULT.contains(&Kind::Field));
+        assert!(Kind::DEFAULT.contains(&Kind::Icd10));
     }
 }

@@ -6,6 +6,8 @@
 
 use crate::detect::{self, Hit, Kind};
 
+/// Longest column list read after `INSERT INTO t (`.
+const MAX_COLUMN_LIST: usize = 4096;
 const DELIMITERS: [u8; 4] = *b"\t|,;";
 
 /// The kind of identifier a column holds, from its header name.
@@ -272,7 +274,15 @@ fn sql(text: &str, want: &dyn Fn(Kind) -> bool, hits: &mut Vec<Hit>) {
         if b.get(i) != Some(&b'(') {
             continue;
         }
-        let Some(close) = b[i..].iter().position(|c| *c == b')').map(|q| i + q) else {
+        // A column list is short and holds no '('. Stopping there keeps a body of unclosed INSERTs
+        // from rescanning ahead on every occurrence.
+        let Some(close) = b[i + 1..]
+            .iter()
+            .take(MAX_COLUMN_LIST)
+            .take_while(|c| **c != b'(')
+            .position(|c| *c == b')')
+            .map(|q| i + 1 + q)
+        else {
             continue;
         };
         let map: Vec<Option<Kind>> = text[i + 1..close]

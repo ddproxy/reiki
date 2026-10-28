@@ -209,6 +209,29 @@ const NON_DATA: &[&str] = &[
     "bytes",
 ];
 
+/// Adds the table hits that do not overlap a hit already found. The covered ranges are merged and
+/// sorted so each check is a binary search; a scan over every earlier hit would be quadratic on a large table.
+fn add_table_hits(text: &str, kinds: &[Kind], hits: &mut Vec<Hit>) {
+    let mut covered: Vec<(usize, usize)> = hits.iter().map(|h| (h.start, h.end)).collect();
+    covered.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(covered.len());
+    for (start, end) in covered {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut table = crate::columnar::scan_tables(text, kinds);
+    table.sort_unstable_by_key(|h| (h.start, h.end));
+    table.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    for hit in table {
+        let at = merged.partition_point(|&(_, end)| end <= hit.start);
+        if !merged.get(at).is_some_and(|&(start, _)| start < hit.end) {
+            hits.push(hit);
+        }
+    }
+}
+
 /// Every hit for the wanted `kinds`, in order of position within each kind.
 pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     let bytes = text.as_bytes();
@@ -263,11 +286,7 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     if want(Kind::Phone) {
         phone(bytes, &mut hits);
     }
-    for hit in crate::columnar::scan_tables(text, kinds) {
-        if !hits.iter().any(|h| h.start < hit.end && hit.start < h.end) {
-            hits.push(hit);
-        }
-    }
+    add_table_hits(text, kinds, &mut hits);
     hits
 }
 

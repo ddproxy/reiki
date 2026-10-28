@@ -16,6 +16,46 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// The token in a `Proxy-Authorization` value: a bearer token, or the password of a basic
+/// credential (the user name when the password is empty), as `HTTPS_PROXY=http://user:token@host` sends it.
+pub fn proxy_token(value: &str) -> Option<String> {
+    let (scheme, rest) = value.trim().split_once(' ')?;
+    let rest = rest.trim();
+    let token = if scheme.eq_ignore_ascii_case("bearer") {
+        rest.to_owned()
+    } else if scheme.eq_ignore_ascii_case("basic") {
+        let decoded = String::from_utf8(base64_decode(rest)?).ok()?;
+        let (user, pass) = decoded.split_once(':').unwrap_or((decoded.as_str(), ""));
+        if pass.is_empty() { user } else { pass }.to_owned()
+    } else {
+        return None;
+    };
+    (!token.is_empty()).then_some(token)
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for byte in text.trim_end_matches('=').bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 pub const CREDENTIAL_HEADERS: [&str; 2] = ["x-api-key", "x-goog-api-key"];
 
 pub fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
@@ -163,5 +203,17 @@ mod tests {
             strip_query_key("q=a%20b&key=tok&r=%2F").as_deref(),
             Some("q=a%20b&r=%2F")
         );
+    }
+
+    #[test]
+    fn a_proxy_credential_yields_its_token() {
+        assert_eq!(proxy_token("Bearer abc").as_deref(), Some("abc"));
+        // "user:tok" and ":tok" and "tok:" as basic credentials.
+        assert_eq!(proxy_token("Basic dXNlcjp0b2s=").as_deref(), Some("tok"));
+        assert_eq!(proxy_token("basic OnRvaw==").as_deref(), Some("tok"));
+        assert_eq!(proxy_token("Basic dG9rOg==").as_deref(), Some("tok"));
+        for bad in ["", "Bearer ", "Basic !!!", "Digest abc", "Basic"] {
+            assert_eq!(proxy_token(bad), None, "{bad}");
+        }
     }
 }

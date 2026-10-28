@@ -1458,3 +1458,53 @@ async fn a_forwarder_that_exhausts_its_keys_still_falls_back() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     let _ = std::fs::remove_file(&sock);
 }
+
+#[tokio::test]
+async fn too_many_copies_of_a_command_are_refused() {
+    let pid_path = std::env::temp_dir().join(format!("reiki-fwd-cap-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pid_path);
+    let text = format!(
+        "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+         [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"{}\", \"hang\", \"{}\"]\nmax_concurrent = 1\n\
+         [keys.k]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+         [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+        python(),
+        child_script().display(),
+        pid_path.display(),
+        reiki::auth::sha256_hex("tok")
+    );
+    let app = App::new(
+        Config::parse(&text).unwrap(),
+        HashMap::from([("k".to_string(), Secret::new("key123"))]),
+        Policy::default(),
+        PluginChain::default(),
+    );
+    let base = serve_app(app).await;
+    let url = format!("{base}/zen/chat");
+    let first = tokio::spawn({
+        let url = url.clone();
+        async move {
+            let _ = reqwest::Client::new()
+                .post(url)
+                .bearer_auth("tok")
+                .body("{}")
+                .send()
+                .await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth("tok")
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("the second request waited instead of being refused")
+    .unwrap();
+    assert_eq!(second.status().as_u16(), 502);
+    first.abort();
+    let _ = std::fs::remove_file(&pid_path);
+}

@@ -169,7 +169,7 @@ impl Snapshot {
         limiter.check(now).err()
     }
 
-    fn authenticate(&self, token: &str) -> Option<&str> {
+    pub(crate) fn authenticate(&self, token: &str) -> Option<&str> {
         let hash = sha256_hex(token);
         let mut found = None;
         // Check every stream so timing does not reveal which one matched.
@@ -266,7 +266,7 @@ impl App {
             policy,
             standard: Standard::new(),
             faithful: Faithful::new(),
-            forwarder: Forwarder,
+            forwarder: Forwarder::default(),
             header_timeout,
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
@@ -439,6 +439,18 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new().fallback(handle).with_state(app)
+}
+
+/// True for a `.` or `..` segment, plain or percent-encoded, an encoded `/` or `\`, or a
+/// raw backslash: forms an upstream may normalise into a path outside the one Reiki checked.
+fn has_path_trick(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains('\\')
+        || lower
+            .split('/')
+            .any(|segment| matches!(segment.replace("%2e", ".").as_str(), "." | ".."))
 }
 
 fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -762,13 +774,31 @@ async fn dispatch_inner(
     faithful: bool,
 ) -> Response {
     let rest = rest.as_str();
-    let Ok(body) = to_bytes(body, MAX_REQUEST_BODY).await else {
+    if has_path_trick(parts.uri.path()) {
         return json_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_large",
-            "request body too large",
+            StatusCode::BAD_REQUEST,
+            "bad_path",
+            "dot segments and encoded separators are not allowed in the path",
         );
-    };
+    }
+    let body =
+        match tokio::time::timeout(app.header_timeout, to_bytes(body, MAX_REQUEST_BODY)).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too_large",
+                    "request body too large",
+                );
+            }
+            Err(_) => {
+                return json_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "body_timeout",
+                    "the request body did not arrive in time",
+                );
+            }
+        };
     let mut body = body;
 
     // Run request hooks once, before the failover loop, so every attempt sees
@@ -930,6 +960,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     let mut skip: Vec<String> = Vec::new();
     let mut last_refusal: Option<(String, StatusCode, HeaderMap, Bytes)> = None;
     let mut pending_failover: Option<(String, FailureKind)> = None;
+    let mut disabled_one = false;
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
             break;
@@ -1029,7 +1060,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let response_headers = response.headers.clone();
-        let snippet = read_limited(response).await;
+        let secrets = [secret.0.as_str(), auth_value.as_str()];
+        let snippet = scrub(read_limited(response).await, &secrets);
+        let response_headers = scrub_headers(response_headers, &secrets);
         app.plugins.on_attempt(
             &mut plugin_states,
             &key_name,
@@ -1060,8 +1093,16 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
             }
+            Outcome::KeyFailure(FailureClass::Unauthorized) if disabled_one => {
+                // A second key refusing the same request points at the request, not at the keys.
+                tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request again, not disabling it");
+                skip.push(key_name.clone());
+                last_refusal = Some((key_name.clone(), status, response_headers, snippet));
+                pending_failover = Some((key_name, FailureKind::Unauthorized));
+            }
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
+                disabled_one |= matches!(class, FailureClass::Unauthorized);
                 record(
                     app,
                     snapshot,
@@ -1282,9 +1323,58 @@ async fn read_limited(mut response: UpstreamResponse) -> Bytes {
     Bytes::from(collected)
 }
 
+/// Headers that identify the account behind a shared key, or set state in the client.
+fn is_account_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "openai-organization"
+            | "openai-project"
+            | "anthropic-organization-id"
+            | "set-cookie"
+            | "set-cookie2"
+    )
+}
+
+/// Replaces a key (or its formatted credential) an upstream echoed back in text relayed to a client.
+fn scrub(bytes: Bytes, secrets: &[&str]) -> Bytes {
+    let mut data = bytes;
+    let mut ordered: Vec<&str> = secrets.iter().copied().filter(|s| s.len() >= 8).collect();
+    // The formatted credential contains the raw key, so it has to go first.
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for secret in ordered {
+        let needle = secret.as_bytes();
+        if !data.windows(needle.len()).any(|w| w == needle) {
+            continue;
+        }
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            if data[i..].starts_with(needle) {
+                out.extend_from_slice(b"[redacted]");
+                i += needle.len();
+            } else {
+                out.push(data[i]);
+                i += 1;
+            }
+        }
+        data = Bytes::from(out);
+    }
+    data
+}
+
+fn scrub_headers(headers: HeaderMap, secrets: &[&str]) -> HeaderMap {
+    let mut out = HeaderMap::with_capacity(headers.len());
+    for (name, value) in &headers {
+        let cleaned = scrub(Bytes::copy_from_slice(value.as_bytes()), secrets);
+        let value = HeaderValue::from_bytes(&cleaned).unwrap_or_else(|_| value.clone());
+        out.append(name.clone(), value);
+    }
+    out
+}
+
 fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
     for (name, value) in from {
-        if !skip_header(name) {
+        if !skip_header(name) && !is_account_header(name) {
             to.append(name.clone(), value.clone());
         }
     }
@@ -1591,5 +1681,53 @@ mod tests {
             Some("a".to_owned())
         );
         assert!(snapshot.soonest_recovery(&health, "s").is_some());
+    }
+
+    #[test]
+    fn dot_segments_and_encoded_separators_are_path_tricks() {
+        for path in [
+            "/up/../admin",
+            "/up/./x",
+            "/up/%2e%2e/admin",
+            "/up/%2E/x",
+            "/up/.%2e/x",
+            "/up/a%2fb",
+            "/up/a%5Cb",
+            "/up\\x",
+        ] {
+            assert!(has_path_trick(path), "{path}");
+        }
+        for path in ["/up/v1/chat", "/up/a..b/c", "/up/.hidden", "/up/..x", "/"] {
+            assert!(!has_path_trick(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_echoed_key_is_scrubbed_from_relayed_text() {
+        let body = Bytes::from_static(b"bad header: Bearer sk-secret-1234 / sk-secret-1234 end");
+        let out = scrub(body, &["sk-secret-1234", "Bearer sk-secret-1234"]);
+        assert_eq!(
+            out,
+            Bytes::from_static(b"bad header: [redacted] / [redacted] end")
+        );
+        // Short values are left alone, they are too likely to be ordinary text.
+        assert_eq!(scrub(Bytes::from_static(b"a b c"), &["b"]), "a b c");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-echo", HeaderValue::from_static("sk-secret-1234"));
+        let cleaned = scrub_headers(headers, &["sk-secret-1234"]);
+        assert_eq!(cleaned["x-echo"], "[redacted]");
+    }
+
+    #[test]
+    fn account_identifying_headers_are_not_relayed() {
+        let mut from = HeaderMap::new();
+        from.insert("openai-organization", HeaderValue::from_static("org-1"));
+        from.insert("set-cookie", HeaderValue::from_static("a=b"));
+        from.insert("x-ratelimit-remaining", HeaderValue::from_static("5"));
+        let mut to = HeaderMap::new();
+        copy_response_headers(&from, &mut to);
+        assert!(to.get("openai-organization").is_none());
+        assert!(to.get("set-cookie").is_none());
+        assert!(to.get("x-ratelimit-remaining").is_some());
     }
 }

@@ -24,8 +24,9 @@ HTTPS_PROXY=http://127.0.0.1:4099 NO_PROXY=127.0.0.1,localhost some-client
 ## What it does and does not do
 
 - Only `CONNECT` is accepted. Any other request gets 400.
-- Names are resolved by Reiki. A name that resolves to a loopback, unspecified, link-local or multicast address is refused with 502, so an allowed name cannot be pointed at Reiki's own admin port or other local services. Private ranges such as `10.0.0.0/8` are allowed.
+- Names are resolved by Reiki. A name that resolves to a loopback, unspecified, link-local or multicast address is refused with 502, so an allowed name cannot be pointed at Reiki's own admin port or other local services. Private ranges such as `10.0.0.0/8` are allowed. The same filter also refuses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`; the host's own other interface addresses are not filtered, so avoid a broad allowlist such as `*`.
 - Each closed tunnel is logged at `info` with the destination host and port, bytes in each direction and the duration. Nothing inside an opaque tunnel is visible, so there is no request log, no placeholders, no key injection and no failover for it.
+- At most 512 tunnels run at once and 64 from one peer address; more get 503. The CONNECT request head must arrive within 10 seconds, and an opaque tunnel is closed after one hour.
 - Changes to `[tunnel]` need a restart; a SIGHUP reload does not rebuild the listener.
 
 ## Interception
@@ -41,6 +42,7 @@ allow = ["api.example.com"]
 ca_cert = "/etc/reiki/ca/ca.pem"
 ca_key = "/etc/reiki/ca/ca.key"
 leaf_ttl_hours = 24
+require_auth = true       # CONNECT to a stream host must carry the stream token
 
 [[tunnel.intercept.hosts]]
 host = "api.example.com"
@@ -61,8 +63,11 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - The client uses the upstream's real URL, so no base URL has to change and the client can hold a placeholder instead of a real key. Reiki replaces the credential, as it does for a route.
 - Each intercepted host must be allowed by `allow` on port 443 and map to an upstream on that same host.
 - Only requests under the upstream's base path are relayed. Others get 403, and a `Host` header that differs from the tunnel destination gets 421.
+- Request paths with `.` or `..` segments (also percent-encoded as `%2e`), an encoded `/` (`%2f`), or a backslash are refused with 400 before any path check.
+- A CONNECT to an intercepted host served from a stream must carry that stream's token in `Proxy-Authorization`, as a bearer token or as the password of a basic credential, so `HTTPS_PROXY=http://user:TOKEN@host:port` works. Without it the tunnel answers 407 with `Proxy-Authenticate: Basic realm="reiki"`. Hosts on a `passthrough` upstream need none, because they spend no key.
+- `require_auth = false` in `[tunnel.intercept]` turns this off (default true). Do that only when every client that can reach the tunnel listener is trusted; Reiki logs a warning at startup when it is off.
 - When an API spans several path prefixes on one host, list them with `paths = ["/v1", "/other"]`. Matching prefixes (whole segments) are sent to the host exactly as the client sent them, and the upstream's `base_url` then supplies only the host and the credential format.
-- An intercepted request is relayed the way the client sent it. The upstream receives the client's header names in their original case and order, its `Accept-Encoding`, and `Connection: keep-alive`, over HTTP/1.1. Reiki changes only the credential (replaced in place), `Host` (set to the upstream's), and the hop-by-hop headers (`Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, `Proxy-*`, and a `Connection` other than `keep-alive`). `Content-Length` is recomputed from the body.
+- An intercepted request is relayed the way the client sent it. The upstream receives the client's header names in their original case and order, its `Accept-Encoding`, and `Connection: keep-alive`, over HTTP/1.1. Reiki changes only the credential (replaced in place), `Host` (set to the upstream's), and the hop-by-hop headers: the client's `Connection` header is replaced by `keep-alive` or removed, and every header named in `Connection` and `Keep-Alive`, `Expect`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade` and `Proxy-*` are removed. `Content-Length` is recomputed from the body.
 - Encoded responses (gzip, deflate, brotli, zstd) are decoded so plugins and failover can read them; the client receives plain bytes without `Content-Encoding`. An unknown encoding passes through untouched.
 - The per-upstream transport settings (`http2`, `forward_accept_encoding`, `title_case_headers`, `send_keep_alive`) apply to the reverse-proxy routes only, not to intercepted traffic.
 - What Reiki cannot reproduce is the client's TLS handshake: the upstream sees Reiki's own TLS client. Only the opaque tunnel keeps the client's handshake, and it cannot swap a key.

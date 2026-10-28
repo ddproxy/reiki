@@ -147,3 +147,17 @@ fn the_tunnel_section_is_validated() {
     ))
     .is_ok());
 }
+
+#[tokio::test]
+async fn one_peer_cannot_hold_more_than_its_share_of_tunnels() {
+    let addr = tunnel(&["127.0.0.1:1".to_owned()], true).await;
+    // Idle connections that never send a request still occupy a slot.
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(TcpStream::connect(&addr).await.unwrap());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut extra = TcpStream::connect(&addr).await.unwrap();
+    assert!(status_line(&mut extra).await.contains("503"));
+    drop(held);
+}

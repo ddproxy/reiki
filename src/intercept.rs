@@ -209,6 +209,7 @@ pub struct Interceptor {
     authority: Authority,
     hosts: HashMap<String, InterceptHost>,
     ttl: Duration,
+    require_auth: bool,
     configs: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
 }
 
@@ -227,6 +228,11 @@ impl Interceptor {
         } else {
             tracing::info!(days_left = left, "interception CA loaded");
         }
+        if !config.require_auth {
+            tracing::warn!(
+                "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
+            );
+        }
         Ok(Self {
             app,
             authority,
@@ -236,12 +242,28 @@ impl Interceptor {
                 .map(|h| (h.host.clone(), h.clone()))
                 .collect(),
             ttl: Duration::from_secs(config.leaf_ttl_hours * 3600),
+            require_auth: config.require_auth,
             configs: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn handles(&self, host: &str) -> bool {
         self.hosts.contains_key(host)
+    }
+
+    /// True when a CONNECT to `host` may be intercepted. A host served from a stream spends that
+    /// stream's keys, so the client must present the stream's token; a passthrough host spends none.
+    pub fn authorize(&self, host: &str, proxy_authorization: Option<&str>) -> bool {
+        let Some(entry) = self.hosts.get(host) else {
+            return false;
+        };
+        let Some(stream) = entry.stream.as_deref().filter(|_| self.require_auth) else {
+            return true;
+        };
+        let Some(token) = proxy_authorization.and_then(crate::auth::proxy_token) else {
+            return false;
+        };
+        self.app.snapshot().authenticate(&token) == Some(stream)
     }
 
     /// Reuses a certificate until half its life is gone.

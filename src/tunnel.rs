@@ -13,6 +13,10 @@ use crate::intercept::{Interceptor, Prefixed};
 
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// An opaque tunnel is closed after this long, so idle ones cannot hold a slot forever.
+const MAX_TUNNEL_LIFETIME: Duration = Duration::from_secs(3600);
+/// Most tunnels one peer address may hold open at once.
+const MAX_TUNNELS_PER_PEER: usize = 64;
 
 /// One entry of the destination allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +124,7 @@ impl Tunnel {
                     || v6.is_unspecified()
                     || v6.is_multicast()
                     || (seg[0] & 0xffc0) == 0xfe80
+                    || seg == [0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254]
                     || embedded.is_some_and(local_v4)
             }
         };
@@ -127,8 +132,14 @@ impl Tunnel {
     }
 }
 
+/// Cloud metadata endpoints outside the link-local range.
+fn metadata_v4(v4: std::net::Ipv4Addr) -> bool {
+    matches!(v4.octets(), [100, 100, 100, 200] | [168, 63, 129, 16])
+}
+
 fn local_v4(v4: std::net::Ipv4Addr) -> bool {
-    v4.is_loopback()
+    metadata_v4(v4)
+        || v4.is_loopback()
         || v4.is_unspecified()
         || v4.is_link_local()
         || v4.is_multicast()
@@ -147,18 +158,26 @@ const MAX_TUNNELS: usize = 512;
 /// Serves CONNECT requests until the listener fails.
 pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS));
+    let peers: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>> = Arc::default();
     loop {
         let Ok((stream, peer)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
         let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
-            tracing::warn!(%peer, "tunnel is at its connection limit, dropping a connection");
+            tracing::warn!(%peer, "tunnel is at its connection limit, refusing a connection");
+            refuse(stream);
+            continue;
+        };
+        let Some(guard) = PeerGuard::enter(&peers, peer.ip()) else {
+            tracing::warn!(%peer, "peer holds too many tunnels, refusing a connection");
+            refuse(stream);
             continue;
         };
         let tunnel = Arc::clone(&tunnel);
         tokio::spawn(async move {
             let _slot = slot;
+            let _guard = guard;
             if let Err(error) = handle(stream, &tunnel).await {
                 tracing::debug!(%peer, %error, "tunnel connection ended with an error");
             }
@@ -166,8 +185,60 @@ pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
     }
 }
 
+/// Counts one open tunnel for a peer address and releases it on drop.
+struct PeerGuard {
+    peers: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl PeerGuard {
+    fn enter(
+        peers: &Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+        ip: IpAddr,
+    ) -> Option<Self> {
+        let mut map = peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = map.entry(ip).or_insert(0);
+        if *count >= MAX_TUNNELS_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            peers: Arc::clone(peers),
+            ip,
+        })
+    }
+}
+
+impl Drop for PeerGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Answers a refused connection with a 503 without holding up the accept loop.
+fn refuse(mut stream: TcpStream) {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            respond(&mut stream, "503 Service Unavailable", "too many tunnels"),
+        )
+        .await;
+    });
+}
+
 async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
-    let Some((target, rest)) = read_connect(&mut client).await? else {
+    let Some((target, rest, proxy_authorization)) = read_connect(&mut client).await? else {
         return respond(&mut client, "400 Bad Request", "expected a CONNECT request").await;
     };
     let Some((host, port)) = split_target(&target) else {
@@ -183,6 +254,16 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
         .as_ref()
         .filter(|i| port == 443 && i.handles(&host))
     {
+        if !interceptor.authorize(&host, proxy_authorization.as_deref()) {
+            tracing::warn!(%host, "tunnel refused an intercepted host without a valid stream token");
+            let message = "a stream token is required";
+            let response = format!(
+                "HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"reiki\"\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
+                message.len()
+            );
+            client.write_all(response.as_bytes()).await?;
+            return client.shutdown().await;
+        }
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -211,7 +292,13 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
     if !rest.is_empty() {
         upstream.write_all(&rest).await?;
     }
-    let (up, down) = match copy_bidirectional(&mut client, &mut upstream).await {
+    let copied = tokio::time::timeout(
+        MAX_TUNNEL_LIFETIME,
+        copy_bidirectional(&mut client, &mut upstream),
+    )
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::other("tunnel lifetime reached")));
+    let (up, down) = match copied {
         Ok(counts) => counts,
         Err(error) => {
             tracing::debug!(%host, port, %error, "tunnel copy ended with an error; byte counts are unknown");
@@ -255,10 +342,14 @@ async fn respond(client: &mut TcpStream, status: &str, message: &str) -> std::io
     client.shutdown().await
 }
 
+/// The CONNECT target, the bytes that arrived after the head, and its `Proxy-Authorization`.
+type ConnectHead = (String, Vec<u8>, Option<String>);
+
 /// Reads the request head. Returns the CONNECT target and any bytes that arrived after the head.
-async fn read_connect(client: &mut TcpStream) -> std::io::Result<Option<(String, Vec<u8>)>> {
+async fn read_connect(client: &mut TcpStream) -> std::io::Result<Option<ConnectHead>> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 1024];
+    let deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
     let end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break i + 4;
@@ -266,7 +357,7 @@ async fn read_connect(client: &mut TcpStream) -> std::io::Result<Option<(String,
         if buf.len() > MAX_REQUEST_HEAD {
             return Ok(None);
         }
-        let n = match tokio::time::timeout(HEAD_TIMEOUT, client.read(&mut chunk)).await {
+        let n = match tokio::time::timeout_at(deadline, client.read(&mut chunk)).await {
             Ok(result) => result?,
             Err(_) => return Ok(None),
         };
@@ -281,7 +372,17 @@ async fn read_connect(client: &mut TcpStream) -> std::io::Result<Option<(String,
         (Some(method), Some(target), Some(version))
             if method.eq_ignore_ascii_case("CONNECT") && version.starts_with("HTTP/1.") =>
         {
-            Ok(Some((target.to_owned(), buf[end..].to_vec())))
+            let proxy_authorization = head.lines().skip(1).find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("proxy-authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            Ok(Some((
+                target.to_owned(),
+                buf[end..].to_vec(),
+                proxy_authorization,
+            )))
         }
         _ => Ok(None),
     }
@@ -368,5 +469,21 @@ mod tests {
         ] {
             assert!(t.reachable(&addr.parse().unwrap()), "{addr}");
         }
+    }
+
+    #[test]
+    fn cloud_metadata_addresses_outside_link_local_are_unreachable() {
+        let t = tunnel(&["*"]);
+        for ip in [
+            "100.100.100.200",
+            "168.63.129.16",
+            "169.254.169.254",
+            "fd00:ec2::254",
+        ] {
+            let addr = SocketAddr::new(ip.parse().unwrap(), 443);
+            assert!(!t.reachable(&addr), "{ip}");
+        }
+        let public = SocketAddr::new("93.184.216.34".parse().unwrap(), 443);
+        assert!(t.reachable(&public));
     }
 }

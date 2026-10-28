@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::Forward;
 use crate::proxy::{passthrough_headers, upstream_headers};
-use crate::upstream::{Call, SendFuture, Transport, UpstreamResponse};
+use crate::upstream::{strip_hop_by_hop, Call, SendFuture, Transport, UpstreamResponse};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 128;
@@ -39,7 +39,34 @@ fn fail(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(ForwarderError(message.into()))
 }
 
-pub struct Forwarder;
+/// Caps the copies of each command running at once, so unauthenticated or hostile traffic
+/// cannot spawn processes without bound.
+#[derive(Default)]
+pub struct Forwarder {
+    limits:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>,
+}
+
+const DEFAULT_MAX_CONCURRENT: u32 = 16;
+
+impl Forwarder {
+    fn permit(&self, spec: &Forward) -> Result<tokio::sync::OwnedSemaphorePermit, std::io::Error> {
+        let limit = spec.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT);
+        let key = format!("{}\0{limit}", spec.command.as_deref().unwrap_or_default());
+        let semaphore = {
+            let mut limits = self
+                .limits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(limits.entry(key).or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(limit as usize))
+            }))
+        };
+        semaphore
+            .try_acquire_owned()
+            .map_err(|_| fail("too many copies of the forward command are running"))
+    }
+}
 
 impl Transport for Forwarder {
     fn send<'a>(&'a self, call: Call<'a>) -> SendFuture<'a> {
@@ -52,7 +79,10 @@ impl Transport for Forwarder {
             let request = build_request(&call).map_err(fail)?;
             match (&spec.socket, &spec.command) {
                 (Some(path), _) => exchange_socket(path, spec.expect_uid, request).await,
-                (None, Some(_)) => exchange_command(spec, request).await,
+                (None, Some(_)) => {
+                    let permit = self.permit(spec)?;
+                    exchange_command(spec, request, permit).await
+                }
                 (None, None) => Err(fail("[upstream.forward] has neither socket nor command")),
             }
         })
@@ -75,27 +105,32 @@ fn build_request(call: &Call<'_>) -> Result<Request<Full<Bytes>>, String> {
     }
 
     let upstream = call.upstream;
+    let mut inbound = call.parts.headers.clone();
+    strip_hop_by_hop(&mut inbound, false);
+    for name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ] {
+        inbound.remove(name);
+    }
     let mut headers = match call.credential {
         Some((name, value)) => upstream_headers(
-            &call.parts.headers,
+            &inbound,
             name,
             value,
             upstream.forward_accept_encoding,
             upstream.send_keep_alive,
         ),
         None => passthrough_headers(
-            &call.parts.headers,
+            &inbound,
             upstream.forward_accept_encoding,
             upstream.send_keep_alive,
         ),
     };
-    for name in [
-        header::CONTENT_LENGTH,
-        header::TRANSFER_ENCODING,
-        header::CONNECTION,
-        header::EXPECT,
-        header::HOST,
-    ] {
+    for name in [header::CONTENT_LENGTH, header::CONNECTION, header::HOST] {
         headers.remove(name);
     }
     headers.insert(
@@ -152,6 +187,7 @@ async fn exchange_socket(
 async fn exchange_command(
     spec: &Forward,
     request: Request<Full<Bytes>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let command = spec.command.as_deref().unwrap_or_default();
     let mut cmd = tokio::process::Command::new(command);
@@ -180,6 +216,7 @@ async fn exchange_command(
     // lingers is stopped after a grace period instead of being left running.
     let failed = result.is_err();
     tokio::spawn(async move {
+        let _permit = permit;
         if failed
             || tokio::time::timeout(CHILD_EXIT_GRACE, child.wait())
                 .await
@@ -233,16 +270,8 @@ where
             .to_bytes();
         let mut headers = parts.headers;
         let original_length = headers.get(header::CONTENT_LENGTH).cloned();
-        for name in [
-            header::CONTENT_LENGTH,
-            header::TRANSFER_ENCODING,
-            header::CONNECTION,
-            header::UPGRADE,
-            HeaderName::from_static("keep-alive"),
-            HeaderName::from_static("proxy-connection"),
-        ] {
-            headers.remove(name);
-        }
+        strip_hop_by_hop(&mut headers, false);
+        headers.remove(header::CONTENT_LENGTH);
         // HEAD keeps the length the forwarder reported, and 204/304 carry none.
         if is_head {
             if let Some(length) = original_length {
@@ -293,32 +322,26 @@ pub fn socket_warnings(config: &crate::config::Config) -> Vec<String> {
         let Some(path) = forward.socket.as_ref() else {
             continue;
         };
-        if !path.exists() {
-            warnings.push(format!(
-                "upstream `{name}`: socket {} does not exist yet (the forwarder may start later)",
-                path.display()
-            ));
-            continue;
-        }
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if !meta.file_type().is_socket() {
-                warnings.push(format!(
-                    "upstream `{name}`: {} exists but is not a socket",
-                    path.display()
-                ));
-            }
-        }
         if forward.expect_uid.is_none() {
-            if let Some(parent) = path.parent() {
-                if let Ok(meta) = std::fs::metadata(parent) {
-                    if meta.mode() & 0o022 != 0 {
-                        warnings.push(format!(
-                            "upstream `{name}`: {} is in a directory others can write to; set `expect_uid` so the key is not sent to another process's socket",
-                            path.display()
-                        ));
-                    }
+            if let Some(meta) = path.parent().and_then(|p| std::fs::metadata(p).ok()) {
+                if meta.mode() & 0o022 != 0 {
+                    warnings.push(format!(
+                        "upstream `{name}`: {} is in a directory others can write to; set `expect_uid` so the key is not sent to another process's socket",
+                        path.display()
+                    ));
                 }
             }
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(_) => warnings.push(format!(
+                "upstream `{name}`: socket {} does not exist yet (the forwarder may start later)",
+                path.display()
+            )),
+            Ok(meta) if !meta.file_type().is_socket() => warnings.push(format!(
+                "upstream `{name}`: {} exists but is not a socket",
+                path.display()
+            )),
+            Ok(_) => {}
         }
     }
     warnings
@@ -444,6 +467,24 @@ file = "/etc/reiki/keys/zen-a"
         let config2 = Config::parse(&text2).unwrap();
         let warnings2 = socket_warnings(&config2);
         assert!(!warnings2.iter().any(|w| w.contains("others can write")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_socket_in_a_writable_directory_still_warns_about_the_directory() {
+        let dir = temp_dir();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        unixfs::PermissionsExt::set_mode(&mut perms, 0o777);
+        fs::set_permissions(&dir, perms).unwrap();
+        let path = dir.join("later.sock");
+        let text = minimal_base(&format!(
+            "[upstream.zen.forward]\nsocket = \"{}\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n",
+            path.display()
+        ));
+        let warnings = socket_warnings(&Config::parse(&text).unwrap());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("others can write to")));
+        assert!(warnings.iter().any(|w| w.contains("does not exist yet")));
         let _ = fs::remove_dir_all(&dir);
     }
 }

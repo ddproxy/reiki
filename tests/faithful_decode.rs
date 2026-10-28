@@ -149,7 +149,7 @@ async fn setup(label: &str, response: Vec<u8>) -> Setup {
 async fn connect(setup: &Setup) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut stream = TcpStream::connect(&setup.tunnel).await?;
     stream
-        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Bearer unused\r\n\r\n").as_bytes())
         .await?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];

@@ -151,6 +151,30 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
+/// True when `"field": "value"` appears as real JSON. Text a client sent that an upstream
+/// echoes inside a string has its quotes escaped, so it cannot imitate a field.
+fn has_json_pair(body: &str, field: &str, value: &str) -> bool {
+    let key = format!("\"{field}\"");
+    let mut from = 0;
+    while let Some(at) = body[from..].find(&key) {
+        let start = from + at;
+        from = start + key.len();
+        if body[..start].ends_with('\\') {
+            continue;
+        }
+        let Some(rest) = body[from..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        if rest.strip_prefix(value).is_some_and(|r| r.starts_with('"')) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_edge_block_page(body: &str) -> bool {
     contains_any(body, &["error code: 10"])
 }
@@ -171,7 +195,7 @@ pub fn classify_at(
         401 => Outcome::KeyFailure(FailureClass::Unauthorized),
         402 => Outcome::KeyFailure(FailureClass::QuotaExhausted),
         400 => {
-            if contains_any(&body, &["api key not valid", "api_key_invalid"]) {
+            if has_json_pair(&body, "reason", "api_key_invalid") {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
             } else if contains_any(&body, &["credit balance is too low"]) {
                 Outcome::KeyFailure(FailureClass::QuotaExhausted)
@@ -431,6 +455,20 @@ mod tests {
                 r#"{"error":{"message":"max_tokens is required"}}"#
             ),
             Outcome::PassThrough
+        );
+    }
+
+    #[test]
+    fn an_echoed_key_invalid_marker_does_not_disable_a_key() {
+        let echoed =
+            r#"{"error":{"message":"Unrecognized request argument supplied: api_key_invalid"}}"#;
+        assert_eq!(classify(400, None, echoed), Outcome::PassThrough);
+        let escaped = r#"{"error":{"message":"bad field \"reason\": \"API_KEY_INVALID\""}}"#;
+        assert_eq!(classify(400, None, escaped), Outcome::PassThrough);
+        let real = r#"{"error":{"details":[{ "reason" : "API_KEY_INVALID" }]}}"#;
+        assert_eq!(
+            classify(400, None, real),
+            Outcome::KeyFailure(FailureClass::Unauthorized)
         );
     }
 }

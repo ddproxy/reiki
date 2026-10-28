@@ -192,9 +192,7 @@ async fn main() {
         tracing::info!(%addr, "reiki admin listening");
         let admin_router = reiki::admin::router(Arc::clone(&app));
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(admin_listener, admin_router).await {
-                tracing::error!(error = %e, "admin server error");
-            }
+            reiki::serve::serve(admin_listener, admin_router, 64, std::future::pending()).await;
         });
     }
     if let Some(tunnel) = &tunnel_config {
@@ -212,14 +210,10 @@ async fn main() {
         tokio::spawn(reiki::tunnel::serve(tunnel_listener, Arc::new(built)));
     }
     tracing::info!(%listen, "reiki listening");
-    let served = axum::serve(listener, router(app))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await;
-    if let Err(e) = served {
-        fail(&format!("server error: {e}"));
-    }
+    reiki::serve::serve(listener, router(app), 1024, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
 }
 
 #[cfg(test)]

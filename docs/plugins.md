@@ -47,7 +47,7 @@ REIKI_PLUGINS=placeholders,requestlog cargo build --release --no-default-feature
 A plugin is trusted code that runs inside the Reiki process.
 
 - Before a key is chosen, `on_request` receives the stream name, the upstream name, the method, the request path, the request headers and the request body. It can change the headers and the body, or reject the request with a status and a message. It runs once per request, so every failover attempt sends the same transformed request.
-- It sees the client's own headers, including the client token, and the whole request body. It never receives an upstream key: the key is attached after the hooks have run, and any `authorization` header a plugin sets is dropped.
+- It sees the client's own headers, including the client token, and the whole request body. It never receives an upstream key: the key is attached after the hooks have run, and on a keyed upstream any `authorization` header a plugin sets is dropped (on a `passthrough` upstream the client's credentials, including one a plugin sets, are forwarded).
 - The request path is passed to plugins, the query string is not.
 - `on_attempt` runs after each upstream attempt, including the ones that fail over to the next key. It receives the key's name from the config, the upstream status (`None` when no response arrived) and, for an error response, the start of its body. It never receives a key's secret.
 - `on_response_head` receives the name of the key that produced the response, the upstream status and the headers. `on_response_chunk` receives each body chunk and may rewrite it.

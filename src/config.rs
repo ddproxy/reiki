@@ -46,6 +46,8 @@ pub enum ConfigError {
         fallback: String,
     },
     BadAdminTokenHash,
+    AdminTokenReused(String),
+    ReservedStreamName(String),
     AdminListenConflict,
     BadTunnel(String),
     BadLog(String),
@@ -127,6 +129,13 @@ impl fmt::Display for ConfigError {
                     f,
                     "admin token_sha256 is not 64 hex characters (it must not be empty)"
                 )
+            }
+            Self::AdminTokenReused(stream) => write!(
+                f,
+                "admin token_sha256 is the same as the token of stream `{stream}`, which would give that stream admin access"
+            ),
+            Self::ReservedStreamName(name) => {
+                write!(f, "stream name `{name}` is reserved for unauthenticated passthrough traffic")
             }
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
@@ -295,6 +304,8 @@ pub struct Forward {
     pub pass_env: Vec<String>,
     pub socket: Option<std::path::PathBuf>,
     pub expect_uid: Option<u32>,
+    /// Most copies of `command` running at once; further requests get a 502. Defaults to 16.
+    pub max_concurrent: Option<u32>,
 }
 
 /// One hop to another upstream, used only when the chain has no usable key left here.
@@ -378,6 +389,10 @@ pub struct InterceptConfig {
     /// How long a minted certificate is valid.
     #[serde(default = "default_leaf_ttl_hours")]
     pub leaf_ttl_hours: u64,
+    /// Whether a CONNECT to a host served from a stream must carry that stream's token.
+    /// Turn it off only when the tunnel listener is reachable by trusted clients alone.
+    #[serde(default = "default_true")]
+    pub require_auth: bool,
     pub hosts: Vec<InterceptHost>,
 }
 
@@ -611,6 +626,18 @@ impl Config {
                         reason: "`expect_uid` applies only to `socket`".to_owned(),
                     });
                 }
+                if forward.max_concurrent == Some(0) {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "`max_concurrent` must be at least 1".to_owned(),
+                    });
+                }
+                if !has_command && forward.max_concurrent.is_some() {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "`max_concurrent` applies only to `command`".to_owned(),
+                    });
+                }
                 if let Some(socket) = &forward.socket {
                     if !socket.is_absolute() {
                         return Err(ConfigError::BadForward {
@@ -689,6 +716,9 @@ impl Config {
             }
         }
         let mut seen: Vec<(&str, &str)> = Vec::new();
+        if self.streams.contains_key("passthrough") {
+            return Err(ConfigError::ReservedStreamName("passthrough".to_owned()));
+        }
         for (name, stream) in &self.streams {
             if stream.chain.is_empty() {
                 return Err(ConfigError::EmptyChain(name.clone()));
@@ -736,6 +766,14 @@ impl Config {
         if let Some(admin) = &self.admin {
             if !is_sha256_hex(&admin.token_sha256) {
                 return Err(ConfigError::BadAdminTokenHash);
+            }
+            let admin_hash = admin.token_sha256.to_ascii_lowercase();
+            if let Some((name, _)) = self
+                .streams
+                .iter()
+                .find(|(_, stream)| stream.token_sha256.to_ascii_lowercase() == admin_hash)
+            {
+                return Err(ConfigError::AdminTokenReused(name.clone()));
             }
             if admin.listen == self.listen {
                 return Err(ConfigError::AdminListenConflict);
@@ -1475,5 +1513,54 @@ socket = "/run/forwarder.sock"
                 reason: "socket forwarding needs a Unix platform".into(),
             }
         );
+    }
+
+    #[test]
+    fn the_admin_token_must_differ_from_every_stream_token() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{}\"\n",
+            HASH_A.to_ascii_uppercase()
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::AdminTokenReused("s".into())
+        );
+    }
+
+    #[test]
+    fn a_stream_cannot_take_the_passthrough_name() {
+        let text = base(&format!(
+            "[streams.passthrough]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::ReservedStreamName("passthrough".into())
+        );
+    }
+
+    #[test]
+    fn forward_max_concurrent_needs_a_command_and_a_positive_value() {
+        for (extra, reason) in [
+            (
+                "socket = \"/run/x.sock\"\nmax_concurrent = 4",
+                "`max_concurrent` applies only to `command`",
+            ),
+            (
+                "command = \"/bin/x\"\nmax_concurrent = 0",
+                "`max_concurrent` must be at least 1",
+            ),
+        ] {
+            let text = base(&format!(
+                "[upstream.zen.forward]\n{extra}\n\
+                 [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+            ));
+            assert_eq!(
+                Config::parse(&text).unwrap_err(),
+                ConfigError::BadForward {
+                    upstream: "zen".into(),
+                    reason: reason.into(),
+                }
+            );
+        }
     }
 }

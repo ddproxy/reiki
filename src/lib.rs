@@ -10,6 +10,7 @@ pub mod plugins;
 pub mod proxy;
 pub mod quota;
 pub mod rewrite;
+pub mod serve;
 pub mod state;
 pub mod tunnel;
 pub mod upstream;

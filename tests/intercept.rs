@@ -133,7 +133,7 @@ async fn connect(
 ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut stream = TcpStream::connect(&setup.tunnel).await?;
     stream
-        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Bearer unused\r\n\r\n").as_bytes())
         .await?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -246,4 +246,49 @@ async fn listed_paths_reach_the_host_as_sent() {
         let (status, _) = request(&s, HOST, "GET", path, "").await;
         assert_eq!(status, 403, "{path}");
     }
+}
+
+async fn connect_status(setup: &Setup, credential: Option<&str>) -> String {
+    let mut stream = TcpStream::connect(&setup.tunnel).await.unwrap();
+    let header = credential.map_or(String::new(), |c| format!("Proxy-Authorization: {c}\r\n"));
+    stream
+        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\n{header}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read_exact(&mut byte).await.is_err() {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_intercepted_host_needs_the_streams_token_on_connect() {
+    let s = setup("auth", "", "").await;
+    assert!(connect_status(&s, None).await.contains("407"));
+    assert!(connect_status(&s, Some("Bearer wrong"))
+        .await
+        .contains("407"));
+    assert!(connect_status(&s, Some("Digest x")).await.contains("407"));
+    assert!(connect_status(&s, Some("Bearer unused"))
+        .await
+        .contains("200"));
+    // HTTPS_PROXY=http://user:unused@host sends this basic credential ("user:unused").
+    assert!(connect_status(&s, Some("Basic dXNlcjp1bnVzZWQ="))
+        .await
+        .contains("200"));
+}
+
+#[tokio::test]
+async fn the_connect_credential_requirement_can_be_turned_off() {
+    let s = setup("noauth", "require_auth = false", "").await;
+    assert!(connect_status(&s, None).await.contains("200"));
 }

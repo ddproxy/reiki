@@ -631,6 +631,47 @@ async fn quota_and_disabled_access_both_move_to_the_next_key() {
 }
 
 #[tokio::test]
+async fn a_request_body_that_stalls_is_timed_out() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h =
+        harness_with_timeout(&one_stream(), Policy::default(), Duration::from_millis(300)).await;
+    let addr = h.relay.trim_start_matches("http://").to_owned();
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /zen/x HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-a\r\nContent-Length: 100\r\n\r\nab",
+        )
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_buf(&mut reply))
+        .await
+        .expect("no answer to a stalled body")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 408"));
+    assert!(h.mock.keys_called().is_empty());
+}
+
+#[tokio::test]
+async fn one_request_disables_at_most_one_key() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    h.mock
+        .script("up-b", vec![Reply::Status(401, "invalid api key", None)]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(
+        res.status(),
+        401,
+        "the upstream's own answer is handed back"
+    );
+    // Only the first key was disabled, so the second still serves the next request.
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
+}
+
+#[tokio::test]
 async fn an_upstream_401_disables_that_key() {
     let h = harness(&one_stream(), Policy::default()).await;
     h.mock

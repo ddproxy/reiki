@@ -311,6 +311,40 @@ impl Default for Faithful {
     }
 }
 
+/// Removes the fixed hop-by-hop headers and every header the sender's `Connection` names, so a
+/// header Reiki sets later cannot be stripped by an intermediary that honours that list.
+/// With `keep_alive` the `Connection` header stays where it was, reduced to `keep-alive`.
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_alive: bool) {
+    let named: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .filter(|name| name != header::CONNECTION)
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in [
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "expect",
+    ] {
+        headers.remove(name);
+    }
+    if keep_alive {
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    } else {
+        headers.remove(header::CONNECTION);
+    }
+}
+
 pub fn faithful_request(
     parts: &Parts,
     url: &str,
@@ -329,25 +363,14 @@ pub fn faithful_request(
     let mut headers = parts.headers.clone();
     let extensions = parts.extensions.clone();
 
-    for name in [
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-    ] {
-        headers.remove(name);
-    }
     let keep_connection = headers
         .get_all(header::CONNECTION)
         .iter()
-        .next()
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"keep-alive"));
-    if !keep_connection {
-        headers.remove(header::CONNECTION);
-    }
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("keep-alive"));
+    strip_hop_by_hop(&mut headers, keep_connection);
+    headers.remove(header::CONTENT_LENGTH);
 
     if let Some((name, value)) = credential {
         for other in ["authorization", "x-api-key", "x-goog-api-key"] {

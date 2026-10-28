@@ -9,6 +9,23 @@
 - `pass_env` for a command; otherwise its environment is cleared except `PATH`, `HOME`, `LANG` and `LC_ALL`.
 - A failed link to a forwarder answers 502 without cooling the key, retrying, or using a fallback upstream.
 - `reiki check` and startup warn about a missing or non-socket path, or a writable socket directory without `expect_uid`.
+- `max_concurrent` on a forward `command` caps simultaneous runs (default 16); a request over the cap gets 502.
+- `[tunnel.intercept] require_auth` (default true) requires the stream token on a CONNECT to an intercepted host served from a stream.
+
+### Security
+
+- CONNECT to an intercepted stream host requires the stream token (`require_auth`); this breaks intercepted setups that send no credential, which should put the token in the `HTTPS_PROXY` URL or set `require_auth = false`.
+- One request disables at most one key, and a key-invalid marker must be a real JSON field.
+- Dot segments and encoded separators in request paths are refused.
+- A second `Connection` header, `Keep-Alive` and `Expect` can no longer reach the upstream, and headers named by `Connection` are removed.
+- Echoed keys are redacted in relayed errors.
+- Account-identifying response headers are not relayed.
+- Client and admin listeners time out slow headers and bodies and cap connections.
+- Tunnel head deadline, per-peer cap, 503 instead of silent drops, and a one-hour cap on opaque tunnels.
+- `max_concurrent` caps forward command runs.
+- The admin token must differ from stream tokens, and `passthrough` is a reserved stream name.
+- The state file is written 0600 and exclusively.
+- Release workflow builds run read-only with the release job isolated, and the toolchain and artifact actions are pinned.
 
 ## 0.6.0
 

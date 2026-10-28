@@ -32,7 +32,7 @@ Reiki rewrites the body once before it picks a key, so a failover to the next ke
 By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Four optional upstream settings make the relay behave more like a plain pass-through:
 
 - `http2 = true` negotiates HTTP/2 with that upstream when it offers it over TLS. Without TLS there is nothing to negotiate and the connection stays HTTP/1.1.
-- `forward_accept_encoding = true` sends the client's own `Accept-Encoding` header upstream instead of `identity`. A client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself, so error bodies are still read for key failover and logging, and the client receives plain bytes without a `Content-Encoding` header.
+- `forward_accept_encoding = true` sends the client's own `Accept-Encoding` header upstream instead of `identity`. A client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses itself (on reverse routes and intercepted hosts; a forward upstream relays `content-encoding` as-is), so error bodies are still read for key failover and logging, and the client receives plain bytes without a `Content-Encoding` header.
 
 - `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
 - `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection.
@@ -89,9 +89,11 @@ Content-Type: application/json
 
 The client's other headers pass through as for a normal upstream. The key is sent only in the upstream's credential header, with no second copy and no Reiki-specific header. On a `passthrough` upstream the client's own credential is forwarded unchanged.
 
+Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `X-Real-IP` are removed (Reiki sets `X-Forwarded-Proto` itself), and so are the hop-by-hop headers and the headers named by the client's `Connection`.
+
 ### What Reiki does with the answer
 
-The status must be 200-599. The body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. Nothing reaches the client until the forwarder has finished.
+The status must be 200-599. The body is fully buffered, up to 8 MiB, with at most 128 headers and 64 KiB per header value. Chunked responses are accepted and joined. Reiki replaces `content-length` with the real buffered length (a HEAD response keeps the length the forwarder reported, and 204 and 304 responses carry none) and forwards `content-encoding` as-is without decoding it. The client's `Expect` header is not passed on. The response gets the same hop-by-hop cleanup. Nothing reaches the client until the forwarder has finished.
 
 A forwarder's own error status (for example 401, 402, 429 or 5xx) is treated exactly like an upstream returning it, so normal key classification and failover apply. A forwarder can acknowledge and queue work by answering at once with 202; no special mode is needed.
 
@@ -106,6 +108,9 @@ Any failure of the link to the forwarder answers the client with 502. That cover
 - `stderr` is discarded.
 - The response is returned as soon as it is complete. The program then has 1 second to exit before it is killed.
 - A program still running when the request times out is killed. Processes it started are not.
+- Reiki does not close the program's stdin after writing the request, so the program must read the request using its `Content-Length` and not wait for end of input.
+- At most 16 copies of the command run at once. Set `max_concurrent = N` (N at least 1, valid only with `command`) to change it; a request that would exceed it gets 502.
+- The command is looked up with Reiki's own `PATH` unless it is an absolute path, so prefer an absolute path.
 
 ### Socket specifics
 
@@ -113,15 +118,15 @@ Any failure of the link to the forwarder answers the client with 502. That cover
 - The path must be absolute and at most 103 bytes. Unix only.
 - With `expect_uid`, Reiki reads the peer's uid after connecting and before writing anything, and refuses with 502 if it differs.
 - Keep the socket in a directory that only the Reiki user and the listener can enter, and set `expect_uid`. See [security](security.md). Inside a rootless container or user namespace, the uid is the mapped one.
-- `reiki check` and startup warn when the socket does not exist yet, is not a socket, or sits in a group- or world-writable directory without `expect_uid`.
+- `reiki check` and startup warn when the socket does not exist yet or is not a socket. They also warn about a group- or world-writable directory without `expect_uid`, even when the socket does not exist yet.
 - Test a listener with `curl --unix-socket PATH http://localhost/...`.
 
 ### Limits and restrictions
 
-- `args` and `pass_env` are valid only with `command`. `expect_uid` is valid only with `socket`.
+- `args`, `pass_env` and `max_concurrent` are valid only with `command`. `expect_uid` is valid only with `socket`.
 - A forward upstream cannot be combined with `http2`, `title_case_headers` or an intercepted tunnel host. Startup rejects these.
-- `header_timeout` (default 120 seconds) bounds the whole exchange: connect, send and the full response.
-- A client that disconnects does not cancel the request.
+- The 120-second request timeout bounds the whole exchange: connect, send and the full response.
+- A client that disconnects does not necessarily stop the request; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
 
@@ -215,7 +220,7 @@ http2 = true
 forward_accept_encoding = true
 ```
 
-A request to `/zen-direct/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions` with every header the client sent, `Authorization` and `x-api-key` included, and the body as sent. Whatever comes back is returned as it is, errors too.
+A request to `/zen-direct/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions` with the client's headers, `Authorization` and `x-api-key` included, and the `key=` query parameter removed. Plugins may rewrite the body. Whatever comes back is returned as it is, errors too.
 
 - No Reiki token is checked, so a client needs none. Anything that can reach the listener can use the upstream with its own credentials, so keep the listener on loopback or behind your own access control.
 - No key from the chain is used and there is no failover. Keys and streams cannot refer to a passthrough upstream, and it cannot have a `fallback`.

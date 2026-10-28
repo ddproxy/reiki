@@ -114,7 +114,7 @@ async fn connect(
 ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut stream = TcpStream::connect(&setup.tunnel).await?;
     stream
-        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .write_all(format!("CONNECT {HOST}:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Bearer unused\r\n\r\n").as_bytes())
         .await?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -319,4 +319,36 @@ async fn the_reverse_proxy_route_still_lowercases_and_sends_identity() {
         assert_eq!(name, name.to_ascii_lowercase(), "{raw}");
     }
     assert!(lines.contains(&"accept-encoding: identity"), "{raw}");
+}
+
+#[tokio::test]
+async fn a_connection_header_cannot_make_an_intermediary_strip_the_injected_key() {
+    let (setup, captured) = setup("conn-trick").await;
+    let body = br#"{"model":"gpt-5"}"#;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: {HOST}\r\n\
+         Authorization: Bearer client-key\r\n\
+         Connection: keep-alive\r\n\
+         Connection: authorization, x-trace\r\n\
+         Keep-Alive: timeout=1\r\n\
+         x-trace: t\r\n\
+         Content-Length: {}\r\n\
+         \r\n",
+        body.len()
+    );
+    let (status, _) = send(&setup, &head, body).await;
+    assert_eq!(status, 200);
+
+    let raw = String::from_utf8_lossy(&captured.await.unwrap()).into_owned();
+    let lower = raw.to_ascii_lowercase();
+    assert_eq!(lower.matches("connection:").count(), 1, "{raw}");
+    assert!(lower.contains("connection: keep-alive"), "{raw}");
+    assert!(
+        lower.contains(&format!("authorization: bearer {REAL_KEY}")),
+        "{raw}"
+    );
+    for gone in ["keep-alive: timeout", "x-trace:"] {
+        assert!(!lower.contains(gone), "{gone} should be gone: {raw}");
+    }
 }

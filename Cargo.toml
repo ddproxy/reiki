@@ -59,6 +59,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio", "
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-roots"] }
 async-compression = { version = "0.4", default-features = false, features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
 http-body-util = "0.1"
+tower-service = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 time = "0.3"
 x509-parser = { version = "0.18", default-features = false }

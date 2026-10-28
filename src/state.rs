@@ -117,7 +117,15 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let mut name: OsString = path.as_os_str().to_owned();
     name.push(format!(".tmp.{}", std::process::id()));
     let temp = PathBuf::from(name);
-    std::fs::write(&temp, text)?;
+    // A stale or planted file at the temporary path is replaced, never followed or reused.
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temp)?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    file.sync_all()?;
     std::fs::rename(&temp, path)
 }
 

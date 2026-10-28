@@ -408,6 +408,22 @@ impl App {
         let _ = self.tunnel.set(tunnel);
     }
 
+    /// Every file whose change should trigger a reload: the config, the key files and the files plugins read.
+    pub fn reload_inputs(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.config_path.get().cloned().into_iter().collect();
+        paths.extend(
+            self.snapshot()
+                .config
+                .keys
+                .values()
+                .map(|key| PathBuf::from(&key.file)),
+        );
+        paths.extend(self.plugins().watched_paths());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Records the config path that `POST /reload` re-reads.
     pub fn set_config_path(&self, path: PathBuf) {
         let _ = self.config_path.set(path);

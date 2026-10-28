@@ -1,8 +1,11 @@
 //! What a config reload did, and the record of the last ones for `/status`.
 
-use std::time::SystemTime;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use crate::proxy::json_escape;
+use crate::plugins::{stamp, FileStamp};
+use crate::proxy::{json_escape, App};
 
 /// The outcome of a successful reload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +131,72 @@ impl Default for ReloadState {
     }
 }
 
+type Stamps = Vec<(PathBuf, Option<FileStamp>)>;
+
+fn stamps(paths: &[PathBuf]) -> Stamps {
+    paths.iter().map(|p| (p.clone(), stamp(p))).collect()
+}
+
+/// Notices when a set of files changed and then held still, so a half-written file is not read.
+pub struct ChangeDetector {
+    settled: Stamps,
+    pending: Option<Stamps>,
+}
+
+impl ChangeDetector {
+    /// Takes the files as they are now as the baseline.
+    pub fn new(paths: &[PathBuf]) -> Self {
+        Self {
+            settled: stamps(paths),
+            pending: None,
+        }
+    }
+
+    /// Call once per interval. True when the files differ from the baseline and are the same as on
+    /// the previous call, which makes them the new baseline.
+    pub fn changed(&mut self, paths: &[PathBuf]) -> bool {
+        let now = stamps(paths);
+        if now == self.settled {
+            self.pending = None;
+            return false;
+        }
+        if self.pending.as_ref() == Some(&now) {
+            self.settled = now;
+            self.pending = None;
+            return true;
+        }
+        self.pending = Some(now);
+        false
+    }
+}
+
+/// Reloads the config when `[reload] watch = true` and its files change. Runs for the life of the
+/// process and reads the setting each round, so a reload can switch it on or off.
+pub async fn watch(app: Arc<App>) {
+    let mut detector = ChangeDetector::new(&app.reload_inputs());
+    loop {
+        let (enabled, seconds) = {
+            let snapshot = app.snapshot();
+            (
+                snapshot.config.reload.watch,
+                snapshot.config.reload.interval_secs,
+            )
+        };
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        if !enabled {
+            detector = ChangeDetector::new(&app.reload_inputs());
+            continue;
+        }
+        if detector.changed(&app.reload_inputs()) {
+            tracing::info!("config or key files changed; reloading");
+            let worker = Arc::clone(&app);
+            // `reload_now` logs the outcome; a bad config is not retried until the files change again.
+            let _ = tokio::task::spawn_blocking(move || worker.reload_now()).await;
+            detector = ChangeDetector::new(&app.reload_inputs());
+        }
+    }
+}
+
 /// `2026-10-23T21:04:10Z` for a point in time, without a date library.
 fn rfc3339(time: SystemTime) -> String {
     let secs = time
@@ -211,6 +280,34 @@ mod tests {
         assert!(
             json.contains("\"ok\":false") && json.contains("bad \\\"thing\\\""),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn a_change_is_reported_once_the_files_hold_still() {
+        let file = std::env::temp_dir().join(format!("reiki-detect-{}.txt", std::process::id()));
+        std::fs::write(&file, "one").unwrap();
+        let paths = [file.clone()];
+        let mut detector = ChangeDetector::new(&paths);
+        assert!(!detector.changed(&paths), "nothing changed");
+
+        std::fs::write(&file, "one, then a longer edit").unwrap();
+        assert!(
+            !detector.changed(&paths),
+            "first sight of a change waits a tick"
+        );
+        std::fs::write(&file, "still being written, now longer again").unwrap();
+        assert!(
+            !detector.changed(&paths),
+            "a file still changing keeps waiting"
+        );
+        assert!(detector.changed(&paths), "unchanged for a tick: report it");
+        assert!(!detector.changed(&paths), "and report it only once");
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            !detector.changed(&paths) && detector.changed(&paths),
+            "a deleted file counts"
         );
     }
 

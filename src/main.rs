@@ -229,6 +229,7 @@ async fn main() {
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.set_config_path(cli.config.clone());
+    tokio::spawn(reiki::reload::watch(Arc::clone(&app)));
     app.load_persisted_state();
     #[cfg(unix)]
     spawn_sighup_reload(Arc::clone(&app), cli.config.clone(), Arc::clone(&logging));

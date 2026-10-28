@@ -51,6 +51,7 @@ pub enum ConfigError {
     AdminListenConflict,
     BadTunnel(String),
     BadLog(String),
+    BadReload(String),
     UnknownPlugin {
         name: String,
         known: Vec<String>,
@@ -139,6 +140,7 @@ impl fmt::Display for ConfigError {
             }
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
+            Self::BadReload(reason) => write!(f, "invalid [reload]: {reason}"),
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -184,6 +186,9 @@ pub struct Config {
     /// Where Reiki's own log lines go and how much it says.
     #[serde(default)]
     pub log: LogConfig,
+    /// Reloading the config when its files change.
+    #[serde(default)]
+    pub reload: ReloadConfig,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
@@ -233,6 +238,31 @@ impl Default for LogConfig {
             file_keep: default_log_file_keep(),
         }
     }
+}
+
+/// `[reload]`: watch the config and key files and reload when they change.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Reload when the config file, a key file or a file a plugin reads has changed. Off by default.
+    #[serde(default)]
+    pub watch: bool,
+    /// Seconds between checks. A change is applied once the files have stayed unchanged for one more check.
+    #[serde(default = "default_reload_interval")]
+    pub interval_secs: u64,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            watch: false,
+            interval_secs: default_reload_interval(),
+        }
+    }
+}
+
+fn default_reload_interval() -> u64 {
+    5
 }
 
 fn default_log_level() -> String {
@@ -791,6 +821,12 @@ impl Config {
                 return Err(ConfigError::AdminListenConflict);
             }
         }
+        if !(1..=3600).contains(&self.reload.interval_secs) {
+            return Err(ConfigError::BadReload(format!(
+                "interval_secs must be between 1 and 3600, got {}",
+                self.reload.interval_secs
+            )));
+        }
         Ok(())
     }
 }
@@ -831,6 +867,21 @@ fn is_port(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_reload_interval_is_checked() {
+        let base = "[upstream.zen]\nbase_url = \"https://example.com\"\n";
+        assert!(Config::parse(&format!(
+            "{base}[reload]\nwatch = true\ninterval_secs = 5\n"
+        ))
+        .is_ok());
+        let zero = Config::parse(&format!("{base}[reload]\ninterval_secs = 0\n")).unwrap_err();
+        assert!(matches!(zero, ConfigError::BadReload(_)), "{zero}");
+        assert!(Config::parse(&format!("{base}[reload]\ninterval_secs = 99999\n")).is_err());
+        assert!(Config::parse(&format!("{base}[reload]\nbogus = 1\n")).is_err());
+        let default = Config::parse(base).unwrap();
+        assert!(!default.reload.watch && default.reload.interval_secs == 5);
+    }
+
     #[test]
     fn the_log_section_defaults_and_validates() {
         let config = Config::parse("").unwrap();

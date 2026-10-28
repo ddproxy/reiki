@@ -355,3 +355,47 @@ async fn a_changed_terms_file_applies_on_reload_without_a_config_change() {
         "no change on disk, no rebuild: {quiet:?}"
     );
 }
+
+#[tokio::test]
+async fn the_watcher_reloads_when_the_config_file_changes() {
+    let rig =
+        Rig::new("[reload]\nwatch = true\ninterval_secs = 1\n[plugins.phi]\nmode = \"report\"\n")
+            .await;
+    tokio::spawn(reiki::reload::watch(Arc::clone(&rig.app)));
+    assert_eq!(rig.send(SSN_BODY).await, 200);
+
+    rig.rewrite("[reload]\nwatch = true\ninterval_secs = 1\n[plugins.phi]\nmode = \"block\"\n");
+    let mut status = 200;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        status = rig.send(SSN_BODY).await;
+        if status == 422 {
+            break;
+        }
+    }
+    assert_eq!(status, 422, "the watcher applied the edit on its own");
+    assert!(rig.admin_get("/status").await.contains("\"generation\":1"));
+
+    // A bad edit is tried once and left alone until the file changes again.
+    std::fs::write(&rig.config, "broken [").unwrap();
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let status_json = rig.admin_get("/status").await;
+    assert!(
+        status_json.contains("\"generation\":1") && status_json.contains("\"ok\":false"),
+        "{status_json}"
+    );
+    assert_eq!(
+        rig.send(SSN_BODY).await,
+        422,
+        "the running config is untouched"
+    );
+}
+
+#[tokio::test]
+async fn the_watcher_does_nothing_while_watch_is_off() {
+    let rig = Rig::new("[reload]\ninterval_secs = 1\n[plugins.phi]\nmode = \"report\"\n").await;
+    tokio::spawn(reiki::reload::watch(Arc::clone(&rig.app)));
+    rig.rewrite("[reload]\ninterval_secs = 1\n[plugins.phi]\nmode = \"block\"\n");
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(rig.send(SSN_BODY).await, 200, "no reload happened");
+}

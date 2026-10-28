@@ -58,6 +58,16 @@ Key values and stream tokens are never logged.
 
 Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config and key files, build and check the whole new state first, and swap it in only if every part is valid. A bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
 
+To reload without a signal, turn on the watcher:
+
+```toml
+[reload]
+watch = true          # off by default
+interval_secs = 5     # 1 to 3600
+```
+
+Every interval Reiki checks the config file, the key files and any file a plugin reads. When they have changed and then stayed unchanged for one more interval, it reloads, so a file still being written is never read half done. A config that fails to load is tried once and left alone until a file changes again. `watch` and `interval_secs` themselves apply on the next reload.
+
 Applied live:
 
 - keys, streams, upstreams and the admin token hash

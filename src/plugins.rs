@@ -60,9 +60,9 @@ struct Entry {
 }
 
 /// Enough of a file's identity to notice an edit: its modification time and size.
-type FileStamp = (std::time::SystemTime, u64);
+pub(crate) type FileStamp = (std::time::SystemTime, u64);
 
-fn stamp(path: &Path) -> Option<FileStamp> {
+pub(crate) fn stamp(path: &Path) -> Option<FileStamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
@@ -291,6 +291,14 @@ impl PluginChain {
     /// Names of the active plugins, for startup logging.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|e| e.plugin.name())
+    }
+
+    /// Every file a plugin in this chain reads, for the watcher.
+    pub fn watched_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .flat_map(|e| e.stamps.iter().map(|(path, _)| path.clone()))
+            .collect()
     }
 
     /// Creates the per-request state for every plugin, in chain order.

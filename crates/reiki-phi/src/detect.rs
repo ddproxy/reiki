@@ -16,6 +16,7 @@ pub enum Kind {
     MedicalId,
     Npi,
     Icd10,
+    Column,
     Field,
     Email,
     Phone,
@@ -23,7 +24,7 @@ pub enum Kind {
 
 impl Kind {
     /// Kinds that are on unless the config narrows the list.
-    pub const DEFAULT: [Kind; 8] = [
+    pub const DEFAULT: [Kind; 9] = [
         Kind::Ssn,
         Kind::Card,
         Kind::Routing,
@@ -32,6 +33,7 @@ impl Kind {
         Kind::MedicalId,
         Kind::Npi,
         Kind::Icd10,
+        Kind::Column,
     ];
 
     pub fn label(self) -> &'static str {
@@ -44,6 +46,7 @@ impl Kind {
             Kind::MedicalId => "medical_id",
             Kind::Npi => "npi",
             Kind::Icd10 => "icd10",
+            Kind::Column => "column",
             Kind::Field => "field",
             Kind::Email => "email",
             Kind::Phone => "phone",
@@ -60,6 +63,7 @@ impl Kind {
             Kind::MedicalId,
             Kind::Npi,
             Kind::Icd10,
+            Kind::Column,
             Kind::Field,
             Kind::Email,
             Kind::Phone,
@@ -259,6 +263,11 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     if want(Kind::Phone) {
         phone(bytes, &mut hits);
     }
+    for hit in crate::columnar::scan_tables(text, kinds) {
+        if !hits.iter().any(|h| h.start < hit.end && hit.start < h.end) {
+            hits.push(hit);
+        }
+    }
     hits
 }
 
@@ -304,7 +313,7 @@ fn plain_runs(bytes: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     })
 }
 
-fn ssn_valid(area: u32, group: u32, serial: u32) -> bool {
+pub(crate) fn ssn_valid(area: u32, group: u32, serial: u32) -> bool {
     area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
 }
 
@@ -361,7 +370,7 @@ fn ssn(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
     }
 }
 
-fn luhn(digits: &[u8]) -> bool {
+pub(crate) fn luhn(digits: &[u8]) -> bool {
     let sum: u32 = digits
         .iter()
         .rev()
@@ -496,7 +505,7 @@ fn account_value(bytes: &[u8], at: usize) -> Option<usize> {
     ((6..=17).contains(&n) && !word_at(bytes, at + n)).then_some(at + n)
 }
 
-fn id_value(bytes: &[u8], at: usize) -> Option<usize> {
+pub(crate) fn id_value(bytes: &[u8], at: usize) -> Option<usize> {
     let token = bytes[at..]
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
@@ -508,7 +517,7 @@ fn id_value(bytes: &[u8], at: usize) -> Option<usize> {
     ((5..=20).contains(&token) && digits >= 4).then_some(at + token)
 }
 
-fn date_value(bytes: &[u8], at: usize) -> Option<usize> {
+pub(crate) fn date_value(bytes: &[u8], at: usize) -> Option<usize> {
     let num = |from: usize, max: usize| {
         let n = digit_run(bytes, from).min(max + 1);
         (n >= 1 && n <= max).then_some((
@@ -545,7 +554,7 @@ fn date_value(bytes: &[u8], at: usize) -> Option<usize> {
 }
 
 /// An ICD-10 code such as C50.911 or E11.9.
-fn icd_value(bytes: &[u8], at: usize) -> Option<usize> {
+pub(crate) fn icd_value(bytes: &[u8], at: usize) -> Option<usize> {
     let b = |i: usize| bytes.get(at + i).copied();
     let first = b(0)?;
     if !first.is_ascii_uppercase() || first == b'U' || !b(1)?.is_ascii_digit() {
@@ -655,6 +664,26 @@ fn data_value(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
         return None;
     }
     Some((start, start + len))
+}
+
+pub(crate) fn scan_email(bytes: &[u8], hits: &mut Vec<Hit>) {
+    email(bytes, hits);
+}
+
+/// A table cell that reads as data: not empty, a type name or a placeholder.
+pub(crate) fn plain_value(bytes: &[u8]) -> bool {
+    let allowed = |c: &u8| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b' ' | b'.' | b',' | b'\'' | b'-' | b'#' | b'/' | b'@' | b'+' | b'(' | b')'
+            )
+    };
+    let word = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    bytes.len() >= 2
+        && bytes.iter().all(allowed)
+        && bytes.iter().any(u8::is_ascii_alphanumeric)
+        && !NON_DATA.contains(&word.trim())
 }
 
 fn email(bytes: &[u8], hits: &mut Vec<Hit>) {
@@ -896,6 +925,6 @@ mod tests {
     #[test]
     fn field_is_off_by_default() {
         assert!(!Kind::DEFAULT.contains(&Kind::Field));
-        assert!(Kind::DEFAULT.contains(&Kind::Icd10));
+        assert!(Kind::DEFAULT.contains(&Kind::Icd10) && Kind::DEFAULT.contains(&Kind::Column));
     }
 }

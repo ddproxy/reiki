@@ -5,6 +5,7 @@
 //! used. In `report` mode it goes through and the finding is logged. Either way the log and the
 //! rejection name the kinds and counts found, never the values.
 
+mod columnar;
 mod detect;
 
 use std::collections::BTreeMap;

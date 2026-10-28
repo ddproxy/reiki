@@ -4,6 +4,7 @@
 
 ### Added
 
+- The `phi` plugin reads tables: it maps header names and SQL column lists to identifier kinds and checks the cells under them, in CSV, TSV, pipe-delimited and Markdown text, SQL `INSERT` and `COPY` blocks. A new default-on `column` kind covers name, address, phone, zip and diagnosis columns.
 - `pass_errors = true` on an upstream relays every error status as it is, so a 403 from a git server cannot take the key out of rotation.
 
 ## 0.7.2

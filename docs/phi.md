@@ -35,9 +35,20 @@ Start in `report`, read the log for false positives, then switch to `block`. For
 | `medical_id` | A token with at least four digits after `mrn`, `member id`, `subscriber id`, `policy number`, `patient id`, `medicare id` or similar, with spaces or underscores. |
 | `npi` | A 10-digit National Provider Identifier with a valid checksum after `npi`. |
 | `icd10` | An ICD-10 diagnosis code such as `C50.911` after `icd`, `icd-10` or `diagnosis code`. |
+| `column` | A cell in a table column whose header names an identifying field, such as `first_name`, `address`, `zip_code` or `diagnosis`. See [Tables](#tables). |
 | `field` | A field named like an identifying field, with a value that reads as data: `"first_name": "Jane"`, `last_name: Doe`, `zip_code`, `phone_number`, `diagnosis`, `treatment_plan`. Finds names and addresses in JSON, YAML and log lines. Off by default, because source code names these fields too. |
 | `email` | An email address. Off by default, because source code and commit metadata carry many. |
 | `phone` | A US phone number written with separators or parentheses. Off by default. |
+
+## Tables
+
+A header names a column, so the plugin checks every cell under it as that kind of identifier. A bare nine-digit value under `ssn` is found even though nothing beside it says so. This covers:
+
+- delimited text with a header row, split by comma, tab, pipe or semicolon, with quoted cells and Markdown tables
+- SQL `INSERT INTO t (a, b) VALUES (...), (...)` with a column list
+- SQL `COPY t (a, b) FROM stdin` blocks
+
+A table without a recognised header, or an `INSERT` without a column list, is checked only by the keyword and shape rules above. A cell that holds a type name, `null` or a placeholder is not reported.
 
 ## Behavior
 

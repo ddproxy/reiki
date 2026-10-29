@@ -57,6 +57,8 @@ struct Entry {
     table: toml::Table,
     /// The files the plugin reads, as they were when it was built.
     stamps: Vec<(PathBuf, Option<FileStamp>)>,
+    /// Streams the plugin runs on; `None` runs it on every stream.
+    streams: Option<Vec<String>>,
 }
 
 /// Enough of a file's identity to notice an edit: its modification time and size.
@@ -84,14 +86,83 @@ impl Entry {
         self.stamps.iter().any(|(path, seen)| stamp(path) != *seen)
     }
 
-    /// The same plugin instance, for the next chain.
-    fn share(&self) -> Self {
+    /// Whether the plugin runs for a request on `stream`; a stream-less event reaches only unscoped plugins.
+    fn runs_for(&self, stream: Option<&str>) -> bool {
+        match (&self.streams, stream) {
+            (None, _) => true,
+            (Some(names), Some(stream)) => names.iter().any(|name| name == stream),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// The same plugin instance, for the next chain, limited to `streams`.
+    fn share(&self, streams: Option<Vec<String>>) -> Self {
         Self {
             plugin: Arc::clone(&self.plugin),
             on_error: self.on_error,
             table: self.table.clone(),
             stamps: self.stamps.clone(),
+            streams,
         }
+    }
+}
+
+/// The streams a plugin is limited to, or `None` when it runs on every stream.
+pub(crate) fn streams_of(
+    name: &str,
+    table: &toml::Table,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    let err = |message: &str| ConfigError::PluginConfig {
+        name: name.to_owned(),
+        message: message.to_owned(),
+    };
+    let items = match table.get("streams") {
+        None => return Ok(None),
+        Some(Value::Array(items)) => items,
+        Some(other) => {
+            return Err(err(&format!(
+                "`streams` must be a list of stream names, got {}",
+                other.type_str()
+            )))
+        }
+    };
+    if items.is_empty() {
+        return Err(err("`streams` must name at least one stream"));
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::String(stream) if !stream.is_empty() => names.push(stream.clone()),
+            Value::String(_) => return Err(err("`streams` must not contain an empty name")),
+            other => {
+                return Err(err(&format!(
+                    "`streams` must list stream names as strings, got {}",
+                    other.type_str()
+                )))
+            }
+        }
+    }
+    Ok(Some(names))
+}
+
+/// True when two tables differ only in `streams`, which applies without a rebuild.
+fn same_settings(a: &toml::Table, b: &toml::Table) -> bool {
+    let without_streams = |table: &toml::Table| {
+        let mut table = table.clone();
+        table.remove("streams");
+        table
+    };
+    without_streams(a) == without_streams(b)
+}
+
+/// The stream an event belongs to; a cooldown is about a key, so it has none.
+fn event_stream<'a>(event: &Event<'a>) -> Option<&'a str> {
+    match event {
+        Event::RequestDone { stream, .. }
+        | Event::Failover { stream, .. }
+        | Event::RateLimited { stream }
+        | Event::Finding { stream, .. } => Some(*stream),
+        _ => None,
     }
 }
 
@@ -153,6 +224,7 @@ impl PluginChain {
                 continue;
             }
             let on_error = on_error(reg.name, table)?;
+            let streams = streams_of(reg.name, table)?;
             let plugin = (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
                 name: reg.name.to_string(),
                 message,
@@ -163,6 +235,7 @@ impl PluginChain {
                 plugin,
                 on_error,
                 table: table.clone(),
+                streams,
             });
         }
         Self::check_admin_paths(&entries)?;
@@ -214,15 +287,27 @@ impl PluginChain {
                 Some(table) if enabled(reg.name, table)? => Some(table),
                 _ => None,
             };
+            let streams = match wanted {
+                Some(table) => streams_of(reg.name, table)?,
+                None => None,
+            };
             match (old, wanted) {
                 (None, None) => {}
                 (Some(_), None) => changed.push(reg.name.to_owned()),
-                (Some(old), Some(table)) if old.table == *table && !old.files_changed() => {
-                    entries.push(old.share());
+                (Some(old), Some(table))
+                    if same_settings(&old.table, table) && !old.files_changed() =>
+                {
+                    if old.streams != streams {
+                        changed.push(reg.name.to_owned());
+                    }
+                    entries.push(old.share(streams));
                 }
                 (Some(old), Some(_)) if !old.plugin.live_reload() => {
                     restart_needed.push(reg.name.to_owned());
-                    entries.push(old.share());
+                    if old.streams != streams {
+                        changed.push(reg.name.to_owned());
+                    }
+                    entries.push(old.share(streams));
                 }
                 (_, Some(table)) => {
                     let on_error = on_error(reg.name, table)?;
@@ -244,6 +329,7 @@ impl PluginChain {
                             plugin,
                             on_error,
                             table: table.clone(),
+                            streams,
                         });
                     }
                 }
@@ -264,7 +350,13 @@ impl PluginChain {
         PluginSession {
             chain: Arc::clone(self),
             states: self.states(),
+            scope: self.scope(None),
         }
+    }
+
+    /// Which plugins run for a request on `stream`, in chain order.
+    fn scope(&self, stream: Option<&str>) -> Vec<bool> {
+        self.entries.iter().map(|e| e.runs_for(stream)).collect()
     }
 
     fn check_admin_paths(entries: &[Entry]) -> Result<(), ConfigError> {
@@ -296,7 +388,8 @@ impl PluginChain {
 
     /// Delivers a relay-level event to every plugin; a panicking hook is logged and skipped.
     pub fn on_event(&self, event: &Event<'_>) {
-        for entry in &self.entries {
+        let stream = event_stream(event);
+        for entry in self.entries.iter().filter(|e| e.runs_for(stream)) {
             let _ = guard(entry.plugin.name(), "on_event", || {
                 entry.plugin.on_event(event);
             });
@@ -352,6 +445,9 @@ impl PluginChain {
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
         for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
+            if !entry.runs_for(Some(meta.stream)) {
+                continue;
+            }
             let mut ctx = RequestCtx::new(
                 meta.stream,
                 meta.upstream,
@@ -425,11 +521,20 @@ impl PluginChain {
     pub fn on_attempt(
         &self,
         states: &mut [Box<dyn Any + Send>],
+        scope: &[bool],
         key: &str,
         status: Option<u16>,
         body: &[u8],
     ) {
-        for (entry, state) in self.entries.iter().zip(states.iter_mut()) {
+        for ((entry, state), runs) in self
+            .entries
+            .iter()
+            .zip(states.iter_mut())
+            .zip(scope.iter().copied())
+        {
+            if !runs {
+                continue;
+            }
             let mut ctx = AttemptCtx::new(key, status, body, &mut **state);
             let _ = guard(entry.plugin.name(), "on_attempt", || {
                 entry.plugin.on_attempt(&mut ctx);
@@ -443,11 +548,21 @@ impl PluginChain {
     pub fn on_response_head(
         &self,
         states: &mut [Box<dyn Any + Send>],
+        scope: &[bool],
         key: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
     ) {
-        for (entry, state) in self.entries.iter().zip(states.iter_mut()).rev() {
+        for ((entry, state), runs) in self
+            .entries
+            .iter()
+            .zip(states.iter_mut())
+            .zip(scope.iter().copied())
+            .rev()
+        {
+            if !runs {
+                continue;
+            }
             let mut ctx = ResponseHeadCtx::new(key, &mut *status, &mut *headers, &mut **state);
             let _ = guard(entry.plugin.name(), "on_response_head", || {
                 entry.plugin.on_response_head(&mut ctx);
@@ -460,10 +575,20 @@ impl PluginChain {
     pub fn on_response_chunk(
         &self,
         states: &mut [Box<dyn Any + Send>],
+        scope: &[bool],
         chunk: &mut Bytes,
         is_last: bool,
     ) {
-        for (entry, state) in self.entries.iter().zip(states.iter_mut()).rev() {
+        for ((entry, state), runs) in self
+            .entries
+            .iter()
+            .zip(states.iter_mut())
+            .zip(scope.iter().copied())
+            .rev()
+        {
+            if !runs {
+                continue;
+            }
             let mut ctx = ChunkCtx::new(&mut *chunk, is_last, &mut **state);
             let _ = guard(entry.plugin.name(), "on_response_chunk", || {
                 entry.plugin.on_response_chunk(&mut ctx);
@@ -477,6 +602,8 @@ impl PluginChain {
 pub struct PluginSession {
     chain: Arc<PluginChain>,
     states: Vec<Box<dyn Any + Send>>,
+    /// Which plugins run for this request, set by `on_request`; only unscoped plugins until then.
+    scope: Vec<bool>,
 }
 
 impl Default for PluginSession {
@@ -484,6 +611,7 @@ impl Default for PluginSession {
         Self {
             chain: Arc::new(PluginChain::default()),
             states: Vec::new(),
+            scope: Vec::new(),
         }
     }
 }
@@ -505,11 +633,13 @@ impl PluginSession {
         headers: &mut HeaderMap,
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
+        self.scope = self.chain.scope(Some(meta.stream));
         self.chain.on_request(&mut self.states, meta, headers, body)
     }
 
     pub fn on_attempt(&mut self, key: &str, status: Option<u16>, body: &[u8]) {
-        self.chain.on_attempt(&mut self.states, key, status, body);
+        self.chain
+            .on_attempt(&mut self.states, &self.scope, key, status, body);
     }
 
     pub fn on_response_head(
@@ -519,12 +649,12 @@ impl PluginSession {
         headers: &mut HeaderMap,
     ) {
         self.chain
-            .on_response_head(&mut self.states, key, status, headers);
+            .on_response_head(&mut self.states, &self.scope, key, status, headers);
     }
 
     pub fn on_response_chunk(&mut self, chunk: &mut Bytes, is_last: bool) {
         self.chain
-            .on_response_chunk(&mut self.states, chunk, is_last);
+            .on_response_chunk(&mut self.states, &self.scope, chunk, is_last);
     }
 }
 
@@ -1125,7 +1255,7 @@ mod tests {
         let chain = PluginChain::build(&configured("[first]\n[second]\n"), &registry).unwrap();
         let mut states = chain.states();
         let mut chunk = Bytes::from_static(b"x");
-        chain.on_response_chunk(&mut states, &mut chunk, false);
+        chain.on_response_chunk(&mut states, &chain.scope(None), &mut chunk, false);
         // The last plugin to see the request sees the response first, so it tags first.
         assert_eq!(&chunk[..], b"xBA");
     }
@@ -1197,7 +1327,8 @@ mod tests {
         let mut status = StatusCode::OK;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, "31".parse().unwrap());
-        chain.on_response_head(&mut states, "key-a", &mut status, &mut headers);
+        let scope = chain.scope(None);
+        chain.on_response_head(&mut states, &scope, "key-a", &mut status, &mut headers);
         assert!(headers.get(CONTENT_LENGTH).is_none());
 
         let payload = b"echo <PLACEHOLDER> end";
@@ -1205,10 +1336,10 @@ mod tests {
             let mut release = Vec::new();
             let (first, second) = payload.split_at(split);
             let mut chunk = Bytes::copy_from_slice(first);
-            chain.on_response_chunk(&mut states, &mut chunk, false);
+            chain.on_response_chunk(&mut states, &scope, &mut chunk, false);
             release.extend_from_slice(&chunk);
             let mut chunk = Bytes::copy_from_slice(second);
-            chain.on_response_chunk(&mut states, &mut chunk, true);
+            chain.on_response_chunk(&mut states, &scope, &mut chunk, true);
             release.extend_from_slice(&chunk);
             assert_eq!(release, b"echo s3cr3t end", "split at {split}");
         }
@@ -1264,6 +1395,7 @@ mod tests {
                 on_error: OnError::PassThrough,
                 table: toml::Table::new(),
                 stamps: Vec::new(),
+                streams: None,
             });
         }
         PluginChain::check_admin_paths(&chain.entries)?;
@@ -1306,5 +1438,147 @@ mod tests {
     fn a_plugin_that_skips_bodies_does_not_make_the_chain_a_body_chain() {
         let chain = admin_chain(vec![admin("quiet", vec![])]).unwrap();
         assert!(chain.is_empty());
+    }
+
+    fn request_on(chain: &PluginChain, stream: &str, body: &mut Bytes) -> Result<(), Blocked> {
+        let mut states = chain.states();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream,
+            upstream: "zen",
+            method: &method,
+            path: "/x",
+        };
+        chain.on_request(&mut states, &meta, &mut HeaderMap::new(), body)
+    }
+
+    #[test]
+    fn a_plugin_with_streams_runs_only_on_those_streams() {
+        let chain = PluginChain::build(&configured("[append]\nstreams = [\"one\"]\n"), &registry())
+            .unwrap();
+        let mut body = Bytes::from_static(b"hi");
+        request_on(&chain, "one", &mut body).unwrap();
+        assert_eq!(&body[..], b"hi-tail");
+        let mut body = Bytes::from_static(b"hi");
+        request_on(&chain, "two", &mut body).unwrap();
+        assert_eq!(&body[..], b"hi");
+    }
+
+    #[test]
+    fn a_plugin_without_streams_runs_on_every_stream() {
+        let chain = PluginChain::build(&configured("[append]\n"), &registry()).unwrap();
+        for stream in ["one", "two", "passthrough"] {
+            let mut body = Bytes::from_static(b"hi");
+            request_on(&chain, stream, &mut body).unwrap();
+            assert_eq!(&body[..], b"hi-tail", "{stream}");
+        }
+    }
+
+    #[test]
+    fn a_scoped_plugin_runs_its_response_hooks_only_for_its_streams() {
+        let registry = vec![Registration {
+            name: "tag",
+            build: |_| Ok(Box::new(Tag("A"))),
+        }];
+        let chain = Arc::new(
+            PluginChain::build(&configured("[tag]\nstreams = [\"one\"]\n"), &registry).unwrap(),
+        );
+        let method = Method::POST;
+        for (stream, expected) in [("one", &b"xA"[..]), ("two", &b"x"[..])] {
+            let mut session = chain.session();
+            let meta = RequestMeta {
+                id: "",
+                stream,
+                upstream: "zen",
+                method: &method,
+                path: "/x",
+            };
+            session
+                .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+                .unwrap();
+            let mut chunk = Bytes::from_static(b"x");
+            session.on_response_chunk(&mut chunk, true);
+            assert_eq!(&chunk[..], expected, "{stream}");
+        }
+    }
+
+    #[test]
+    fn events_reach_a_scoped_plugin_only_for_its_streams() {
+        let scoped = admin("scoped", vec!["/scoped"]);
+        let seen = Arc::clone(&scoped.events);
+        let mut chain = PluginChain::default();
+        chain.entries.push(Entry {
+            plugin: Arc::new(scoped),
+            on_error: OnError::PassThrough,
+            table: toml::Table::new(),
+            stamps: Vec::new(),
+            streams: Some(vec!["one".to_owned()]),
+        });
+        let count = || seen.load(std::sync::atomic::Ordering::Relaxed);
+        chain.on_event(&Event::RateLimited { stream: "two" });
+        chain.on_event(&Event::Cooldown {
+            key: "k",
+            kind: reiki_plugin::FailureKind::Transient,
+        });
+        assert_eq!(count(), 0);
+        chain.on_event(&Event::RateLimited { stream: "one" });
+        assert_eq!(count(), 1);
+        let keys = KeyCounts::default();
+        assert!(
+            chain.on_admin("/scoped", keys).is_some(),
+            "admin paths ignore streams"
+        );
+    }
+
+    #[test]
+    fn a_live_reload_of_only_streams_keeps_the_running_instance() {
+        let registry = rebuild_registry();
+        let first = PluginChain::build(&configured("[append]\n[sticky]\n"), &registry).unwrap();
+        let next = first
+            .rebuild(
+                &configured("[append]\nstreams = [\"one\"]\n[sticky]\nstreams = [\"one\"]\n"),
+                &registry,
+            )
+            .unwrap();
+        assert!(
+            same_instance(&first, &next.chain, "append"),
+            "counters survive"
+        );
+        assert!(
+            same_instance(&first, &next.chain, "sticky"),
+            "counters survive"
+        );
+        assert!(next.restart_needed.is_empty());
+        assert_eq!(next.changed, ["append", "sticky"]);
+        let mut body = Bytes::from_static(b"hi");
+        request_on(&next.chain, "two", &mut body).unwrap();
+        assert_eq!(&body[..], b"hi", "append no longer runs on stream two");
+        let mut body = Bytes::from_static(b"hi");
+        request_on(&next.chain, "one", &mut body).unwrap();
+        assert_eq!(&body[..], b"hi-tail");
+
+        let edited = first
+            .rebuild(
+                &configured("[append]\n[sticky]\nsize = 2\nstreams = [\"one\"]\n"),
+                &registry,
+            )
+            .unwrap();
+        assert_eq!(edited.restart_needed, ["sticky"]);
+        assert!(same_instance(&first, &edited.chain, "sticky"));
+    }
+
+    #[test]
+    fn a_bad_streams_value_is_a_config_error() {
+        for bad in [
+            "streams = \"one\"",
+            "streams = []",
+            "streams = [\"\"]",
+            "streams = [1]",
+        ] {
+            let err = PluginChain::build(&configured(&format!("[append]\n{bad}\n")), &registry())
+                .unwrap_err();
+            assert!(err.to_string().contains("streams"), "{bad}: {err}");
+        }
     }
 }

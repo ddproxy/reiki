@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
+use reiki_plugin::HOST_KEYS;
 use toml::{Table, Value};
-
-/// Keys the host reads itself; the plugin accepts them but ignores them.
-const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES_LIMIT: usize = 256 * 1024 * 1024;
@@ -197,6 +195,7 @@ mod tests {
         assert!(parse("terms_file = \"terms.txt\"").is_err());
         assert!(parse("surprise = 1").is_err());
         assert!(parse("enabled = true\non_error = \"reject\"").is_ok());
+        assert!(parse("streams = [\"a\"]").is_ok());
         assert!(parse("max_response_bytes = 0").is_err());
         assert!(parse("rehydrate = \"yes\"").is_err());
     }

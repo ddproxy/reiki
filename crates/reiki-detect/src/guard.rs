@@ -9,12 +9,10 @@ use std::collections::BTreeMap;
 
 use http::header::CONTENT_ENCODING;
 use http::StatusCode;
-use reiki_plugin::{Plugin, PluginError, RequestCtx};
+use reiki_plugin::{Plugin, PluginError, RequestCtx, HOST_KEYS};
 use toml::Value;
 
 use crate::Hit;
-
-const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 /// An identifier kind a detection plugin looks for.
 pub trait Kind: Copy + Ord + Send + Sync + 'static {

@@ -608,3 +608,32 @@ async fn a_head_response_keeps_its_content_length_while_plugins_are_active() {
         Some("11")
     );
 }
+
+#[tokio::test]
+async fn a_plugin_limited_to_one_stream_runs_only_for_that_stream() {
+    let streams = [
+        ("ct", "tok-a", &["a", "b"][..]),
+        ("other", "tok-b", &["c"][..]),
+    ];
+    let h = harness_with_plugins(
+        &streams,
+        Policy::default(),
+        "[plugins.marker]\nstreams = [\"ct\"]\n",
+        marker_registry(),
+    )
+    .await;
+    let res = h
+        .post("tok-a", "/zen/chat/completions", "one")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = h
+        .post("tok-b", "/zen/chat/completions", "two")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bodies: Vec<Vec<u8>> = h.mock.calls().into_iter().map(|c| c.body).collect();
+    assert_eq!(bodies, [b"one-x".to_vec(), b"two".to_vec()]);
+}

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use reiki_plugin::HOST_KEYS;
 use toml::{Table, Value};
 
 /// Credential headers, refused in `headers` so they can never be logged.
@@ -20,7 +21,6 @@ const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
 /// Below the 104-byte limit of the smallest platform (macOS), leaving room for the terminator.
 const MAX_SOCKET_PATH: usize = 100;
-const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
@@ -352,6 +352,7 @@ mod tests {
     #[test]
     fn host_keys_are_accepted_and_unknown_keys_are_not() {
         assert!(parse("socket = \"/run/r.sock\"\nenabled = true\non_error = \"reject\"").is_ok());
+        assert!(parse("socket = \"/run/r.sock\"\nstreams = [\"a\"]").is_ok());
         assert!(parse("socket = \"/run/r.sock\"\nfiel = 1")
             .unwrap_err()
             .contains("fiel"));

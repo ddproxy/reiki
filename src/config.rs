@@ -4,6 +4,7 @@ use std::fmt;
 use serde::Deserialize;
 
 use crate::chain::Strategy;
+use crate::proxy::PASSTHROUGH_STREAM;
 use crate::quota::Reset;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -805,6 +806,19 @@ impl Config {
             }
             seen.push((name.as_str(), hash));
         }
+        for (name, table) in &self.plugins {
+            let Some(streams) = crate::plugins::streams_of(name, table)? else {
+                continue;
+            };
+            if let Some(stream) = streams.iter().find(|s| {
+                s.as_str() != PASSTHROUGH_STREAM && !self.streams.contains_key(s.as_str())
+            }) {
+                return Err(ConfigError::PluginConfig {
+                    name: name.clone(),
+                    message: format!("stream `{stream}` is not configured"),
+                });
+            }
+        }
         if let Some(admin) = &self.admin {
             if !is_sha256_hex(&admin.token_sha256) {
                 return Err(ConfigError::BadAdminTokenHash);
@@ -1308,6 +1322,24 @@ chain = ["zen-a"]
         assert_eq!(
             table.get("path").and_then(toml::Value::as_str),
             Some("/etc/reiki/secrets.toml")
+        );
+    }
+
+    #[test]
+    fn a_plugin_may_name_configured_streams_and_passthrough_only() {
+        let ok = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n\
+             [plugins.marker]\nstreams = [\"s\", \"passthrough\"]\n"
+        ));
+        assert!(Config::parse(&ok).is_ok());
+        let typo = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n\
+             [plugins.marker]\nstreams = [\"ghost\"]\n"
+        ));
+        let err = Config::parse(&typo).unwrap_err().to_string();
+        assert!(
+            err.contains("marker") && err.contains("ghost"),
+            "error was: {err}"
         );
     }
 

@@ -7,6 +7,7 @@
 - Plugins can report a finding with a `detail` label through `RequestCtx::report_detail`, for example a tool name or a lint rule. The host keeps only `[A-Za-z0-9_.:*/-]`, cuts the label at 64 bytes and drops it when empty. `Event::Finding` carries it as `detail`.
 - The request log adds `detail` to a `finding` record when one is set. OCSF puts it in `finding_info.title` as `(kind:detail)`; `finding_info.types` stays the kind.
 - `reiki_findings_total` ignores `detail`, so the label set does not grow with the names a plugin reports.
+- `streams = ["a", "b"]` in a `[plugins.<name>]` table runs the plugin only for requests on those streams. Without it the plugin runs on every stream. An unknown stream name is a startup error. A reload that changes only `streams` applies live and keeps the plugin running with its counters.
 
 ## 0.7.8
 

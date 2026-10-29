@@ -5,6 +5,7 @@
 //! writer thread parses, masks and writes them, so logging never delays a request.
 
 mod config;
+mod ocsf;
 mod redact;
 mod shape;
 mod sink;
@@ -20,11 +21,11 @@ use std::time::{Instant, SystemTime};
 
 use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
-pub use config::{BodyMode, Config, ResponseMode, SseMode, DENIED_HEADERS};
+pub use config::{BodyMode, Config, LogFormat, ResponseMode, SseMode, DENIED_HEADERS};
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
-use writer::{AttemptEvent, Event, RequestEvent, ResponseEvent, Sinks};
+use writer::{AttemptEvent, Event, FindingEvent, RequestEvent, ResponseEvent, Sinks};
 
 /// The `[plugins.requestlog]` table this plugin reads.
 pub const NAME: &str = "requestlog";
@@ -165,6 +166,28 @@ impl Plugin for RequestLog {
 
     fn live_reload(&self) -> bool {
         false
+    }
+
+    fn on_event(&self, event: &reiki_plugin::Event<'_>) {
+        if let reiki_plugin::Event::Finding {
+            id,
+            stream,
+            plugin,
+            kind,
+            count,
+            blocked,
+        } = *event
+        {
+            self.send(Event::Finding(FindingEvent {
+                id: id.to_owned(),
+                at: SystemTime::now(),
+                stream: stream.to_owned(),
+                plugin: plugin.to_owned(),
+                kind: kind.to_owned(),
+                count,
+                blocked,
+            }));
+        }
     }
 
     fn new_state(&self) -> Box<dyn Any + Send> {

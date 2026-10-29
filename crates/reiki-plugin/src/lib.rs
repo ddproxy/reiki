@@ -134,6 +134,8 @@ pub enum Event<'a> {
     /// A detection plugin found identifiers in a request body: how many of one kind, and whether
     /// the request was blocked for it. The event never carries the matched text.
     Finding {
+        /// The id of the request the finding is in, as it appears in Reiki's logs.
+        id: &'a str,
         stream: &'a str,
         plugin: &'a str,
         kind: &'a str,

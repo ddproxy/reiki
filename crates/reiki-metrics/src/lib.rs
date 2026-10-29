@@ -54,6 +54,7 @@ impl Plugin for MetricsPlugin {
                 kind,
                 count,
                 blocked,
+                ..
             } => self
                 .metrics
                 .record_finding(stream, plugin, kind, count, blocked),
@@ -363,6 +364,7 @@ mod tests {
     fn findings_are_counted_by_stream_plugin_kind_and_action() {
         let plugin = build(&toml::Table::new()).unwrap();
         let finding = |count, blocked| Event::Finding {
+            id: "r1",
             stream: "s",
             plugin: "phi",
             kind: "ssn",

@@ -355,6 +355,7 @@ impl PluginChain {
             .unwrap_or_else(|| Err(PluginError::Skip("plugin panicked".to_owned())));
             for found in std::mem::take(&mut ctx.reported) {
                 self.on_event(&Event::Finding {
+                    id: meta.id,
                     stream: meta.stream,
                     plugin: entry.plugin.name(),
                     kind: found.kind,

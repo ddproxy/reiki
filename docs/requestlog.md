@@ -29,6 +29,7 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `exclude` | none | Top-level keys or JSON pointers removed from logged JSON bodies, for example `["tools", "/messages/0"]`. The record lists what was dropped in `body_excluded`. |
 | `summarize` | none | Paths replaced by a short description: an array of named items (such as tools) becomes the list of names, any other array becomes `"[N items]"`, an object becomes its key names. |
 | `max_string_bytes` | `0` | Longest string kept in a logged JSON body; `0` keeps them whole. Longer ones are cut and end in `…[+N bytes]`. |
+| `format` | `json` | `json` writes Reiki's own records. `ocsf` writes [OCSF](https://schema.ocsf.io/) 1.3 events for a SIEM: see [OCSF output](#ocsf-output). |
 | `sse` | `events` | How an event-stream response is logged under `response = "body"`: `events` (an array of the parsed `data:` events), `assembled` (the streamed text, finish reason and usage) or `raw` (the stream's text). |
 | `redact` | `true` | Mask credential-shaped text (see below). |
 | `queue` | 1024 | Records buffered for the writer thread (16 to 65536). |
@@ -80,3 +81,24 @@ Request bodies are prompts, so treat the file and socket as sensitive. Both are 
 ## Where it sits in the chain
 
 Reiki runs plugins in the order they are registered in the build, not in the order of the config. The log sees the request as it is at that point, after any plugin that runs before it.
+
+## Findings from detection plugins
+
+When `phi`, `finance` or `gov` finds identifiers in a request, the log gets a `finding` record with the same `id` as the request: `{"event":"finding","id":"...","plugin":"phi","kind":"ssn","count":2,"action":"reported"}`. `action` is `blocked` or `reported`. The record names a kind and a count and never the matched text.
+
+A request a plugin blocks is rejected before it reaches the request log, so it has a `finding` record and no `request` or `response` record.
+
+The request log does not mask detected identifiers in the body it records. With the default `body = "full"`, a request that `phi` only reports is written to the log with its identifiers in it. Where a detection plugin runs in `report` mode, set `body = "summary"` or `body = "none"`.
+
+## OCSF output
+
+`format = "ocsf"` writes each record as an OCSF 1.3 event, one JSON object per line, to the file and the socket:
+
+| Record | OCSF class | Notes |
+| --- | --- | --- |
+| request | HTTP Activity (4002) | `activity_id` from the method, `http_request` with the redacted path and headers, `src_endpoint` the stream, `dst_endpoint` the upstream |
+| response | HTTP Activity (4002) | `http_response.code`, `duration` in milliseconds, `status_id` 1 or 2 |
+| finding | Detection Finding (2004) | `finding_info.types` is the kind, `count`, and `disposition` `Blocked` or `Logged` |
+
+Every event carries `metadata.correlation_uid`, the request id, so a SIEM can join a request, its response and its findings. Redaction, `headers` and `body` apply as in the JSON format.
+

@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
-use crate::config::{BodyMode, Config, SseMode};
+use crate::config::{BodyMode, Config, LogFormat, SseMode};
 use crate::redact;
 use crate::shape;
 use crate::sink::FileSink;
@@ -20,7 +20,19 @@ const MAX_HEADER_VALUE: usize = 256;
 pub enum Event {
     Request(RequestEvent),
     Response(ResponseEvent),
+    Finding(FindingEvent),
     Shutdown,
+}
+
+/// A detection plugin found identifiers in a request. It names a kind and a count, never the text.
+pub struct FindingEvent {
+    pub id: String,
+    pub at: SystemTime,
+    pub stream: String,
+    pub plugin: String,
+    pub kind: String,
+    pub count: u64,
+    pub blocked: bool,
 }
 
 pub struct RequestEvent {
@@ -117,11 +129,35 @@ fn emit(sinks: &mut Sinks, line: &str, file_failing: &mut bool) {
 }
 
 pub fn render(config: &Config, event: Event) -> String {
+    if config.format == LogFormat::Ocsf {
+        return match event {
+            Event::Request(request) => crate::ocsf::request(config, request),
+            Event::Response(response) => crate::ocsf::response(response),
+            Event::Finding(finding) => crate::ocsf::finding(finding),
+            Event::Shutdown => String::new(),
+        };
+    }
     match event {
         Event::Request(request) => render_request(config, request),
         Event::Shutdown => String::new(),
         Event::Response(response) => render_response(config, response),
+        Event::Finding(finding) => render_finding(finding),
     }
+}
+
+fn render_finding(finding: FindingEvent) -> String {
+    json!({
+        "v": 1,
+        "event": "finding",
+        "id": finding.id,
+        "ts": rfc3339_millis(finding.at),
+        "stream": finding.stream,
+        "plugin": finding.plugin,
+        "kind": finding.kind,
+        "count": finding.count,
+        "action": if finding.blocked { "blocked" } else { "reported" },
+    })
+    .to_string()
 }
 
 fn render_response(config: &Config, response: ResponseEvent) -> String {
@@ -614,5 +650,146 @@ mod tests {
         assert_eq!(record["body"]["text"], "po");
         assert_eq!(record["body"]["events"], 1);
         assert_eq!(record["body_truncated"], true);
+    }
+
+    fn finding(blocked: bool) -> FindingEvent {
+        FindingEvent {
+            id: "abc".to_owned(),
+            at: UNIX_EPOCH + Duration::from_secs(951_782_401),
+            stream: "zen".to_owned(),
+            plugin: "phi".to_owned(),
+            kind: "ssn".to_owned(),
+            count: 2,
+            blocked,
+        }
+    }
+
+    fn response() -> ResponseEvent {
+        ResponseEvent {
+            id: "abc".to_owned(),
+            at: UNIX_EPOCH + Duration::from_secs(951_782_402),
+            status: Some(429),
+            duration_ms: 120,
+            bytes: 64,
+            key: Some("zen-a".to_owned()),
+            attempts: Vec::new(),
+            body: None,
+            body_truncated: false,
+        }
+    }
+
+    fn line(config: &Config, event: Event) -> Value {
+        serde_json::from_str(&render(config, event)).unwrap()
+    }
+
+    #[test]
+    fn the_json_format_records_a_finding_with_its_request_id() {
+        let c = config("");
+        let record = line(&c, Event::Finding(finding(true)));
+        assert_eq!(record["event"], "finding");
+        assert_eq!(record["id"], "abc");
+        assert_eq!(
+            (
+                record["plugin"].as_str(),
+                record["kind"].as_str(),
+                record["count"].as_u64()
+            ),
+            (Some("phi"), Some("ssn"), Some(2))
+        );
+        assert_eq!(record["action"], "blocked");
+        assert_eq!(
+            line(&c, Event::Finding(finding(false)))["action"],
+            "reported"
+        );
+    }
+
+    #[test]
+    fn ocsf_requests_are_http_activity_events() {
+        let c = config("format = \"ocsf\"\nheaders = [\"user-agent\"]");
+        let event = line(&c, Event::Request(request("{}")));
+        assert_eq!(
+            (event["class_uid"].as_u64(), event["type_uid"].as_u64()),
+            (Some(4002), Some(400_206))
+        );
+        assert_eq!(event["activity_name"], "Post");
+        assert_eq!(event["time"], 951_782_400_000_u64);
+        assert_eq!(event["metadata"]["correlation_uid"], "abc");
+        assert_eq!(event["metadata"]["version"], "1.3.0");
+        assert_eq!(event["http_request"]["http_method"], "POST");
+        assert_eq!(
+            event["http_request"]["url"]["path"],
+            "/zen/chat/completions"
+        );
+        assert_eq!(event["http_request"]["user_agent"], "opencode/1.18.35");
+        assert_eq!(event["src_endpoint"]["name"], "zen");
+    }
+
+    #[test]
+    fn ocsf_responses_carry_the_status_and_share_the_request_id() {
+        let c = config("format = \"ocsf\"");
+        let event = line(&c, Event::Response(response()));
+        assert_eq!(event["class_uid"], 4002);
+        assert_eq!(event["metadata"]["correlation_uid"], "abc");
+        assert_eq!(event["http_response"]["code"], 429);
+        assert_eq!(
+            (event["status_id"].as_u64(), event["duration"].as_u64()),
+            (Some(2), Some(120))
+        );
+        let mut ok = response();
+        ok.status = Some(200);
+        assert_eq!(line(&c, Event::Response(ok))["status_id"], 1);
+        let mut none = response();
+        none.status = None;
+        assert_eq!(
+            line(&c, Event::Response(none))["status_detail"],
+            "no response"
+        );
+    }
+
+    #[test]
+    fn ocsf_findings_are_detection_findings_that_name_a_kind_and_a_count() {
+        let c = config("format = \"ocsf\"");
+        let blocked = line(&c, Event::Finding(finding(true)));
+        assert_eq!(
+            (blocked["class_uid"].as_u64(), blocked["type_uid"].as_u64()),
+            (Some(2004), Some(200_401))
+        );
+        assert_eq!(blocked["disposition"], "Blocked");
+        assert_eq!(blocked["finding_info"]["types"][0], "ssn");
+        assert_eq!(blocked["count"], 2);
+        assert_eq!(blocked["metadata"]["correlation_uid"], "abc");
+        let logged = line(&c, Event::Finding(finding(false)));
+        assert_eq!(
+            (
+                logged["disposition"].as_str(),
+                logged["severity_id"].as_u64()
+            ),
+            (Some("Logged"), Some(3))
+        );
+    }
+
+    #[test]
+    fn ocsf_output_masks_credentials_in_the_path_and_headers() {
+        let c = config("format = \"ocsf\"\nheaders = [\"user-agent\"]");
+        let mut event = request("{}");
+        event.path = "/zen/models?key=hunter2".to_owned();
+        event.headers = vec![(
+            "user-agent".to_owned(),
+            "tool Bearer abcdef0123456789abcdef".to_owned(),
+        )];
+        let text = render(&c, Event::Request(event));
+        assert!(
+            !text.contains("hunter2") && !text.contains("abcdef0123456789abcdef"),
+            "{text}"
+        );
+        assert!(text.contains("[REDACTED]"), "{text}");
+    }
+
+    #[test]
+    fn the_format_setting_is_checked() {
+        assert_eq!(config("").format, LogFormat::Json);
+        assert_eq!(config("format = \"ocsf\"").format, LogFormat::Ocsf);
+        let bad: toml::Table = "file = \"/x\"\nformat = \"xml\"".parse().unwrap();
+        assert!(Config::parse(&bad).unwrap_err().contains("format"));
     }
 }

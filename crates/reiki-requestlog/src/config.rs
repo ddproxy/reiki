@@ -40,6 +40,15 @@ pub enum ResponseMode {
     Body,
 }
 
+/// How each log record is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Reiki's own JSON lines.
+    Json,
+    /// OCSF events: HTTP Activity for requests and responses, Detection Finding for findings.
+    Ocsf,
+}
+
 /// How an event-stream response body is logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseMode {
@@ -71,6 +80,7 @@ pub struct Config {
     /// Longest string kept in a logged JSON body; 0 keeps them whole.
     pub max_string_bytes: usize,
     pub sse: SseMode,
+    pub format: LogFormat,
 }
 
 impl Config {
@@ -90,6 +100,7 @@ impl Config {
             "summarize",
             "max_string_bytes",
             "sse",
+            "format",
         ];
         for key in table.keys() {
             if !KNOWN.contains(&key.as_str()) && !HOST_KEYS.contains(&key.as_str()) {
@@ -158,6 +169,15 @@ impl Config {
                 ))
             }
         };
+        let format = match string(table, "format")?.as_deref() {
+            None | Some("json") => LogFormat::Json,
+            Some("ocsf") => LogFormat::Ocsf,
+            Some(other) => {
+                return Err(format!(
+                    "`format` must be \"json\" or \"ocsf\", got \"{other}\""
+                ))
+            }
+        };
         let dry_run = match table.get("dry_run") {
             None => false,
             Some(Value::Boolean(value)) => *value,
@@ -195,6 +215,7 @@ impl Config {
             summarize,
             max_string_bytes,
             sse,
+            format,
         })
     }
 }

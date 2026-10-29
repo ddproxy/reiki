@@ -32,6 +32,10 @@ fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn python_available() -> bool {
+    which("python3") || which("python")
+}
+
 fn child_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/forward_child.py")
 }
@@ -964,6 +968,9 @@ async fn forward_socket_early_reply_no_hang() {
 
 #[tokio::test]
 async fn forward_command_echo_round_trip() {
+    if !python_available() {
+        return;
+    }
     let text = format!(
         "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
          [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"{}\"]\n\
@@ -1026,6 +1033,9 @@ async fn forward_command_echo_round_trip() {
 
 #[tokio::test]
 async fn forward_command_passthrough() {
+    if !python_available() {
+        return;
+    }
     let text = format!(
         "[upstream.direct]\nbase_url = \"https://example.test/v1\"\npassthrough = true\n\
          [upstream.direct.forward]\ncommand = \"{}\"\nargs = [\"{}\"]\n",
@@ -1060,6 +1070,9 @@ async fn forward_command_passthrough() {
 
 #[tokio::test]
 async fn forward_command_big_both_ways() {
+    if !python_available() {
+        return;
+    }
     let text = format!(
         "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
          [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"{}\", \"big\"]\n\
@@ -1093,6 +1106,9 @@ async fn forward_command_big_both_ways() {
 
 #[tokio::test]
 async fn forward_command_exit_silent() {
+    if !python_available() {
+        return;
+    }
     let text = format!(
         "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
          [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"{}\", \"exit-silent\"]\n\
@@ -1131,6 +1147,9 @@ async fn forward_command_exit_silent() {
 
 #[tokio::test]
 async fn forward_command_missing_binary() {
+    if !python_available() {
+        return;
+    }
     let text = format!(
         "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
          [upstream.zen.forward]\ncommand = \"/no/such/bin\"\n\
@@ -1176,6 +1195,9 @@ async fn wait_until_dead(pid: u32, secs: u64) {
 
 #[tokio::test]
 async fn forward_command_hang_header_timeout() {
+    if !python_available() {
+        return;
+    }
     let pid_path = std::env::temp_dir().join(format!("reiki-fwd-hang-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pid_path);
     let text = format!(
@@ -1217,6 +1239,9 @@ async fn forward_command_hang_header_timeout() {
 
 #[tokio::test]
 async fn forward_command_linger() {
+    if !python_available() {
+        return;
+    }
     let pid_path =
         std::env::temp_dir().join(format!("reiki-fwd-linger-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pid_path);
@@ -1267,6 +1292,9 @@ async fn forward_command_linger() {
 
 #[tokio::test]
 async fn forward_command_env_report() {
+    if !python_available() {
+        return;
+    }
     std::env::set_var("REIKI_TEST_SECRET", "x");
     std::env::set_var("REIKI_TEST_PASSED", "y");
     let text = format!(
@@ -1612,6 +1640,9 @@ async fn forward_socket_without_streaming_waits_for_the_whole_reply() {
 
 #[tokio::test]
 async fn forward_command_streaming_relays_before_exit_and_reaps_the_child() {
+    if !python_available() {
+        return;
+    }
     let script = r#"
 import sys, time
 head = b""

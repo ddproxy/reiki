@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `reiki keys` shows each key's upstream, state, cooldown, last status code and streams from the admin `/status`, as a table or with `--json`.
+- `reiki keys --check` checks the configured key files offline for missing, unreadable, empty or group/world-readable files.
+- `/status` key entries include `last_status_code`.
+
 ## 0.7.6
 
 ### Fixed

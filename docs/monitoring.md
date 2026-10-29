@@ -28,6 +28,7 @@ Each key:
 - `state`: `available`, `cooling` or `out_of_rotation`
 - `retry_after_seconds`: present only while `cooling`
 - `consecutive_failures`: consecutive transient failures since the last success
+- `last_status_code`: the upstream status of the key's latest attempt, or `null` before one
 
 Each stream:
 
@@ -38,6 +39,19 @@ Each stream:
 - `config`: `generation` (successful reloads since start), `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and, after a failure, `error`
 
 The response carries no key values, token hashes or file paths.
+
+## Check key health
+
+`reiki keys` calls `GET /status` and prints one row per key: its name, upstream, state (`ok`, `cooling` or `disabled`), cooldown seconds remaining, last status code and the streams whose chain includes it. `reiki keys --json` prints a JSON document with a `keys` array instead.
+
+```bash
+reiki keys --token-file /etc/reiki/admin.token
+reiki keys --url http://127.0.0.1:4098 --token-file /etc/reiki/admin.token --json
+```
+
+It takes `--url` and `--token-file` the same way as `reiki reload`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It exits 0 on success, 1 when the instance refuses the token or the answer, and 2 when it cannot reach the instance or resolve the admin address.
+
+To check the key files from the config without a running instance, use `reiki keys --check`; see [troubleshooting](troubleshooting.md#key-health).
 
 ## POST /reload
 

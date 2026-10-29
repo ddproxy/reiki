@@ -35,6 +35,7 @@ struct KeyHealth {
     cooling_until: Option<Instant>,
     disabled: bool,
     transient_failures: u32,
+    last_status: Option<u16>,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +87,17 @@ impl KeyState {
         self.health.get(key).map_or(0, |h| h.transient_failures)
     }
 
+    /// The upstream status of the key's latest attempt, if one arrived.
+    pub fn last_status(&self, key: &str) -> Option<u16> {
+        self.health.get(key).and_then(|h| h.last_status)
+    }
+
+    /// Remember the upstream status of an attempt, including a failed connection
+    /// that produced none.
+    pub fn record_status(&mut self, key: &str, status: Option<u16>) {
+        self.health.entry(key.to_owned()).or_default().last_status = status;
+    }
+
     pub fn is_disabled(&self, key: &str) -> bool {
         self.health.get(key).is_some_and(|h| h.disabled)
     }
@@ -124,6 +136,7 @@ impl KeyState {
                 cooling_until: saved.cooling.map(|cooling| now + cooling),
                 disabled: saved.disabled,
                 transient_failures: saved.transient_failures,
+                last_status: None,
             },
         );
     }
@@ -575,6 +588,16 @@ mod tests {
         }
         assert_eq!(restored.cooling_remaining("cool", now), Some(secs(40)));
         assert!(!restored.is_available("dead", now + secs(100_000)));
+    }
+
+    #[test]
+    fn the_last_status_tracks_the_latest_attempt() {
+        let mut state = KeyState::default();
+        assert_eq!(state.last_status("a"), None);
+        state.record_status("a", Some(429));
+        assert_eq!(state.last_status("a"), Some(429));
+        state.record_status("a", None);
+        assert_eq!(state.last_status("a"), None);
     }
 
     #[test]

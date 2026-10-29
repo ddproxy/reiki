@@ -1220,6 +1220,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             let had_failures = if let Ok(mut health) = app.health.lock() {
                 let had = health.consecutive_failures(&key_name) > 0;
                 health.record_success(&key_name);
+                health.record_status(&key_name, Some(status.as_u16()));
                 had
             } else {
                 false
@@ -1449,6 +1450,7 @@ fn record(
         }
         let cooled =
             health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
+        health.record_status(key, status);
         if cooled {
             app.plugins().on_event(&Event::Cooldown {
                 key,

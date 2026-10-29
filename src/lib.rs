@@ -5,6 +5,7 @@ pub mod classify;
 pub mod config;
 pub mod forward;
 pub mod intercept;
+pub mod keys;
 pub mod logging;
 pub mod plugins;
 pub mod proxy;

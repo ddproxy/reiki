@@ -98,6 +98,8 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 
 `GET /__reiki/healthz` returns 200 and `ok` when Reiki is up. It needs no token.
 
+`reiki keys` prints each key's state, cooldown and last status from the admin listener, and `reiki keys --check` checks the key files offline. See [docs/monitoring.md](docs/monitoring.md#check-key-health).
+
 ## Failover
 
 | Upstream response | Action |

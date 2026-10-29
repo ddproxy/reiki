@@ -18,7 +18,7 @@ It does not make either side trustworthy. A client that can read a secret on its
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
 - A failed token check is logged with the peer address and path. An address with 10 failures in 60 seconds gets 429 with `Retry-After` until the window passes, and a good login clears its count. The throttle covers the client listener; a refused CONNECT is logged but not counted.
 - Upstreams come only from the config. A request cannot choose its own destination, so Reiki is not an open proxy.
-- Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions, so create them with mode 0600.
+- Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions at startup; `reiki keys --check` reports a key file that the group or other users can read. Create them with mode 0600.
 
 ## Network
 

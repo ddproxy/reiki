@@ -186,6 +186,11 @@ fn build_status(snapshot: &Snapshot, health: &KeyState, now: Instant) -> String 
         out.push_str(&json_string(&key.upstream));
         out.push_str(",\"consecutive_failures\":");
         out.push_str(&health.consecutive_failures(name).to_string());
+        out.push_str(",\"last_status_code\":");
+        match health.last_status(name) {
+            Some(status) => out.push_str(&status.to_string()),
+            None => out.push_str("null"),
+        }
         match health.status(name, now) {
             KeyStatus::Available => out.push_str(",\"state\":\"available\""),
             KeyStatus::OutOfRotation => out.push_str(",\"state\":\"out_of_rotation\""),

@@ -88,6 +88,10 @@ The result lists what changed, and the log carries one line per reload. `GET /st
 
 ## Key health
 
+`reiki keys` prints the live health of every key from the admin listener, including the last status code and the streams that use it. See [monitoring](monitoring.md#check-key-health).
+
+`reiki keys --check` reads only the config file and checks every key file: it must exist, be readable and not be empty, and its mode must not let the group or other users read it. It exits 0 when all files are clean, 1 for any problem or permission warning, and 2 when the config cannot be read. It never prints a key value.
+
 Key health is saved next to the config, as `<config>.state`, and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as; otherwise Reiki logs a warning and runs without persistence. A reload keeps the live health of keys whose files did not change and resets the keys whose files did, and does not read the state file again. The file holds key names and timings only, never a key value or its hash. A key file modified after the state was written counts as rotated and starts healthy (rotation is detected from the file's modification time, so a copy that preserves the old time, such as `cp -p` or `mv` of an old file, is not seen); a missing or unreadable state file is ignored with a warning.
 
 ## Common problems

@@ -13,6 +13,7 @@ use crate::shape;
 use crate::sink::FileSink;
 #[cfg(unix)]
 use crate::sink::SocketHub;
+use crate::syslog::{Meta, Syslog, SEVERITY_INFO, SEVERITY_WARNING};
 use crate::timefmt::rfc3339_millis;
 
 const MAX_HEADER_VALUE: usize = 256;
@@ -76,6 +77,30 @@ pub struct Sinks {
     pub file: Option<FileSink>,
     #[cfg(unix)]
     pub socket: Option<SocketHub>,
+    pub syslog: Option<Syslog>,
+}
+
+/// The syslog header for an event. A response with a 5xx status is a warning, like a finding.
+fn meta(event: &Event) -> Meta {
+    let (msgid, severity, at) = match event {
+        Event::Request(request) => ("request", SEVERITY_INFO, request.at),
+        Event::Response(response) => {
+            let failed = response.status.is_some_and(|code| code >= 500);
+            let severity = if failed {
+                SEVERITY_WARNING
+            } else {
+                SEVERITY_INFO
+            };
+            ("response", severity, response.at)
+        }
+        Event::Finding(finding) => ("finding", SEVERITY_WARNING, finding.at),
+        Event::Shutdown => ("request", SEVERITY_INFO, SystemTime::now()),
+    };
+    Meta {
+        msgid,
+        severity,
+        at,
+    }
 }
 
 pub fn spawn(
@@ -88,28 +113,62 @@ pub fn spawn(
         .name("requestlog-writer".to_owned())
         .spawn(move || {
             let mut file_failing = false;
+            // Records only syslog missed. The file and socket have them, so only syslog hears of it.
+            let mut syslog_lost: u64 = 0;
             for event in rx {
                 if matches!(event, Event::Shutdown) {
                     break;
                 }
+                let meta = meta(&event);
                 let line = render(&config, event);
-                emit(&mut sinks, &line, &mut file_failing);
+                if emit(&mut sinks, &line, &meta, &mut file_failing) {
+                    if syslog_lost > 0 {
+                        if let Some(syslog) = sinks.syslog.as_mut() {
+                            let now = SystemTime::now();
+                            let note = json!({
+                                "v": 1,
+                                "event": "dropped",
+                                "ts": rfc3339_millis(now),
+                                "count": syslog_lost,
+                            })
+                            .to_string();
+                            let meta = Meta {
+                                msgid: "dropped",
+                                severity: SEVERITY_WARNING,
+                                at: now,
+                            };
+                            if syslog.send(&meta, &note) {
+                                syslog_lost = 0;
+                            }
+                        }
+                    }
+                } else {
+                    syslog_lost += 1;
+                }
                 let lost = dropped.swap(0, Ordering::Relaxed);
                 if lost > 0 {
+                    let now = SystemTime::now();
                     let note = json!({
                         "v": 1,
                         "event": "dropped",
-                        "ts": rfc3339_millis(SystemTime::now()),
+                        "ts": rfc3339_millis(now),
                         "count": lost,
                     })
                     .to_string();
-                    emit(&mut sinks, &note, &mut file_failing);
+                    let meta = Meta {
+                        msgid: "dropped",
+                        severity: SEVERITY_WARNING,
+                        at: now,
+                    };
+                    emit(&mut sinks, &note, &meta, &mut file_failing);
                 }
             }
         })
 }
 
-fn emit(sinks: &mut Sinks, line: &str, file_failing: &mut bool) {
+/// Writes one record to every sink. Returns `false` when the syslog send failed; the file and the
+/// socket never affect the result.
+fn emit(sinks: &mut Sinks, line: &str, meta: &Meta, file_failing: &mut bool) -> bool {
     if let Some(file) = sinks.file.as_mut() {
         match file.write_line(line) {
             Ok(()) if *file_failing => {
@@ -128,6 +187,10 @@ fn emit(sinks: &mut Sinks, line: &str, file_failing: &mut bool) {
     if let Some(socket) = sinks.socket.as_ref() {
         socket.broadcast(&Arc::from(line));
     }
+    sinks
+        .syslog
+        .as_mut()
+        .is_none_or(|syslog| syslog.send(meta, line))
 }
 
 pub fn render(config: &Config, event: Event) -> String {
@@ -500,6 +563,7 @@ mod tests {
             file: Some(FileSink::open(&path, 0, 0).unwrap()),
             #[cfg(unix)]
             socket: None,
+            syslog: None,
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         let dropped = Arc::new(AtomicU64::new(3));

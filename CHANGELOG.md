@@ -15,6 +15,7 @@
 - A reload swaps the interception CA when `ca_cert` or `ca_key` changes, or when a renewed CA file is seen by the watcher. The new CA must have a key that matches its certificate, a DNS name constraint covering every intercepted host, and no past expiry. A CA that fails a check refuses the whole reload and the old CA keeps serving.
 - A swapped CA drops the certificates the old CA minted. New connections get certificates from the new CA, and open connections keep theirs. The reload report lists `intercept ca` in `changed`, and the log warns that clients must trust the new CA.
 - `GET /status` shows the new CA's expiry after a swap.
+- `requestlog` sends records to a syslog collector. `syslog = "udp://host:port"`, `"tcp://host:port"` or `"unix:///dev/log"` sends each record as an RFC 5424 message, with `syslog_facility` (default `local0`) and `syslog_app_name` (default `reiki`). A request never waits for the collector. A record only the collector misses is reported to the collector alone, once it is reachable again.
 
 ## 0.7.8
 

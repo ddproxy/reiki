@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use reiki_plugin::HOST_KEYS;
 use toml::{Table, Value};
 
+use crate::syslog::facility_code;
+
 /// Credential headers, refused in `headers` so they can never be logged.
 pub const DENIED_HEADERS: &[&str] = &[
     "authorization",
@@ -21,6 +23,10 @@ const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
 /// Below the 104-byte limit of the smallest platform (macOS), leaving room for the terminator.
 const MAX_SOCKET_PATH: usize = 100;
+const DEFAULT_SYSLOG_FACILITY: u8 = 16;
+const DEFAULT_SYSLOG_APP_NAME: &str = "reiki";
+/// RFC 5424 APP-NAME is at most 48 printable ASCII characters.
+const MAX_SYSLOG_APP_NAME: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
@@ -49,6 +55,17 @@ pub enum LogFormat {
     Ocsf,
 }
 
+/// Where the syslog export sends its records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyslogTarget {
+    /// `host:port`, one message per datagram.
+    Udp(String),
+    /// `host:port`, messages framed by octet count.
+    Tcp(String),
+    /// A Unix datagram socket, usually `/dev/log`.
+    Unix(PathBuf),
+}
+
 /// How an event-stream response body is logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseMode {
@@ -66,6 +83,10 @@ pub struct Config {
     pub file_max_bytes: u64,
     pub file_keep: u32,
     pub socket: Option<PathBuf>,
+    pub syslog: Option<SyslogTarget>,
+    /// The RFC 5424 facility code, `local0` (16) by default.
+    pub syslog_facility: u8,
+    pub syslog_app_name: String,
     pub body: BodyMode,
     pub max_body_bytes: usize,
     pub headers: Vec<String>,
@@ -90,6 +111,9 @@ impl Config {
             "file_max_bytes",
             "file_keep",
             "socket",
+            "syslog",
+            "syslog_facility",
+            "syslog_app_name",
             "body",
             "max_body_bytes",
             "headers",
@@ -118,9 +142,37 @@ impl Config {
                 "`socket` is longer than {MAX_SOCKET_PATH} bytes, which a Unix socket path cannot be"
             ));
         }
-        if file.is_none() && socket.is_none() {
-            return Err("set `file`, `socket` or both; nothing would be logged".to_owned());
+        let syslog = syslog_target(table)?;
+        if file.is_none() && socket.is_none() && syslog.is_none() {
+            return Err(
+                "set `file`, `socket`, `syslog` or several; nothing would be logged".to_owned(),
+            );
         }
+        if syslog.is_none()
+            && (table.contains_key("syslog_facility") || table.contains_key("syslog_app_name"))
+        {
+            return Err("`syslog_facility` and `syslog_app_name` need `syslog`".to_owned());
+        }
+        let syslog_facility = match string(table, "syslog_facility")? {
+            None => DEFAULT_SYSLOG_FACILITY,
+            Some(name) => facility_code(&name).ok_or_else(|| {
+                format!("`syslog_facility` must be a syslog facility name such as \"local0\", got \"{name}\"")
+            })?,
+        };
+        let syslog_app_name = match string(table, "syslog_app_name")? {
+            None => DEFAULT_SYSLOG_APP_NAME.to_owned(),
+            Some(name) => {
+                let valid = (1..=MAX_SYSLOG_APP_NAME).contains(&name.len())
+                    && name.bytes().all(|b| b.is_ascii_graphic())
+                    && name != "-";
+                if !valid {
+                    return Err(format!(
+                        "`syslog_app_name` must be 1 to {MAX_SYSLOG_APP_NAME} printable ASCII characters without spaces, got \"{name}\""
+                    ));
+                }
+                name
+            }
+        };
 
         let body = match string(table, "body")?.as_deref() {
             None | Some("full") => BodyMode::Full,
@@ -204,6 +256,9 @@ impl Config {
             file_max_bytes,
             file_keep,
             socket,
+            syslog,
+            syslog_facility,
+            syslog_app_name,
             body,
             max_body_bytes,
             headers,
@@ -228,6 +283,50 @@ fn string(table: &Table, key: &str) -> Result<Option<String>, String> {
             "`{key}` must be a string, got {}",
             other.type_str()
         )),
+    }
+}
+
+/// `udp://host:port`, `tcp://host:port` or `unix:///absolute/path`.
+fn syslog_target(table: &Table) -> Result<Option<SyslogTarget>, String> {
+    let Some(text) = string(table, "syslog")? else {
+        return Ok(None);
+    };
+    let target = if let Some(rest) = text.strip_prefix("udp://") {
+        SyslogTarget::Udp(host_port(rest)?)
+    } else if let Some(rest) = text.strip_prefix("tcp://") {
+        SyslogTarget::Tcp(host_port(rest)?)
+    } else if let Some(rest) = text.strip_prefix("unix://") {
+        let path = PathBuf::from(rest);
+        if !path.is_absolute() {
+            return Err("`syslog` unix path must be absolute".to_owned());
+        }
+        if path.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(format!(
+                "`syslog` unix path is longer than {MAX_SOCKET_PATH} bytes"
+            ));
+        }
+        SyslogTarget::Unix(path)
+    } else {
+        return Err(format!(
+            "`syslog` must start with udp://, tcp:// or unix://, got \"{text}\""
+        ));
+    };
+    Ok(Some(target))
+}
+
+fn host_port(rest: &str) -> Result<String, String> {
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("`syslog` must be host:port, got \"{rest}\""))?;
+    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == '/') {
+        return Err(format!("`syslog` has an invalid host in \"{rest}\""));
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err("`syslog` IPv6 addresses must be in brackets, such as [::1]:514".to_owned());
+    }
+    match port.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(format!("{host}:{port}")),
+        _ => Err(format!("`syslog` port must be 1 to 65535, got \"{port}\"")),
     }
 }
 
@@ -392,6 +491,82 @@ mod tests {
         let ok =
             parse("file = \"/x\"\nheaders = [\"User-Agent\", \"x-opencode-session\"]").unwrap();
         assert_eq!(ok.headers, ["user-agent", "x-opencode-session"]);
+    }
+
+    #[test]
+    fn syslog_targets_parse_for_each_transport() {
+        let udp = parse("syslog = \"udp://collector.internal:514\"").unwrap();
+        assert_eq!(
+            udp.syslog,
+            Some(SyslogTarget::Udp("collector.internal:514".to_owned()))
+        );
+        let tcp = parse("syslog = \"tcp://[::1]:6514\"").unwrap();
+        assert_eq!(tcp.syslog, Some(SyslogTarget::Tcp("[::1]:6514".to_owned())));
+        let unix = parse("syslog = \"unix:///dev/log\"").unwrap();
+        assert_eq!(
+            unix.syslog,
+            Some(SyslogTarget::Unix(PathBuf::from("/dev/log")))
+        );
+        assert_eq!(
+            (unix.syslog_facility, unix.syslog_app_name.as_str()),
+            (16, "reiki")
+        );
+    }
+
+    #[test]
+    fn a_syslog_only_config_is_a_valid_sink() {
+        let config = parse("syslog = \"udp://127.0.0.1:514\"\nbody = \"none\"").unwrap();
+        assert!(config.file.is_none() && config.socket.is_none());
+    }
+
+    #[test]
+    fn bad_syslog_targets_are_refused() {
+        for text in [
+            "syslog = \"http://collector:514\"",
+            "syslog = \"udp://collector\"",
+            "syslog = \"udp://collector:0\"",
+            "syslog = \"tcp://collector:70000\"",
+            "syslog = \"udp://:514\"",
+            "syslog = \"udp://::1:514\"",
+            "syslog = \"unix://dev/log\"",
+            "syslog = 514",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        let long = format!("unix:///{}/log", "d".repeat(100));
+        assert!(parse(&format!("syslog = \"{long}\"")).is_err());
+    }
+
+    #[test]
+    fn syslog_facility_and_app_name_are_validated() {
+        let config = parse(
+            "syslog = \"tcp://collector:514\"\nsyslog_facility = \"local5\"\nsyslog_app_name = \"gateway\"",
+        )
+        .unwrap();
+        assert_eq!(
+            (config.syslog_facility, config.syslog_app_name.as_str()),
+            (21, "gateway")
+        );
+        assert!(
+            parse("syslog = \"tcp://c:514\"\nsyslog_facility = \"local9\"")
+                .unwrap_err()
+                .contains("syslog_facility")
+        );
+        assert!(parse("syslog = \"tcp://c:514\"\nsyslog_app_name = \"has space\"").is_err());
+        assert!(parse("syslog = \"tcp://c:514\"\nsyslog_app_name = \"-\"").is_err());
+        let too_long = "a".repeat(49);
+        assert!(parse(&format!(
+            "syslog = \"tcp://c:514\"\nsyslog_app_name = \"{too_long}\""
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn syslog_options_need_a_syslog_target() {
+        assert!(parse("file = \"/x\"\nsyslog_facility = \"local0\"")
+            .unwrap_err()
+            .contains("need `syslog`"));
+        assert!(parse("file = \"/x\"\nsyslog_app_name = \"reiki\"").is_err());
     }
 
     #[test]

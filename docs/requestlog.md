@@ -1,6 +1,6 @@
 # Request log plugin
 
-The `requestlog` plugin records the requests that pass through Reiki as JSON lines. It writes them to a file, streams them live over a Unix socket, or both.
+The `requestlog` plugin records the requests that pass through Reiki as JSON lines. It writes them to a file, streams them live over a Unix socket, sends them to a syslog collector, or any mix of these.
 
 Compiled in by the default `plugin-requestlog` feature; inactive until a `[plugins.requestlog]` table exists.
 
@@ -10,11 +10,12 @@ Compiled in by the default `plugin-requestlog` feature; inactive until a `[plugi
 [plugins.requestlog]
 file = "/var/lib/reiki/requests.jsonl"     # JSON lines, rotated by size
 socket = "/run/reiki/requests.sock"        # live feed, one JSON line per record
+# syslog = "tcp://collector.internal:514"  # RFC 5424 messages, see Syslog output
 body = "full"                              # "full", "summary" or "none"
 headers = ["user-agent", "x-session-id"]
 ```
 
-At least one of `file` and `socket` is required, both as absolute paths. At startup, a bad value, an unknown key or an unwritable path stops Reiki from starting.
+At least one of `file`, `socket` and `syslog` is required. File and socket paths are absolute. At startup, a bad value, an unknown key or an unwritable path stops Reiki from starting.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -22,6 +23,9 @@ At least one of `file` and `socket` is required, both as absolute paths. At star
 | `file_max_bytes` | 52428800 | Rotate when the next line would pass this size. `0` never rotates. |
 | `file_keep` | 5 | Rotated files kept as `<file>.1` (newest) to `<file>.N`. `0` discards the old file at rotation. |
 | `socket` | none | Unix socket, mode 0600, path at most 100 bytes. The socket is created first and restricted a moment later, so put it in a directory that is not world-writable, ideally private (0700). A stale socket file is replaced; a live listener or any other file at that path is an error and is left alone. |
+| `syslog` | none | Syslog collector: `udp://host:port`, `tcp://host:port` or `unix:///dev/log`. Each record is sent as an RFC 5424 message. See [Syslog output](#syslog-output). |
+| `syslog_facility` | `local0` | RFC 5424 facility name, from `kern` to `local7`. Needs `syslog`. |
+| `syslog_app_name` | `reiki` | APP-NAME: 1 to 48 printable ASCII characters, no spaces, not `-`. Needs `syslog`. |
 | `body` | `full` | `full` logs the request body, `summary` logs counts only, `none` logs its size only. |
 | `max_body_bytes` | 65536 | Longest body text logged (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
 | `headers` | none | Request headers to log, matched case-insensitively, each value cut at 256 bytes. Credential headers are refused (see below). |
@@ -51,7 +55,7 @@ Every record is one line with `"v":1`. A request produces two records that share
 - `body` is parsed JSON when the body is JSON and fits `max_body_bytes` after `exclude`, `summarize` and `max_string_bytes` have trimmed it; otherwise it is a string. `body_bytes` is always the original size. Trim with those options instead of raising the cap, so large bodies stay parsed JSON.
 - In `summary` mode the record has `body_summary` with `model`, `stream`, `max_tokens`, `temperature` and the counts of `messages`, `tools` and `input_items`.
 - The response record is written once the response has finished, or the client has gone away. `status` is the upstream status, and `null` when Reiki answered without an upstream response, for example when every key is cooling. `bytes` is the size of the response body as it passed through the plugin. Response bodies are never logged.
-- If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows.
+- If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows. A record only the syslog collector misses is reported to syslog alone, see [Syslog output](#syslog-output).
 
 The request record carries the request `path` without its query string. The response record carries `key`, the name in the config of the key that produced the response (`null` when Reiki answered itself), and `attempts`, every key tried in order with the upstream status it returned (`null` for a connection error or timeout). Only key names are logged, never a key's value.
 
@@ -103,4 +107,71 @@ The request log does not mask detected identifiers in the body it records. With 
 | finding | Detection Finding (2004) | `finding_info.types` is the kind, `count`, and `disposition` `Blocked` or `Logged`. With a `detail`, `finding_info.title` ends in `(kind:detail)` |
 
 Every event carries `metadata.correlation_uid`, the request id, so a SIEM can join a request, its response and its findings. Redaction, `headers` and `body` apply as in the JSON format.
+
+## Syslog output
+
+`syslog` sends each record to a syslog collector as an RFC 5424 message. The message body is the same JSON line or OCSF event that the file gets, so `format` applies here too.
+
+```toml
+[plugins.requestlog]
+syslog = "tcp://collector.internal:514"
+syslog_facility = "local0"
+syslog_app_name = "reiki"
+```
+
+`syslog_facility` accepts the RFC 5424 names: `kern`, `user`, `mail`, `daemon`, `auth`, `syslog`, `lpr`, `news`, `uucp`, `cron`, `authpriv`, `ftp`, `ntp`, `audit`, `alert`, `clock`, and `local0` to `local7`.
+
+### Transports
+
+- `udp://host:port` sends one message per datagram, with no framing. A message larger than the datagram limit is dropped and counted.
+- `tcp://host:port` frames each message by its octet count, `LEN SP MSG`, as RFC 6587 describes. A write that waits longer than one second counts as a failure.
+- `unix:///dev/log` sends one message per datagram to a Unix datagram socket. Stream sockets are not supported. The path must be absolute and at most 100 bytes.
+
+IPv6 hosts go in brackets, such as `tcp://[::1]:514`.
+
+### Field mapping
+
+| Field | Value |
+| --- | --- |
+| PRI | Facility times 8, plus severity. Severity is 6 (info) for requests and responses, and 4 (warning) for findings, responses with a status of 500 or more, and `dropped` records. |
+| VERSION | `1` |
+| TIMESTAMP | The record's time, RFC 3339 in UTC with milliseconds. |
+| HOSTNAME | The host name from `/proc/sys/kernel/hostname`, or from `/etc/hostname`. `-` when neither gives a usable name. |
+| APP-NAME | `syslog_app_name` |
+| PROCID | Reiki's process id. |
+| MSGID | `request`, `response`, `finding` or `dropped`. |
+| STRUCTURED-DATA | `-` |
+| MSG | The record, as a JSON line or an OCSF event, as `format` selects. |
+
+A response that Reiki generates itself has no upstream status, so it is logged at info. An example is the 503 returned when every key is cooling.
+
+Example message:
+
+```
+<134>1 2026-10-23T23:27:24.291Z gw-1 reiki 4242 request - {"v":1,"event":"request","id":"d87b738bb70ccae6",...}
+```
+
+### Delivery
+
+The writer thread connects on the first record, not at startup, so Reiki starts while the collector is down. A failed connect or write drops the record. The next attempt waits 250 milliseconds. Each further failure doubles the wait, up to 30 seconds. A successful connect resets it.
+
+Records that arrive during the wait are dropped without a connect attempt. The file and the socket still have them. Once a send succeeds again, Reiki sends one `dropped` record with the count to the collector only.
+
+Requests never wait for the collector.
+
+### Example collector
+
+An rsyslog collector that receives the TCP feed and writes Reiki's records to their own file:
+
+```
+module(load="imtcp")
+input(type="imtcp" port="514")
+
+if $programname == 'reiki' then {
+    action(type="omfile" file="/var/log/reiki/requests.log")
+    stop
+}
+```
+
+Open the collector's port only to the hosts that send to it. The records hold prompts, so keep the collector's files readable by its operators only.
 

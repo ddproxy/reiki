@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An upstream key that a successful response echoes back, in a header or in the body, is now replaced before plugins and the client see it, including when it is split across streamed chunks. Before, only error responses were scrubbed.
+
 ## 0.7.7
 
 ### Added

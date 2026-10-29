@@ -184,13 +184,18 @@ async fn request(
     (status, body)
 }
 
+/// What the relay returns for the credential the upstream echoed: same length, blanked.
+fn blanked() -> String {
+    format!("[{}]", "*".repeat(format!("Bearer {REAL_KEY}").len() - 2))
+}
+
 #[tokio::test]
 async fn a_request_gets_the_real_key_and_the_plugins() {
     let s = setup("key", "[plugins.tag]", "").await;
     let (status, body) = request(&s, HOST, "POST", "/v1/chat/completions", "{\"a\":1}").await;
     assert_eq!(status, 200, "{body}");
     // With a plugin configured the response is chunked, so only the payload is compared.
-    let expected = format!("/v1/chat/completions|Bearer {REAL_KEY}|seen|{{\"a\":1}}");
+    let expected = format!("/v1/chat/completions|{}|seen|{{\"a\":1}}", blanked());
     assert!(body.contains(&expected), "{body}");
     assert!(!body.contains("client-supplied"));
 }
@@ -240,7 +245,7 @@ async fn listed_paths_reach_the_host_as_sent() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        format!("/inference/openai/v1/chat|Bearer {REAL_KEY}|-|{{}}")
+        format!("/inference/openai/v1/chat|{}|-|{{}}", blanked())
     );
     for path in ["/v1/chat", "/inference2/x", "/"] {
         let (status, _) = request(&s, HOST, "GET", path, "").await;

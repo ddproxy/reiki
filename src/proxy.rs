@@ -1229,11 +1229,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             if had_failures {
                 app.persist_state();
             }
+            let secrets = [secret.0.as_str(), auth_value.as_str()];
             return Ok(stream_response(
                 plugin_states,
                 &key_name,
                 response,
                 parts.method == Method::HEAD,
+                &secrets,
             ));
         }
 
@@ -1353,6 +1355,7 @@ async fn forward_passthrough(
                 PASSTHROUGH_KEY,
                 response,
                 parts.method == Method::HEAD,
+                &[],
             ))
         }
         Ok(Err(err)) => {
@@ -1576,16 +1579,38 @@ fn stream_response(
     key: &str,
     response: UpstreamResponse,
     is_head: bool,
+    secrets: &[&str],
 ) -> Response {
     let mut status = response.status;
     let mut headers = HeaderMap::new();
-    copy_response_headers(&response.headers, &mut headers);
+    // An upstream that echoes the key back must not hand it to a plugin or the client. A
+    // compressed body cannot be read, so it is passed on as it is.
+    let echoed_headers = if secrets.is_empty() {
+        None
+    } else {
+        Some(scrub_headers(response.headers.clone(), secrets))
+    };
+    copy_response_headers(
+        echoed_headers.as_ref().unwrap_or(&response.headers),
+        &mut headers,
+    );
     // Pass the length through when the upstream gave one, so non-chunked bodies stay non-chunked.
     if let Some(length) = response.headers.get(header::CONTENT_LENGTH) {
         headers.insert(header::CONTENT_LENGTH, length.clone());
     }
+    let scrubber = if response.headers.contains_key(header::CONTENT_ENCODING) {
+        None
+    } else {
+        crate::scrub::StreamScrubber::new(secrets)
+    };
+    let stream = |response: UpstreamResponse| -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+        match scrubber {
+            Some(scrubber) => Box::pin(crate::scrub::ScrubbedStream::new(response.into_stream(), scrubber)),
+            None => response.into_stream(),
+        }
+    };
     let body = if plugin_states.is_empty() {
-        Body::from_stream(response.into_stream())
+        Body::from_stream(stream(response))
     } else {
         let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
@@ -1600,7 +1625,7 @@ fn stream_response(
         }
         Body::from_stream(PluginBody {
             session,
-            inner: response.into_stream(),
+            inner: stream(response),
             done: false,
         })
     };

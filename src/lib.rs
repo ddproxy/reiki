@@ -13,6 +13,7 @@ pub mod quota;
 pub mod reload;
 pub mod rewrite;
 pub mod scan;
+pub mod scrub;
 pub mod serve;
 pub mod state;
 pub mod tunnel;

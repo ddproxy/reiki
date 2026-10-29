@@ -1016,13 +1016,14 @@ async fn forward_command_echo_round_trip() {
         resp.headers().get("x-saw-host").unwrap().to_str().unwrap(),
         "example.test"
     );
+    // The child saw the credential; the relay scrubs it from what it echoes back.
     assert_eq!(
         resp.headers()
             .get("x-saw-authorization")
             .unwrap()
             .to_str()
             .unwrap(),
-        "Bearer key123"
+        "[redacted]"
     );
     assert_eq!(
         resp.headers().get("x-saw-xfp").unwrap().to_str().unwrap(),

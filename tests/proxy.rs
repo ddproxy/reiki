@@ -1719,3 +1719,22 @@ async fn the_openapi_document_lists_exactly_the_v1_routes_that_answer() {
         );
     }
 }
+
+#[tokio::test]
+async fn usage_needs_the_admin_token_and_answers_under_v1() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    let admin = h.admin.as_ref().unwrap();
+    for path in ["/usage", "/v1/usage"] {
+        let refused = h.client.get(format!("{admin}{path}")).send().await.unwrap();
+        assert_eq!(refused.status(), 401, "{path}");
+        let ok = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200, "{path}");
+        assert_eq!(ok.headers()["content-type"], "application/json");
+    }
+}

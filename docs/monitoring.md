@@ -96,7 +96,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
 
 ## GET /usage
 
-Served by the `metrics` plugin with the same bearer auth as `/status`. Returns JSON per stream and upstream with `input`, `output`, and `request` counts since start.
+Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
 
 ```json
 {"stream":{"upstream":{"input":10,"output":20,"requests":1}}}

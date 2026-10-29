@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
     AdminCtx, AdminReply, ChunkCtx, Event, FailureKind, KeyCounts, Plugin, RequestCtx,
@@ -25,7 +25,7 @@ pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
 /// Counts events and renders them for the admin `/metrics` path.
 #[derive(Debug, Default)]
 pub struct MetricsPlugin {
-    metrics: Metrics,
+    metrics: Arc<Metrics>,
 }
 
 impl Plugin for MetricsPlugin {
@@ -66,7 +66,7 @@ impl Plugin for MetricsPlugin {
     }
 
     fn new_state(&self) -> Box<dyn std::any::Any + Send> {
-        Box::new(RequestState::default())
+        Box::new(RequestState::new(Arc::clone(&self.metrics)))
     }
 
     fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), reiki_plugin::PluginError> {
@@ -95,54 +95,9 @@ impl Plugin for MetricsPlugin {
         let Some(state) = ctx.state.downcast_mut::<RequestState>() else {
             return;
         };
-        if state.exceeded {
-            if ctx.is_last {
-                // a response that exceeds the bound counts nothing and is not an error
-            }
-            return;
-        }
-        if state.is_sse {
-            if state.buffer.len() < 16 * 1024 {
-                let remaining = 16 * 1024 - state.buffer.len();
-                if ctx.chunk.len() <= remaining {
-                    state.buffer.extend_from_slice(ctx.chunk);
-                } else {
-                    state.buffer.extend_from_slice(&ctx.chunk[..remaining]);
-                }
-            } else {
-                state.buffer.extend_from_slice(ctx.chunk);
-                if state.buffer.len() > 16 * 1024 {
-                    let start = state.buffer.len() - 16 * 1024;
-                    state.buffer.drain(0..start);
-                }
-            }
-        } else if state.buffer.len() < 1024 * 1024 {
-            let remaining = 1024 * 1024 - state.buffer.len();
-            if ctx.chunk.len() <= remaining {
-                state.buffer.extend_from_slice(ctx.chunk);
-            } else {
-                state.buffer.extend_from_slice(&ctx.chunk[..remaining]);
-                state.exceeded = true;
-            }
-        } else {
-            state.exceeded = true;
-        }
+        state.feed(ctx.chunk);
         if ctx.is_last {
-            if state.exceeded && !state.is_sse {
-                // exceeded bound - counts nothing
-                return;
-            }
-            if state.is_sse && state.buffer.len() > 16 * 1024 {
-                return;
-            }
-            if let Some((input, output)) = extract_usage(&state.buffer, state.is_sse) {
-                let stream = state.stream.as_deref().unwrap_or("");
-                let upstream = state.upstream.as_deref().unwrap_or("");
-                self.metrics.record_tokens(stream, upstream, "input", input);
-                self.metrics
-                    .record_tokens(stream, upstream, "output", output);
-                self.metrics.record_usage_request(stream, upstream);
-            }
+            state.finish();
         }
     }
 
@@ -193,15 +148,132 @@ impl StatusClass {
     }
 }
 
-#[derive(Debug, Default)]
+/// The most JSON response body kept to read `usage` from.
+const MAX_JSON_BODY: usize = 1024 * 1024;
+/// The longest event-stream line kept while waiting for its newline.
+const MAX_SSE_LINE: usize = 64 * 1024;
+
+/// What one request needs to count its tokens. Dropping it counts them too: with a known
+/// content length the host never makes the final `is_last` call.
+#[derive(Debug)]
 struct RequestState {
+    metrics: Arc<Metrics>,
     stream: Option<String>,
     upstream: Option<String>,
     key: Option<String>,
     status: Option<u16>,
-    buffer: Vec<u8>,
     is_sse: bool,
+    /// A JSON body, or the unfinished line of an event stream.
+    buffer: Vec<u8>,
     exceeded: bool,
+    input: Option<u64>,
+    output: Option<u64>,
+    done: bool,
+}
+
+impl RequestState {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            metrics,
+            stream: None,
+            upstream: None,
+            key: None,
+            status: None,
+            is_sse: false,
+            buffer: Vec::new(),
+            exceeded: false,
+            input: None,
+            output: None,
+            done: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.is_sse {
+            self.buffer.extend_from_slice(chunk);
+            while let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                self.read_event_line(&line);
+            }
+            if self.buffer.len() > MAX_SSE_LINE {
+                self.buffer.clear();
+            }
+        } else if !self.exceeded {
+            if self.buffer.len() + chunk.len() > MAX_JSON_BODY {
+                self.exceeded = true;
+                self.buffer.clear();
+            } else {
+                self.buffer.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    /// An event stream reports usage in whichever events carry it: one final chunk for OpenAI
+    /// style, `message_start` and `message_delta` for Anthropic style. Later values win.
+    fn read_event_line(&mut self, line: &[u8]) {
+        let text = String::from_utf8_lossy(line);
+        let Some(data) = text.trim().strip_prefix("data:") else {
+            return;
+        };
+        if !data.contains("\"usage\"") {
+            return;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+            self.take(usage_in(&value));
+        }
+    }
+
+    fn take(&mut self, (input, output): (Option<u64>, Option<u64>)) {
+        self.input = input.or(self.input);
+        self.output = output.or(self.output);
+    }
+
+    fn finish(&mut self) {
+        if std::mem::replace(&mut self.done, true) {
+            return;
+        }
+        if self.is_sse {
+            let rest = std::mem::take(&mut self.buffer);
+            self.read_event_line(&rest);
+        } else if !self.exceeded {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buffer) {
+                self.take(usage_in(&value));
+            }
+        }
+        if self.input.is_none() && self.output.is_none() {
+            return;
+        }
+        let stream = self.stream.as_deref().unwrap_or("");
+        let upstream = self.upstream.as_deref().unwrap_or("");
+        self.metrics
+            .record_tokens(stream, upstream, "input", self.input.unwrap_or(0));
+        self.metrics
+            .record_tokens(stream, upstream, "output", self.output.unwrap_or(0));
+        self.metrics.record_usage_request(stream, upstream);
+    }
+}
+
+impl Drop for RequestState {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Input and output tokens from a response or an event, in OpenAI
+/// (`prompt_tokens`/`completion_tokens`) or Anthropic (`input_tokens`/`output_tokens`) naming.
+/// Anthropic's `message_start` nests them under `message.usage`.
+fn usage_in(value: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/message/usage"));
+    let Some(usage) = usage else {
+        return (None, None);
+    };
+    let count = |names: [&str; 2]| names.iter().find_map(|n| usage.get(*n)?.as_u64());
+    (
+        count(["prompt_tokens", "input_tokens"]),
+        count(["completion_tokens", "output_tokens"]),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -422,106 +494,26 @@ impl Metrics {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut streams: BTreeMap<String, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
+        let mut streams = serde_json::Map::new();
+        let mut cell = |stream: &str, upstream: &str, field: &str, count: u64| {
+            let upstreams = streams
+                .entry(stream.to_owned())
+                .or_insert_with(|| serde_json::json!({}));
+            let totals = upstreams
+                .as_object_mut()
+                .expect("an object")
+                .entry(upstream.to_owned())
+                .or_insert_with(|| serde_json::json!({"input": 0, "output": 0, "requests": 0}));
+            totals[field] = serde_json::json!(count);
+        };
         for ((stream, upstream), requests) in &inner.usage_requests {
-            let entry = streams
-                .entry(stream.clone())
-                .or_default()
-                .entry(upstream.clone())
-                .or_insert((0, 0, 0));
-            entry.2 = *requests;
+            cell(stream, upstream, "requests", *requests);
         }
         for ((stream, upstream, direction), count) in &inner.tokens {
-            let entry = streams
-                .entry(stream.clone())
-                .or_default()
-                .entry(upstream.clone())
-                .or_insert((0, 0, 0));
-            if *direction == "input" {
-                entry.0 += *count;
-            } else if *direction == "output" {
-                entry.1 += *count;
-            }
+            cell(stream, upstream, direction, *count);
         }
-        let mut stream_entries: Vec<String> = Vec::new();
-        for (stream, upstreams) in &streams {
-            let mut upstream_entries: Vec<String> = Vec::new();
-            for (upstream, (input, output, requests)) in upstreams {
-                upstream_entries.push(format!(
-                    "\"{}\":{{\"input\":{},\"output\":{},\"requests\":{}}}",
-                    json_escape(upstream),
-                    input,
-                    output,
-                    requests
-                ));
-            }
-            stream_entries.push(format!(
-                "\"{}\":{{{}}}",
-                json_escape(stream),
-                upstream_entries.join(",")
-            ));
-        }
-        format!("{{{}}}", stream_entries.join(","))
+        serde_json::Value::Object(streams).to_string()
     }
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn extract_usage(buffer: &[u8], is_sse: bool) -> Option<(u64, u64)> {
-    if is_sse {
-        // Look for the last data: event
-        let text = String::from_utf8_lossy(buffer);
-        let mut last_data: Option<String> = None;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("data:") {
-                let rest = rest.trim_start();
-                if rest == "[DONE]" {
-                    continue;
-                }
-                last_data = Some(rest.to_string());
-            }
-        }
-        if let Some(data) = last_data {
-            return extract_usage_from_json_str(&data);
-        }
-        None
-    } else {
-        let text = String::from_utf8_lossy(buffer);
-        extract_usage_from_json_str(&text)
-    }
-}
-
-fn extract_usage_from_json_str(s: &str) -> Option<(u64, u64)> {
-    // Try to parse as JSON
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    // Try OpenAI style
-    if let Some(usage) = v.get("usage") {
-        if let Some(prompt) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
-            if let Some(completion) = usage.get("completion_tokens").and_then(|x| x.as_u64()) {
-                return Some((prompt, completion));
-            }
-        }
-        if let Some(input) = usage.get("input_tokens").and_then(|x| x.as_u64()) {
-            if let Some(output) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
-                return Some((input, output));
-            }
-        }
-    }
-    // Also check Anthropic style at top level sometimes? The requirement says "OpenAI-style usage.prompt_tokens / usage.completion_tokens and Anthropic-style usage.input_tokens / usage.output_tokens" - both under usage object typically
-    None
 }
 
 /// Escape a value for a Prometheus text label: backslash, double quote and newline.
@@ -674,5 +666,108 @@ mod tests {
         assert!(build(&table).is_err());
         let host: toml::Table = "enabled = true\non_error = \"reject\"".parse().unwrap();
         assert!(build(&host).is_ok());
+    }
+
+    fn usage_of(metrics: &Arc<Metrics>) -> serde_json::Value {
+        serde_json::from_str(&metrics.render_usage()).unwrap()
+    }
+
+    fn state(metrics: &Arc<Metrics>, sse: bool) -> RequestState {
+        let mut state = RequestState::new(Arc::clone(metrics));
+        state.stream = Some("s".to_owned());
+        state.upstream = Some("zen".to_owned());
+        state.is_sse = sse;
+        state
+    }
+
+    #[test]
+    fn a_json_body_counts_openai_and_anthropic_usage() {
+        let metrics = Arc::new(Metrics::default());
+        let mut openai = state(&metrics, false);
+        openai.feed(br#"{"usage":{"prompt_tokens":10,"completion_tokens":20}}"#);
+        openai.finish();
+        let mut anthropic = state(&metrics, false);
+        anthropic.feed(br#"{"usage":{"input_tokens":3,"output_tokens":4}}"#);
+        anthropic.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(usage["s"]["zen"]["input"], 13);
+        assert_eq!(usage["s"]["zen"]["output"], 24);
+        assert_eq!(usage["s"]["zen"]["requests"], 2);
+    }
+
+    #[test]
+    fn an_event_stream_usage_split_across_chunks_is_counted() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, true);
+        let stream = "data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\ndata: [DONE]\n\n";
+        for piece in stream.as_bytes().chunks(5) {
+            s.feed(piece);
+        }
+        s.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(
+            (
+                usage["s"]["zen"]["input"].as_u64(),
+                usage["s"]["zen"]["output"].as_u64()
+            ),
+            (Some(7), Some(9))
+        );
+    }
+
+    #[test]
+    fn anthropic_streams_combine_message_start_and_message_delta() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, true);
+        s.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n");
+        s.feed(&vec![b'x'; 200_000]);
+        s.feed(b"\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":77}}\n\n");
+        s.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(
+            (
+                usage["s"]["zen"]["input"].as_u64(),
+                usage["s"]["zen"]["output"].as_u64()
+            ),
+            (Some(25), Some(77))
+        );
+    }
+
+    #[test]
+    fn a_response_without_usage_or_over_the_bound_counts_nothing() {
+        let metrics = Arc::new(Metrics::default());
+        let mut none = state(&metrics, false);
+        none.feed(br#"{"choices":[]}"#);
+        none.finish();
+        let mut big = state(&metrics, false);
+        big.feed(&vec![b' '; MAX_JSON_BODY]);
+        big.feed(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
+        assert!(big.buffer.is_empty(), "an oversized body is not kept");
+        big.finish();
+        assert_eq!(usage_of(&metrics), serde_json::json!({}));
+    }
+
+    #[test]
+    fn dropping_the_state_counts_a_response_that_never_saw_its_last_chunk() {
+        let metrics = Arc::new(Metrics::default());
+        {
+            let mut s = state(&metrics, false);
+            s.feed(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
+        }
+        assert_eq!(usage_of(&metrics)["s"]["zen"]["output"], 3);
+    }
+
+    #[test]
+    fn the_token_counter_is_exposed_in_prometheus_text() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, false);
+        s.feed(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
+        s.finish();
+        let text = metrics.render(KeyCounts::default());
+        assert!(
+            text.contains(
+                "reiki_tokens_total{stream=\"s\",upstream=\"zen\",direction=\"input\"} 2"
+            ),
+            "{text}"
+        );
     }
 }

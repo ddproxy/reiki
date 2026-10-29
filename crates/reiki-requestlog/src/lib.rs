@@ -9,6 +9,7 @@ mod ocsf;
 mod redact;
 mod shape;
 mod sink;
+mod syslog;
 mod timefmt;
 mod writer;
 
@@ -21,10 +22,13 @@ use std::time::{Instant, SystemTime};
 
 use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
-pub use config::{BodyMode, Config, LogFormat, ResponseMode, SseMode, DENIED_HEADERS};
+pub use config::{
+    BodyMode, Config, LogFormat, ResponseMode, SseMode, SyslogTarget, DENIED_HEADERS,
+};
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
+use syslog::Syslog;
 use writer::{AttemptEvent, Event, FindingEvent, RequestEvent, ResponseEvent, Sinks};
 
 /// The `[plugins.requestlog]` table this plugin reads.
@@ -114,6 +118,19 @@ impl RequestLog {
         if config.socket.is_some() {
             return Err(format!("{NAME}: `socket` needs a Unix platform"));
         }
+        #[cfg(not(unix))]
+        if matches!(config.syslog, Some(SyslogTarget::Unix(_))) {
+            return Err(format!(
+                "{NAME}: a unix `syslog` target needs a Unix platform"
+            ));
+        }
+        let syslog = config.syslog.clone().map(|target| {
+            Syslog::new(
+                target,
+                config.syslog_facility,
+                config.syslog_app_name.clone(),
+            )
+        });
 
         let config = Arc::new(config);
         let (tx, rx) = sync_channel(config.queue);
@@ -122,6 +139,7 @@ impl RequestLog {
             file,
             #[cfg(unix)]
             socket,
+            syslog,
         };
         let writer = writer::spawn(Arc::clone(&config), sinks, rx, Arc::clone(&dropped))
             .map_err(|e| format!("{NAME}: cannot start the writer thread: {e}"))?;
@@ -497,6 +515,86 @@ mod tests {
         let record: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(record["body"]["model"], "streamed");
         drop(plugin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every datagram the collector receives until the socket goes quiet.
+    fn datagrams(peer: &std::net::UdpSocket) -> Vec<String> {
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = [0u8; 65_536];
+        let mut out = Vec::new();
+        while let Ok((n, _)) = peer.recv_from(&mut buf) {
+            out.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        out
+    }
+
+    #[test]
+    fn syslog_carries_each_record_with_its_priority_beside_the_file() {
+        let dir = dir("syslog-udp");
+        let path = dir.join("req.jsonl");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let text = format!(
+            "file = \"{}\"\nsyslog = \"udp://{}\"\nsyslog_facility = \"local3\"\nsyslog_app_name = \"gateway\"",
+            path.display(),
+            peer.local_addr().unwrap()
+        );
+        let plugin = build(&text.parse().unwrap()).unwrap();
+        drive(plugin.as_ref(), &[], r#"{"model":"m"}"#, 200);
+        drive(plugin.as_ref(), &[], r#"{"model":"m"}"#, 503);
+        plugin.on_event(&reiki_plugin::Event::Finding {
+            id: "finding-id",
+            stream: "zen",
+            plugin: "phi",
+            kind: "ssn",
+            count: 1,
+            blocked: false,
+        });
+        drop(plugin);
+
+        // local3 is facility 19: info is 152 + 6 = 158 and warning is 152 + 4 = 156.
+        let messages = datagrams(&peer);
+        let fields: Vec<&str> = messages
+            .iter()
+            .map(|m| m.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(fields, ["<158>1", "<158>1", "<158>1", "<156>1", "<156>1"]);
+        let msgids: Vec<&str> = messages
+            .iter()
+            .map(|m| m.split(' ').nth(5).unwrap())
+            .collect();
+        assert_eq!(
+            msgids,
+            ["request", "response", "request", "response", "finding"]
+        );
+        assert!(messages.iter().all(|m| m.contains(" gateway ")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_down_collector_never_blocks_requests_and_the_file_keeps_every_record() {
+        let dir = dir("syslog-down");
+        let path = dir.join("req.jsonl");
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let text = format!("file = \"{}\"\nsyslog = \"tcp://{closed}\"", path.display());
+        let plugin = build(&text.parse().unwrap()).unwrap();
+        let started = Instant::now();
+        for _ in 0..300 {
+            drive(plugin.as_ref(), &[], "{}", 200);
+        }
+        assert!(started.elapsed().as_secs() < 2, "hooks blocked");
+        drop(plugin);
+
+        let records: Vec<Value> = lines(&path)
+            .into_iter()
+            .filter(|r| r["event"] != "dropped")
+            .collect();
+        assert_eq!(records.len(), 600);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -316,6 +316,14 @@ impl PluginChain {
         .flatten()
     }
 
+    /// Every path an active plugin answers on the admin listener.
+    pub fn admin_paths(&self) -> Vec<&'static str> {
+        self.entries
+            .iter()
+            .flat_map(|e| e.plugin.admin_paths())
+            .collect()
+    }
+
     /// Names of the active plugins, for startup logging.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|e| e.plugin.name())

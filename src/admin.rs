@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 
 use crate::auth::{constant_time_eq, sha256_hex};
@@ -16,19 +16,96 @@ use reiki_plugin::KeyCounts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Prefix of the versioned copy of every admin route. v1 only gains fields.
+const V1: &str = "/v1";
+
+/// The routes this file serves itself. Each is mounted bare and under [`V1`], and the OpenAPI
+/// document is built from this table, so the two cannot drift.
+const ROUTES: &[(&str, &str, &str)] = &[
+    ("/status", "get", "Key, stream and config status"),
+    (
+        "/reload",
+        "post",
+        "Reload the config, or preview it with dry_run",
+    ),
+];
+
+fn handler(method: &str) -> MethodRouter<Arc<App>> {
+    if method == "post" {
+        post(reload)
+    } else {
+        get(status)
+    }
+}
+
 /// The admin listener's routes. Mounted on its own socket, never on the client
 /// listener, so it is only reachable where the operator exposes it.
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/status", get(status))
-        .route("/reload", post(reload))
-        .route("/v1/status", get(status))
-        .route("/v1/reload", post(reload))
-        .route("/v1/openapi.json", get(openapi))
-        .route("/v1/metrics", get(plugin_route_v1_metrics))
-        .route("/metrics", get(plugin_route))
+    let mut router = Router::new();
+    for (path, method, _) in ROUTES {
+        router = router
+            .route(path, handler(method))
+            .route(&format!("{V1}{path}"), handler(method));
+    }
+    router
+        .route(&format!("{V1}/openapi.json"), get(openapi))
         .fallback(get(plugin_route))
+        .layer(axum::middleware::map_response(with_version))
         .with_state(app)
+}
+
+async fn with_version(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("x-reiki-version", HeaderValue::from_static(VERSION));
+    response
+}
+
+fn operation(summary: &str) -> serde_json::Value {
+    serde_json::json!({
+        "summary": summary,
+        "security": [{"bearerAuth": []}],
+        "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or wrong token"}},
+    })
+}
+
+/// The OpenAPI 3.1 description of the v1 routes, including those plugins add.
+async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if !access_allowed(&app, &headers) {
+        return unauthorized();
+    }
+    let mut paths = serde_json::Map::new();
+    for (path, method, summary) in ROUTES {
+        let mut op = operation(summary);
+        if *path == "/reload" {
+            op["parameters"] = serde_json::json!([{
+                "name": "dry_run", "in": "query", "required": false,
+                "schema": {"type": "string", "enum": ["true", "1", "false", "0"]},
+            }]);
+            op["responses"]["400"] =
+                serde_json::json!({"description": "Unreadable dry_run value; nothing changed"});
+            op["responses"]["422"] =
+                serde_json::json!({"description": "The config was refused; nothing changed"});
+        }
+        paths.insert(format!("{V1}{path}"), serde_json::json!({ *method: op }));
+    }
+    for path in app.plugins().admin_paths() {
+        paths.insert(
+            format!("{V1}{path}"),
+            serde_json::json!({"get": operation("Provided by a plugin")}),
+        );
+    }
+    paths.insert(
+        format!("{V1}/openapi.json"),
+        serde_json::json!({"get": operation("This document")}),
+    );
+    let document = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Reiki admin API", "version": VERSION},
+        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+        "paths": paths,
+    });
+    text_response(StatusCode::OK, "application/json", document.to_string())
 }
 
 async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -131,54 +208,15 @@ async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap)
         }
         counts
     };
-    match app.plugins().on_admin(uri.path(), keys) {
+    let path = uri.path();
+    let path = path
+        .strip_prefix(V1)
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path);
+    match app.plugins().on_admin(path, keys) {
         Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
         None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
     }
-}
-
-async fn plugin_route_v1_metrics(
-    State(app): State<Arc<App>>,
-    _uri: Uri,
-    headers: HeaderMap,
-) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
-    }
-    // For /v1/metrics, try plugin admin with /metrics
-    let snapshot = app.snapshot();
-    let now = Instant::now();
-    let keys = {
-        let health = app
-            .health()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut counts = KeyCounts::default();
-        for name in snapshot.config.keys.keys() {
-            match health.status(name, now) {
-                KeyStatus::Available => counts.available += 1,
-                KeyStatus::Cooling(_) => counts.cooling += 1,
-                KeyStatus::OutOfRotation => counts.out_of_rotation += 1,
-            }
-        }
-        counts
-    };
-    match app.plugins().on_admin("/metrics", keys) {
-        Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
-        None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
-    }
-}
-
-async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
-    }
-    let doc = build_openapi();
-    text_response(StatusCode::OK, "application/json", doc)
-}
-
-fn build_openapi() -> String {
-    "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"Reiki Admin API\",\"version\":\"1.0.0\"},\"tags\":[{\"name\":\"admin\"}],\"components\":{\"securitySchemes\":{\"bearerAuth\":{\"type\":\"http\",\"scheme\":\"bearer\"}},\"schemas\":{\"Error\":{\"type\":\"object\",\"required\":[\"ok\",\"error\"],\"properties\":{\"ok\":{\"type\":\"boolean\",\"const\":false},\"error\":{\"type\":\"string\"}}},\"ReloadReport\":{\"type\":\"object\",\"required\":[\"ok\",\"dry_run\",\"generation\",\"keys\",\"streams\",\"changed\",\"restart_needed\"],\"properties\":{\"ok\":{\"type\":\"boolean\",\"const\":true},\"dry_run\":{\"type\":\"boolean\"},\"generation\":{\"type\":\"integer\"},\"keys\":{\"type\":\"integer\"},\"streams\":{\"type\":\"integer\"},\"changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"restart_needed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}},\"security\":[{\"bearerAuth\":[]}],\"paths\":{\"/v1/status\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Status\",\"responses\":{\"200\":{\"description\":\"Status\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\"}}}}}}},\"/v1/reload\":{\"post\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Reload\",\"parameters\":[{\"name\":\"dry_run\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"string\",\"enum\":[\"true\",\"1\",\"false\",\"0\"]}}],\"responses\":{\"200\":{\"description\":\"Reload report\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ReloadReport\"}}}},\"400\":{\"description\":\"Bad request\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}},\"422\":{\"description\":\"Unprocessable entity\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}},\"500\":{\"description\":\"Internal server error\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}}}}},\"/v1/metrics\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Metrics\",\"responses\":{\"200\":{\"description\":\"Metrics\",\"content\":{\"text/plain\":{\"schema\":{\"type\":\"string\"}}}},\"404\":{\"description\":\"Not found\"}}}},\"/v1/openapi.json\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"OpenAPI\",\"responses\":{\"200\":{\"description\":\"OpenAPI document\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\"}}}}}}}}}".to_owned()
 }
 
 /// Constant-time check of the `Authorization: Bearer <token>` header against the
@@ -211,9 +249,6 @@ fn bearer_token(value: &str) -> Option<&str> {
 fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
-    if let Ok(v) = HeaderValue::from_str(VERSION) {
-        response.headers_mut().insert("X-Reiki-Version", v);
-    }
     response
 }
 
@@ -223,9 +258,6 @@ fn text_response(status: StatusCode, content_type: &'static str, body: String) -
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    if let Ok(v) = HeaderValue::from_str(VERSION) {
-        response.headers_mut().insert("X-Reiki-Version", v);
-    }
     response
 }
 

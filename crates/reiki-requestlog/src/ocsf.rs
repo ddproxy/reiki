@@ -44,6 +44,7 @@ fn activity(method: &str) -> (u32, &'static str) {
         "POST" => (6, "Post"),
         "PUT" => (7, "Put"),
         "TRACE" => (8, "Trace"),
+        "PATCH" => (9, "Patch"),
         _ => (99, "Other"),
     }
 }
@@ -152,6 +153,7 @@ pub fn finding(finding: FindingEvent) -> String {
         "finding_info": {
             "title": format!("{}: {} in an outbound request", finding.plugin, finding.kind),
             "uid": format!("{}:{}:{}", finding.id, finding.plugin, finding.kind),
+            "created_time": millis(finding.at),
             "types": [finding.kind],
         },
         "src_endpoint": {"name": finding.stream},

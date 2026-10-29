@@ -712,6 +712,16 @@ mod tests {
             (Some(4002), Some(400_206))
         );
         assert_eq!(event["activity_name"], "Post");
+        let mut patch = request("{}");
+        patch.method = "PATCH".to_owned();
+        let patched = line(&c, Event::Request(patch));
+        assert_eq!(
+            (
+                patched["activity_id"].as_u64(),
+                patched["type_uid"].as_u64()
+            ),
+            (Some(9), Some(400_209))
+        );
         assert_eq!(event["time"], 951_782_400_000_u64);
         assert_eq!(event["metadata"]["correlation_uid"], "abc");
         assert_eq!(event["metadata"]["version"], "1.3.0");
@@ -756,6 +766,7 @@ mod tests {
         );
         assert_eq!(blocked["disposition"], "Blocked");
         assert_eq!(blocked["finding_info"]["types"][0], "ssn");
+        assert_eq!(blocked["finding_info"]["created_time"], 951_782_401_000_u64);
         assert_eq!(blocked["count"], 2);
         assert_eq!(blocked["metadata"]["correlation_uid"], "abc");
         let logged = line(&c, Event::Finding(finding(false)));

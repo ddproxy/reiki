@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.7.8
 
 ### Fixed
 
-- An upstream key that a successful response echoes back, in a header or in the body, is now replaced before plugins and the client see it, including when it is split across streamed chunks. Before, only error responses were scrubbed.
+- An upstream key that a successful response echoes back, in a header or in the body, is now replaced before plugins and the client see it, including when it is split across streamed chunks. Before, only error responses were scrubbed. A server that echoes the key (a debug echo endpoint, for example) now returns it blanked, with the same length.
 
 ## 0.7.7
 

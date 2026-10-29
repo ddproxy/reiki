@@ -1,12 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.7.5
 
 ### Added
 
 - Live reload. SIGHUP and the new `POST /reload` on the admin listener now apply plugin settings, the tunnel allowlist, `deny_private`, the intercept host table, `require_auth` and `leaf_ttl_hours` without a restart. A plugin whose table did not change keeps running with its counters, and requests already in flight finish on the plugins they started with. Listen addresses, the log file path and the CA files still need a restart and are reported as `restart_needed`. `/status` gains `config.generation`, `config.loaded_at` and `config.last_reload`, and `reiki check` summarises the tunnel policy.
 - The request log records a `finding` for each detection hit, tied to its request by id, and `format = "ocsf"` writes the log as OCSF 1.3 events: HTTP Activity for requests and responses, Detection Finding for findings.
-- `reiki reload [--dry-run]` and `POST /reload?dry_run=true` preview what a reload would change without applying, building or recording anything.
+- `reiki reload [--dry-run]` and `POST /reload?dry_run=true` preview what a reload would change without applying or recording anything.
 - `[reload] watch = true` reloads the config when the config file, a key file or a file a plugin reads has changed and stayed unchanged for one more `interval_secs` (default 5). It is off by default.
 - A reload also rebuilds a plugin whose watched file changed: the placeholders `terms_file` is re-read when it is edited, without a config change.
 - `reiki_findings_total{stream,plugin,kind,action}` counts what the detection plugins find, by kind and whether the request was blocked. Plugins report through a new `RequestCtx::report`, and the chain forwards each report to every plugin as `Event::Finding`.

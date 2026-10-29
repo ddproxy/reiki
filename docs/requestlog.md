@@ -55,7 +55,7 @@ Every record is one line with `"v":1`. A request produces two records that share
 - `body` is parsed JSON when the body is JSON and fits `max_body_bytes` after `exclude`, `summarize` and `max_string_bytes` have trimmed it; otherwise it is a string. `body_bytes` is always the original size. Trim with those options instead of raising the cap, so large bodies stay parsed JSON.
 - In `summary` mode the record has `body_summary` with `model`, `stream`, `max_tokens`, `temperature` and the counts of `messages`, `tools` and `input_items`.
 - The response record is written once the response has finished, or the client has gone away. `status` is the upstream status, and `null` when Reiki answered without an upstream response, for example when every key is cooling. `bytes` is the size of the response body as it passed through the plugin. Response bodies are never logged.
-- If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows. A record the syslog collector does not receive counts the same way, see [Syslog output](#syslog-output).
+- If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows. A record only the syslog collector misses is reported to syslog alone, see [Syslog output](#syslog-output).
 
 The request record carries the request `path` without its query string. The response record carries `key`, the name in the config of the key that produced the response (`null` when Reiki answered itself), and `attempts`, every key tried in order with the upstream status it returned (`null` for a connection error or timeout). Only key names are logged, never a key's value.
 
@@ -153,7 +153,7 @@ Example message:
 
 The writer thread connects on the first record, not at startup, so Reiki starts while the collector is down. A failed connect or write drops the record. The next attempt waits 250 milliseconds. Each further failure doubles the wait, up to 30 seconds. A successful connect resets it.
 
-Records that arrive during the wait are dropped without a connect attempt. Dropped records count in the same counter as a full queue. The next `dropped` record reports them. While the collector is down, a `dropped` record therefore follows each record that could not be sent, in the file and on the socket as well.
+Records that arrive during the wait are dropped without a connect attempt. The file and the socket still have them. Once a send succeeds again, Reiki sends one `dropped` record with the count to the collector only.
 
 Requests never wait for the collector.
 

@@ -4,7 +4,7 @@
 
 ### Added
 
-- `requestlog` sends records to a syslog collector. `syslog = "udp://host:port"`, `"tcp://host:port"` or `"unix:///dev/log"` sends each record as an RFC 5424 message, with `syslog_facility` (default `local0`) and `syslog_app_name` (default `reiki`). A record the collector does not receive is counted as dropped, and a request never waits for the collector.
+- `requestlog` sends records to a syslog collector. `syslog = "udp://host:port"`, `"tcp://host:port"` or `"unix:///dev/log"` sends each record as an RFC 5424 message, with `syslog_facility` (default `local0`) and `syslog_app_name` (default `reiki`). A request never waits for the collector. A record only the collector misses is reported to the collector alone, once it is reachable again.
 
 ## 0.7.8
 

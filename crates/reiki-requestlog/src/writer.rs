@@ -111,14 +111,37 @@ pub fn spawn(
         .name("requestlog-writer".to_owned())
         .spawn(move || {
             let mut file_failing = false;
+            // Records only syslog missed. The file and socket have them, so only syslog hears of it.
+            let mut syslog_lost: u64 = 0;
             for event in rx {
                 if matches!(event, Event::Shutdown) {
                     break;
                 }
                 let meta = meta(&event);
                 let line = render(&config, event);
-                if !emit(&mut sinks, &line, &meta, &mut file_failing) {
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                if emit(&mut sinks, &line, &meta, &mut file_failing) {
+                    if syslog_lost > 0 {
+                        if let Some(syslog) = sinks.syslog.as_mut() {
+                            let now = SystemTime::now();
+                            let note = json!({
+                                "v": 1,
+                                "event": "dropped",
+                                "ts": rfc3339_millis(now),
+                                "count": syslog_lost,
+                            })
+                            .to_string();
+                            let meta = Meta {
+                                msgid: "dropped",
+                                severity: SEVERITY_WARNING,
+                                at: now,
+                            };
+                            if syslog.send(&meta, &note) {
+                                syslog_lost = 0;
+                            }
+                        }
+                    }
+                } else {
+                    syslog_lost += 1;
                 }
                 let lost = dropped.swap(0, Ordering::Relaxed);
                 if lost > 0 {
@@ -141,8 +164,8 @@ pub fn spawn(
         })
 }
 
-/// Writes one record to every sink. Returns `false` when the syslog send failed, so the record
-/// counts as dropped; the file and the socket never affect the result.
+/// Writes one record to every sink. Returns `false` when the syslog send failed; the file and the
+/// socket never affect the result.
 fn emit(sinks: &mut Sinks, line: &str, meta: &Meta, file_failing: &mut bool) -> bool {
     if let Some(file) = sinks.file.as_mut() {
         match file.write_line(line) {

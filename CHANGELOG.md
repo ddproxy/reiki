@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.6
+
+### Fixed
+
+- OCSF output maps `PATCH` to HTTP Activity id 9 and findings carry `finding_info.created_time`.
+
 ## 0.7.5
 
 ### Added

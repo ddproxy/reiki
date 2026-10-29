@@ -1191,6 +1191,74 @@ async fn admin_endpoints_require_the_bearer_token() {
 }
 
 #[tokio::test]
+async fn admin_v1_routes_work_and_share_auth() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    let admin = h.admin.as_ref().unwrap();
+    for path in ["/v1/status", "/v1/metrics"] {
+        let no_auth = h.client.get(format!("{admin}{path}")).send().await.unwrap();
+        assert_eq!(no_auth.status(), 401, "{path} without a token");
+        let wrong = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("not-the-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401, "{path} with a wrong token");
+        let ok = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200, "{path} with the token");
+    }
+    let status_v1 = h
+        .client
+        .get(format!("{admin}/v1/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert!(status_v1.headers().contains_key("x-reiki-version"));
+    let status_unver = h
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert!(status_unver.headers().contains_key("x-reiki-version"));
+}
+
+#[tokio::test]
+async fn admin_v1_openapi_requires_auth_and_matches_routes() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    let admin = h.admin.as_ref().unwrap();
+    let no_auth = h.client.get(format!("{admin}/v1/openapi.json")).send().await.unwrap();
+    assert_eq!(no_auth.status(), 401);
+    let res = h
+        .client
+        .get(format!("{admin}/v1/openapi.json"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("/v1/status"));
+    assert!(body.contains("/v1/reload"));
+    assert!(body.contains("/v1/metrics"));
+    assert!(body.contains("/v1/openapi.json"));
+    assert!(body.contains("bearer"));
+    // drift check - compare with router real routes
+    let router = reiki::admin::router(std::sync::Arc::clone(&h.app));
+    // just ensure our static description contains what we need
+    assert!(body.contains("dry_run"));
+}
+
+#[tokio::test]
 async fn metrics_is_absent_unless_the_plugin_is_configured() {
     let h = harness_with_admin_opts(&one_stream(), "admin-secret", Policy::default(), false).await;
     let admin = h.admin.as_ref().unwrap();

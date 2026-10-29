@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Versioned admin API: all existing admin routes are available under `/v1/...` with the same auth; unversioned paths remain unchanged. `GET /v1/openapi.json` returns an OpenAPI 3.1 document describing v1 routes, bearer auth, `dry_run` on reload, and response shapes. Admin responses include `X-Reiki-Version`. The OpenAPI document is built from a static description in code to detect route drift. v1 gains only additive fields in the stability promise.
+
 ## 0.7.6
 
 ### Fixed

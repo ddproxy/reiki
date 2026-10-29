@@ -227,13 +227,18 @@ impl PluginChain {
                 (_, Some(table)) => {
                     let on_error = on_error(reg.name, table)?;
                     changed.push(reg.name.to_owned());
-                    if build {
+                    // A preview builds a plugin that is already running (so it is safe to build
+                    // again) and drops it, so a bad file path fails the preview as it would the reload.
+                    if build || old.is_some() {
                         let plugin =
                             (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
                                 name: reg.name.to_string(),
                                 message,
                             })?;
                         let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+                        if !build {
+                            continue;
+                        }
                         entries.push(Entry {
                             stamps: stamps_of(plugin.as_ref()),
                             plugin,
@@ -848,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_names_the_changes_without_building_any_plugin() {
+    fn a_plan_checks_a_changed_plugin_builds_but_keeps_the_running_one() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static BUILDS: AtomicUsize = AtomicUsize::new(0);
         let registry = vec![Registration {
@@ -867,9 +872,10 @@ mod tests {
         assert_eq!(planned.changed, ["append"]);
         assert_eq!(
             BUILDS.load(Ordering::SeqCst),
-            1,
-            "a plan constructs nothing"
+            2,
+            "a plan builds to validate, then drops it"
         );
+        assert!(planned.chain.entries.is_empty(), "and installs nothing");
         assert!(first.plan(&configured("[nope]\n"), &registry).is_err());
     }
 

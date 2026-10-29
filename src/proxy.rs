@@ -240,6 +240,11 @@ pub struct App {
     /// Where the config was read from, for a reload that is not tied to a file argument.
     config_path: OnceLock<PathBuf>,
     reload_state: Mutex<crate::reload::ReloadState>,
+    /// Held for the whole of a reload, so two reloads never interleave their steps.
+    reload_lock: Mutex<()>,
+    /// Write-held while a reload swaps the snapshot, plugin chain and tunnel policy; a request
+    /// takes its snapshot and plugin session under a read hold so it sees one config.
+    swap: std::sync::RwLock<()>,
 }
 
 impl App {
@@ -285,6 +290,8 @@ impl App {
             tunnel: OnceLock::new(),
             config_path: OnceLock::new(),
             reload_state: Mutex::new(crate::reload::ReloadState::new()),
+            reload_lock: Mutex::new(()),
+            swap: std::sync::RwLock::new(()),
         })
     }
 
@@ -311,6 +318,13 @@ impl App {
     }
 
     /// Starts a request's plugin session on the current chain.
+    /// The snapshot and plugin session for one request, taken together so a reload cannot land
+    /// between them.
+    pub(crate) fn view(&self) -> (Arc<Snapshot>, PluginSession) {
+        let _held = self.swap.read().unwrap_or_else(PoisonError::into_inner);
+        (self.snapshot(), self.session())
+    }
+
     pub(crate) fn session(&self) -> PluginSession {
         self.plugins().session()
     }
@@ -474,6 +488,10 @@ impl App {
     /// upstreams, plugin settings, the tunnel policy and the intercept host table. Everything is
     /// built and checked first, so a failure at any step leaves the running state untouched.
     pub fn reload_from_file(&self, path: &Path) -> Result<crate::reload::ReloadReport, String> {
+        let _serial = self
+            .reload_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let result = self.try_reload(path, true);
         let mut state = self
             .reload_state
@@ -572,6 +590,7 @@ impl App {
         }
         let generation = next_generation;
         // Nothing below can fail, so the new state lands whole or not at all.
+        let _swap = self.swap.write().unwrap_or_else(PoisonError::into_inner);
         self.reload(config, keys);
         *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
         if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
@@ -725,7 +744,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
 
     // Take one snapshot for the whole request, so a reload cannot change what is
     // already in flight.
-    let snapshot = app.snapshot();
+    let (snapshot, plugin_session) = app.view();
 
     // The client's own credentials go upstream, so there is no Reiki token to check.
     let passthrough = split_upstream(parts.uri.path())
@@ -784,6 +803,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         parts,
         body,
         false,
+        plugin_session,
     )
     .await
 }
@@ -810,7 +830,7 @@ pub(crate) async fn handle_intercepted(
         );
     }
 
-    let snapshot = app.snapshot();
+    let (snapshot, plugin_session) = app.view();
     let Some(upstream) = snapshot.config.upstream.get(&target.upstream) else {
         return json_error(StatusCode::BAD_GATEWAY, "bad_gateway", "unknown upstream");
     };
@@ -855,6 +875,7 @@ pub(crate) async fn handle_intercepted(
         parts,
         body,
         true,
+        plugin_session,
     )
     .await
 }
@@ -904,6 +925,7 @@ async fn dispatch(
     parts: Parts,
     body: Body,
     faithful: bool,
+    plugin_session: PluginSession,
 ) -> Response {
     use tracing::Instrument;
     let id = reiki_plugin::new_request_id();
@@ -919,6 +941,7 @@ async fn dispatch(
         body,
         &id,
         faithful,
+        plugin_session,
     )
     .instrument(span)
     .await
@@ -936,6 +959,7 @@ async fn dispatch_inner(
     body: Body,
     id: &str,
     faithful: bool,
+    plugin_session: PluginSession,
 ) -> Response {
     let rest = rest.as_str();
     if has_path_trick(parts.uri.path()) {
@@ -967,7 +991,7 @@ async fn dispatch_inner(
 
     // Run request hooks once, before the failover loop, so every attempt sees
     // the same transformed request.
-    let mut plugin_states = app.session();
+    let mut plugin_states = plugin_session;
     let meta = RequestMeta {
         id,
         stream,

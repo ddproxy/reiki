@@ -193,9 +193,11 @@ pub async fn watch(app: Arc<App>) {
         if detector.changed(&app.reload_inputs()) {
             tracing::info!("config or key files changed; reloading");
             let worker = Arc::clone(&app);
+            // Stamp the files before reloading, so an edit that lands mid-reload is seen next tick.
+            let baseline = ChangeDetector::new(&app.reload_inputs());
             // `reload_now` logs the outcome; a bad config is not retried until the files change again.
             let _ = tokio::task::spawn_blocking(move || worker.reload_now()).await;
-            detector = ChangeDetector::new(&app.reload_inputs());
+            detector = baseline;
         }
     }
 }

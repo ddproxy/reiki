@@ -502,3 +502,67 @@ async fn reiki_reload_calls_the_running_instance() {
     assert_eq!(code, 2);
     assert!(err.contains("admin token"), "{err}");
 }
+
+#[tokio::test]
+async fn a_preview_fails_when_a_running_plugin_would_fail_to_rebuild() {
+    let rig = Rig::new("").await;
+    let terms = rig.dir.join("preview-terms.txt");
+    std::fs::write(&terms, "Falcon\n").unwrap();
+    let with_terms = |path: &std::path::Path| {
+        format!(
+            "[plugins.placeholders]\nterms_file = \"{}\"\nbuiltin = false\nrehydrate = false\n",
+            path.display()
+        )
+    };
+    rig.rewrite(&with_terms(&terms));
+    let app = Arc::clone(&rig.app);
+    tokio::task::spawn_blocking(move || app.reload_now())
+        .await
+        .unwrap()
+        .unwrap();
+
+    rig.rewrite(&with_terms(&rig.dir.join("missing.txt")));
+    let app = Arc::clone(&rig.app);
+    let preview = tokio::task::spawn_blocking(move || app.preview_reload())
+        .await
+        .unwrap();
+    assert!(
+        preview.is_err(),
+        "the preview must fail as the reload would"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_dry_run_value_is_refused_and_applies_nothing() {
+    let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
+    rig.rewrite("[plugins.phi]\nmode = \"block\"\n");
+    let answer = rig
+        .client
+        .post(format!("{}/reload?dry_run=yes", rig.admin))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 400);
+    assert_eq!(rig.send(SSN_BODY).await, 200, "nothing was applied");
+    let status = rig.admin_get("/status").await;
+    assert!(status.contains("\"generation\":0"), "{status}");
+}
+
+#[tokio::test]
+async fn overlapping_reloads_each_get_their_own_generation() {
+    let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
+    rig.rewrite("[plugins.phi]\nmode = \"block\"\n");
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let app = Arc::clone(&rig.app);
+        tasks.push(tokio::task::spawn_blocking(move || app.reload_now()));
+    }
+    let mut generations = Vec::new();
+    for task in tasks {
+        generations.push(task.await.unwrap().unwrap().generation);
+    }
+    generations.sort_unstable();
+    assert_eq!(generations, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(rig.send(SSN_BODY).await, 422);
+}

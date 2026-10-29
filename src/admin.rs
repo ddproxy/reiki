@@ -62,10 +62,23 @@ async fn reload(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Re
     if !access_allowed(&app, &headers) {
         return unauthorized();
     }
-    let dry_run = uri.query().is_some_and(|q| {
-        q.split('&')
-            .any(|p| matches!(p, "dry_run" | "dry_run=1" | "dry_run=true"))
-    });
+    let mut dry_run = false;
+    for pair in uri.query().unwrap_or("").split('&') {
+        match pair {
+            "" => {}
+            "dry_run" | "dry_run=1" | "dry_run=true" => dry_run = true,
+            "dry_run=0" | "dry_run=false" => {}
+            other if other.starts_with("dry_run=") => {
+                // Fail closed: an unreadable preview flag must not apply a live reload.
+                return text_response(
+                    StatusCode::BAD_REQUEST,
+                    "application/json",
+                    "{\"ok\":false,\"error\":\"dry_run must be true, 1, false or 0\"}".to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
     let worker = Arc::clone(&app);
     let outcome = tokio::task::spawn_blocking(move || {
         if dry_run {

@@ -231,7 +231,7 @@ pub struct App {
     /// Overrides the wall clock for tests; production reads the system clock.
     wall_clock: OnceLock<SystemTime>,
     /// When the interception CA expires, as Unix seconds; unset without interception.
-    ca_not_after: OnceLock<i64>,
+    ca_not_after: RwLock<Option<i64>>,
     logins: LoginThrottle,
     /// Replaced by a reload; a request holds the chain it started with through its [`PluginSession`].
     plugins: RwLock<Arc<PluginChain>>,
@@ -284,7 +284,7 @@ impl App {
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
-            ca_not_after: OnceLock::new(),
+            ca_not_after: RwLock::new(None),
             logins: LoginThrottle::default(),
             plugins: RwLock::new(Arc::new(plugins)),
             tunnel: OnceLock::new(),
@@ -338,14 +338,19 @@ impl App {
         let _ = self.state_path.set(path);
     }
 
-    /// Fix the wall clock, so reset schedules can be tested against a known
-    /// instant. Unset in production, where the system clock is read.
+    /// Records the interception CA expiry, which a CA swap on reload updates.
     pub fn set_ca_not_after(&self, unix_seconds: i64) {
-        let _ = self.ca_not_after.set(unix_seconds);
+        *self
+            .ca_not_after
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(unix_seconds);
     }
 
     pub(crate) fn ca_not_after(&self) -> Option<i64> {
-        self.ca_not_after.get().copied()
+        *self
+            .ca_not_after
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn set_wall_clock(&self, now: SystemTime) {
@@ -422,16 +427,26 @@ impl App {
         let _ = self.tunnel.set(tunnel);
     }
 
-    /// Every file whose change should trigger a reload: the config, the key files and the files plugins read.
+    /// Every file whose change should trigger a reload: the config, the key files, the interception CA files and the files plugins read.
     pub fn reload_inputs(&self) -> Vec<PathBuf> {
+        let snapshot = self.snapshot();
         let mut paths: Vec<PathBuf> = self.config_path.get().cloned().into_iter().collect();
         paths.extend(
-            self.snapshot()
+            snapshot
                 .config
                 .keys
                 .values()
                 .map(|key| PathBuf::from(&key.file)),
         );
+        if let Some(intercept) = snapshot
+            .config
+            .tunnel
+            .as_ref()
+            .and_then(|tunnel| tunnel.intercept.as_ref())
+        {
+            paths.push(PathBuf::from(&intercept.ca_cert));
+            paths.push(PathBuf::from(&intercept.ca_key));
+        }
         paths.extend(self.plugins().watched_paths());
         paths.sort();
         paths.dedup();

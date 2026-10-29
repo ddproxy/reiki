@@ -1,16 +1,20 @@
-//! A reload changes the tunnel allowlist and the intercept host table in place, refuses a different
-//! CA, and reports interception that appears or disappears as needing a restart.
+//! Tunnel reload: policy and intercept hosts apply in place, and a changed CA is validated before the swap
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use rcgen::{
+    BasicConstraints, CertificateParams, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose,
+    NameConstraints,
+};
 use reiki::chain::Policy;
 use reiki::config::{Config, TunnelConfig};
 use reiki::intercept::{init_ca, Interceptor};
 use reiki::plugins::PluginChain;
 use reiki::proxy::{load_keys, App};
 use reiki::tunnel::Tunnel;
+use time::OffsetDateTime;
 
 const HOSTS: [&str; 2] = ["api.test", "other.test"];
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -170,17 +174,124 @@ fn require_auth_and_the_private_range_policy_change_live() {
     );
 }
 
+/// Writes a CA with the given validity window and DNS name constraint; no constraint when `dns` is empty.
+fn write_ca(dir: &Path, dns: &[&str], not_before: OffsetDateTime, not_after: OffsetDateTime) {
+    std::fs::create_dir_all(dir).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    if !dns.is_empty() {
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: dns
+                .iter()
+                .map(|d| GeneralSubtree::DnsName((*d).to_owned()))
+                .collect(),
+            excluded_subtrees: Vec::new(),
+        });
+    }
+    params.not_before = not_before;
+    params.not_after = not_after;
+    let cert = params.self_signed(&key).unwrap();
+    std::fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("ca.key"), key.serialize_pem()).unwrap();
+}
+
+fn write_valid_ca(dir: &Path, dns: &[&str]) {
+    let now = OffsetDateTime::now_utc();
+    write_ca(
+        dir,
+        dns,
+        now - time::Duration::hours(1),
+        now + time::Duration::days(30),
+    );
+}
+
 #[test]
-fn a_different_ca_refuses_the_reload() {
+fn a_different_valid_ca_is_planned_as_a_change() {
     let rig = rig();
     let other = rig.dir.join("other-ca");
     init_ca(&other, &HOSTS.map(str::to_owned), 30, false).unwrap();
-    let error = rig
+    let plan = rig
         .tunnel
         .plan_reload(&rig.config(&["api.test"], "", &other.display().to_string()))
+        .unwrap();
+    assert!(
+        plan.changed.contains(&"intercept ca".to_owned()),
+        "{:?}",
+        plan.changed
+    );
+    assert!(plan.restart_needed.is_empty(), "{:?}", plan.restart_needed);
+}
+
+#[test]
+fn a_ca_that_misses_a_configured_host_refuses_the_reload() {
+    let rig = rig();
+    let narrow = rig.dir.join("narrow-ca");
+    write_valid_ca(&narrow, &["api.test"]);
+    let error = rig
+        .tunnel
+        .plan_reload(&rig.config(
+            &["api.test", "other.test"],
+            "",
+            &narrow.display().to_string(),
+        ))
         .err()
-        .expect("a CA path change is refused");
-    assert!(error.contains("restart"), "{error}");
+        .unwrap_or_else(|| panic!("a CA that does not cover every host is refused"));
+    assert!(error.contains("other.test"), "{error}");
+}
+
+#[test]
+fn a_ca_key_that_does_not_match_its_certificate_refuses_the_reload() {
+    let rig = rig();
+    let (a, b, mixed) = (
+        rig.dir.join("ca-a"),
+        rig.dir.join("ca-b"),
+        rig.dir.join("mixed"),
+    );
+    write_valid_ca(&a, &HOSTS);
+    write_valid_ca(&b, &HOSTS);
+    std::fs::create_dir_all(&mixed).unwrap();
+    std::fs::copy(a.join("ca.pem"), mixed.join("ca.pem")).unwrap();
+    std::fs::copy(b.join("ca.key"), mixed.join("ca.key")).unwrap();
+    let error = rig
+        .tunnel
+        .plan_reload(&rig.config(&["api.test"], "", &mixed.display().to_string()))
+        .err()
+        .unwrap_or_else(|| panic!("a mismatched key is refused"));
+    assert!(error.contains("does not match"), "{error}");
+}
+
+#[test]
+fn an_expired_ca_refuses_the_reload() {
+    let rig = rig();
+    let old = rig.dir.join("expired-ca");
+    let now = OffsetDateTime::now_utc();
+    write_ca(
+        &old,
+        &HOSTS,
+        now - time::Duration::days(60),
+        now - time::Duration::days(1),
+    );
+    let error = rig
+        .tunnel
+        .plan_reload(&rig.config(&["api.test"], "", &old.display().to_string()))
+        .err()
+        .unwrap_or_else(|| panic!("an expired CA is refused"));
+    assert!(error.contains("expired"), "{error}");
+}
+
+#[test]
+fn a_ca_without_a_dns_name_constraint_refuses_the_reload() {
+    let rig = rig();
+    let open = rig.dir.join("unconstrained-ca");
+    write_valid_ca(&open, &[]);
+    let error = rig
+        .tunnel
+        .plan_reload(&rig.config(&["api.test"], "", &open.display().to_string()))
+        .err()
+        .unwrap_or_else(|| panic!("an unconstrained CA is refused"));
+    assert!(error.contains("name constraint"), "{error}");
 }
 
 #[test]

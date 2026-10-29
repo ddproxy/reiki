@@ -12,6 +12,9 @@
 - The request log adds `detail` to a `finding` record when one is set. OCSF puts it in `finding_info.title` as `(kind:detail)`; `finding_info.types` stays the kind.
 - `reiki_findings_total` ignores `detail`, so the label set does not grow with the names a plugin reports.
 - `streams = ["a", "b"]` in a `[plugins.<name>]` table runs the plugin only for requests on those streams. Without it the plugin runs on every stream. An unknown stream name is a startup error. A reload that changes only `streams` applies live and keeps the plugin running with its counters.
+- A reload swaps the interception CA when `ca_cert` or `ca_key` changes, or when a renewed CA file is seen by the watcher. The new CA must have a key that matches its certificate, a DNS name constraint covering every intercepted host, and no past expiry. A CA that fails a check refuses the whole reload and the old CA keeps serving.
+- A swapped CA drops the certificates the old CA minted. New connections get certificates from the new CA, and open connections keep theirs. The reload report lists `intercept ca` in `changed`, and the log warns that clients must trust the new CA.
+- `GET /status` shows the new CA's expiry after a swap.
 
 ## 0.7.8
 

@@ -131,9 +131,7 @@ impl Tunnel {
         Arc::clone(&guard)
     }
 
-    /// Checks `config` against the running tunnel and describes what a reload would change. The
-    /// CA files and the listen address are not reloadable: a CA path change refuses the whole
-    /// reload, and adding or removing interception is reported as needing a restart.
+    /// Checks `config` against the running tunnel and describes what a reload would change, with the listen address and interception add or remove needing a restart.
     pub fn plan_reload(&self, config: &TunnelConfig) -> Result<TunnelPlan, String> {
         let current = self.policy();
         let next = Arc::new(Policy::from_config(config));

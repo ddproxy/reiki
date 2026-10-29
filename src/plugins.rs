@@ -528,7 +528,6 @@ impl PluginSession {
     }
 }
 
-/// Runs a plugin hook, turning a panic into a logged `None` so one faulty plugin cannot take the request task down.
 /// Longest finding detail the host forwards, in bytes.
 const DETAIL_MAX_BYTES: usize = 64;
 
@@ -543,6 +542,7 @@ fn sanitize_detail(raw: &str) -> Option<String> {
     (!kept.is_empty()).then_some(kept)
 }
 
+/// Runs a plugin hook, turning a panic into a logged `None` so one faulty plugin cannot take the request task down.
 fn guard<T>(plugin: &str, hook: &str, run: impl FnOnce() -> T) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(value) => Some(value),

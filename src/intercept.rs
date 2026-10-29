@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints,
+    GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PublicKeyData,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
+use x509_parser::extensions::{GeneralName, GeneralSubtree as ParsedSubtree};
 
 use crate::config::{InterceptConfig, InterceptHost};
 use crate::proxy::{handle_intercepted, App};
@@ -53,6 +54,32 @@ pub fn base_host(base_url: &str) -> Option<String> {
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Whether `host` falls under the name constraint `domain`, where a leading dot admits subdomains only.
+fn within(host: &str, domain: &str) -> bool {
+    if domain.starts_with('.') {
+        host.len() > domain.len() && host.ends_with(domain)
+    } else {
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
+}
+
+fn dns_names(subtrees: Option<&[ParsedSubtree<'_>]>) -> Vec<String> {
+    subtrees
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|subtree| match subtree.base {
+            GeneralName::DNSName(name) => Some(name.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn at(offset: Duration, future: bool) -> time::OffsetDateTime {
@@ -131,27 +158,74 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 struct Authority {
     issuer: Issuer<'static, KeyPair>,
+    cert_path: String,
+    key_path: String,
+    /// Digest of the two PEM files, so a reload can tell a renewed CA from the one running.
+    fingerprint: String,
     /// Unix seconds at which the CA certificate expires.
     not_after: i64,
+    /// DNS names the CA may sign for; empty without a DNS name constraint.
+    permitted: Vec<String>,
+    excluded: Vec<String>,
+    key_matches: bool,
 }
 
 impl Authority {
-    fn load(cert: &str, key: &str) -> Result<Self, String> {
-        let cert_pem =
-            std::fs::read_to_string(cert).map_err(|e| format!("cannot read {cert}: {e}"))?;
-        let key_pem =
-            std::fs::read_to_string(key).map_err(|e| format!("cannot read {key}: {e}"))?;
+    fn load(cert_path: &str, key_path: &str) -> Result<Self, String> {
+        let cert_pem = std::fs::read_to_string(cert_path)
+            .map_err(|e| format!("cannot read {cert_path}: {e}"))?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .map_err(|e| format!("cannot read {key_path}: {e}"))?;
+        let fingerprint = crate::auth::sha256_hex(&format!("{cert_pem}\n{key_pem}"));
         let key = KeyPair::from_pem(&key_pem).map_err(|e| format!("bad CA key: {e}"))?;
+        let key_spki = key.subject_public_key_info();
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, key)
             .map_err(|e| format!("bad CA certificate: {e}"))?;
-        let not_after = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
-            .map_err(|e| format!("bad CA certificate: {e}"))
-            .and_then(|(_, pem)| {
-                pem.parse_x509()
-                    .map(|cert| cert.validity().not_after.timestamp())
-                    .map_err(|e| format!("bad CA certificate: {e}"))
-            })?;
-        Ok(Self { issuer, not_after })
+        let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+            .map_err(|e| format!("bad CA certificate: {e}"))?;
+        let cert = pem
+            .parse_x509()
+            .map_err(|e| format!("bad CA certificate: {e}"))?;
+        let (permitted, excluded) = match cert
+            .name_constraints()
+            .map_err(|e| format!("bad CA certificate: {e}"))?
+        {
+            Some(ext) => (
+                dns_names(ext.value.permitted_subtrees.as_deref()),
+                dns_names(ext.value.excluded_subtrees.as_deref()),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        Ok(Self {
+            issuer,
+            cert_path: cert_path.to_owned(),
+            key_path: key_path.to_owned(),
+            fingerprint,
+            not_after: cert.validity().not_after.timestamp(),
+            permitted,
+            excluded,
+            key_matches: cert.public_key().raw == key_spki.as_slice(),
+        })
+    }
+
+    /// Refuses a CA that cannot serve `hosts` safely; it runs only on a CA that replaces the running one.
+    fn validate(&self, hosts: &[String]) -> Result<(), String> {
+        if !self.key_matches {
+            return Err("the CA key does not match the CA certificate".to_owned());
+        }
+        if self.not_after <= now_unix() {
+            return Err("the CA certificate has expired".to_owned());
+        }
+        if self.permitted.is_empty() {
+            return Err("the CA certificate has no DNS name constraint".to_owned());
+        }
+        for host in hosts {
+            let permitted = self.permitted.iter().any(|d| within(host, d));
+            if !permitted || self.excluded.iter().any(|d| within(host, d)) {
+                return Err(format!("the CA certificate does not cover {host}"));
+            }
+        }
+        Ok(())
     }
 
     fn server_config(
@@ -189,10 +263,7 @@ impl Authority {
 
 /// Days left on a CA that expires at `not_after` (Unix seconds); negative once expired.
 pub fn days_left(not_after: i64) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    (not_after - now).div_euclid(86_400)
+    (not_after - now_unix()).div_euclid(86_400)
 }
 
 /// Loads the CA without starting anything, for `reiki check`; returns the days it has left.
@@ -206,12 +277,14 @@ const CA_WARN_DAYS: i64 = 30;
 /// Serves intercepted CONNECT tunnels.
 pub struct Interceptor {
     app: Arc<App>,
-    authority: Authority,
-    /// The CA paths it loaded, so a reload can refuse a change it cannot apply.
-    ca_cert: String,
-    ca_key: String,
+    /// The CA and the certificates it signed, replaced together so no old-CA leaf outlives a swap.
+    minting: Mutex<Minting>,
     settings: RwLock<Arc<Settings>>,
-    configs: Mutex<HashMap<String, (Instant, Arc<rustls::ServerConfig>)>>,
+}
+
+struct Minting {
+    authority: Arc<Authority>,
+    leaves: HashMap<String, (Instant, Arc<rustls::ServerConfig>)>,
 }
 
 /// What a reload can replace while tunnels are open.
@@ -238,6 +311,8 @@ impl Settings {
 /// A validated interception change, ready to apply.
 pub struct InterceptPlan {
     settings: Arc<Settings>,
+    /// The CA to swap in, when its files differ from the running one.
+    authority: Option<Arc<Authority>>,
     pub changed: Vec<String>,
 }
 
@@ -263,11 +338,11 @@ impl Interceptor {
         }
         Ok(Self {
             app,
-            authority,
-            ca_cert: config.ca_cert.clone(),
-            ca_key: config.ca_key.clone(),
+            minting: Mutex::new(Minting {
+                authority: Arc::new(authority),
+                leaves: HashMap::new(),
+            }),
             settings: RwLock::new(Arc::new(Settings::from_config(config))),
-            configs: Mutex::new(HashMap::new()),
         })
     }
 
@@ -276,18 +351,27 @@ impl Interceptor {
         Arc::clone(&guard)
     }
 
-    /// Checks `config` against the loaded CA and describes the change. The CA files cannot be
-    /// swapped live, so a different path refuses the reload.
+    /// Checks `config` and describes the change, validating a CA whose paths or contents differ.
     pub fn plan_reload(&self, config: &InterceptConfig) -> Result<InterceptPlan, String> {
-        if config.ca_cert != self.ca_cert || config.ca_key != self.ca_key {
-            return Err(
-                "tunnel.intercept ca_cert or ca_key changed; the CA is loaded at startup, restart reiki to use another"
-                    .to_owned(),
-            );
-        }
+        let running = {
+            let minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(&minting.authority)
+        };
+        let loaded = Authority::load(&config.ca_cert, &config.ca_key)?;
         let current = self.settings();
         let next = Arc::new(Settings::from_config(config));
         let mut changed = Vec::new();
+        let ca_changed = loaded.cert_path != running.cert_path
+            || loaded.key_path != running.key_path
+            || loaded.fingerprint != running.fingerprint;
+        let authority = if ca_changed {
+            let hosts: Vec<String> = next.hosts.keys().cloned().collect();
+            loaded.validate(&hosts)?;
+            changed.push("intercept ca".to_owned());
+            Some(Arc::new(loaded))
+        } else {
+            None
+        };
         let added = next
             .hosts
             .keys()
@@ -316,17 +400,26 @@ impl Interceptor {
         }
         Ok(InterceptPlan {
             settings: next,
+            authority,
             changed,
         })
     }
 
-    /// Swaps in a plan from [`Interceptor::plan_reload`]. Certificates already minted stay cached
-    /// until they age out, and open tunnels finish on the settings they started with.
+    /// Swaps in a plan from [`Interceptor::plan_reload`], dropping the certificates the old CA minted.
     pub fn apply_reload(&self, plan: InterceptPlan) {
         if !plan.settings.require_auth {
             tracing::warn!(
                 "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
             );
+        }
+        if let Some(authority) = plan.authority {
+            self.app.set_ca_not_after(authority.not_after);
+            tracing::warn!(
+                "the interception CA changed; clients must trust the new CA before their next connection"
+            );
+            let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
+            minting.authority = authority;
+            minting.leaves.clear();
         }
         *self
             .settings
@@ -357,14 +450,15 @@ impl Interceptor {
     /// Reuses a certificate until half its life is gone.
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
         let ttl = self.settings().ttl;
-        let mut cache = self.configs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((made, config)) = cache.get(host) {
+        let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
+        let Minting { authority, leaves } = &mut *minting;
+        if let Some((made, config)) = leaves.get(host) {
             if made.elapsed() < ttl / 2 {
                 return Ok(Arc::clone(config));
             }
         }
-        let config = self.authority.server_config(host, ttl)?;
-        cache.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
+        let config = authority.server_config(host, ttl)?;
+        leaves.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
         Ok(config)
     }
 
@@ -476,6 +570,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_constraint_admits_the_name_and_its_subdomains() {
+        assert!(within("api.test", "api.test"));
+        assert!(within("a.b.test", "b.test"));
+        assert!(!within("badb.test", "b.test"));
+        assert!(!within("b.test", ".b.test"));
+        assert!(within("a.b.test", ".b.test"));
+    }
 
     #[test]
     fn only_plain_dns_names_are_valid_hosts() {

@@ -58,7 +58,7 @@ Create the CA, name-constrained to the hosts it may sign for, and give only `ca.
 reiki ca-init --dir /etc/reiki/ca --host api.example.com --days 365
 ```
 
-A CA is limited to the hosts it was created with, so adding a host means creating a new one with `--replace` and giving clients the new `ca.pem`. `reiki check` prints the days the CA has left, startup logs a warning within 30 days of expiry, and `GET /status` reports `intercept.ca_days_left`.
+A CA is limited to the hosts it was created with, so adding a host means creating a new one with `--replace`, giving clients the new `ca.pem`, and reloading. `reiki check` prints the days the CA has left, startup logs a warning within 30 days of expiry, and `GET /status` reports `intercept.ca_days_left`.
 
 Clients must trust that certificate: add it to the system store, or point the runtime at it with `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS`, whichever the client reads.
 
@@ -76,4 +76,7 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - An intercepted host may use an upstream with an `[upstream.X.forward]` table. Reiki still terminates the client's TLS, authenticates the stream and swaps the key; the request then goes to the forwarder instead of Reiki's own TLS client, so the upstream sees the forwarder's handshake. Add `streaming = true` there so event streams are not held until they finish. See [providers](providers.md#forwarding).
 - What Reiki cannot reproduce is the client's TLS handshake: the upstream sees Reiki's own TLS client. Only the opaque tunnel keeps the client's handshake, and it cannot swap a key.
 - Hosts that are allowed but not listed under `hosts` stay opaque.
-- A reload changes the intercept hosts, `require_auth` and `leaf_ttl_hours`. The CA files cannot change live: a different `ca_cert` or `ca_key` refuses the reload, and adding or removing `[tunnel.intercept]` needs a restart. See [security](security.md) for what to protect.
+- A reload changes the intercept hosts, `require_auth` and `leaf_ttl_hours`.
+- A reload also swaps in a new CA when `ca_cert` or `ca_key` changes, or when the files are renewed in place. The new CA must have a key that matches its certificate, a DNS name constraint that covers every intercepted host, and no expiry in the past. A CA that fails a check refuses the whole reload, and the running CA keeps serving.
+- After a swap, new connections get certificates from the new CA, and clients must trust the new `ca.pem`. Connections already open keep their certificate until they close.
+- Adding or removing `[tunnel.intercept]` needs a restart. See [reload](troubleshooting.md#reload) and [security](security.md) for what to protect.

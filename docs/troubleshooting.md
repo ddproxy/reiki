@@ -56,7 +56,7 @@ Key values and stream tokens are never logged.
 
 ## Reload
 
-Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config and key files, build and check the whole new state first, and swap it in only if every part is valid. A bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
+Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config, key files and interception CA files, build and check the whole new state first, and swap it in only if every part is valid. A bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
 
 To see what a reload would do first, run `reiki reload --dry-run`. It calls the admin listener (taking the address from the config's `[admin] listen` and the token from `--token-file` or `REIKI_ADMIN_TOKEN`) and prints the JSON answer, so `reiki reload --dry-run | jq .changed` lists the changes. Without `--dry-run` it applies the reload. It exits 0 on success, 1 when the instance refused or the config failed, and 2 when it could not reach the instance.
 
@@ -68,7 +68,7 @@ watch = true          # off by default
 interval_secs = 5     # 1 to 3600
 ```
 
-Every interval Reiki checks the config file, the key files and any file a plugin reads. When they have changed and then stayed unchanged for one more interval, it reloads, so a file still being written is never read half done. A config that fails to load is tried once and left alone until a file changes again. `watch` and `interval_secs` themselves apply on the next reload.
+Every interval Reiki checks the config file, the key files, the interception CA files and any file a plugin reads. When they have changed and then stayed unchanged for one more interval, it reloads, so a file still being written is never read half done. A config that fails to load is tried once and left alone until a file changes again. `watch` and `interval_secs` themselves apply on the next reload.
 
 Applied live:
 
@@ -77,12 +77,12 @@ Applied live:
 - files a plugin reads: editing the placeholders `terms_file` and reloading builds that plugin again, even when the config text is the same
 - the tunnel `allow` list, `deny_private`, `allow_loopback` and `connect_timeout_secs`
 - the intercept host table, `require_auth` and `leaf_ttl_hours`
+- the interception CA: Reiki reads `ca_cert` and `ca_key` on every reload, and when they differ from the running CA it checks the new one before anything changes. The key must match the certificate, the certificate must not be expired, and its DNS name constraint must cover every intercepted host. A CA that fails a check refuses the whole reload. A valid one is listed as `intercept ca` in `changed`, and the log warns that clients must trust the new CA. New connections get certificates from the new CA, and connections already open keep theirs until they close.
 
 Needs a restart, and is reported in the result as `restart_needed`:
 
 - every `listen` address (client, admin and tunnel) and the `[log]` file path
 - adding or removing `[tunnel]` or `[tunnel.intercept]`
-- the CA files: a changed `ca_cert` or `ca_key` refuses the whole reload
 
 The result lists what changed, and the log carries one line per reload. `GET /status` shows `config.generation` (the number of successful reloads), `config.loaded_at` and `config.last_reload`, with the error when the last attempt failed. See [monitoring](monitoring.md#post-reload).
 

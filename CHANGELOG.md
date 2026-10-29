@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A reload swaps the interception CA when `ca_cert` or `ca_key` changes, or when a renewed CA file is seen by the watcher. The new CA must have a key that matches its certificate, a DNS name constraint covering every intercepted host, and no past expiry. A CA that fails a check refuses the whole reload and the old CA keeps serving.
+- A swapped CA drops the certificates the old CA minted. New connections get certificates from the new CA, and open connections keep theirs. The reload report lists `intercept ca` in `changed`, and the log warns that clients must trust the new CA.
+- `GET /status` shows the new CA's expiry after a swap.
+
 ## 0.7.8
 
 ### Fixed

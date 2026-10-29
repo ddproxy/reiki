@@ -6,13 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
     AdminCtx, AdminReply, ChunkCtx, Event, FailureKind, KeyCounts, Plugin, RequestCtx,
-    ResponseHeadCtx,
+    ResponseHeadCtx, HOST_KEYS,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
 pub const NAME: &str = "metrics";
-
-const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run"];
 
 /// Builds the plugin from its config table, which takes no settings of its own.
 pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {

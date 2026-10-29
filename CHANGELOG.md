@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `streams = ["a", "b"]` in a `[plugins.<name>]` table runs the plugin only for requests on those streams. Without it the plugin runs on every stream. An unknown stream name is a startup error. A reload that changes only `streams` applies live and keeps the plugin running with its counters.
+
 ## 0.7.8
 
 ### Fixed

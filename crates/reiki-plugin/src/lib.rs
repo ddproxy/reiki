@@ -16,6 +16,9 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 
+/// Keys every plugin table accepts. The host reads them, so a plugin must not reject them as unknown.
+pub const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run", "streams"];
+
 /// A fresh 16-hex-digit request id, unique enough to follow one request through logs.
 pub fn new_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);

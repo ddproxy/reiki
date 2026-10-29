@@ -31,7 +31,7 @@ const FORWARDER_FAILED_BODY: &[u8] =
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Stands in for the stream name when a request needs none.
-const PASSTHROUGH_STREAM: &str = "passthrough";
+pub(crate) const PASSTHROUGH_STREAM: &str = "passthrough";
 /// Stands in for the key name on a request that used none of Reiki's keys.
 const PASSTHROUGH_KEY: &str = "-";
 const HEALTH_PATH: &str = "/__reiki/healthz";

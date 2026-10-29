@@ -8,6 +8,7 @@
 - `reiki keys --check` checks the configured key files offline for missing, unreadable, empty or group/world-readable files.
 - `/status` key entries include `last_status_code`.
 - Versioned admin API: all existing admin routes are available under `/v1/...` with the same auth; unversioned paths remain unchanged. `GET /v1/openapi.json` returns an OpenAPI 3.1 document describing v1 routes, bearer auth, `dry_run` on reload, and response shapes. Admin responses include `X-Reiki-Version`. The OpenAPI document is built from a static description in code to detect route drift. v1 gains only additive fields in the stability promise.
+- Per-stream token usage reporting: Prometheus counter `reiki_tokens_total{stream,upstream,direction}` with direction `input` or `output`. Admin `GET /usage` returns JSON per stream and upstream with input, output and request counts since start. Token usage is extracted from OpenAI-style and Anthropic-style `usage` in non-streaming JSON bodies and from the last `data:` event of SSE streams.
 
 ## 0.7.6
 

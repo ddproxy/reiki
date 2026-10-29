@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
-use reiki_plugin::{AdminCtx, AdminReply, Event, FailureKind, KeyCounts, Plugin};
+use reiki_plugin::{
+    AdminCtx, AdminReply, ChunkCtx, Event, FailureKind, KeyCounts, Plugin, RequestCtx,
+    ResponseHeadCtx,
+};
 
 /// The `[plugins.metrics]` table this plugin reads.
 pub const NAME: &str = "metrics";
@@ -62,15 +65,105 @@ impl Plugin for MetricsPlugin {
         }
     }
 
+    fn new_state(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(RequestState::default())
+    }
+
+    fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), reiki_plugin::PluginError> {
+        if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
+            state.stream = Some(ctx.stream.to_owned());
+            state.upstream = Some(ctx.upstream.to_owned());
+        }
+        Ok(())
+    }
+
+    fn on_response_head(&self, ctx: &mut ResponseHeadCtx<'_>) {
+        let Some(state) = ctx.state.downcast_mut::<RequestState>() else {
+            return;
+        };
+        state.key = Some(ctx.key.to_owned());
+        state.status = Some(ctx.status.as_u16());
+        let content_type = ctx
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        state.is_sse = content_type.contains("text/event-stream");
+    }
+
+    fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+        let Some(state) = ctx.state.downcast_mut::<RequestState>() else {
+            return;
+        };
+        if state.exceeded {
+            if ctx.is_last {
+                // a response that exceeds the bound counts nothing and is not an error
+            }
+            return;
+        }
+        if state.is_sse {
+            if state.buffer.len() < 16 * 1024 {
+                let remaining = 16 * 1024 - state.buffer.len();
+                if ctx.chunk.len() <= remaining {
+                    state.buffer.extend_from_slice(ctx.chunk);
+                } else {
+                    state.buffer.extend_from_slice(&ctx.chunk[..remaining]);
+                }
+            } else {
+                state.buffer.extend_from_slice(ctx.chunk);
+                if state.buffer.len() > 16 * 1024 {
+                    let start = state.buffer.len() - 16 * 1024;
+                    state.buffer.drain(0..start);
+                }
+            }
+        } else if state.buffer.len() < 1024 * 1024 {
+            let remaining = 1024 * 1024 - state.buffer.len();
+            if ctx.chunk.len() <= remaining {
+                state.buffer.extend_from_slice(ctx.chunk);
+            } else {
+                state.buffer.extend_from_slice(&ctx.chunk[..remaining]);
+                state.exceeded = true;
+            }
+        } else {
+            state.exceeded = true;
+        }
+        if ctx.is_last {
+            if state.exceeded && !state.is_sse {
+                // exceeded bound - counts nothing
+                return;
+            }
+            if state.is_sse && state.buffer.len() > 16 * 1024 {
+                return;
+            }
+            if let Some((input, output)) = extract_usage(&state.buffer, state.is_sse) {
+                let stream = state.stream.as_deref().unwrap_or("");
+                let upstream = state.upstream.as_deref().unwrap_or("");
+                self.metrics.record_tokens(stream, upstream, "input", input);
+                self.metrics
+                    .record_tokens(stream, upstream, "output", output);
+                self.metrics.record_usage_request(stream, upstream);
+            }
+        }
+    }
+
     fn admin_paths(&self) -> Vec<&'static str> {
-        vec!["/metrics"]
+        vec!["/metrics", "/usage"]
     }
 
     fn on_admin(&self, ctx: &AdminCtx<'_>) -> Option<AdminReply> {
-        Some(AdminReply {
-            content_type: "text/plain; version=0.0.4; charset=utf-8",
-            body: self.metrics.render(ctx.keys),
-        })
+        if ctx.path == "/metrics" {
+            Some(AdminReply {
+                content_type: "text/plain; version=0.0.4; charset=utf-8",
+                body: self.metrics.render(ctx.keys),
+            })
+        } else if ctx.path == "/usage" {
+            Some(AdminReply {
+                content_type: "application/json",
+                body: self.metrics.render_usage(),
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -101,12 +194,25 @@ impl StatusClass {
 }
 
 #[derive(Debug, Default)]
+struct RequestState {
+    stream: Option<String>,
+    upstream: Option<String>,
+    key: Option<String>,
+    status: Option<u16>,
+    buffer: Vec<u8>,
+    is_sse: bool,
+    exceeded: bool,
+}
+
+#[derive(Debug, Default)]
 struct Inner {
     requests: BTreeMap<(String, String, &'static str), u64>,
     failovers: BTreeMap<(String, String, &'static str), u64>,
     cooldowns: BTreeMap<(String, &'static str), u64>,
     rate_limit_rejections: BTreeMap<String, u64>,
     findings: BTreeMap<(String, String, String, &'static str), u64>,
+    tokens: BTreeMap<(String, String, &'static str), u64>,
+    usage_requests: BTreeMap<(String, String), u64>,
 }
 
 /// In-memory counters for the admin `/metrics` endpoint. Bounded by the number
@@ -189,6 +295,24 @@ impl Metrics {
         });
     }
 
+    pub fn record_tokens(&self, stream: &str, upstream: &str, direction: &'static str, count: u64) {
+        self.with(|inner| {
+            *inner
+                .tokens
+                .entry((stream.to_owned(), upstream.to_owned(), direction))
+                .or_insert(0) += count;
+        });
+    }
+
+    pub fn record_usage_request(&self, stream: &str, upstream: &str) {
+        self.with(|inner| {
+            *inner
+                .usage_requests
+                .entry((stream.to_owned(), upstream.to_owned()))
+                .or_insert(0) += 1;
+        });
+    }
+
     /// Render the Prometheus text exposition. `keys` is the current gauge,
     /// sampled by the caller so it reflects the same instant as the scrape.
     pub fn render(&self, keys: KeyCounts) -> String {
@@ -267,6 +391,19 @@ impl Metrics {
             );
         }
 
+        out.push_str("# HELP reiki_tokens_total Tokens by stream, upstream and direction.\n");
+        out.push_str("# TYPE reiki_tokens_total counter\n");
+        for ((stream, upstream, direction), count) in &inner.tokens {
+            let _ = writeln!(
+                out,
+                "reiki_tokens_total{{stream=\"{}\",upstream=\"{}\",direction=\"{}\"}} {}",
+                escape_label(stream),
+                escape_label(upstream),
+                direction,
+                count
+            );
+        }
+
         out.push_str("# HELP reiki_keys Keys by rotation state.\n");
         out.push_str("# TYPE reiki_keys gauge\n");
         let _ = writeln!(out, "reiki_keys{{state=\"available\"}} {}", keys.available);
@@ -279,6 +416,112 @@ impl Metrics {
 
         out
     }
+
+    pub fn render_usage(&self) -> String {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut streams: BTreeMap<String, BTreeMap<String, (u64, u64, u64)>> = BTreeMap::new();
+        for ((stream, upstream), requests) in &inner.usage_requests {
+            let entry = streams
+                .entry(stream.clone())
+                .or_default()
+                .entry(upstream.clone())
+                .or_insert((0, 0, 0));
+            entry.2 = *requests;
+        }
+        for ((stream, upstream, direction), count) in &inner.tokens {
+            let entry = streams
+                .entry(stream.clone())
+                .or_default()
+                .entry(upstream.clone())
+                .or_insert((0, 0, 0));
+            if *direction == "input" {
+                entry.0 += *count;
+            } else if *direction == "output" {
+                entry.1 += *count;
+            }
+        }
+        let mut stream_entries: Vec<String> = Vec::new();
+        for (stream, upstreams) in &streams {
+            let mut upstream_entries: Vec<String> = Vec::new();
+            for (upstream, (input, output, requests)) in upstreams {
+                upstream_entries.push(format!(
+                    "\"{}\":{{\"input\":{},\"output\":{},\"requests\":{}}}",
+                    json_escape(upstream),
+                    input,
+                    output,
+                    requests
+                ));
+            }
+            stream_entries.push(format!(
+                "\"{}\":{{{}}}",
+                json_escape(stream),
+                upstream_entries.join(",")
+            ));
+        }
+        format!("{{{}}}", stream_entries.join(","))
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn extract_usage(buffer: &[u8], is_sse: bool) -> Option<(u64, u64)> {
+    if is_sse {
+        // Look for the last data: event
+        let text = String::from_utf8_lossy(buffer);
+        let mut last_data: Option<String> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                let rest = rest.trim_start();
+                if rest == "[DONE]" {
+                    continue;
+                }
+                last_data = Some(rest.to_string());
+            }
+        }
+        if let Some(data) = last_data {
+            return extract_usage_from_json_str(&data);
+        }
+        None
+    } else {
+        let text = String::from_utf8_lossy(buffer);
+        extract_usage_from_json_str(&text)
+    }
+}
+
+fn extract_usage_from_json_str(s: &str) -> Option<(u64, u64)> {
+    // Try to parse as JSON
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    // Try OpenAI style
+    if let Some(usage) = v.get("usage") {
+        if let Some(prompt) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
+            if let Some(completion) = usage.get("completion_tokens").and_then(|x| x.as_u64()) {
+                return Some((prompt, completion));
+            }
+        }
+        if let Some(input) = usage.get("input_tokens").and_then(|x| x.as_u64()) {
+            if let Some(output) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
+                return Some((input, output));
+            }
+        }
+    }
+    // Also check Anthropic style at top level sometimes? The requirement says "OpenAI-style usage.prompt_tokens / usage.completion_tokens and Anthropic-style usage.input_tokens / usage.output_tokens" - both under usage object typically
+    None
 }
 
 /// Escape a value for a Prometheus text label: backslash, double quote and newline.
@@ -353,6 +596,7 @@ mod tests {
             "reiki_cooldowns_total",
             "reiki_rate_limit_rejections_total",
             "reiki_findings_total",
+            "reiki_tokens_total",
             "reiki_keys",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
@@ -420,7 +664,7 @@ mod tests {
             .body
             .contains("reiki_cooldowns_total{key=\"k\",class=\"rate_limited\"} 1"));
         assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
-        assert_eq!(plugin.admin_paths(), ["/metrics"]);
+        assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
         assert!(!plugin.uses_bodies());
     }
 

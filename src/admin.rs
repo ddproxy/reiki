@@ -14,12 +14,19 @@ use crate::config::StrategyConfig;
 use crate::proxy::{App, Snapshot};
 use reiki_plugin::KeyCounts;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The admin listener's routes. Mounted on its own socket, never on the client
 /// listener, so it is only reachable where the operator exposes it.
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/reload", post(reload))
+        .route("/v1/status", get(status))
+        .route("/v1/reload", post(reload))
+        .route("/v1/openapi.json", get(openapi))
+        .route("/v1/metrics", get(plugin_route_v1_metrics))
+        .route("/metrics", get(plugin_route))
         .fallback(get(plugin_route))
         .with_state(app)
 }
@@ -130,6 +137,50 @@ async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap)
     }
 }
 
+async fn plugin_route_v1_metrics(
+    State(app): State<Arc<App>>,
+    _uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if !access_allowed(&app, &headers) {
+        return unauthorized();
+    }
+    // For /v1/metrics, try plugin admin with /metrics
+    let snapshot = app.snapshot();
+    let now = Instant::now();
+    let keys = {
+        let health = app
+            .health()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut counts = KeyCounts::default();
+        for name in snapshot.config.keys.keys() {
+            match health.status(name, now) {
+                KeyStatus::Available => counts.available += 1,
+                KeyStatus::Cooling(_) => counts.cooling += 1,
+                KeyStatus::OutOfRotation => counts.out_of_rotation += 1,
+            }
+        }
+        counts
+    };
+    match app.plugins().on_admin("/metrics", keys) {
+        Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
+        None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
+    }
+}
+
+async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if !access_allowed(&app, &headers) {
+        return unauthorized();
+    }
+    let doc = build_openapi();
+    text_response(StatusCode::OK, "application/json", doc)
+}
+
+fn build_openapi() -> String {
+    "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"Reiki Admin API\",\"version\":\"1.0.0\"},\"tags\":[{\"name\":\"admin\"}],\"components\":{\"securitySchemes\":{\"bearerAuth\":{\"type\":\"http\",\"scheme\":\"bearer\"}},\"schemas\":{\"Error\":{\"type\":\"object\",\"required\":[\"ok\",\"error\"],\"properties\":{\"ok\":{\"type\":\"boolean\",\"const\":false},\"error\":{\"type\":\"string\"}}},\"ReloadReport\":{\"type\":\"object\",\"required\":[\"ok\",\"dry_run\",\"generation\",\"keys\",\"streams\",\"changed\",\"restart_needed\"],\"properties\":{\"ok\":{\"type\":\"boolean\",\"const\":true},\"dry_run\":{\"type\":\"boolean\"},\"generation\":{\"type\":\"integer\"},\"keys\":{\"type\":\"integer\"},\"streams\":{\"type\":\"integer\"},\"changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"restart_needed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}},\"security\":[{\"bearerAuth\":[]}],\"paths\":{\"/v1/status\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Status\",\"responses\":{\"200\":{\"description\":\"Status\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\"}}}}}}},\"/v1/reload\":{\"post\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Reload\",\"parameters\":[{\"name\":\"dry_run\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"string\",\"enum\":[\"true\",\"1\",\"false\",\"0\"]}}],\"responses\":{\"200\":{\"description\":\"Reload report\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/ReloadReport\"}}}},\"400\":{\"description\":\"Bad request\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}},\"422\":{\"description\":\"Unprocessable entity\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}},\"500\":{\"description\":\"Internal server error\",\"content\":{\"application/json\":{\"schema\":{\"$ref\":\"#/components/schemas/Error\"}}}}}}},\"/v1/metrics\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"Metrics\",\"responses\":{\"200\":{\"description\":\"Metrics\",\"content\":{\"text/plain\":{\"schema\":{\"type\":\"string\"}}}},\"404\":{\"description\":\"Not found\"}}}},\"/v1/openapi.json\":{\"get\":{\"tags\":[\"admin\"],\"security\":[{\"bearerAuth\":[]}],\"summary\":\"OpenAPI\",\"responses\":{\"200\":{\"description\":\"OpenAPI document\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\"}}}}}}}}}".to_owned()
+}
+
 /// Constant-time check of the `Authorization: Bearer <token>` header against the
 /// configured admin token hash. A missing config or header is a plain refusal.
 fn access_allowed(app: &App, headers: &HeaderMap) -> bool {
@@ -160,6 +211,9 @@ fn bearer_token(value: &str) -> Option<&str> {
 fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
+    if let Ok(v) = HeaderValue::from_str(VERSION) {
+        response.headers_mut().insert("X-Reiki-Version", v);
+    }
     response
 }
 
@@ -169,6 +223,9 @@ fn text_response(status: StatusCode, content_type: &'static str, body: String) -
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Ok(v) = HeaderValue::from_str(VERSION) {
+        response.headers_mut().insert("X-Reiki-Version", v);
+    }
     response
 }
 

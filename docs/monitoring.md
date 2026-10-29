@@ -2,6 +2,10 @@
 
 Reiki can serve a small admin listener with `GET /status`, plus any paths a plugin adds such as `GET /metrics` from the `metrics` plugin. It is off unless you add an `[admin]` table, and it always listens on its own socket, never the client one.
 
+## Admin API
+
+Routes: `GET /status`, `POST /reload`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API follows a stability promise: v1 only gains fields.
+
 ## Configure
 
 ```toml

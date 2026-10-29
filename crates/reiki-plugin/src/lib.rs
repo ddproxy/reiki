@@ -139,6 +139,9 @@ pub enum Event<'a> {
         stream: &'a str,
         plugin: &'a str,
         kind: &'a str,
+        /// A short label for one name or rule within the kind, such as a tool name. The host
+        /// sanitises it before a listener sees it; see [`RequestCtx::report_detail`].
+        detail: Option<&'a str>,
         count: u64,
         blocked: bool,
     },
@@ -214,9 +217,12 @@ pub struct RequestCtx<'a> {
 }
 
 /// Identifiers of one kind that a detection plugin found in a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reported {
     pub kind: &'static str,
+    /// An optional label for a name or rule within the kind. Limited to `[A-Za-z0-9_.:*/-]` and 64
+    /// bytes by the host, and dropped when empty.
+    pub detail: Option<String>,
     pub count: usize,
     pub blocked: bool,
 }
@@ -285,6 +291,19 @@ impl<'a> RequestCtx<'a> {
     pub fn report(&mut self, kind: &'static str, count: usize, blocked: bool) {
         self.reported.push(Reported {
             kind,
+            detail: None,
+            count,
+            blocked,
+        });
+    }
+
+    /// Like [`RequestCtx::report`], with a `detail` label for one name or rule within the kind, such
+    /// as a tool name. The host keeps only `[A-Za-z0-9_.:*/-]`, cuts the rest at 64 bytes and drops
+    /// an empty result, so a plugin cannot send free text. Never pass the matched text.
+    pub fn report_detail(&mut self, kind: &'static str, detail: &str, count: usize, blocked: bool) {
+        self.reported.push(Reported {
+            kind,
+            detail: Some(detail.to_owned()),
             count,
             blocked,
         });

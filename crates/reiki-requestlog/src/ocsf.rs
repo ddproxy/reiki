@@ -135,6 +135,13 @@ pub fn finding(finding: FindingEvent) -> String {
     } else {
         (17, "Logged", 3)
     };
+    let mut title = format!(
+        "{}: {} in an outbound request",
+        finding.plugin, finding.kind
+    );
+    if let Some(detail) = &finding.detail {
+        title = format!("{title} ({}:{detail})", finding.kind);
+    }
     json!({
         "class_uid": 2004,
         "class_name": "Detection Finding",
@@ -151,7 +158,7 @@ pub fn finding(finding: FindingEvent) -> String {
         "disposition_id": disposition_id,
         "disposition": disposition,
         "finding_info": {
-            "title": format!("{}: {} in an outbound request", finding.plugin, finding.kind),
+            "title": title,
             "uid": format!("{}:{}:{}", finding.id, finding.plugin, finding.kind),
             "created_time": millis(finding.at),
             "types": [finding.kind],

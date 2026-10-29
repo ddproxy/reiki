@@ -1241,7 +1241,9 @@ dependencies = [
 name = "reiki-metrics"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "reiki-plugin",
+ "serde_json",
  "toml",
 ]
 

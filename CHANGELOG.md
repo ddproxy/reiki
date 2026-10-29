@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Per-stream token usage reporting: Prometheus counter `reiki_tokens_total{stream,upstream,direction}` with direction `input` or `output`. Admin `GET /usage` returns JSON per stream and upstream with input, output and request counts since start. Token usage is extracted from OpenAI-style and Anthropic-style `usage` in non-streaming JSON bodies and from the last `data:` event of SSE streams.
+
 ## 0.7.6
 
 ### Fixed

@@ -75,3 +75,11 @@ Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape t
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
 ```
+
+## GET /usage
+
+Served by the `metrics` plugin with the same bearer auth as `/status`. Returns JSON per stream and upstream with `input`, `output`, and `request` counts since start.
+
+```json
+{"stream":{"upstream":{"input":10,"output":20,"requests":1}}}
+```

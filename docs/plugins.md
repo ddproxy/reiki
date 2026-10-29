@@ -47,6 +47,24 @@ reiki scan --all --json notes.txt           # every kind, one JSON object per fi
 - `--kinds` takes labels from any plugin. `--all` adds the kinds that are off by default.
 - It reads bytes as UTF-8 text with lossy conversion, the same way the plugins read a request body.
 
+## Report findings with a detail
+
+A detection plugin reports a finding with `RequestCtx::report(kind, count, blocked)`. A plugin that reports per name or per rule, such as a tool allowlist or a lint rule, can add a short label with `RequestCtx::report_detail(kind, detail, count, blocked)`:
+
+```rust
+ctx.report_detail("tool", "get_weather", 1, true);
+```
+
+The host checks the label before any listener sees it:
+
+- It keeps only the characters `A-Z`, `a-z`, `0-9`, `_`, `.`, `:`, `*`, `/` and `-`. Other characters are removed, not replaced, so a space, a newline or a quote never gets through.
+- It cuts the result at 64 bytes.
+- It drops the label when nothing is left.
+
+The filter is not a privacy check. A plugin must still never pass matched text, even text that fits the character set.
+
+`Event::Finding` has a `detail: Option<&str>` field with the sanitised label. Plugins that match with `..` need no change.
+
 ## Choose and order plugins at build time
 
 Cargo features only switch a plugin's code on, and they carry no order. Order comes from `REIKI_PLUGINS`, an ordered, comma-separated list read by `build.rs`:

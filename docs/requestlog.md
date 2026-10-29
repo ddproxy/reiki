@@ -88,6 +88,8 @@ When `phi`, `finance` or `gov` finds identifiers in a request, the log gets a `f
 
 A request a plugin blocks is rejected before it reaches the request log, so it has a `finding` record and no `request` or `response` record.
 
+A finding can also carry a `detail` label, such as a tool name, when the plugin reports one. It is a short sanitised string (see [Report findings with a detail](plugins.md#report-findings-with-a-detail)), and the record has no `detail` field when the plugin sent none.
+
 The request log does not mask detected identifiers in the body it records. With the default `body = "full"`, a request that `phi` only reports is written to the log with its identifiers in it. Where a detection plugin runs in `report` mode, set `body = "summary"` or `body = "none"`.
 
 ## OCSF output
@@ -98,7 +100,7 @@ The request log does not mask detected identifiers in the body it records. With 
 | --- | --- | --- |
 | request | HTTP Activity (4002) | `activity_id` from the method, `http_request` with the redacted path and headers, `src_endpoint` the stream, `dst_endpoint` the upstream |
 | response | HTTP Activity (4002) | `http_response.code`, `duration` in milliseconds, `status_id` 1 or 2 |
-| finding | Detection Finding (2004) | `finding_info.types` is the kind, `count`, and `disposition` `Blocked` or `Logged` |
+| finding | Detection Finding (2004) | `finding_info.types` is the kind, `count`, and `disposition` `Blocked` or `Logged`. With a `detail`, `finding_info.title` ends in `(kind:detail)` |
 
 Every event carries `metadata.correlation_uid`, the request id, so a SIEM can join a request, its response and its findings. Redaction, `headers` and `body` apply as in the JSON format.
 

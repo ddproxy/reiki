@@ -174,6 +174,7 @@ impl Plugin for RequestLog {
             stream,
             plugin,
             kind,
+            detail,
             count,
             blocked,
         } = *event
@@ -184,6 +185,7 @@ impl Plugin for RequestLog {
                 stream: stream.to_owned(),
                 plugin: plugin.to_owned(),
                 kind: kind.to_owned(),
+                detail: detail.map(str::to_owned),
                 count,
                 blocked,
             }));

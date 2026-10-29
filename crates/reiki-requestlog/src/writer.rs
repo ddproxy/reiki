@@ -31,6 +31,8 @@ pub struct FindingEvent {
     pub stream: String,
     pub plugin: String,
     pub kind: String,
+    /// A sanitised label for one name or rule within the kind. Already filtered by the host.
+    pub detail: Option<String>,
     pub count: u64,
     pub blocked: bool,
 }
@@ -146,7 +148,7 @@ pub fn render(config: &Config, event: Event) -> String {
 }
 
 fn render_finding(finding: FindingEvent) -> String {
-    json!({
+    let mut record = json!({
         "v": 1,
         "event": "finding",
         "id": finding.id,
@@ -156,8 +158,11 @@ fn render_finding(finding: FindingEvent) -> String {
         "kind": finding.kind,
         "count": finding.count,
         "action": if finding.blocked { "blocked" } else { "reported" },
-    })
-    .to_string()
+    });
+    if let Some(detail) = finding.detail {
+        record["detail"] = json!(detail);
+    }
+    record.to_string()
 }
 
 fn render_response(config: &Config, response: ResponseEvent) -> String {
@@ -659,6 +664,7 @@ mod tests {
             stream: "zen".to_owned(),
             plugin: "phi".to_owned(),
             kind: "ssn".to_owned(),
+            detail: None,
             count: 2,
             blocked,
         }
@@ -701,6 +707,18 @@ mod tests {
             line(&c, Event::Finding(finding(false)))["action"],
             "reported"
         );
+        assert!(record.get("detail").is_none(), "{record}");
+    }
+
+    #[test]
+    fn the_json_finding_carries_a_detail_only_when_one_is_set() {
+        let c = config("");
+        let mut with = finding(false);
+        with.detail = Some("get_weather".to_owned());
+        let record = line(&c, Event::Finding(with));
+        assert_eq!(record["detail"], "get_weather");
+        assert_eq!(record["kind"], "ssn");
+        assert_eq!(record["count"], 2);
     }
 
     #[test]
@@ -766,6 +784,14 @@ mod tests {
         );
         assert_eq!(blocked["disposition"], "Blocked");
         assert_eq!(blocked["finding_info"]["types"][0], "ssn");
+        assert_eq!(
+            blocked["finding_info"]["types"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            blocked["finding_info"]["title"],
+            "phi: ssn in an outbound request"
+        );
         assert_eq!(blocked["finding_info"]["created_time"], 951_782_401_000_u64);
         assert_eq!(blocked["count"], 2);
         assert_eq!(blocked["metadata"]["correlation_uid"], "abc");
@@ -777,6 +803,20 @@ mod tests {
             ),
             (Some("Logged"), Some(3))
         );
+    }
+
+    #[test]
+    fn ocsf_findings_add_the_detail_to_the_title_and_keep_types_as_the_kind() {
+        let c = config("format = \"ocsf\"");
+        let mut with = finding(true);
+        with.detail = Some("get_weather".to_owned());
+        let record = line(&c, Event::Finding(with));
+        assert_eq!(
+            record["finding_info"]["title"],
+            "phi: ssn in an outbound request (ssn:get_weather)"
+        );
+        assert_eq!(record["finding_info"]["types"], serde_json::json!(["ssn"]));
+        assert_eq!(record["finding_info"]["uid"], "abc:phi:ssn");
     }
 
     #[test]

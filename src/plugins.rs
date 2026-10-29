@@ -367,11 +367,13 @@ impl PluginChain {
             })
             .unwrap_or_else(|| Err(PluginError::Skip("plugin panicked".to_owned())));
             for found in std::mem::take(&mut ctx.reported) {
+                let detail = found.detail.as_deref().and_then(sanitize_detail);
                 self.on_event(&Event::Finding {
                     id: meta.id,
                     stream: meta.stream,
                     plugin: entry.plugin.name(),
                     kind: found.kind,
+                    detail: detail.as_deref(),
                     count: found.count as u64,
                     blocked: found.blocked,
                 });
@@ -524,6 +526,20 @@ impl PluginSession {
         self.chain
             .on_response_chunk(&mut self.states, chunk, is_last);
     }
+}
+
+/// Longest finding detail the host forwards, in bytes.
+const DETAIL_MAX_BYTES: usize = 64;
+
+/// Keeps only `[A-Za-z0-9_.:*/-]`, cuts the result at [`DETAIL_MAX_BYTES`] and drops an empty
+/// result. The filter runs here, not in each plugin, so no plugin can send free text as a detail.
+fn sanitize_detail(raw: &str) -> Option<String> {
+    let mut kept: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '*' | '/' | '-'))
+        .collect();
+    kept.truncate(DETAIL_MAX_BYTES);
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Runs a plugin hook, turning a panic into a logged `None` so one faulty plugin cannot take the request task down.
@@ -981,6 +997,90 @@ mod tests {
             .on_request(&mut states, &meta, &mut headers, &mut body)
             .unwrap();
         assert_eq!(*SEEN.lock().unwrap(), ["reporter ssn 2 false"]);
+    }
+
+    #[test]
+    fn finding_details_keep_only_label_characters_and_stay_short() {
+        assert_eq!(
+            sanitize_detail("get_weather.v2:*/x-y").as_deref(),
+            Some("get_weather.v2:*/x-y")
+        );
+        assert_eq!(
+            sanitize_detail("bad name\nwith \"quotes\" and ünïcode!").as_deref(),
+            Some("badnamewithquotesandncode")
+        );
+        assert_eq!(sanitize_detail("  \n\"\" "), None);
+        assert_eq!(sanitize_detail("").as_deref(), None);
+        let long = "a".repeat(100);
+        assert_eq!(
+            sanitize_detail(&long).map(|s| s.len()),
+            Some(DETAIL_MAX_BYTES)
+        );
+        // Filtering happens before the cut, so spaces do not eat into the 64 bytes.
+        let spaced = format!("{} {}", "b".repeat(60), "c".repeat(10));
+        assert_eq!(
+            sanitize_detail(&spaced).map(|s| s.len()),
+            Some(DETAIL_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn a_finding_detail_reaches_listeners_sanitised() {
+        use std::sync::Mutex;
+
+        static SEEN: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
+
+        struct Reporter;
+        impl Plugin for Reporter {
+            fn name(&self) -> &str {
+                "detailer"
+            }
+            fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+                ctx.report_detail("tool", "get weather\n\"x\"", 1, false);
+                ctx.report("tool", 1, false);
+                Ok(())
+            }
+        }
+        struct Listener;
+        impl Plugin for Listener {
+            fn name(&self) -> &str {
+                "listener"
+            }
+            fn on_event(&self, event: &Event<'_>) {
+                if let Event::Finding { detail, .. } = event {
+                    SEEN.lock().unwrap().push(detail.map(str::to_owned));
+                }
+            }
+        }
+        let registry = vec![
+            Registration {
+                name: "detailer",
+                build: |_| Ok(Box::new(Reporter) as Box<dyn Plugin>),
+            },
+            Registration {
+                name: "listener",
+                build: |_| Ok(Box::new(Listener) as Box<dyn Plugin>),
+            },
+        ];
+        let chain = PluginChain::build(&configured("[detailer]\n[listener]\n"), &registry).unwrap();
+        let mut states = chain.states();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream: "s",
+            upstream: "u",
+            method: &method,
+            path: "/x",
+        };
+        let mut headers = HeaderMap::new();
+        let mut body = Bytes::new();
+        chain
+            .on_request(&mut states, &meta, &mut headers, &mut body)
+            .unwrap();
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [Some("getweatherx".to_owned()), None]
+        );
     }
 
     #[test]

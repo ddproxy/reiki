@@ -1,7 +1,7 @@
 //! Large bodies must scan in time linear in their size: a request can be megabytes, and the
 //! check runs on the request path.
 
-use reiki_gov::{scan, Kind};
+use reiki_controlled::{scan, Kind};
 use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(15);

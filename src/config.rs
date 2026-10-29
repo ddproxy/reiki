@@ -168,6 +168,9 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Plugin names that were renamed, as (old, current).
+const RENAMED_PLUGINS: &[(&str, &str)] = &[("gov", "controlled")];
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -481,9 +484,30 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut config: Config =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.rename_old_plugins()?;
         config.resolve_quota_resets()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Plugin tables under a name the plugin used to have move to the current one.
+    fn rename_old_plugins(&mut self) -> Result<(), ConfigError> {
+        for (old, new) in RENAMED_PLUGINS {
+            let Some(table) = self.plugins.remove(*old) else {
+                continue;
+            };
+            if self.plugins.contains_key(*new) {
+                return Err(ConfigError::PluginConfig {
+                    name: (*old).to_owned(),
+                    message: format!(
+                        "`{old}` is the old name of `{new}`; keep only `[plugins.{new}]`"
+                    ),
+                });
+            }
+            tracing::warn!(old, new, "plugin table uses an old name; rename it");
+            self.plugins.insert((*new).to_owned(), table);
+        }
+        Ok(())
     }
 
     /// The parsed reset schedule for a key, if it has one.
@@ -1653,5 +1677,14 @@ socket = "/run/forwarder.sock"
                 }
             );
         }
+    }
+
+    #[test]
+    fn an_old_plugin_name_is_renamed_and_never_doubled() {
+        let old = Config::parse(&base("[plugins.gov]\nmode = \"report\"\n")).unwrap();
+        assert!(old.plugins.contains_key("controlled") && !old.plugins.contains_key("gov"));
+        let both = base("[plugins.gov]\n[plugins.controlled]\n");
+        let err = Config::parse(&both).unwrap_err().to_string();
+        assert!(err.contains("gov") && err.contains("controlled"), "{err}");
     }
 }

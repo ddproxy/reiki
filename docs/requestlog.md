@@ -84,7 +84,7 @@ Reiki runs plugins in the order they are registered in the build, not in the ord
 
 ## Findings from detection plugins
 
-When `phi`, `finance` or `gov` finds identifiers in a request, the log gets a `finding` record with the same `id` as the request: `{"event":"finding","id":"...","plugin":"phi","kind":"ssn","count":2,"action":"reported"}`. `action` is `blocked` or `reported`. The record names a kind and a count and never the matched text.
+When `phi`, `finance` or `controlled` finds identifiers in a request, the log gets a `finding` record with the same `id` as the request: `{"event":"finding","id":"...","plugin":"phi","kind":"ssn","count":2,"action":"reported"}`. `action` is `blocked` or `reported`. The record names a kind and a count and never the matched text.
 
 A request a plugin blocks is rejected before it reaches the request log, so it has a `finding` record and no `request` or `response` record.
 

@@ -1,9 +1,9 @@
 [package]
-name = "reiki-gov"
+name = "reiki-controlled"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.99"
-description = "Reiki plugin that blocks or reports government markings and identifiers in outbound requests"
+description = "Reiki plugin that blocks or reports controlled-information markings and identifiers in outbound requests"
 license = "MIT"
 publish = false
 

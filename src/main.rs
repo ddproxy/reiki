@@ -36,7 +36,7 @@ enum Command {
     /// there are findings, 2 on a usage or read error. Use it to tune `kinds` before switching a
     /// plugin from `report` to `block`.
     Scan {
-        /// Plugin to run (phi, finance, gov); repeat for several. Default: every compiled-in one.
+        /// Plugin to run (phi, finance, controlled); repeat for several. Default: every compiled-in one.
         #[arg(long = "plugin")]
         plugins: Vec<String>,
         /// Kinds to look for, comma separated. Default: each plugin's default set.

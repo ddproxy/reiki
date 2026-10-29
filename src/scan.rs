@@ -8,7 +8,7 @@
     not(any(
         feature = "plugin-phi",
         feature = "plugin-finance",
-        feature = "plugin-gov"
+        feature = "plugin-controlled"
     )),
     allow(dead_code, unused_variables)
 )]
@@ -38,7 +38,7 @@ pub fn plugins() -> Vec<&'static str> {
     [
         ("phi", cfg!(feature = "plugin-phi")),
         ("finance", cfg!(feature = "plugin-finance")),
-        ("gov", cfg!(feature = "plugin-gov")),
+        ("controlled", cfg!(feature = "plugin-controlled")),
     ]
     .into_iter()
     .filter_map(|(name, compiled)| compiled.then_some(name))
@@ -69,8 +69,8 @@ pub fn known_labels() -> Vec<&'static str> {
     labels.extend(reiki_phi::Kind::ALL.iter().map(|k| k.label()));
     #[cfg(feature = "plugin-finance")]
     labels.extend(reiki_finance::Kind::ALL.iter().map(|k| k.label()));
-    #[cfg(feature = "plugin-gov")]
-    labels.extend(reiki_gov::Kind::ALL.iter().map(|k| k.label()));
+    #[cfg(feature = "plugin-controlled")]
+    labels.extend(reiki_controlled::Kind::ALL.iter().map(|k| k.label()));
     labels.sort_unstable();
     labels.dedup();
     labels
@@ -78,6 +78,18 @@ pub fn known_labels() -> Vec<&'static str> {
 
 /// Scans `text` with the named plugins (all compiled-in ones when `only` is empty).
 pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Finding>, String> {
+    // `gov` is the former name of `controlled`.
+    let only: Vec<String> = only
+        .iter()
+        .map(|p| {
+            if p == "gov" {
+                "controlled".to_owned()
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+    let only = only.as_slice();
     let available = plugins();
     if let Some(unknown) = only.iter().find(|p| !available.contains(&p.as_str())) {
         return Err(format!(
@@ -132,26 +144,30 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
             );
         }
     }
-    #[cfg(feature = "plugin-gov")]
-    if wanted("gov") {
+    #[cfg(feature = "plugin-controlled")]
+    if wanted("controlled") {
         if let Some(kinds) = pick(
             selection,
-            &reiki_gov::Kind::DEFAULT,
-            &reiki_gov::Kind::ALL,
-            reiki_gov::Kind::parse,
+            &reiki_controlled::Kind::DEFAULT,
+            &reiki_controlled::Kind::ALL,
+            reiki_controlled::Kind::parse,
         ) {
-            findings.extend(reiki_gov::scan(text, &kinds).into_iter().map(|h| Finding {
-                plugin: "gov",
-                kind: h.kind.label(),
-                start: h.start,
-                end: h.end,
-            }));
+            findings.extend(
+                reiki_controlled::scan(text, &kinds)
+                    .into_iter()
+                    .map(|h| Finding {
+                        plugin: "controlled",
+                        kind: h.kind.label(),
+                        start: h.start,
+                        end: h.end,
+                    }),
+            );
         }
     }
     #[cfg(not(any(
         feature = "plugin-phi",
         feature = "plugin-finance",
-        feature = "plugin-gov"
+        feature = "plugin-controlled"
     )))]
     let _ = (&wanted, selection);
     findings.sort_by_key(|f| (f.start, f.end, f.plugin));
@@ -307,7 +323,7 @@ mod tests {
             "{found:?}"
         );
         assert!(
-            found.contains(&("gov".into(), "classification".into())),
+            found.contains(&("controlled".into(), "classification".into())),
             "{found:?}"
         );
     }

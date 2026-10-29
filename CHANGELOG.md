@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- The `gov` plugin is now `controlled` (crate `reiki-controlled`, feature `plugin-controlled`, docs `controlled.md`), since it looks for controlled-information markings and identifiers, not government data in general. `[plugins.gov]`, `reiki scan --plugin gov` and the `plugin-gov` feature still work. Findings now name the plugin `controlled`, so a dashboard or alert that matches `plugin="gov"` needs the new name.
+
 ### Added
 
 - Plugins can report a finding with a `detail` label through `RequestCtx::report_detail`, for example a tool name or a lint rule. The host keeps only `[A-Za-z0-9_.:*/-]`, cuts the label at 64 bytes and drops it when empty. `Event::Finding` carries it as `detail`.

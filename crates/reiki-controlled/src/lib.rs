@@ -1,4 +1,4 @@
-//! Reiki plugin that stops government markings and identifiers from leaving in an outbound request.
+//! Reiki plugin that stops controlled-information markings and identifiers from leaving in an outbound request.
 //!
 //! In `block` mode a request that holds a recognised marking or identifier is rejected before any
 //! key is used. In `report` mode it goes through and the finding is logged. Either way the log and
@@ -11,8 +11,8 @@ use reiki_plugin::Plugin;
 
 pub use detect::{scan, Hit, Kind};
 
-/// The `[plugins.gov]` table this plugin reads.
-pub const NAME: &str = "gov";
+/// The `[plugins.controlled]` table this plugin reads.
+pub const NAME: &str = "controlled";
 
 impl guard::Kind for Kind {
     fn label(self) -> &'static str {
@@ -33,7 +33,7 @@ pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
     guard::build(
         Spec {
             name: NAME,
-            finding: "possible government data",
+            finding: "possible controlled data",
             scan,
         },
         table,
@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             message,
-            "gov: request blocked, it contains cui x1, dissemination x1"
+            "controlled: request blocked, it contains cui x1, dissemination x1"
         );
         assert!(!message.contains("SP-CTI"));
     }

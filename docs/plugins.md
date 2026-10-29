@@ -29,14 +29,14 @@ file = "/var/lib/reiki/requests.jsonl"
 | --- | --- | --- |
 | `phi` | `plugin-phi` | Blocks or reports PHI and NPPI identifiers in outbound requests. See [phi](phi.md). |
 | `finance` | `plugin-finance` | Blocks or reports financial identifiers in outbound requests. See [finance](finance.md). |
-| `gov` | `plugin-gov` | Blocks or reports government markings and label-bound identifiers in outbound requests. See [gov](gov.md). |
+| `controlled` | `plugin-controlled` | Blocks or reports controlled-information markings (CUI, classification) and label-bound identifiers in outbound requests. See [controlled](controlled.md). |
 | `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
 | `metrics` | `plugin-metrics` | Serves Prometheus metrics at `GET /metrics` on the admin listener. See [monitoring](monitoring.md). |
 
 ## Tune a detector with `reiki scan`
 
-`reiki scan` runs the `phi`, `finance` and `gov` detectors over files or stdin without the proxy, so you can see what a plugin would flag before you switch it from `report` to `block`.
+`reiki scan` runs the `phi`, `finance` and `controlled` detectors over files or stdin without the proxy, so you can see what a plugin would flag before you switch it from `report` to `block`.
 
 ```bash
 reiki scan export.csv                       # each plugin's default kinds

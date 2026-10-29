@@ -1,4 +1,4 @@
-//! Finds government markings and identifier values in text.
+//! Finds controlled-information markings and identifier values in text.
 //!
 //! Markings are detected from their own upper-case form, such as a CUI banner or a classification
 //! level with a `//` caveat chain. Identifiers with no usable checksum are only reported next to

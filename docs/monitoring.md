@@ -86,7 +86,7 @@ Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape t
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
 | `reiki_keys` | gauge | `state` |
 
-`reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `gov`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value. The `detail` label that a plugin can attach to a finding is not a label here: `reiki_findings_total` ignores it so that the number of series does not grow with the names a plugin reports. Use the request log for per-name counts.
+`reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value. The `detail` label that a plugin can attach to a finding is not a label here: `reiki_findings_total` ignores it so that the number of series does not grow with the names a plugin reports. Use the request log for per-name counts.
 
 `status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. The `reiki_keys` gauge always reports all three states, even at zero.
 

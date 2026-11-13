@@ -137,10 +137,9 @@ async fn health_is_not_served_on_the_client_listener() {
 #[cfg(target_os = "linux")]
 fn process_sockets(pid: u32) -> Vec<(String, u16)> {
     let mut inodes = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap()
-        .flatten()
-    {
+    // A child that just exited has no fd table; that reads as no sockets.
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"));
+    for entry in fds.into_iter().flatten().flatten() {
         if let Ok(link) = std::fs::read_link(entry.path()) {
             let link = link.to_string_lossy().into_owned();
             if let Some(inode) = link
@@ -171,19 +170,36 @@ fn process_sockets(pid: u32) -> Vec<(String, u16)> {
     found
 }
 
+/// Client, admin and peer ports for one start attempt, all distinct.
 #[cfg(target_os = "linux")]
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+#[derive(Clone, Copy)]
+struct Ports {
+    client: u16,
+    admin: u16,
+    peer: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl Ports {
+    fn fresh() -> Self {
+        // Held together so the system cannot hand out one port twice.
+        let held: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let port = |i: usize| held[i].local_addr().unwrap().port();
+        Self {
+            client: port(0),
+            admin: port(1),
+            peer: port(2),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 struct Running {
     child: std::process::Child,
     dir: std::path::PathBuf,
+    ports: Ports,
 }
 
 #[cfg(target_os = "linux")]
@@ -195,9 +211,35 @@ impl Drop for Running {
     }
 }
 
-/// Starts the binary with `extra` appended to the config and waits for the listeners in `wait`.
 #[cfg(target_os = "linux")]
-fn start(label: &str, ports: (u16, u16), extra: &str, wait: &[u16]) -> Running {
+const START_ATTEMPTS: u32 = 3;
+#[cfg(target_os = "linux")]
+const START_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Starts the binary with `extra(ports)` appended to the config and waits until it listens on the
+/// client and admin ports, and the peer port too with `wait_peer`. A port picked by
+/// [`Ports::fresh`] is free only until it is released, so another test can take it before the
+/// child binds; such an attempt is retried with fresh ports.
+#[cfg(target_os = "linux")]
+fn start(label: &str, extra: impl Fn(Ports) -> String, wait_peer: bool) -> Running {
+    let mut failures = Vec::new();
+    for attempt in 1..=START_ATTEMPTS {
+        let ports = Ports::fresh();
+        match try_start(
+            &format!("{label}-{attempt}"),
+            ports,
+            &extra(ports),
+            wait_peer,
+        ) {
+            Ok(running) => return running,
+            Err(reason) => failures.push(format!("attempt {attempt}: {reason}")),
+        }
+    }
+    panic!("reiki never started: {}", failures.join("; "));
+}
+
+#[cfg(target_os = "linux")]
+fn try_start(label: &str, ports: Ports, extra: &str, wait_peer: bool) -> Result<Running, String> {
     let dir = std::env::temp_dir().join(format!("reiki-peers-off-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["a", "b", "c"] {
@@ -207,9 +249,9 @@ fn start(label: &str, ports: (u16, u16), extra: &str, wait: &[u16]) -> Running {
         .replace("/unused/", &format!("{}/", dir.display()))
         .replace(
             "listen = \"127.0.0.1:0\"",
-            &format!("listen = \"127.0.0.1:{}\"", ports.1),
+            &format!("listen = \"127.0.0.1:{}\"", ports.admin),
         );
-    let text = format!("listen = \"127.0.0.1:{}\"\n{text}", ports.0);
+    let text = format!("listen = \"127.0.0.1:{}\"\n{text}", ports.client);
     let config = dir.join("reiki.toml");
     std::fs::write(&config, text).unwrap();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_reiki"))
@@ -221,20 +263,27 @@ fn start(label: &str, ports: (u16, u16), extra: &str, wait: &[u16]) -> Running {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let running = Running { child, dir };
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    for port in [ports.0, ports.1].iter().chain(wait) {
-        while std::net::TcpStream::connect(("127.0.0.1", *port)).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "port {port} never opened"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    let mut running = Running { child, dir, ports };
+    let mut wanted = vec![ports.client, ports.admin];
+    if wait_peer {
+        wanted.push(ports.peer);
     }
-    // Let the probe connections close before the socket table is read.
-    std::thread::sleep(Duration::from_millis(300));
-    running
+    let deadline = std::time::Instant::now() + START_DEADLINE;
+    // Read from the child's own socket table, so a port another process took never counts.
+    loop {
+        if let Ok(Some(status)) = running.child.try_wait() {
+            return Err(format!("exited with {status}"));
+        }
+        let (listening, _) = listening_and_outbound(running.child.id());
+        if wanted.iter().all(|port| listening.contains(port)) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("listening on {listening:?}, wanted {wanted:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(running)
 }
 
 /// Listening ports and the count of outbound connections, which are sockets whose local port is
@@ -266,51 +315,56 @@ fn sorted(mut ports: Vec<u16>) -> Vec<u16> {
 #[cfg(target_os = "linux")]
 #[test]
 fn without_peers_only_the_client_and_admin_sockets_are_open() {
-    let ports = (free_port(), free_port());
-    let running = start("none", ports, "", &[]);
+    let running = start("none", |_| String::new(), false);
+    let ports = running.ports;
     let (listening, outbound) = listening_and_outbound(running.child.id());
-    assert_eq!(listening, sorted(vec![ports.0, ports.1]));
+    assert_eq!(listening, sorted(vec![ports.client, ports.admin]));
     assert_eq!(outbound, 0, "no outbound connection");
 }
 
 #[cfg(all(target_os = "linux", feature = "peers"))]
 #[test]
 fn a_disabled_peers_table_opens_nothing_either() {
-    let ports = (free_port(), free_port());
-    let peer_port = free_port();
     let running = start(
         "disabled",
-        ports,
-        &format!(
-            "[peers]\nenabled = false\npublish = true\nlisten = \"127.0.0.1:{peer_port}\"\n\
-             peer_token_sha256 = \"{}\"\n\
-             [peers.other]\nurl = \"http://127.0.0.1:{peer_port}\"\ntoken_file = \"/nonexistent\"\n",
-            sha("peer-token-for-tests")
-        ),
-        &[],
+        |ports| {
+            format!(
+                "[peers]\nenabled = false\npublish = true\nlisten = \"127.0.0.1:{peer}\"\n\
+                 peer_token_sha256 = \"{}\"\n\
+                 [peers.other]\nurl = \"http://127.0.0.1:{peer}\"\ntoken_file = \"/nonexistent\"\n",
+                sha("peer-token-for-tests"),
+                peer = ports.peer,
+            )
+        },
+        false,
     );
+    let ports = running.ports;
     let (listening, outbound) = listening_and_outbound(running.child.id());
-    assert_eq!(listening, sorted(vec![ports.0, ports.1]));
+    assert_eq!(listening, sorted(vec![ports.client, ports.admin]));
     assert_eq!(outbound, 0);
 }
 
 #[cfg(all(target_os = "linux", feature = "peers"))]
 #[test]
 fn publishing_adds_exactly_the_peer_listener_and_no_outbound_connection() {
-    let ports = (free_port(), free_port());
-    let peer_port = free_port();
     let running = start(
         "publish",
-        ports,
-        &format!(
-            "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:{peer_port}\"\n\
-             peer_token_sha256 = \"{}\"\n",
-            sha("peer-token-for-tests")
-        ),
-        &[peer_port],
+        |ports| {
+            format!(
+                "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:{}\"\n\
+                 peer_token_sha256 = \"{}\"\n",
+                ports.peer,
+                sha("peer-token-for-tests")
+            )
+        },
+        true,
     );
+    let ports = running.ports;
     let (listening, outbound) = listening_and_outbound(running.child.id());
-    assert_eq!(listening, sorted(vec![ports.0, ports.1, peer_port]));
+    assert_eq!(
+        listening,
+        sorted(vec![ports.client, ports.admin, ports.peer])
+    );
     assert_eq!(outbound, 0);
 }
 

@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.8.3
+
+### Fixed
+
+- The x86-64 Linux release binaries 0.8.0 to 0.8.2 used AVX instructions in the TLS library's CPU detection and crashed with an illegal instruction on CPUs without them (a Nehalem Xeon and a Sandy Bridge Core i3 were affected). The release now builds the C code for baseline x86-64 and the workflow runs `ca-init` on an emulated Nehalem CPU before publishing.
 
 ### Added
 

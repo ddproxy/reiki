@@ -21,8 +21,14 @@ use crate::proxy::{passthrough_headers, upstream_headers};
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
-/// Most bytes a decoded response body may reach, so a small compressed body cannot expand without bound.
-const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+/// The error a decoded body yields when it passes its configured cap. The proxy turns this into
+/// a 502 before any of a buffered response is sent.
+const BODY_LIMIT_MESSAGE: &str = "decoded response body exceeds the size limit";
+
+/// True for the error [`Capped`] produces when a decoded body is over its limit.
+pub fn is_body_limit_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidData && error.to_string() == BODY_LIMIT_MESSAGE
+}
 
 /// Fails the stream once more than `left` bytes have passed through.
 struct Capped {
@@ -46,7 +52,7 @@ impl Stream for Capped {
                     this.inner = Box::pin(OnceBody(None));
                     Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "decoded response body exceeds the size limit",
+                        BODY_LIMIT_MESSAGE,
                     ))))
                 }
             },
@@ -55,11 +61,68 @@ impl Stream for Capped {
     }
 }
 
-fn capped(inner: ByteStream) -> ByteStream {
-    Box::pin(Capped {
-        inner,
-        left: MAX_DECODED_BYTES,
-    })
+fn capped(inner: ByteStream, max: u64) -> ByteStream {
+    Box::pin(Capped { inner, left: max })
+}
+
+/// Fails a response body when it stops producing chunks for too long, or when it takes
+/// longer than the optional total limit. The idle timer starts at the response head and
+/// resets after every chunk.
+struct DeadlineStream {
+    inner: ByteStream,
+    idle: Pin<Box<tokio::time::Sleep>>,
+    idle_for: std::time::Duration,
+    total: Option<Pin<Box<tokio::time::Sleep>>>,
+    done: bool,
+}
+
+impl Stream for DeadlineStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if this
+            .total
+            .as_mut()
+            .is_some_and(|total| total.as_mut().poll(cx).is_ready())
+        {
+            this.done = true;
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the upstream response exceeded its total timeout",
+            ))));
+        }
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Pending => {
+                if this.idle.as_mut().poll(cx).is_ready() {
+                    this.done = true;
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the upstream response idle timeout expired",
+                    ))))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle_for);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
 }
 
 pub struct UpstreamResponse {
@@ -67,34 +130,65 @@ pub struct UpstreamResponse {
     pub headers: HeaderMap,
     pub version: Version,
     body: ByteStream,
+    /// True when Reiki decoded a `content-encoding` itself, so the body is no longer
+    /// the bytes the upstream sent.
+    decoded: bool,
 }
 
 impl UpstreamResponse {
-    pub fn from_reqwest(response: reqwest::Response) -> Self {
+    pub fn from_reqwest(response: reqwest::Response, max_decoded_bytes: u64) -> Self {
         let status = response.status();
-        let headers = response.headers().clone();
+        let mut headers = response.headers().clone();
         let version = response.version();
-        let body = capped(Box::pin(ErrMap {
+        let bodyless = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+        let encoding = if bodyless {
+            None
+        } else {
+            content_encoding(&headers)
+        };
+        let source: ByteStream = Box::pin(ErrMap {
             inner: Box::pin(response.bytes_stream()),
-        }));
+        });
+        let body = match encoding {
+            Some(Encoding::Gzip) => decode(source, max_decoded_bytes, GzipDecoder::new),
+            Some(Encoding::Deflate) => decode(source, max_decoded_bytes, ZlibDecoder::new),
+            Some(Encoding::Brotli) => decode(source, max_decoded_bytes, BrotliDecoder::new),
+            Some(Encoding::Zstd) => decode(source, max_decoded_bytes, ZstdDecoder::new),
+            None => capped(source, max_decoded_bytes),
+        };
+        if encoding.is_some() {
+            headers.remove(header::CONTENT_ENCODING);
+            headers.remove(header::CONTENT_LENGTH);
+        }
         Self {
             status,
             headers,
             version,
             body,
+            decoded: encoding.is_some(),
         }
     }
 
-    pub fn from_hyper(response: hyper::Response<hyper::body::Incoming>) -> Self {
-        Self::from_hyper_inner(response, false)
+    pub fn from_hyper(
+        response: hyper::Response<hyper::body::Incoming>,
+        max_decoded_bytes: u64,
+    ) -> Self {
+        Self::from_hyper_inner(response, false, max_decoded_bytes)
     }
 
     /// A HEAD response carries no body to decode, whatever its headers claim.
-    pub fn from_hyper_head(response: hyper::Response<hyper::body::Incoming>) -> Self {
-        Self::from_hyper_inner(response, true)
+    pub fn from_hyper_head(
+        response: hyper::Response<hyper::body::Incoming>,
+        max_decoded_bytes: u64,
+    ) -> Self {
+        Self::from_hyper_inner(response, true, max_decoded_bytes)
     }
 
-    fn from_hyper_inner(response: hyper::Response<hyper::body::Incoming>, is_head: bool) -> Self {
+    fn from_hyper_inner(
+        response: hyper::Response<hyper::body::Incoming>,
+        is_head: bool,
+        max_decoded_bytes: u64,
+    ) -> Self {
         let status = response.status();
         let mut headers = response.headers().clone();
         let version = response.version();
@@ -106,14 +200,15 @@ impl UpstreamResponse {
             content_encoding(&headers)
         };
         let incoming = response.into_body();
+        let source: ByteStream = Box::pin(ErrMap {
+            inner: Box::pin(incoming.into_data_stream()),
+        });
         let body = match encoding {
-            Some(Encoding::Gzip) => decode(incoming, GzipDecoder::new),
-            Some(Encoding::Deflate) => decode(incoming, ZlibDecoder::new),
-            Some(Encoding::Brotli) => decode(incoming, BrotliDecoder::new),
-            Some(Encoding::Zstd) => decode(incoming, ZstdDecoder::new),
-            None => Box::pin(ErrMap {
-                inner: Box::pin(incoming.into_data_stream()),
-            }),
+            Some(Encoding::Gzip) => decode(source, max_decoded_bytes, GzipDecoder::new),
+            Some(Encoding::Deflate) => decode(source, max_decoded_bytes, ZlibDecoder::new),
+            Some(Encoding::Brotli) => decode(source, max_decoded_bytes, BrotliDecoder::new),
+            Some(Encoding::Zstd) => decode(source, max_decoded_bytes, ZstdDecoder::new),
+            None => capped(source, max_decoded_bytes),
         };
         if encoding.is_some() {
             headers.remove(header::CONTENT_ENCODING);
@@ -124,11 +219,50 @@ impl UpstreamResponse {
             headers,
             version,
             body,
+            decoded: encoding.is_some(),
         }
     }
 
     pub async fn chunk(&mut self) -> Option<Result<Bytes, std::io::Error>> {
         poll_fn(|cx| self.body.as_mut().poll_next(cx)).await
+    }
+
+    /// True when the body is the decoded form of a compressed upstream response.
+    pub fn is_decoded(&self) -> bool {
+        self.decoded
+    }
+
+    /// Bounds how long the body may take: the idle limit resets on every chunk, and the
+    /// optional total limit starts now, once the response head is in hand.
+    pub fn with_deadlines(
+        mut self,
+        idle: std::time::Duration,
+        total: Option<std::time::Duration>,
+    ) -> Self {
+        self.body = Box::pin(DeadlineStream {
+            inner: self.body,
+            idle: Box::pin(tokio::time::sleep(idle)),
+            idle_for: idle,
+            total: total.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            done: false,
+        });
+        self
+    }
+
+    /// Reads the whole body into memory. The encoding cap still applies, so this cannot
+    /// grow without bound; the caller uses it to turn an over-limit response into a clean
+    /// 502 before any bytes reach the client.
+    pub async fn buffer(mut self) -> Result<Self, std::io::Error> {
+        let mut collected = Vec::new();
+        while let Some(chunk) = self.chunk().await {
+            collected.extend_from_slice(&chunk?);
+        }
+        Ok(Self::from_bytes(
+            self.status,
+            self.headers,
+            self.version,
+            Bytes::from(collected),
+        ))
     }
 
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
@@ -147,6 +281,7 @@ impl UpstreamResponse {
             headers,
             version,
             body: Box::pin(body),
+            decoded: false,
         }
     }
 
@@ -161,6 +296,7 @@ impl UpstreamResponse {
             headers,
             version,
             body: Box::pin(OnceBody(Some(body))),
+            decoded: false,
         }
     }
 }
@@ -200,17 +336,17 @@ fn content_encoding(headers: &HeaderMap) -> Option<Encoding> {
     }
 }
 
-fn decode<D, F>(body: hyper::body::Incoming, make: F) -> ByteStream
+fn decode<D, F>(source: ByteStream, max: u64, make: F) -> ByteStream
 where
     D: tokio::io::AsyncRead + Send + 'static,
     F: FnOnce(BufReader<StreamReader<ByteStream, Bytes>>) -> D,
 {
-    let source: ByteStream = Box::pin(ErrMap {
-        inner: Box::pin(body.into_data_stream()),
-    });
-    capped(Box::pin(ReaderStream::new(make(BufReader::new(
-        StreamReader::new(source),
-    )))))
+    capped(
+        Box::pin(ReaderStream::new(make(BufReader::new(StreamReader::new(
+            source,
+        ))))),
+        max,
+    )
 }
 
 pub type SendFuture<'a> =
@@ -241,8 +377,15 @@ pub struct Standard {
 impl Standard {
     pub fn new() -> Self {
         let build = |http1_only: bool, title_case: bool| {
+            // Reiki decodes compressed bodies itself, so the configured cap applies to the
+            // expanded bytes and error bodies stay readable. Letting reqwest decode would hide
+            // `content-encoding` and the size from the relay.
             let builder = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .redirect(reqwest::redirect::Policy::none());
             let builder = if http1_only {
                 builder.http1_only()
@@ -310,8 +453,17 @@ impl Transport for Standard {
                 .body(body)
                 .send()
                 .await
-                .map(UpstreamResponse::from_reqwest)
-                .map_err(std::io::Error::other)
+                .map(|response| {
+                    let response =
+                        UpstreamResponse::from_reqwest(response, upstream.max_decoded_bytes);
+                    response.with_deadlines(
+                        std::time::Duration::from_secs(upstream.response_idle_timeout_secs),
+                        upstream
+                            .response_timeout_secs
+                            .map(std::time::Duration::from_secs),
+                    )
+                })
+                .map_err(reqwest_error)
         })
     }
 }
@@ -320,8 +472,42 @@ impl Transport for Faithful {
     fn send<'a>(&'a self, call: Call<'a>) -> SendFuture<'a> {
         Box::pin(async move {
             let request = faithful_request(call.parts, call.url, call.credential, call.body)?;
-            Faithful::send(self, request).await
+            Faithful::send(self, request, call.upstream.max_decoded_bytes)
+                .await
+                .map(|response| {
+                    response.with_deadlines(
+                        std::time::Duration::from_secs(call.upstream.response_idle_timeout_secs),
+                        call.upstream
+                            .response_timeout_secs
+                            .map(std::time::Duration::from_secs),
+                    )
+                })
         })
+    }
+}
+
+/// Marks a failure that happened while connecting, before any request bytes were sent.
+/// The proxy may replay a non-idempotent request only for this kind of failure.
+fn connect_error<E>(error: E) -> std::io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, error)
+}
+
+fn reqwest_error(error: reqwest::Error) -> std::io::Error {
+    if error.is_connect() {
+        connect_error(error)
+    } else {
+        std::io::Error::other(error)
+    }
+}
+
+fn hyper_error(error: hyper_util::client::legacy::Error) -> std::io::Error {
+    if error.is_connect() {
+        connect_error(error)
+    } else {
+        std::io::Error::other(error)
     }
 }
 
@@ -346,17 +532,14 @@ impl Faithful {
     pub async fn send(
         &self,
         request: Request<Full<Bytes>>,
+        max_decoded_bytes: u64,
     ) -> Result<UpstreamResponse, std::io::Error> {
         let is_head = request.method() == Method::HEAD;
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(std::io::Error::other)?;
+        let response = self.client.request(request).await.map_err(hyper_error)?;
         Ok(if is_head {
-            UpstreamResponse::from_hyper_head(response)
+            UpstreamResponse::from_hyper_head(response, max_decoded_bytes)
         } else {
-            UpstreamResponse::from_hyper(response)
+            UpstreamResponse::from_hyper(response, max_decoded_bytes)
         })
     }
 }

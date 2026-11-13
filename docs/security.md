@@ -52,7 +52,7 @@ Plugins are compiled into the binary and run inside the Reiki process, so a plug
 
 - A stream's chain is shared state: two streams that list the same key share its cooldown, and a key rejected with 401, or with a 403 or 400 the upstream attributes to the key, is out of rotation for every stream that lists it until it is rotated and Reiki receives SIGHUP.
 - Streams are not a security boundary against each other beyond key separation. Run separate instances for mutually untrusted clients.
-- A stream's `rate_limit_per_minute`, when set, caps that stream and is enforced before a key is picked.
+- A stream's `rate_limit_per_minute`, when set, caps that stream's upstream attempts. Every selected-key attempt counts, including retries and a fallback upstream, so a failover cannot spend more calls than the limit allows. A rejected attempt does not reach the upstream or change key health.
 - The optional admin listener (`[admin]`) is a second socket guarded by its own bearer token, compared by hash in constant time. Keep it on loopback. It exposes key names, upstream names and stream routing, but never key values, token hashes or file paths.
 
 **Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
@@ -61,8 +61,10 @@ Plugins are compiled into the binary and run inside the Reiki process, so a plug
 
 - The upstream key and the formatted credential are replaced by `[redacted]` in error bodies and headers relayed to a client.
 - Account-identifying response headers (`openai-organization`, `openai-project`, `anthropic-organization-id`, `set-cookie`, `set-cookie2`) are not relayed.
-- A response body decoded from gzip, deflate, brotli or zstd is cut off with an error past 512 MiB, so a small compressed body cannot expand without bound.
+- A response body is capped after decoding (gzip, deflate, brotli or zstd included), so a small compressed body cannot expand without bound. The cap is per upstream with `max_decoded_bytes` (default 64 MiB). A decoded response that is not `text/event-stream` is buffered before its head is sent, so an over-limit body becomes a 502 instead of a truncated 200. SSE still streams and ends with an error if it passes the cap.
+- Response bodies are bounded in time too: `response_idle_timeout_secs` (default 300) abandons a body that produces no chunk, and the optional `response_timeout_secs` bounds the whole body after its head. A buffered decoded body that runs out of time answers 504; a streamed body ends with an error, so a stalled upstream cannot hold a client connection forever.
 - The `placeholders` plugin keeps credential placeholders masked inside tool-call arguments unless `restore_tool_args` is set.
+- A transport failure is replayed only when replay cannot duplicate a side effect: any method when the connect itself failed, and GET, HEAD, PUT, DELETE, OPTIONS or TRACE otherwise. A POST or PATCH whose request may have reached the upstream is answered with 502 (504 on timeout) instead of being sent again on another key. An explicit upstream error response still fails over for every method.
 - Request paths with dot segments or encoded separators are refused.
 - The client and admin listeners close a connection that does not finish its headers within 30 seconds, cap open connections (1024 client, 64 admin), and a request body must arrive within the 120-second request timeout (408).
 - The admin token must differ from every stream token, and the stream name `passthrough` is reserved.

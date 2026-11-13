@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- Response bodies are decoded by Reiki itself and capped at the per-upstream `max_decoded_bytes` (default 64 MiB) after decoding, so a small compressed body cannot expand without bound. A decoded, non-SSE response over the cap is buffered and answered with a 502 instead of streaming a truncated 200. SSE keeps streaming and ends with an error past the cap. Previously reqwest decoded on the standard transport and the 512 MiB check only covered the faithful transport.
+- A stream's `rate_limit_per_minute` is enforced per selected-key attempt instead of once before dispatch. A failover, retry or fallback upstream now counts against the limit too, so a failing key cannot turn one allowed request into several upstream calls.
+- Response bodies have a per-upstream idle timeout, `response_idle_timeout_secs` (default 300), and an optional total timeout, `response_timeout_secs` (unset by default). A stalled body no longer holds a client connection forever. A buffered decoded body times out with 504; a streamed body ends with an error.
+- A POST or PATCH is no longer replayed after an ambiguous transport failure. A connect failure before the request was sent still permits a retry for any method, as does any explicit upstream error response. Idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) keep their retry. An uncertain POST or PATCH now answers 502, or 504 on timeout.
+
 ## 0.8.0
 
 ### Changed

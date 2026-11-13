@@ -741,6 +741,23 @@ mod tests {
     use axum::http::header::CONTENT_LENGTH;
     use std::any::Any;
 
+    #[test]
+    fn placeholders_are_compiled_before_the_request_log() {
+        let registry = builtin();
+        let names: Vec<&str> = registry
+            .iter()
+            .map(|registration| registration.name)
+            .collect();
+        let placeholders = names.iter().position(|name| *name == "placeholders");
+        let requestlog = names.iter().position(|name| *name == "requestlog");
+        if let (Some(placeholders), Some(requestlog)) = (placeholders, requestlog) {
+            assert!(
+                placeholders < requestlog,
+                "compiled plugin order is {names:?}"
+            );
+        }
+    }
+
     struct Append(&'static str);
     impl Plugin for Append {
         fn name(&self) -> &str {

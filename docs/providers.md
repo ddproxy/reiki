@@ -29,10 +29,13 @@ Reiki rewrites the body once before it picks a key, so a failover to the next ke
 
 ## Transport options
 
-By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Four optional upstream settings make the relay behave more like a plain pass-through:
+By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Optional upstream settings make the relay behave more like a plain pass-through:
 
 - `http2 = true` negotiates HTTP/2 with that upstream when it offers it over TLS. Without TLS there is nothing to negotiate and the connection stays HTTP/1.1.
 - `forward_accept_encoding = true` sends the client's own `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses so error bodies can be read for failover and logging, and the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is.
+- `max_decoded_bytes` caps a response body after decoding, including compressed responses. It defaults to 64 MiB and must be at least 1. A decoded, non-SSE response over the cap becomes a 502 before any of it reaches the client; an SSE response that passes the cap ends with an error.
+- `response_idle_timeout_secs` drops a response body that produces no chunk for that many seconds. It defaults to 300 and must be at least 1. A buffered decoded body answers 504; a streamed body ends with an error.
+- `response_timeout_secs` bounds the whole response body, starting when its head arrives. It is unset by default, so only the idle limit applies; when set it must be at least 1. The separate 120-second request timeout still bounds the wait for the head.
 
 - `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
 - `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection.

@@ -103,6 +103,19 @@ fn main() {
         _ => all.iter().filter(|p| enabled(&p.feature)).collect(),
     };
 
+    // The request log and the placeholder mask both inspect bodies. Placeholders must run
+    // first so the log records masked text, and because response hooks run in reverse, must
+    // restore only after the log has seen the response. A custom order that puts the log
+    // first would log real credentials and leak them to the collector.
+    let position = |name: &str| chosen.iter().position(|p| p.name == name);
+    if let (Some(placeholders), Some(requestlog)) =
+        (position("placeholders"), position("requestlog"))
+    {
+        if placeholders > requestlog {
+            fail("REIKI_PLUGINS puts `requestlog` before `placeholders`; placeholders must come first so logged bodies are masked");
+        }
+    }
+
     let mut code = String::from("vec![\n");
     for plugin in chosen {
         code.push_str(&format!(

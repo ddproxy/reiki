@@ -21,9 +21,11 @@ These come from Reiki itself. Any other status is the upstream's answer, passed 
 | 413 | `too_large`: `request body too large` | The body is over 8 MiB |
 | 429 | `rate_limited`: `stream request rate limit exceeded` | The stream is over its `rate_limit_per_minute` |
 | 429 | Too many failed logins | The client address sent 10 bad tokens in a minute; wait for `Retry-After` |
+| 502 | `bad_gateway` | The upstream could not be reached, or a buffered response was over its decoded limit |
 | 503 | `reiki_exhausted` | Every key in the stream's chain is cooling or out of rotation |
+| 504 | `gateway_timeout` | The upstream did not answer in time, or a buffered response body passed a timeout |
 
-A 429 from Reiki comes from a stream's `rate_limit_per_minute`, carries `Retry-After` in whole seconds, and is decided before any key is picked, so no key enters cooldown. The counter lives in memory and resets on reload.
+A 429 from Reiki comes from a stream's `rate_limit_per_minute`, carries `Retry-After` in whole seconds, and is decided per selected-key attempt, before the request is sent, so the rejected attempt does not reach the upstream and no key enters cooldown. A request that fails over or uses a fallback spends one count per attempt. The counter lives in memory and resets on reload.
 
 A 503 carries `Retry-After` (at least 1 second) when some key will recover. It carries none when every key is out of rotation, because those keys stay out until you replace the key file and send SIGHUP.
 

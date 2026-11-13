@@ -32,16 +32,35 @@ pub(crate) enum Refused {
     Full,
     /// `max_subscribers_per_peer` are connected from this address.
     PeerFull,
+    /// `max_subscribers_per_token` are connected with this peer token.
+    TokenFull,
+}
+
+/// The subscriber caps: in total, per client address and per peer token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    pub(crate) total: usize,
+    pub(crate) per_peer: usize,
+    pub(crate) per_token: usize,
 }
 
 #[derive(Default)]
 struct Slots {
     total: usize,
     per_peer: HashMap<IpAddr, usize>,
+    per_token: HashMap<String, usize>,
+}
+
+/// What goes through the broadcast.
+#[derive(Clone)]
+enum Event {
+    Frame(Bytes),
+    /// Ends the streams opened with these tokens, or every stream for `None`.
+    Close(Option<Arc<[String]>>),
 }
 
 pub(crate) struct Hub {
-    tx: broadcast::Sender<Bytes>,
+    tx: broadcast::Sender<Event>,
     slots: Mutex<Slots>,
     ticker: OnceLock<()>,
 }
@@ -50,6 +69,8 @@ pub(crate) struct Hub {
 struct Slot {
     hub: Arc<Hub>,
     peer: Option<IpAddr>,
+    /// Name of the peer token the stream was opened with.
+    token: String,
 }
 
 impl Drop for Slot {
@@ -61,12 +82,17 @@ impl Drop for Slot {
             .unwrap_or_else(PoisonError::into_inner);
         slots.total = slots.total.saturating_sub(1);
         if let Some(ip) = self.peer {
-            if let Some(count) = slots.per_peer.get_mut(&ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    slots.per_peer.remove(&ip);
-                }
-            }
+            release(&mut slots.per_peer, &ip);
+        }
+        release(&mut slots.per_token, &self.token);
+    }
+}
+
+fn release<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, usize>, key: &K) {
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
         }
     }
 }
@@ -97,24 +123,28 @@ impl Hub {
     fn reserve(
         self: &Arc<Self>,
         peer: Option<IpAddr>,
-        max_total: usize,
-        max_per_peer: usize,
+        token: &str,
+        limits: Limits,
     ) -> Result<Slot, Refused> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        if slots.total >= max_total {
+        if slots.total >= limits.total {
             return Err(Refused::Full);
         }
-        if let Some(ip) = peer {
-            let count = slots.per_peer.entry(ip).or_insert(0);
-            if *count >= max_per_peer {
-                return Err(Refused::PeerFull);
-            }
-            *count += 1;
+        if peer.is_some_and(|ip| slots.per_peer.get(&ip).copied().unwrap_or(0) >= limits.per_peer) {
+            return Err(Refused::PeerFull);
         }
+        if slots.per_token.get(token).copied().unwrap_or(0) >= limits.per_token {
+            return Err(Refused::TokenFull);
+        }
+        if let Some(ip) = peer {
+            *slots.per_peer.entry(ip).or_insert(0) += 1;
+        }
+        *slots.per_token.entry(token.to_owned()).or_insert(0) += 1;
         slots.total += 1;
         Ok(Slot {
             hub: Arc::clone(self),
             peer,
+            token: token.to_owned(),
         })
     }
 
@@ -122,11 +152,12 @@ impl Hub {
     pub(crate) fn subscribe(
         self: &Arc<Self>,
         peer: Option<IpAddr>,
-        limits: (usize, usize),
+        token: &str,
+        limits: Limits,
         heartbeat: Duration,
         snapshot: impl FnOnce() -> Bytes,
     ) -> Result<mpsc::Receiver<Bytes>, Refused> {
-        let slot = self.reserve(peer, limits.0, limits.1)?;
+        let slot = self.reserve(peer, token, limits)?;
         let events = self.tx.subscribe();
         let (out, inbox) = mpsc::channel(SUBSCRIBER_BUFFER);
         let _ = out.try_send(snapshot());
@@ -135,17 +166,22 @@ impl Hub {
     }
 
     pub(crate) fn publish(&self, frame: Bytes) {
-        let _ = self.tx.send(frame);
+        let _ = self.tx.send(Event::Frame(frame));
     }
 
-    /// Ends every open stream, for a reload that stops publishing or changes the token.
+    /// Ends every open stream, for a reload that stops publishing.
     pub(crate) fn close_all(&self) {
-        self.publish(Bytes::new());
+        let _ = self.tx.send(Event::Close(None));
+    }
+
+    /// Ends the streams opened with any of `tokens`, for a reload that removes or changes them.
+    pub(crate) fn close_tokens(&self, tokens: Vec<String>) {
+        let _ = self.tx.send(Event::Close(Some(tokens.into())));
     }
 }
 
 async fn forward(
-    mut events: broadcast::Receiver<Bytes>,
+    mut events: broadcast::Receiver<Event>,
     out: mpsc::Sender<Bytes>,
     heartbeat: Duration,
     slot: Slot,
@@ -154,8 +190,10 @@ async fn forward(
     loop {
         let next = tokio::select! {
             event = events.recv() => match event {
-                Ok(frame) if frame.is_empty() => break,
-                Ok(frame) => frame,
+                Ok(Event::Frame(frame)) => frame,
+                Ok(Event::Close(None)) => break,
+                Ok(Event::Close(Some(tokens))) if tokens.contains(&slot.token) => break,
+                Ok(Event::Close(Some(_))) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     tracing::debug!(peer = ?slot.peer, "peer stream fell behind the broadcast; dropping it");
                     break;
@@ -198,7 +236,8 @@ fn fingerprint(entry: &Value) -> Value {
 
 /// What the ticker last told subscribers.
 struct Watcher {
-    token: Option<String>,
+    /// The peer tokens as (name, hash) when the ticker last looked; `None` before the first look.
+    tokens: Option<Vec<(String, String)>>,
     upstreams: Vec<(String, Value)>,
     sessions: Option<Value>,
     next_host: Instant,
@@ -207,22 +246,32 @@ struct Watcher {
 impl Watcher {
     fn new() -> Self {
         Self {
-            token: None,
+            tokens: None,
             upstreams: Vec::new(),
             sessions: None,
             next_host: Instant::now(),
         }
     }
 
-    /// The frames that describe what changed since the last call, or `None` to close every stream.
-    fn changes(&mut self, app: &App, now: Instant) -> Option<Vec<Bytes>> {
+    /// What changed since the last call, or `None` to close every stream.
+    fn changes(&mut self, app: &App, now: Instant) -> Option<Vec<Event>> {
         let snapshot = app.snapshot();
         let peers = snapshot.config.peers.as_ref().filter(|p| p.publishing())?;
-        if self.token.as_ref() != peers.peer_token_sha256.as_ref() {
-            let first = self.token.is_none();
-            self.token.clone_from(&peers.peer_token_sha256);
-            if !first {
-                return None;
+        let tokens: Vec<(String, String)> = peers
+            .tokens
+            .iter()
+            .map(|t| (t.name.clone(), t.token_sha256.to_ascii_lowercase()))
+            .collect();
+        let mut events = Vec::new();
+        if let Some(before) = self.tokens.replace(tokens.clone()) {
+            // A token whose hash changed is as gone as a removed one.
+            let gone: Vec<String> = before
+                .into_iter()
+                .filter(|pair| !tokens.contains(pair))
+                .map(|(name, _)| name)
+                .collect();
+            if !gone.is_empty() {
+                events.push(Event::Close(Some(gone.into())));
             }
         }
         let observed_at = crate::reload::rfc3339(app.wall_now());
@@ -284,7 +333,8 @@ impl Watcher {
         } else {
             self.sessions = None;
         }
-        Some(frames)
+        events.extend(frames.into_iter().map(Event::Frame));
+        Some(events)
     }
 }
 
@@ -308,7 +358,11 @@ async fn tick(app: Weak<App>, hub: Arc<Hub>, mut watcher: Watcher) {
             return;
         };
         match watcher.changes(&app, Instant::now()) {
-            Some(frames) => frames.into_iter().for_each(|f| hub.publish(f)),
+            Some(events) => events.into_iter().for_each(|event| match event {
+                Event::Frame(frame) => hub.publish(frame),
+                Event::Close(Some(tokens)) => hub.close_tokens(tokens.to_vec()),
+                Event::Close(None) => hub.close_all(),
+            }),
             None => {
                 hub.close_all();
                 watcher = Watcher::new();
@@ -326,6 +380,14 @@ mod tests {
         Some(IpAddr::from([192, 0, 2, last]))
     }
 
+    fn limits(total: usize, per_peer: usize) -> Limits {
+        Limits {
+            total,
+            per_peer,
+            per_token: total,
+        }
+    }
+
     fn snapshot() -> Bytes {
         frame("snapshot", &json!({"x": 1}))
     }
@@ -340,7 +402,9 @@ mod tests {
     #[tokio::test]
     async fn a_subscriber_gets_the_snapshot_then_published_events() {
         let hub = Hub::new();
-        let mut inbox = hub.subscribe(ip(1), (4, 4), HEARTBEAT, snapshot).unwrap();
+        let mut inbox = hub
+            .subscribe(ip(1), "default", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
         hub.publish(frame("key", &json!({"n": 1})));
         assert_eq!(next(&mut inbox).await.unwrap(), snapshot());
         assert_eq!(
@@ -353,7 +417,13 @@ mod tests {
     async fn heartbeats_arrive_while_nothing_changes() {
         let hub = Hub::new();
         let mut inbox = hub
-            .subscribe(ip(1), (4, 4), Duration::from_millis(50), snapshot)
+            .subscribe(
+                ip(1),
+                "default",
+                limits(4, 4),
+                Duration::from_millis(50),
+                snapshot,
+            )
             .unwrap();
         assert_eq!(next(&mut inbox).await.unwrap(), snapshot());
         assert_eq!(
@@ -379,28 +449,38 @@ mod tests {
     #[tokio::test]
     async fn caps_apply_in_total_and_per_address_and_free_on_disconnect() {
         let hub = Hub::new();
-        let first = hub.subscribe(ip(1), (2, 1), HEARTBEAT, snapshot).unwrap();
+        let first = hub
+            .subscribe(ip(1), "default", limits(2, 1), HEARTBEAT, snapshot)
+            .unwrap();
         assert_eq!(
-            hub.subscribe(ip(1), (2, 1), HEARTBEAT, snapshot)
+            hub.subscribe(ip(1), "default", limits(2, 1), HEARTBEAT, snapshot)
                 .unwrap_err(),
             Refused::PeerFull
         );
-        let _second = hub.subscribe(ip(2), (2, 1), HEARTBEAT, snapshot).unwrap();
+        let _second = hub
+            .subscribe(ip(2), "default", limits(2, 1), HEARTBEAT, snapshot)
+            .unwrap();
         assert_eq!(
-            hub.subscribe(ip(3), (2, 1), HEARTBEAT, snapshot)
+            hub.subscribe(ip(3), "default", limits(2, 1), HEARTBEAT, snapshot)
                 .unwrap_err(),
             Refused::Full
         );
         drop(first);
         settle(&hub, 1).await;
-        assert!(hub.subscribe(ip(1), (2, 1), HEARTBEAT, snapshot).is_ok());
+        assert!(hub
+            .subscribe(ip(1), "default", limits(2, 1), HEARTBEAT, snapshot)
+            .is_ok());
     }
 
     #[tokio::test]
     async fn a_consumer_that_stops_reading_is_dropped() {
         let hub = Hub::new();
-        let mut stalled = hub.subscribe(ip(1), (4, 4), HEARTBEAT, snapshot).unwrap();
-        let mut reading = hub.subscribe(ip(2), (4, 4), HEARTBEAT, snapshot).unwrap();
+        let mut stalled = hub
+            .subscribe(ip(1), "default", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
+        let mut reading = hub
+            .subscribe(ip(2), "default", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
         for n in 0..SUBSCRIBER_BUFFER + 5 {
             hub.publish(frame("key", &json!({"n": n})));
             // Keep one subscriber current so only the stalled one overflows.
@@ -420,11 +500,63 @@ mod tests {
     #[tokio::test]
     async fn close_all_ends_every_stream() {
         let hub = Hub::new();
-        let mut inbox = hub.subscribe(ip(1), (4, 4), HEARTBEAT, snapshot).unwrap();
+        let mut inbox = hub
+            .subscribe(ip(1), "default", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
         hub.close_all();
         assert_eq!(next(&mut inbox).await.unwrap(), snapshot());
         assert_eq!(next(&mut inbox).await, None);
         settle(&hub, 0).await;
+    }
+
+    #[tokio::test]
+    async fn the_per_token_cap_counts_streams_of_one_token_across_addresses() {
+        let hub = Hub::new();
+        let caps = Limits {
+            total: 8,
+            per_peer: 8,
+            per_token: 2,
+        };
+        let first = hub
+            .subscribe(ip(1), "ct-5", caps, HEARTBEAT, snapshot)
+            .unwrap();
+        let _second = hub
+            .subscribe(ip(2), "ct-5", caps, HEARTBEAT, snapshot)
+            .unwrap();
+        assert_eq!(
+            hub.subscribe(ip(3), "ct-5", caps, HEARTBEAT, snapshot)
+                .unwrap_err(),
+            Refused::TokenFull
+        );
+        let _other = hub
+            .subscribe(ip(3), "ct-6", caps, HEARTBEAT, snapshot)
+            .expect("another token has its own count");
+        drop(first);
+        settle(&hub, 2).await;
+        assert!(hub
+            .subscribe(ip(3), "ct-5", caps, HEARTBEAT, snapshot)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_a_token_ends_only_its_streams() {
+        let hub = Hub::new();
+        let mut gone = hub
+            .subscribe(ip(1), "ct-5", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
+        let mut kept = hub
+            .subscribe(ip(1), "ct-6", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
+        hub.close_tokens(vec!["ct-5".to_owned()]);
+        hub.publish(frame("key", &json!({"n": 1})));
+        assert_eq!(next(&mut gone).await.unwrap(), snapshot());
+        assert_eq!(next(&mut gone).await, None);
+        assert_eq!(next(&mut kept).await.unwrap(), snapshot());
+        assert_eq!(
+            next(&mut kept).await.unwrap(),
+            Bytes::from("event: key\ndata: {\"n\":1}\n\n")
+        );
+        settle(&hub, 1).await;
     }
 
     #[test]

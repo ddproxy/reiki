@@ -17,6 +17,7 @@ use reiki::proxy::{router, App, Secret};
 const ADMIN_TOKEN: &str = "admin-token-for-stream-tests";
 const STREAM_TOKEN: &str = "stream-token-for-stream-tests";
 const PEER_TOKEN: &str = "peer-token-for-stream-tests";
+const CT5_TOKEN: &str = "ct-5-token-for-stream-tests";
 
 fn sha(token: &str) -> String {
     reiki::auth::sha256_hex(token)
@@ -56,7 +57,8 @@ struct Rig {
     relay: String,
     peer: String,
     client: reqwest::Client,
-    _app: Arc<App>,
+    app: Arc<App>,
+    text: String,
 }
 
 impl Rig {
@@ -92,8 +94,25 @@ impl Rig {
             relay,
             peer,
             client: reqwest::Client::new(),
-            _app: app,
+            app,
+            text,
         }
+    }
+
+    /// Reloads the rig's config with `edit` applied, from real key files.
+    fn reload(&self, label: &str, edit: impl Fn(&str) -> String) {
+        let dir =
+            std::env::temp_dir().join(format!("reiki-peers-stream-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["zen-a", "zen-b"] {
+            std::fs::write(dir.join(name), format!("upstream-{name}\n")).unwrap();
+        }
+        let path = dir.join("reiki.toml");
+        let text = edit(&self.text).replace("/unused/", &format!("{}/", dir.display()));
+        std::fs::write(&path, text).unwrap();
+        let report = self.app.reload_from_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        report.unwrap();
     }
 
     async fn open(&self, token: &str) -> reqwest::Response {
@@ -158,6 +177,18 @@ impl Reader {
                 .unwrap()
                 .expect("the stream stays open");
             self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    /// True when the server ends the stream within 10 s, whatever it sent before.
+    async fn ends(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, self.response.chunk()).await {
+                Err(_) => return false,
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None) | Err(_)) => return true,
+            }
         }
     }
 
@@ -299,6 +330,77 @@ async fn subscriber_caps_refuse_extra_streams_until_one_closes() {
         }
     }
     assert_eq!(status, 200, "a closed stream frees its place");
+}
+
+fn ct5_token() -> String {
+    format!(
+        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+        sha(CT5_TOKEN)
+    )
+}
+
+#[tokio::test]
+async fn every_configured_peer_token_opens_a_stream() {
+    let rig = Rig::new(&ct5_token()).await;
+    for token in [PEER_TOKEN, CT5_TOKEN] {
+        let mut reader = Reader::new(rig.open(token).await);
+        assert_eq!(reader.next().await.0, "snapshot", "{token}");
+    }
+    for token in [ADMIN_TOKEN, STREAM_TOKEN, "wrong-token"] {
+        assert_eq!(rig.open(token).await.status(), 401, "{token}");
+    }
+}
+
+#[tokio::test]
+async fn removing_a_token_on_reload_ends_its_streams_and_keeps_the_others() {
+    let rig = Rig::new(&ct5_token()).await;
+    let mut removed = Reader::new(rig.open(CT5_TOKEN).await);
+    let mut kept = Reader::new(rig.open(PEER_TOKEN).await);
+    assert_eq!(removed.next().await.0, "snapshot");
+    assert_eq!(kept.next().await.0, "snapshot");
+    rig.reload("remove", |text| text.replace(&ct5_token(), ""));
+    assert!(removed.ends().await, "the removed token's stream ends");
+    assert_eq!(rig.open(CT5_TOKEN).await.status(), 401);
+    rig.cool_both_keys().await;
+    let (event, _) = kept.next_change().await;
+    assert_eq!(event, "key", "the remaining token's stream stays open");
+}
+
+#[tokio::test]
+async fn a_token_added_on_reload_works_at_once() {
+    let rig = Rig::new("").await;
+    assert_eq!(rig.open(CT5_TOKEN).await.status(), 401);
+    rig.reload("add", |text| format!("{text}{}", ct5_token()));
+    assert_eq!(rig.open(CT5_TOKEN).await.status(), 200);
+}
+
+#[tokio::test]
+async fn the_per_token_cap_counts_one_token_whatever_the_address() {
+    let rig = Rig::new(&format!(
+        "max_subscribers = 8\nmax_subscribers_per_peer = 8\nmax_subscribers_per_token = 1\n{}",
+        ct5_token()
+    ))
+    .await;
+    let first = rig.open(CT5_TOKEN).await;
+    assert_eq!(first.status(), 200);
+    let second = rig.open(CT5_TOKEN).await;
+    assert_eq!(second.status(), 429, "one stream for this token");
+    assert!(second.headers().contains_key("retry-after"));
+    assert_eq!(
+        rig.open(PEER_TOKEN).await.status(),
+        200,
+        "another token has its own place"
+    );
+    drop(first);
+    let mut status = 0;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = rig.open(CT5_TOKEN).await.status().as_u16();
+        if status == 200 {
+            break;
+        }
+    }
+    assert_eq!(status, 200, "a closed stream frees the token's place");
 }
 
 struct TokenFile(PathBuf);

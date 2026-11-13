@@ -15,7 +15,7 @@ Peer support is the `peers` cargo feature, which is in the default feature set l
 enabled = false                    # master switch; the table can exist and do nothing
 publish = false                    # serve GET /v1/health on `listen`
 listen = "127.0.0.1:4099"          # required to publish; its own socket
-peer_token_sha256 = "<sha256 of the peer token>"   # required to publish
+peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; this or [[peers.tokens]] to publish
 # instance = "ct-1"                # published name; the host name by default
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
@@ -23,6 +23,11 @@ expose_host_stats = false          # publish load, memory, disk use and active s
 # stream_interval_secs = 5         # period of `host` events on /v1/health/stream
 # max_subscribers = 16             # open streams in total
 # max_subscribers_per_peer = 4     # open streams per client address
+# max_subscribers_per_token = 8    # open streams per peer token
+
+[[peers.tokens]]                   # more peer tokens, one per reader, each with a name
+name = "ct-5"
+token_sha256 = "<sha256 of the token issued to ct-5>"
 
 [peers.ct-4]                       # one table per instance to read
 url = "https://10.0.6.153:4099"    # https, or http on a loopback address
@@ -35,11 +40,12 @@ Validation, at startup, on reload and in `reiki check`:
 - Settings and peer tables refuse unknown keys. Every sub-table of `[peers]` is a peer, named with letters, digits, `-`, `_` and `.`.
 - `poll_interval_secs` is between 1 and 86400.
 - With `enabled` and `publish`, `listen` must be an `IP:port` that differs from the client, admin and tunnel listeners, and `peer_token_sha256` is required.
-- `peer_token_sha256` must be 64 hex characters and must differ from the admin token hash and from every stream token hash, so a peer token can never act as a stronger credential.
+- Every peer token hash (`peer_token_sha256` and each `[[peers.tokens]]` `token_sha256`) must be 64 hex characters and must differ from the admin token hash, from every stream token hash and from every other peer token, so a peer token can never act as a stronger credential and a name always identifies one token.
+- A `[[peers.tokens]]` `name` is lowercase letters, digits and `-`, 1 to 32 bytes, and unique; `peer_token_sha256` takes the name `default`.
 - The peer listener serves plain HTTP, so `listen` must be a loopback address. Reach it from another host through a tunnel you control (WireGuard, `ssh -L`) or a TLS-terminating proxy.
 - A peer `url` uses https, or plain http only on a loopback address, and carries no credentials, query or fragment. An https peer needs `ca_file`.
 
-`instance` (optional) sets the name published as `instance`, with the same character rules as a peer name; without it the host name is used. A change to `listen`, or turning publishing on or off, needs a restart and shows in a reload's `restart_needed` as `peers.listen`. The token hash and the other settings apply on reload, and a reload that turns publishing off makes the listener answer 404 at once.
+`instance` (optional) sets the name published as `instance`, with the same character rules as a peer name; without it the host name is used. A change to `listen`, or turning publishing on or off, needs a restart and shows in a reload's `restart_needed` as `peers.listen`. The tokens and the other settings apply on reload, and a reload that turns publishing off makes the listener answer 404 at once.
 
 ## Publish: GET /v1/health
 
@@ -91,8 +97,9 @@ expose_host_stats = true
 
 ### Authentication
 
-- Only `Authorization: Bearer <peer token>` is accepted. The token is hashed and compared in constant time against `peer_token_sha256`, and only that hash: the admin token and the stream tokens are refused here, and the peer token is refused on the admin and client listeners because config validation keeps the three apart. `x-api-key` and `?key=` are not read.
+- Only `Authorization: Bearer <peer token>` is accepted. The token is hashed and compared in constant time against every peer token hash, all of them on each request, so the timing does not tell which one matched. Only those hashes count: the admin token and the stream tokens are refused here, and the peer token is refused on the admin and client listeners because config validation keeps the three apart. `x-api-key` and `?key=` are not read.
 - A missing or wrong token gets a bare 401. Each failure is logged with the peer address and never the token, and counts towards the same per-address lockout as the other listeners (`[auth]`, default 10 failures in 60 s, then 429 with `Retry-After`). The peer listener keeps its own counts, so failed peer logins never lock an address out of the admin or client listener. When the table of tracked addresses is full, the address with the fewest failures, then the oldest, is dropped, so a flood of addresses cannot leave a new one untracked.
+- The matching token's name stays with the request: it counts towards `max_subscribers_per_token` and may appear in Reiki's log lines. The token itself is never logged and the name is never published.
 - The listener caps open connections at 32 and closes a connection that does not finish its headers within 30 s.
 
 ### What a peer token holder learns
@@ -124,8 +131,8 @@ data: {"observed_at":"...","upstream":{"name":"zen","healthy_keys":0,"cooling_ke
 - With `expose_host_stats`, `host` comes every `stream_interval_secs` (default 5) and `sessions` whenever the session counts change.
 - A `: heartbeat` comment comes every 15 seconds, so a reader can tell a quiet stream from a dead one.
 - Changes are checked once a second and fed through one bounded broadcast. A subscriber that stops reading is dropped once 32 frames are queued for it, rather than buffered without limit, and so is one that falls behind the broadcast.
-- `max_subscribers` (default 16, at most 256) caps open streams in total, and `max_subscribers_per_peer` (default 4) caps them per client address; past either the answer is 503 or 429 with `Retry-After`. A closed connection frees its place. The listener accepts `max_subscribers` plus 16 connections.
-- The stream carries the same fields as `/v1/health` and nothing else: no bodies, no key labels unless `expose_key_labels`, no stream names. A reload that stops publishing or changes `peer_token_sha256` ends every open stream.
+- `max_subscribers` (default 16, at most 256) caps open streams in total, `max_subscribers_per_peer` (default 4) caps them per client address and `max_subscribers_per_token` (default 8, at most 256) per peer token; past the first the answer is 503, past the others 429, with `Retry-After`. A closed connection frees its place. The listener accepts `max_subscribers` plus 16 connections.
+- The stream carries the same fields as `/v1/health` and nothing else: no bodies, no key labels unless `expose_key_labels`, no stream names. A reload that stops publishing ends every open stream; one that removes a peer token or changes its hash ends the streams opened with that token, within a second, and leaves the others open.
 
 ## Read: reiki peers
 
@@ -154,4 +161,4 @@ ct-5  -         -         unknown  -        -        -         -     -
 
 ## Check
 
-`reiki check` prints a `peers:` line: `peers: disabled`, or the effective settings, for example `peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 1 peer(s)[ct-4], poll every 30s`.
+`reiki check` prints a `peers:` line: `peers: disabled`, or the effective settings, for example `peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 1 peer(s)[ct-4], poll every 30s`. With more than one peer token it names them, as `2 token(s)[default, ct-5]`, after the listener.

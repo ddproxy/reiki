@@ -226,8 +226,10 @@ pub struct PeersConfig {
     pub publish: bool,
     /// Address of the peer listener, never the client, admin or tunnel one.
     pub listen: Option<String>,
-    /// SHA-256 of the read-only peer token, required to publish.
+    /// SHA-256 of the read-only peer token: shorthand for one `[[peers.tokens]]` named `default`.
     pub peer_token_sha256: Option<String>,
+    /// Every peer token, the shorthand first; publishing needs at least one.
+    pub tokens: Vec<PeerToken>,
     /// Name published as `instance`; the host name when unset.
     pub instance: Option<String>,
     /// Reader poll period; data older than three of them counts as unknown.
@@ -246,8 +248,21 @@ pub struct PeersConfig {
     pub max_subscribers: u32,
     /// Open stream connections allowed from one client address.
     pub max_subscribers_per_peer: u32,
+    /// Open stream connections allowed for one peer token.
+    pub max_subscribers_per_token: u32,
     pub peers: BTreeMap<String, PeerEntry>,
 }
+
+/// One `[[peers.tokens]]`: a named read-only peer token. The name may be logged; the token never.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerToken {
+    pub name: String,
+    pub token_sha256: String,
+}
+
+/// The name the `peer_token_sha256` shorthand gets.
+pub const DEFAULT_PEER_TOKEN: &str = "default";
 
 /// Kept apart from the peer sub-tables so a misspelt setting is refused.
 #[derive(Deserialize)]
@@ -279,6 +294,14 @@ struct PeersSettings {
     max_subscribers: u32,
     #[serde(default = "default_max_subscribers_per_peer")]
     max_subscribers_per_peer: u32,
+    #[serde(default = "default_max_subscribers_per_token")]
+    max_subscribers_per_token: u32,
+    #[serde(default)]
+    tokens: Vec<PeerToken>,
+}
+
+fn default_max_subscribers_per_token() -> u32 {
+    8
 }
 
 fn default_stream_interval_secs() -> u64 {
@@ -340,11 +363,21 @@ impl TryFrom<toml::Table> for PeersConfig {
         let settings: PeersSettings = toml::Value::Table(table)
             .try_into()
             .map_err(|e| format!("[peers]: {e}"))?;
+        let tokens = settings
+            .peer_token_sha256
+            .iter()
+            .map(|hash| PeerToken {
+                name: DEFAULT_PEER_TOKEN.to_owned(),
+                token_sha256: hash.clone(),
+            })
+            .chain(settings.tokens)
+            .collect();
         Ok(Self {
             enabled: settings.enabled,
             publish: settings.publish,
             listen: settings.listen,
             peer_token_sha256: settings.peer_token_sha256,
+            tokens,
             instance: settings.instance,
             poll_interval_secs: settings.poll_interval_secs,
             expose_key_labels: settings.expose_key_labels,
@@ -354,6 +387,7 @@ impl TryFrom<toml::Table> for PeersConfig {
             stream_interval_secs: settings.stream_interval_secs,
             max_subscribers: settings.max_subscribers,
             max_subscribers_per_peer: settings.max_subscribers_per_peer,
+            max_subscribers_per_token: settings.max_subscribers_per_token,
             peers,
         })
     }
@@ -380,6 +414,12 @@ impl PeersConfig {
                 }
             ),
             _ => "not publishing".to_owned(),
+        };
+        let publish = if peers.publish && peers.tokens.len() > 1 {
+            let names: Vec<&str> = peers.tokens.iter().map(|t| t.name.as_str()).collect();
+            format!("{publish}, {} token(s)[{}]", names.len(), names.join(", "))
+        } else {
+            publish
         };
         let names = peers.peers.keys().cloned().collect::<Vec<_>>();
         let host = if peers.expose_host_stats {
@@ -1211,6 +1251,12 @@ impl Config {
                 peers.max_subscribers, peers.max_subscribers_per_peer
             ));
         }
+        if !(1..=256).contains(&peers.max_subscribers_per_token) {
+            return Some(format!(
+                "max_subscribers_per_token must be between 1 and 256, got {}",
+                peers.max_subscribers_per_token
+            ));
+        }
         let header = peers.session_header.as_str();
         if axum::http::HeaderName::from_bytes(header.as_bytes())
             .map_or(true, |name| name.as_str() != header)
@@ -1234,10 +1280,8 @@ impl Config {
                 ));
             }
         }
-        if let Some(hash) = &peers.peer_token_sha256 {
-            if let Some(reason) = self.peer_token_problem(hash) {
-                return Some(reason);
-            }
+        if let Some(reason) = self.peer_tokens_problem(peers) {
+            return Some(reason);
         }
         for (name, peer) in &peers.peers {
             if let Some(reason) = peer_entry_problem(name, peer) {
@@ -1267,8 +1311,8 @@ impl Config {
                 "listen must differ from the client, admin and tunnel listen addresses".to_owned(),
             );
         }
-        if peers.peer_token_sha256.is_none() {
-            return Some("publish needs peer_token_sha256".to_owned());
+        if peers.tokens.is_empty() {
+            return Some("publish needs peer_token_sha256 or a [[peers.tokens]] entry".to_owned());
         }
         if !addr.ip().is_loopback() {
             return Some(format!(
@@ -1278,27 +1322,50 @@ impl Config {
         None
     }
 
-    /// Why a peer token hash cannot be used: wrong shape, or shared with a stronger credential.
-    fn peer_token_problem(&self, hash: &str) -> Option<String> {
-        if !is_sha256_hex(hash) {
-            return Some("peer_token_sha256 is not 64 hex characters".to_owned());
-        }
-        let hash = hash.to_ascii_lowercase();
-        if self
-            .admin
-            .as_ref()
-            .is_some_and(|admin| admin.token_sha256.to_ascii_lowercase() == hash)
-        {
-            return Some("peer_token_sha256 is the same as the admin token".to_owned());
-        }
-        if let Some((name, _)) = self
-            .streams
-            .iter()
-            .find(|(_, stream)| stream.token_sha256.to_ascii_lowercase() == hash)
-        {
-            return Some(format!(
-                "peer_token_sha256 is the same as the token of stream `{name}`"
-            ));
+    /// Why the peer tokens cannot be used: a bad or repeated name, a hash of the wrong shape, one
+    /// shared with a stronger credential, or two tokens with the same hash.
+    fn peer_tokens_problem(&self, peers: &PeersConfig) -> Option<String> {
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (index, token) in peers.tokens.iter().enumerate() {
+            let name = token.name.as_str();
+            // The shorthand is named by the key the operator wrote.
+            let what = if index == 0 && peers.peer_token_sha256.is_some() {
+                "peer_token_sha256".to_owned()
+            } else {
+                format!("peer token `{name}`")
+            };
+            if !valid_peer_token_name(name) {
+                return Some(format!(
+                    "peer token name `{name}` may only hold lowercase letters, digits and `-` (at most 32)"
+                ));
+            }
+            if !is_sha256_hex(&token.token_sha256) {
+                return Some(format!("{what} is not 64 hex characters"));
+            }
+            let hash = token.token_sha256.to_ascii_lowercase();
+            if self
+                .admin
+                .as_ref()
+                .is_some_and(|admin| admin.token_sha256.to_ascii_lowercase() == hash)
+            {
+                return Some(format!("{what} is the same as the admin token"));
+            }
+            if let Some((stream, _)) = self
+                .streams
+                .iter()
+                .find(|(_, stream)| stream.token_sha256.to_ascii_lowercase() == hash)
+            {
+                return Some(format!(
+                    "{what} is the same as the token of stream `{stream}`"
+                ));
+            }
+            if seen.iter().any(|(other, _)| *other == name) {
+                return Some(format!("peer token name `{name}` is used twice"));
+            }
+            if let Some((other, _)) = seen.iter().find(|(_, other)| *other == hash) {
+                return Some(format!("{what} is the same as peer token `{other}`"));
+            }
+            seen.push((name, hash));
         }
         None
     }
@@ -1324,6 +1391,13 @@ fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
                 == Some(addr.port())
         }
     }
+}
+
+fn valid_peer_token_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn valid_peer_name(name: &str) -> bool {
@@ -2414,6 +2488,113 @@ socket = "/run/forwarder.sock"
             Config::parse(&with_peers("[peers]\npublish = true\n")).is_ok(),
             "publish without enabled does nothing and needs nothing"
         );
+    }
+
+    #[cfg(feature = "peers")]
+    const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn several_named_peer_tokens_join_the_shorthand() {
+        let config = Config::parse(&with_peers(&format!(
+            "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
+             peer_token_sha256 = \"{HASH_C}\"\nmax_subscribers_per_token = 3\n\
+             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{HASH_D}\"\n"
+        )))
+        .unwrap();
+        let peers = config.peers.unwrap();
+        let names: Vec<&str> = peers.tokens.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["default", "ct-5"]);
+        assert_eq!(peers.tokens[1].token_sha256, HASH_D);
+        assert_eq!(peers.max_subscribers_per_token, 3);
+        assert_eq!(
+            PeersConfig::check_line(Some(&peers)),
+            "peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 2 token(s)[default, ct-5], 0 peer(s)[], poll every 30s"
+        );
+        let only_list = Config::parse(&with_peers(&format!(
+            "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
+             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{HASH_D}\"\n"
+        )))
+        .unwrap();
+        assert_eq!(
+            only_list.peers.unwrap().tokens.len(),
+            1,
+            "the list alone is enough"
+        );
+        assert_eq!(
+            Config::parse(&with_peers("[peers]\n"))
+                .unwrap()
+                .peers
+                .unwrap()
+                .max_subscribers_per_token,
+            8
+        );
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peer_tokens_need_unique_names_and_hashes_apart_from_every_other_credential() {
+        let token = |name: &str, hash: &str| {
+            format!("[[peers.tokens]]\nname = \"{name}\"\ntoken_sha256 = \"{hash}\"\n")
+        };
+        for (peers, needle) in [
+            (
+                format!("[peers]\n{}{}", token("a", HASH_C), token("a", HASH_D)),
+                "`a` is used twice",
+            ),
+            (
+                format!(
+                    "[peers]\npeer_token_sha256 = \"{HASH_C}\"\n{}",
+                    token("default", HASH_D)
+                ),
+                "`default` is used twice",
+            ),
+            (
+                format!("[peers]\n{}{}", token("a", HASH_C), token("b", HASH_C)),
+                "peer token `b` is the same as peer token `a`",
+            ),
+            (
+                format!(
+                    "[peers]\npeer_token_sha256 = \"{HASH_C}\"\n{}",
+                    token("b", &HASH_C.to_ascii_uppercase())
+                ),
+                "the same as peer token `default`",
+            ),
+            (
+                format!("[peers]\n{}", token("a", HASH_B)),
+                "peer token `a` is the same as the admin token",
+            ),
+            (
+                format!("[peers]\n{}", token("a", HASH_A)),
+                "peer token `a` is the same as the token of stream `s`",
+            ),
+            (format!("[peers]\n{}", token("a", "short")), "64 hex"),
+            (format!("[peers]\n{}", token("Upper", HASH_C)), "token name"),
+            (format!("[peers]\n{}", token("a_b", HASH_C)), "token name"),
+            (format!("[peers]\n{}", token("", HASH_C)), "token name"),
+            (
+                format!("[peers]\n{}", token(&"a".repeat(33), HASH_C)),
+                "token name",
+            ),
+            (
+                "[peers]\nmax_subscribers_per_token = 0\n".to_owned(),
+                "max_subscribers_per_token",
+            ),
+        ] {
+            let reason = peers_error(&peers);
+            assert!(reason.contains(needle), "{peers}: {reason}");
+        }
+        assert!(Config::parse(&with_peers(&format!(
+            "[peers]\n{}",
+            token(&"a".repeat(32), HASH_C)
+        )))
+        .is_ok());
+        assert!(matches!(
+            Config::parse(&with_peers(&format!(
+                "[peers]\n[[peers.tokens]]\nname = \"a\"\ntoken_sha256 = \"{HASH_C}\"\ntoken = \"x\"\n"
+            ))),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[cfg(feature = "peers")]

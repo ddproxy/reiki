@@ -419,6 +419,58 @@ async fn a_peer_token_hash_shared_with_another_credential_is_refused() {
     }
 }
 
+#[tokio::test]
+async fn any_of_several_named_peer_tokens_opens_health() {
+    let second = "second-peer-token-for-peer-tests";
+    let rig = Rig::new(&format!(
+        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+        sha(second)
+    ))
+    .await;
+    for token in [PEER_TOKEN, second] {
+        let (code, body) = rig.peer_get("/v1/health", Some(token)).await;
+        assert_eq!(code, 200, "{token}: {body}");
+        assert!(
+            !body.contains("ct-5"),
+            "token names are never published: {body}"
+        );
+    }
+    for token in [ADMIN_TOKEN, STREAM_TOKEN, "not-a-peer-token"] {
+        let (code, _) = rig.peer_get("/v1/health", Some(token)).await;
+        assert_eq!(code, 401, "{token}");
+    }
+}
+
+#[tokio::test]
+async fn a_second_peer_token_equal_to_another_credential_is_refused() {
+    let addr: SocketAddr = "127.0.0.1:4999".parse().unwrap();
+    for (reused, needle) in [
+        (
+            ADMIN_TOKEN,
+            "peer token `ct-5` is the same as the admin token",
+        ),
+        (
+            STREAM_TOKEN,
+            "peer token `ct-5` is the same as the token of stream",
+        ),
+        (
+            PEER_TOKEN,
+            "peer token `ct-5` is the same as peer token `default`",
+        ),
+    ] {
+        let text = config_text(
+            "http://127.0.0.1:9",
+            addr,
+            &format!(
+                "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+                sha(reused)
+            ),
+        );
+        let error = Config::parse(&text).unwrap_err().to_string();
+        assert!(error.contains(needle), "{error}");
+    }
+}
+
 impl Rig {
     async fn send(&self, session: Option<&str>) -> u16 {
         let mut request = self

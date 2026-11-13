@@ -108,7 +108,7 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
             "responses": {
                 "200": {"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}},
                 "401": {"description": "Missing or wrong peer token"},
-                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address"},
+                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address, or max_subscribers_per_token with this token"},
                 "503": {"description": "max_subscribers streams are open"},
             },
         },

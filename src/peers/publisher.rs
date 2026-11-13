@@ -11,11 +11,11 @@ use axum::Router;
 
 use crate::admin::{bearer_token, text_response, throttled, unauthorized};
 use crate::auth::{constant_time_eq, sha256_hex, LoginThrottle, Peer, ThrottleSettings};
-use crate::config::PeersConfig;
+use crate::config::{PeerToken, PeersConfig};
 use crate::proxy::App;
 
 use super::sessions::Sessions;
-use super::stream::{ensure_ticker, Frames, Hub, Refused, HEARTBEAT, STREAM_PATH};
+use super::stream::{ensure_ticker, Frames, Hub, Limits, Refused, HEARTBEAT, STREAM_PATH};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
 
@@ -81,11 +81,12 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return not_found();
     }
     let peer = req.extensions().get::<Peer>().map(|p| p.0);
-    if let Err(refusal) = authorize(&app, peers, peer, req.headers()) {
-        return *refusal;
-    }
+    let token = match authorize(&app, peers, peer, req.headers()) {
+        Ok(token) => token,
+        Err(refusal) => return *refusal,
+    };
     let mut response = if path == STREAM_PATH {
-        subscribe(&app, peers, peer)
+        subscribe(&app, peers, peer, token)
     } else {
         let body = super::health::document(&app, peers).to_string();
         text_response(StatusCode::OK, "application/json", body)
@@ -97,14 +98,15 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
 }
 
 /// Opens one event stream, or refuses it when the subscriber caps are reached.
-fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>) -> Response {
+fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &str) -> Response {
     let hub = Arc::clone(&app.peer_publisher().hub);
     ensure_ticker(app, &hub);
-    let limits = (
-        peers.max_subscribers as usize,
-        peers.max_subscribers_per_peer as usize,
-    );
-    let subscribed = hub.subscribe(peer, limits, HEARTBEAT, || {
+    let limits = Limits {
+        total: peers.max_subscribers as usize,
+        per_peer: peers.max_subscribers_per_peer as usize,
+        per_token: peers.max_subscribers_per_token as usize,
+    };
+    let subscribed = hub.subscribe(peer, token, limits, HEARTBEAT, || {
         super::stream::frame("snapshot", &super::health::document(app, peers))
     });
     match subscribed {
@@ -120,10 +122,10 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>) -> Respo
             response
         }
         Err(refused) => {
-            tracing::warn!(?peer, ?refused, "peer stream refused");
+            tracing::warn!(?peer, token, ?refused, "peer stream refused");
             let status = match refused {
                 Refused::Full => StatusCode::SERVICE_UNAVAILABLE,
-                Refused::PeerFull => StatusCode::TOO_MANY_REQUESTS,
+                Refused::PeerFull | Refused::TokenFull => StatusCode::TOO_MANY_REQUESTS,
             };
             let mut response = text_response(status, "text/plain", String::new());
             response
@@ -134,14 +136,15 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>) -> Respo
     }
 }
 
-/// Checks the bearer token against `peer_token_sha256` alone, so no admin or stream token opens
-/// this listener; failures are logged with the peer address, never the token.
-fn authorize(
+/// Checks the bearer token against the peer token hashes alone, so no admin or stream token
+/// opens this listener, and returns the matching token's name. Failures are logged with the peer
+/// address, never the token.
+fn authorize<'a>(
     app: &App,
-    peers: &PeersConfig,
+    peers: &'a PeersConfig,
     peer: Option<IpAddr>,
     headers: &HeaderMap,
-) -> Result<(), Box<Response>> {
+) -> Result<&'a str, Box<Response>> {
     let logins = app.peer_publisher().logins();
     if let Some(ip) = peer {
         if let Some(wait) = logins.blocked(ip, Instant::now()) {
@@ -150,11 +153,12 @@ fn authorize(
         }
     }
     match token_matches(peers, headers) {
-        Ok(()) => {
+        Ok(name) => {
             if let Some(ip) = peer {
                 logins.succeed(ip);
             }
-            Ok(())
+            tracing::debug!(?peer, token = name, "peer authenticated");
+            Ok(name)
         }
         Err(reason) => {
             let failures = peer.map(|ip| logins.fail(ip, Instant::now()));
@@ -164,10 +168,10 @@ fn authorize(
     }
 }
 
-fn token_matches(peers: &PeersConfig, headers: &HeaderMap) -> Result<(), &'static str> {
-    let Some(expected) = peers.peer_token_sha256.as_deref() else {
+fn token_matches<'a>(peers: &'a PeersConfig, headers: &HeaderMap) -> Result<&'a str, &'static str> {
+    if peers.tokens.is_empty() {
         return Err("no peer token configured");
-    };
+    }
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return Err("missing authorization header");
     };
@@ -177,9 +181,34 @@ fn token_matches(peers: &PeersConfig, headers: &HeaderMap) -> Result<(), &'stati
     let Some(token) = bearer_token(value) else {
         return Err("not a bearer credential");
     };
-    if constant_time_eq(&expected.to_ascii_lowercase(), &sha256_hex(token)) {
-        Ok(())
-    } else {
-        Err("wrong token")
+    matching_token(&peers.tokens, &sha256_hex(token)).ok_or("wrong token")
+}
+
+/// The name of the token whose hash is `presented`. Every hash is compared, whatever matched
+/// before, so the time taken does not tell which token, or how many, came first.
+fn matching_token<'a>(tokens: &'a [PeerToken], presented: &str) -> Option<&'a str> {
+    let mut found = None;
+    for token in tokens {
+        let hit = constant_time_eq(&token.token_sha256.to_ascii_lowercase(), presented);
+        found = found.or(hit.then_some(token.name.as_str()));
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_configured_token_matches_and_names_itself() {
+        let token = |name: &str, secret: &str| PeerToken {
+            name: name.to_owned(),
+            token_sha256: sha256_hex(secret).to_ascii_uppercase(),
+        };
+        let tokens = [token("default", "one"), token("ct-5", "two")];
+        assert_eq!(matching_token(&tokens, &sha256_hex("one")), Some("default"));
+        assert_eq!(matching_token(&tokens, &sha256_hex("two")), Some("ct-5"));
+        assert_eq!(matching_token(&tokens, &sha256_hex("three")), None);
+        assert_eq!(matching_token(&[], &sha256_hex("one")), None);
     }
 }

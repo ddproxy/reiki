@@ -240,6 +240,12 @@ pub struct PeersConfig {
     pub session_header: String,
     /// How long a session id counts as active after its last request.
     pub session_window_secs: u64,
+    /// Period of `host` events on `/v1/health/stream`.
+    pub stream_interval_secs: u64,
+    /// Open `/v1/health/stream` connections allowed at once.
+    pub max_subscribers: u32,
+    /// Open stream connections allowed from one client address.
+    pub max_subscribers_per_peer: u32,
     pub peers: BTreeMap<String, PeerEntry>,
 }
 
@@ -267,6 +273,24 @@ struct PeersSettings {
     session_header: String,
     #[serde(default = "default_session_window_secs")]
     session_window_secs: u64,
+    #[serde(default = "default_stream_interval_secs")]
+    stream_interval_secs: u64,
+    #[serde(default = "default_max_subscribers")]
+    max_subscribers: u32,
+    #[serde(default = "default_max_subscribers_per_peer")]
+    max_subscribers_per_peer: u32,
+}
+
+fn default_stream_interval_secs() -> u64 {
+    5
+}
+
+fn default_max_subscribers() -> u32 {
+    16
+}
+
+fn default_max_subscribers_per_peer() -> u32 {
+    4
 }
 
 fn default_poll_interval_secs() -> u64 {
@@ -327,6 +351,9 @@ impl TryFrom<toml::Table> for PeersConfig {
             expose_host_stats: settings.expose_host_stats,
             session_header: settings.session_header,
             session_window_secs: settings.session_window_secs,
+            stream_interval_secs: settings.stream_interval_secs,
+            max_subscribers: settings.max_subscribers,
+            max_subscribers_per_peer: settings.max_subscribers_per_peer,
             peers,
         })
     }
@@ -1160,6 +1187,24 @@ impl Config {
             return Some(format!(
                 "session_window_secs must be between 10 and 86400, got {}",
                 peers.session_window_secs
+            ));
+        }
+        if !(1..=3600).contains(&peers.stream_interval_secs) {
+            return Some(format!(
+                "stream_interval_secs must be between 1 and 3600, got {}",
+                peers.stream_interval_secs
+            ));
+        }
+        if !(1..=256).contains(&peers.max_subscribers) {
+            return Some(format!(
+                "max_subscribers must be between 1 and 256, got {}",
+                peers.max_subscribers
+            ));
+        }
+        if !(1..=peers.max_subscribers).contains(&peers.max_subscribers_per_peer) {
+            return Some(format!(
+                "max_subscribers_per_peer must be between 1 and max_subscribers ({}), got {}",
+                peers.max_subscribers, peers.max_subscribers_per_peer
             ));
         }
         let header = peers.session_header.as_str();
@@ -2238,6 +2283,9 @@ socket = "/run/forwarder.sock"
         assert!(!peers.expose_host_stats);
         assert_eq!(peers.session_header, "x-opencode-session");
         assert_eq!(peers.session_window_secs, 300);
+        assert_eq!(peers.stream_interval_secs, 5);
+        assert_eq!(peers.max_subscribers, 16);
+        assert_eq!(peers.max_subscribers_per_peer, 4);
         assert_eq!(
             PeersConfig::check_line(Some(&peers)),
             "peers: disabled",
@@ -2342,6 +2390,18 @@ socket = "/run/forwarder.sock"
                 "credentials",
             ),
             ("[peers]\ninstance = \"a b\"\n".to_owned(), "instance"),
+            (
+                "[peers]\nstream_interval_secs = 0\n".to_owned(),
+                "stream_interval_secs",
+            ),
+            (
+                "[peers]\nmax_subscribers = 0\n".to_owned(),
+                "max_subscribers",
+            ),
+            (
+                "[peers]\nmax_subscribers = 2\nmax_subscribers_per_peer = 3\n".to_owned(),
+                "max_subscribers_per_peer",
+            ),
         ] {
             let reason = peers_error(&peers);
             assert!(reason.contains(needle), "{peers}: {reason}");

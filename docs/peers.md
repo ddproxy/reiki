@@ -19,6 +19,10 @@ peer_token_sha256 = "<sha256 of the peer token>"   # required to publish
 # instance = "ct-1"                # published name; the host name by default
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
+expose_host_stats = false          # publish load, memory, disk use and active sessions
+# stream_interval_secs = 5         # period of `host` events on /v1/health/stream
+# max_subscribers = 16             # open streams in total
+# max_subscribers_per_peer = 4     # open streams per client address
 
 [peers.ct-4]                       # one table per instance to read
 url = "https://10.0.6.153:4099"    # https, or http on a loopback address
@@ -97,6 +101,32 @@ The summary is coarse, but it still tells a reader which of this instance's upst
 
 The route is listed in the admin `GET /v1/openapi.json` while publishing, with the peer listener as its `servers` entry and a separate `peerAuth` security scheme. Without publishing the document is unchanged.
 
+## Push: GET /v1/health/stream
+
+The same listener and the same peer token also serve `GET /v1/health/stream`, a Server-Sent Events stream, so a reader does not have to poll:
+
+```bash
+curl -N -H "Authorization: Bearer $PEER_TOKEN" http://127.0.0.1:4099/v1/health/stream
+```
+
+```text
+event: snapshot
+data: {"instance":"ct-4","observed_at":"...","upstreams":[...]}
+
+event: key
+data: {"observed_at":"...","upstream":{"name":"zen","healthy_keys":0,"cooling_keys":2,...}}
+
+: heartbeat
+```
+
+- `snapshot` comes first on every connection and holds the full `/v1/health` document. It is sent again if the set of upstreams changes on a reload.
+- `key` carries one upstream entry whenever its key counts, its `last_status_class` or (with labels) a key's state changes. A cooldown counting down is not a change.
+- With `expose_host_stats`, `host` comes every `stream_interval_secs` (default 5) and `sessions` whenever the session counts change.
+- A `: heartbeat` comment comes every 15 seconds, so a reader can tell a quiet stream from a dead one.
+- Changes are checked once a second and fed through one bounded broadcast. A subscriber that stops reading is dropped once 32 frames are queued for it, rather than buffered without limit, and so is one that falls behind the broadcast.
+- `max_subscribers` (default 16, at most 256) caps open streams in total, and `max_subscribers_per_peer` (default 4) caps them per client address; past either the answer is 503 or 429 with `Retry-After`. A closed connection frees its place. The listener accepts `max_subscribers` plus 16 connections.
+- The stream carries the same fields as `/v1/health` and nothing else: no bodies, no key labels unless `expose_key_labels`, no stream names. A reload that stops publishing or changes `peer_token_sha256` ends every open stream.
+
 ## Read: reiki peers
 
 `reiki peers` fetches `/v1/health` from every `[peers.<name>]` in the config and prints one row per peer upstream:
@@ -119,6 +149,8 @@ ct-5  -         -         unknown  -        -        -         -     -
 - A peer shows as `unknown`, with no counts, when it cannot be reached, fails the TLS check, refuses the token, answers anything but 200, sends a body that is too big or not a health document, or reports an `observed_at` more than three `poll_interval_secs` away from this host's clock (in either direction). The reason goes to stderr. Unknown never means healthy.
 - `STATE` is `ok` while a key is usable, else `cooling`, `disabled` or `no_keys`. `WAIT` is `soonest_cooldown_seconds` and `AGE` the age of the data.
 - Exit status: 0 when at least one peer gave fresh data, 1 when none did, 2 on a config problem.
+
+`reiki peers --watch` follows every peer's `/v1/health/stream` instead and prints the table again (or, with `--json`, one JSON document per line) whenever something changes. Each stream uses the same pinned client and token rules, with a 64 KiB cap per event. When a stream cannot be opened, ends, or sends nothing for 40 s, it polls `/v1/health` once, waits `poll_interval_secs` and tries the stream again. `AGE` is the time since the last frame from that peer, heartbeats included, measured on this host's clock; a peer with nothing for three poll intervals turns `unknown`. It runs until interrupted.
 
 ## Check
 

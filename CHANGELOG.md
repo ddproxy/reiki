@@ -12,6 +12,8 @@
 - `[peers] expose_host_stats` (off by default) adds `host` (load average, cores, memory and swap, disk use per role for the config, state, log and request log directories, never paths) and `sessions` to `/v1/health`. `active_sessions` counts distinct values of `session_header` (default `x-opencode-session`) over `session_window_secs` (default 300), once per client request, kept only as salted hashes in a bounded table. A per-stream breakdown needs `expose_key_labels` too.
 - The `peers` feature adds the `rustix` crate (unix only) for `statvfs`.
 - `reiki peers` (and `--json`) reads `/v1/health` from each `[peers.<name>]`. Every peer gets its own client that trusts only its `ca_file`, sends only the peer bearer token, follows no redirect, gives up after 5 s and refuses a body over 64 KiB. A failure, or data more than three poll intervals old, shows as `unknown` and never as healthy. It exits 1 when no peer gave fresh data. A token file that group or others can read is refused.
+- `GET /v1/health/stream` on the peer listener, with the same token: Server-Sent Events with a `snapshot` on connect, `key` when an upstream's key counts or states change, `host` every `stream_interval_secs` (default 5) and `sessions` on change with `expose_host_stats`, and a heartbeat comment every 15 s. Events go through one bounded broadcast; a subscriber that stops reading is dropped. `max_subscribers` (default 16) and `max_subscribers_per_peer` (default 4) cap open streams. In `/v1/openapi.json` while publishing.
+- `reiki peers --watch` follows each peer's stream and reprints on every change, polling `/v1/health` while a stream is down.
 
 ## 0.8.2
 

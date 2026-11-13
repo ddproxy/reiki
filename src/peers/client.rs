@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::config::{PeerEntry, PeersConfig};
 
@@ -383,7 +384,7 @@ pub fn render_json(reports: &[PeerReport]) -> Result<String, String> {
 
 /// The `reiki peers` command: 0 when a peer gave fresh data, 1 when none did, 2 on a config
 /// problem.
-pub async fn run(peers: Option<&PeersConfig>, json: bool) -> i32 {
+pub async fn run(peers: Option<&PeersConfig>, json: bool, follow: bool) -> i32 {
     let Some(peers) = peers else {
         eprintln!("reiki: the config has no [peers] table");
         return 2;
@@ -395,6 +396,15 @@ pub async fn run(peers: Option<&PeersConfig>, json: bool) -> i32 {
     if peers.peers.is_empty() {
         eprintln!("reiki: [peers] lists no peers");
         return 2;
+    }
+    if follow {
+        return watch(peers, json, None, |text| {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(text.as_bytes());
+            let _ = stdout.flush();
+        })
+        .await;
     }
     let reports = poll(peers).await;
     print_reports(&reports, json)
@@ -421,9 +431,319 @@ pub(crate) fn print_reports(reports: &[PeerReport], json: bool) -> i32 {
     i32::from(!reports.iter().any(PeerReport::is_fresh))
 }
 
+/// A stream that sends nothing, not even a heartbeat, for this long is given up.
+const STREAM_IDLE: Duration = Duration::from_secs(40);
+
+/// One parsed Server-Sent Events item.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SseItem {
+    Event { event: String, data: String },
+    Comment,
+}
+
+/// Splits a byte stream into SSE items, refusing any event or line over `cap` bytes.
+pub(crate) struct SseParser {
+    cap: usize,
+    line: Vec<u8>,
+    event: String,
+    data: String,
+}
+
+impl SseParser {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            line: Vec::new(),
+            event: String::new(),
+            data: String::new(),
+        }
+    }
+
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseItem>, String> {
+        let mut items = Vec::new();
+        for &byte in bytes {
+            if byte != b'\n' {
+                self.line.push(byte);
+                if self.line.len() + self.data.len() > self.cap {
+                    return Err(format!("an event is over {} KiB", self.cap / 1024));
+                }
+                continue;
+            }
+            let line = std::mem::take(&mut self.line);
+            let line =
+                String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
+            if line.is_empty() {
+                if !self.data.is_empty() || !self.event.is_empty() {
+                    items.push(SseItem::Event {
+                        event: std::mem::take(&mut self.event),
+                        data: std::mem::take(&mut self.data),
+                    });
+                }
+            } else if line.starts_with(':') {
+                items.push(SseItem::Comment);
+            } else {
+                let (field, value) = line.split_once(':').unwrap_or((line.as_str(), ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => value.clone_into(&mut self.event),
+                    "data" => {
+                        if !self.data.is_empty() {
+                            self.data.push('\n');
+                        }
+                        self.data.push_str(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(items)
+    }
+}
+
+#[derive(Deserialize)]
+struct KeyEvent {
+    observed_at: String,
+    upstream: UpstreamHealth,
+}
+
+enum Watched {
+    Report(PeerReport),
+    /// A frame arrived, a heartbeat included, so the data is still current.
+    Alive,
+}
+
+/// Follows one peer's event stream, sending a report per change; returns why it stopped.
+async fn follow_stream(
+    name: &str,
+    peer: &PeerEntry,
+    poll: Duration,
+    tx: &mpsc::Sender<Watched>,
+) -> String {
+    let token = match read_token(peer) {
+        Ok(token) => token,
+        Err(e) => return e,
+    };
+    let client = match client_for(peer, None) {
+        Ok(client) => client,
+        Err(e) => return e,
+    };
+    let request = client
+        .get(endpoint(peer, "/v1/health/stream"))
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send();
+    let mut response = match tokio::time::timeout(FETCH_TIMEOUT, request).await {
+        Err(_) => return "timed out".to_owned(),
+        Ok(Err(e)) => return describe(&e),
+        Ok(Ok(response)) => response,
+    };
+    if response.status() != reqwest::StatusCode::OK {
+        return refusal(response.status());
+    }
+    let streams = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"));
+    if !streams {
+        return "the peer does not stream".to_owned();
+    }
+    let mut parser = SseParser::new(MAX_BODY);
+    let mut doc: Option<HealthDoc> = None;
+    loop {
+        let chunk = match tokio::time::timeout(STREAM_IDLE, response.chunk()).await {
+            Err(_) => return "the stream went quiet".to_owned(),
+            Ok(Err(e)) => return describe(&e),
+            Ok(Ok(None)) => return "the stream ended".to_owned(),
+            Ok(Ok(Some(chunk))) => chunk,
+        };
+        let items = match parser.feed(&chunk) {
+            Ok(items) => items,
+            Err(e) => return e,
+        };
+        for item in items {
+            let changed = match item {
+                SseItem::Comment => false,
+                SseItem::Event { event, data } => match event.as_str() {
+                    "snapshot" => match serde_json::from_str::<HealthDoc>(&data) {
+                        Ok(snapshot) => {
+                            doc = Some(snapshot);
+                            true
+                        }
+                        Err(e) => return format!("not a /v1/health snapshot: {e}"),
+                    },
+                    "key" => match (serde_json::from_str::<KeyEvent>(&data), doc.as_mut()) {
+                        (Ok(key), Some(doc)) => {
+                            doc.observed_at = key.observed_at;
+                            match doc
+                                .upstreams
+                                .iter_mut()
+                                .find(|u| u.name == key.upstream.name)
+                            {
+                                Some(slot) => *slot = key.upstream,
+                                None => doc.upstreams.push(key.upstream),
+                            }
+                            true
+                        }
+                        (Err(e), _) => return format!("not a key event: {e}"),
+                        (Ok(_), None) => return "a key event came before the snapshot".to_owned(),
+                    },
+                    _ => false,
+                },
+            };
+            let message = match (&doc, changed) {
+                (Some(doc), true) => {
+                    Watched::Report(assess(name, doc.clone(), poll, SystemTime::now()))
+                }
+                _ => Watched::Alive,
+            };
+            if tx.send(message).await.is_err() {
+                return "stopped".to_owned();
+            }
+        }
+    }
+}
+
+/// Follows one peer for as long as the watch runs: its stream, and a poll whenever that fails.
+async fn follow(name: String, peer: PeerEntry, poll: Duration, tx: mpsc::Sender<Watched>) {
+    loop {
+        let reason = follow_stream(&name, &peer, poll, &tx).await;
+        let report = match fetch(&peer).await {
+            Ok(doc) => assess(&name, doc, poll, SystemTime::now()),
+            Err(error) => PeerReport::unknown(&name, format!("stream: {reason}; poll: {error}")),
+        };
+        if tx.send(Watched::Report(report)).await.is_err() || tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// `reiki peers --watch`: prints the table (or one JSON line) on each change; with
+/// `max_updates` it stops after that many and returns the exit status `run` would.
+pub async fn watch(
+    peers: &PeersConfig,
+    json: bool,
+    max_updates: Option<usize>,
+    mut out: impl FnMut(&str),
+) -> i32 {
+    let poll = Duration::from_secs(peers.poll_interval_secs);
+    let names: Vec<String> = peers.peers.keys().cloned().collect();
+    let mut inboxes = Vec::new();
+    let mut tasks = Vec::new();
+    for (name, peer) in &peers.peers {
+        let (tx, rx) = mpsc::channel(64);
+        tasks.push(tokio::spawn(follow(name.clone(), peer.clone(), poll, tx)));
+        inboxes.push(rx);
+    }
+    let (merged_tx, mut merged) = mpsc::channel::<(usize, Watched)>(64);
+    for (index, mut inbox) in inboxes.into_iter().enumerate() {
+        let merged_tx = merged_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(message) = inbox.recv().await {
+                if merged_tx.send((index, message)).await.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(merged_tx);
+    let mut reports: Vec<PeerReport> = names
+        .iter()
+        .map(|name| PeerReport::unknown(name, "no answer yet".to_owned()))
+        .collect();
+    let mut received: Vec<Option<std::time::Instant>> = vec![None; names.len()];
+    let limit = poll.saturating_mul(3);
+    let mut expiry = tokio::time::interval(poll.min(Duration::from_secs(5)));
+    let mut updates = 0usize;
+    let status = loop {
+        let mut changed = false;
+        tokio::select! {
+            message = merged.recv() => match message {
+                None => break i32::from(!reports.iter().any(PeerReport::is_fresh)),
+                Some((index, Watched::Alive)) => {
+                    if reports[index].is_fresh() {
+                        received[index] = Some(std::time::Instant::now());
+                    }
+                }
+                Some((index, Watched::Report(report))) => {
+                    received[index] = report.is_fresh().then(std::time::Instant::now);
+                    reports[index] = report;
+                    changed = true;
+                }
+            },
+            _ = expiry.tick() => {
+                for (report, seen) in reports.iter_mut().zip(&mut received) {
+                    if seen.is_some_and(|at| at.elapsed() > limit) {
+                        *report = PeerReport::unknown(&report.name, format!("no data for over {}s", limit.as_secs()));
+                        *seen = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let mut shown = reports.clone();
+        for (report, seen) in shown.iter_mut().zip(&received) {
+            if let Some(at) = seen {
+                report.age_seconds = Some(at.elapsed().as_secs());
+            }
+        }
+        let text = if json {
+            serde_json::to_string(&serde_json::json!({ "peers": shown }))
+                .map_or_else(|e| e.to_string(), |t| t + "\n")
+        } else {
+            render_table(&shown) + "\n"
+        };
+        out(&text);
+        updates += 1;
+        if max_updates.is_some_and(|max| updates >= max) {
+            break i32::from(!reports.iter().any(PeerReport::is_fresh));
+        }
+    };
+    for task in tasks {
+        task.abort();
+    }
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_frames_split_on_blank_lines_across_chunks() {
+        let mut parser = SseParser::new(1024);
+        let mut items = parser.feed(b"event: snap").unwrap();
+        assert!(items.is_empty());
+        items.extend(
+            parser
+                .feed(b"shot\ndata: {\"a\":1}\n\n: heartbeat\n\nevent: key\r\ndata: x\r\n")
+                .unwrap(),
+        );
+        items.extend(parser.feed(b"data: y\n\n").unwrap());
+        assert_eq!(
+            items,
+            [
+                SseItem::Event {
+                    event: "snapshot".into(),
+                    data: "{\"a\":1}".into()
+                },
+                SseItem::Comment,
+                SseItem::Event {
+                    event: "key".into(),
+                    data: "x\ny".into()
+                },
+            ]
+        );
+        let mut small = SseParser::new(8);
+        assert!(
+            small.feed(b"data: 0123456789").is_err(),
+            "an endless line is refused"
+        );
+    }
 
     fn doc(observed_at: &str) -> HealthDoc {
         HealthDoc {

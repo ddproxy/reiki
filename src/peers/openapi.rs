@@ -99,5 +99,22 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
             },
         },
     });
-    vec![(super::publisher::HEALTH_PATH.to_owned(), health)]
+    let stream = json!({
+        "servers": servers,
+        "get": {
+            "summary": "Server-Sent Events: a snapshot, then key, sessions and host events",
+            "description": "event: snapshot carries the /v1/health document; event: key carries {observed_at, upstream} for one upstream whose key counts or states changed; event: sessions and event: host carry {observed_at, sessions|host} with expose_host_stats; a `: heartbeat` comment comes every 15 s",
+            "security": [{"peerAuth": []}],
+            "responses": {
+                "200": {"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}},
+                "401": {"description": "Missing or wrong peer token"},
+                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address"},
+                "503": {"description": "max_subscribers streams are open"},
+            },
+        },
+    });
+    vec![
+        (super::publisher::HEALTH_PATH.to_owned(), health),
+        (super::stream::STREAM_PATH.to_owned(), stream),
+    ]
 }

@@ -15,6 +15,7 @@ use crate::config::PeersConfig;
 use crate::proxy::App;
 
 use super::sessions::Sessions;
+use super::stream::{ensure_ticker, Frames, Hub, Refused, HEARTBEAT, STREAM_PATH};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
 
@@ -23,6 +24,7 @@ pub struct Publisher {
     /// Kept apart from the client and admin counts, so peer guessing locks out only peers.
     logins: LoginThrottle,
     sessions: Sessions,
+    hub: Arc<Hub>,
 }
 
 impl Publisher {
@@ -30,6 +32,7 @@ impl Publisher {
         Arc::new(Self {
             logins: LoginThrottle::new(throttle),
             sessions: Sessions::new(),
+            hub: Hub::new(),
         })
     }
 
@@ -73,19 +76,62 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let Some(peers) = snapshot.config.peers.as_ref().filter(|p| p.publishing()) else {
         return not_found();
     };
-    if req.method() != Method::GET || req.uri().path() != HEALTH_PATH {
+    let path = req.uri().path();
+    if req.method() != Method::GET || (path != HEALTH_PATH && path != STREAM_PATH) {
         return not_found();
     }
     let peer = req.extensions().get::<Peer>().map(|p| p.0);
     if let Err(refusal) = authorize(&app, peers, peer, req.headers()) {
         return *refusal;
     }
-    let body = super::health::document(&app, peers).to_string();
-    let mut response = text_response(StatusCode::OK, "application/json", body);
+    let mut response = if path == STREAM_PATH {
+        subscribe(&app, peers, peer)
+    } else {
+        let body = super::health::document(&app, peers).to_string();
+        text_response(StatusCode::OK, "application/json", body)
+    };
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// Opens one event stream, or refuses it when the subscriber caps are reached.
+fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>) -> Response {
+    let hub = Arc::clone(&app.peer_publisher().hub);
+    ensure_ticker(app, &hub);
+    let limits = (
+        peers.max_subscribers as usize,
+        peers.max_subscribers_per_peer as usize,
+    );
+    let subscribed = hub.subscribe(peer, limits, HEARTBEAT, || {
+        super::stream::frame("snapshot", &super::health::document(app, peers))
+    });
+    match subscribed {
+        Ok(inbox) => {
+            let mut response = Response::new(axum::body::Body::from_stream(Frames(inbox)));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+                .headers_mut()
+                .insert("x-accel-buffering", HeaderValue::from_static("no"));
+            response
+        }
+        Err(refused) => {
+            tracing::warn!(?peer, ?refused, "peer stream refused");
+            let status = match refused {
+                Refused::Full => StatusCode::SERVICE_UNAVAILABLE,
+                Refused::PeerFull => StatusCode::TOO_MANY_REQUESTS,
+            };
+            let mut response = text_response(status, "text/plain", String::new());
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            response
+        }
+    }
 }
 
 /// Checks the bearer token against `peer_token_sha256` alone, so no admin or stream token opens

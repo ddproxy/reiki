@@ -6,7 +6,7 @@ Reiki can serve a small admin listener with `GET /status`, plus any paths a plug
 
 Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API follows a stability promise: v1 only gains fields.
 
-`GET /v1/health`, the coarse summary other instances read, is never served here: it lives on the separate `[peers]` listener with its own read-only token. See [peers](peers.md). While publishing, `/v1/openapi.json` lists it with that listener as its server.
+`GET /v1/health` and `GET /v1/health/stream`, the coarse summary other instances read, are never served here: it lives on the separate `[peers]` listener with its own read-only token. See [peers](peers.md). While publishing, `/v1/openapi.json` lists them with that listener as their server.
 
 ## Configure
 

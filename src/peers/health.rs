@@ -131,7 +131,7 @@ pub(crate) fn document(app: &App, peers: &PeersConfig) -> Value {
 }
 
 /// The directories Reiki writes to, by role: config and state, its own log, the request log.
-fn disk_dirs(app: &App, config: &Config) -> Vec<(&'static str, std::path::PathBuf)> {
+pub(crate) fn disk_dirs(app: &App, config: &Config) -> Vec<(&'static str, std::path::PathBuf)> {
     let parent = |path: &std::path::Path| {
         path.parent()
             .filter(|dir| !dir.as_os_str().is_empty())

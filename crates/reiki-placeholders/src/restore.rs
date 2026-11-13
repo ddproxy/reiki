@@ -14,7 +14,14 @@ const MAX_PLACEHOLDER: usize = 48;
 const SECRET_HEAD: &str = "[[REIKI_SECRET_";
 
 /// Field names under which a model's tool call carries its arguments.
-const TOOL_CALL_MARKERS: &[&str] = &["tool_calls", "function_call", "tool_use", "partial_json"];
+const TOOL_CALL_MARKERS: &[&str] = &[
+    "tool_calls",
+    "function_call",
+    "functionCall",
+    "tool_use",
+    "toolUse",
+    "partial_json",
+];
 
 /// Replaces every complete placeholder that was written for this request.
 pub fn restore_text(text: &str, reverse: &HashMap<String, String>) -> String {
@@ -483,6 +490,23 @@ mod tests {
         let out = String::from_utf8(chunk.to_vec()).unwrap();
         assert!(out.contains(&format!("curl {SECRET} Falcon")), "{out}");
         assert!(out.contains("\"content\":\"tok-123\""), "{out}");
+    }
+
+    #[test]
+    fn camel_case_tool_calls_keep_credentials_masked() {
+        let body = serde_json::json!({"candidates": [{"content": {"parts": [
+            {"text": SECRET},
+            {"functionCall": {"name": "run", "args": {"cmd": SECRET}}}
+        ]}}]})
+        .to_string();
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("application/json"), false);
+        let mut chunk = Bytes::from(body);
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        let out: Value = serde_json::from_slice(&chunk).unwrap();
+        let parts = &out["candidates"][0]["content"]["parts"];
+        assert_eq!(parts[0]["text"], "tok-123");
+        assert_eq!(parts[1]["functionCall"]["args"]["cmd"], SECRET);
     }
 
     #[test]

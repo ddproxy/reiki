@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The placeholders plugin now treats Gemini-style `functionCall` and Bedrock-style `toolUse` bodies as tool calls, so credential placeholders stay masked in their arguments unless `restore_tool_args` is set.
+
 ## 0.8.0
 
 ### Changed

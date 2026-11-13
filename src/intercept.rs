@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 use x509_parser::extensions::{GeneralName, GeneralSubtree as ParsedSubtree};
 
-use crate::config::{InterceptConfig, InterceptHost};
+use crate::config::{CaKeyPermissions, InterceptConfig, InterceptHost};
 use crate::proxy::{handle_intercepted, App};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -170,8 +170,37 @@ struct Authority {
     key_matches: bool,
 }
 
+/// Refuses, or warns about, a CA key file that its group or other users can read or write.
+#[cfg(unix)]
+fn check_key_mode(path: &str, policy: CaKeyPermissions) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {path}: {e}"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    let message = format!("CA key {path} has mode {mode:03o}; it must not be accessible to group or others (chmod 600)");
+    match policy {
+        CaKeyPermissions::Error => Err(message),
+        CaKeyPermissions::Warn => {
+            tracing::warn!("{message}");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn check_key_mode(_path: &str, _policy: CaKeyPermissions) -> Result<(), String> {
+    Ok(())
+}
+
 impl Authority {
-    fn load(cert_path: &str, key_path: &str) -> Result<Self, String> {
+    fn load(config: &InterceptConfig) -> Result<Self, String> {
+        let (cert_path, key_path) = (config.ca_cert.as_str(), config.ca_key.as_str());
+        check_key_mode(key_path, config.ca_key_permissions)?;
         let cert_pem = std::fs::read_to_string(cert_path)
             .map_err(|e| format!("cannot read {cert_path}: {e}"))?;
         let key_pem = std::fs::read_to_string(key_path)
@@ -268,7 +297,7 @@ pub fn days_left(not_after: i64) -> i64 {
 
 /// Loads the CA without starting anything, for `reiki check`; returns the days it has left.
 pub fn check_ca(config: &InterceptConfig) -> Result<i64, String> {
-    Authority::load(&config.ca_cert, &config.ca_key).map(|a| days_left(a.not_after))
+    Authority::load(config).map(|a| days_left(a.not_after))
 }
 
 /// Days of validity at or below which startup warns.
@@ -318,7 +347,7 @@ pub struct InterceptPlan {
 
 impl Interceptor {
     pub fn new(app: Arc<App>, config: &InterceptConfig) -> Result<Self, String> {
-        let authority = Authority::load(&config.ca_cert, &config.ca_key)?;
+        let authority = Authority::load(config)?;
         let left = days_left(authority.not_after);
         app.set_ca_not_after(authority.not_after);
         if left < 0 {
@@ -357,7 +386,7 @@ impl Interceptor {
             let minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(&minting.authority)
         };
-        let loaded = Authority::load(&config.ca_cert, &config.ca_key)?;
+        let loaded = Authority::load(config)?;
         let current = self.settings();
         let next = Arc::new(Settings::from_config(config));
         let mut changed = Vec::new();
@@ -570,6 +599,43 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ca_key_open_to_group_or_others_is_refused_unless_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("reiki-ca-key-{}", std::process::id()));
+        std::fs::write(&path, "k").unwrap();
+        let path_str = path.to_str().unwrap();
+        for (mode, private) in [
+            (0o600, true),
+            (0o400, true),
+            (0o640, false),
+            (0o604, false),
+            (0o660, false),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                check_key_mode(path_str, CaKeyPermissions::Error).is_ok(),
+                private,
+                "mode {mode:o}"
+            );
+            assert!(check_key_mode(path_str, CaKeyPermissions::Warn).is_ok());
+        }
+        let message = {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            check_key_mode(path_str, CaKeyPermissions::Error).unwrap_err()
+        };
+        assert!(
+            message.contains("644") && message.contains("chmod 600"),
+            "{message}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            check_key_mode(path_str, CaKeyPermissions::Error).is_err(),
+            "a missing key is an error"
+        );
+    }
 
     #[test]
     fn a_name_constraint_admits_the_name_and_its_subdomains() {

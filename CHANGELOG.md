@@ -15,9 +15,11 @@
 - A POST or PATCH is no longer replayed after an ambiguous transport failure. A connect failure before the request was sent still permits a retry for any method, as does any explicit upstream error response. Idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) keep their retry. An uncertain POST or PATCH now answers 502, or 504 on timeout.
 - Failed admin logins are logged with the peer address (never the token) and counted for a per-address lockout, as on the client listener.
 - `reiki hash-token` refuses a token shorter than 16 characters.
+- The interception CA key is checked on load and reload: a key file that group or others can access is refused. Set `[tunnel.intercept] ca_key_permissions = "warn"` to load it with a warning instead, or `chmod 600` the key. `reiki ca-init` already writes it as 0600.
 
 ### Fixed
 
+- The failed-login table no longer stops tracking new addresses when it is full of live entries: it drops the address with the fewest failures (oldest first), so a flood of addresses cannot leave a fresh one free to guess and a blocked address stays blocked.
 - The placeholders plugin now treats Gemini-style `functionCall` and Bedrock-style `toolUse` bodies as tool calls, so credential placeholders stay masked in their arguments unless `restore_tool_args` is set.
 
 ## 0.8.0

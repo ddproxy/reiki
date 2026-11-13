@@ -506,7 +506,21 @@ pub struct InterceptConfig {
     /// Turn it off only when the tunnel listener is reachable by trusted clients alone.
     #[serde(default = "default_true")]
     pub require_auth: bool,
+    /// What to do when the CA key file can be read by its group or by everyone.
+    #[serde(default)]
+    pub ca_key_permissions: CaKeyPermissions,
     pub hosts: Vec<InterceptHost>,
+}
+
+/// How a CA key file that is not private to its owner is treated.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CaKeyPermissions {
+    /// Refuse to load the CA.
+    #[default]
+    Error,
+    /// Load it and log a warning.
+    Warn,
 }
 
 fn default_leaf_ttl_hours() -> u64 {

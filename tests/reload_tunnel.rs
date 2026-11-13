@@ -195,6 +195,11 @@ fn write_ca(dir: &Path, dns: &[&str], not_before: OffsetDateTime, not_after: Off
     let cert = params.self_signed(&key).unwrap();
     std::fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
     std::fs::write(dir.join("ca.key"), key.serialize_pem()).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("ca.key"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
 }
 
 fn write_valid_ca(dir: &Path, dns: &[&str]) {

@@ -45,6 +45,7 @@ ca_cert = "/etc/reiki/ca/ca.pem"
 ca_key = "/etc/reiki/ca/ca.key"
 leaf_ttl_hours = 24
 require_auth = true       # CONNECT to a stream host must carry the stream token
+ca_key_permissions = "error"   # refuse a CA key that group or others can access; "warn" only logs
 
 [[tunnel.intercept.hosts]]
 host = "api.example.com"

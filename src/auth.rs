@@ -107,7 +107,15 @@ impl LoginThrottle {
         if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
             seen.retain(|_, (_, since)| now.saturating_duration_since(*since) < settings.window);
             if seen.len() >= MAX_TRACKED {
-                return 0;
+                // Still full of live entries: drop the least-failed, then oldest, so a flood of fresh
+                // addresses cannot leave a new one untracked and does not release a blocked one.
+                if let Some(oldest) = seen
+                    .iter()
+                    .min_by_key(|(_, (count, since))| (*count, *since))
+                    .map(|(ip, _)| *ip)
+                {
+                    seen.remove(&oldest);
+                }
             }
         }
         let entry = seen.entry(ip).or_insert((0, now));
@@ -308,6 +316,36 @@ mod tests {
             assert_eq!(throttle.fail(ip, t0), 0);
         }
         assert!(throttle.blocked(ip, t0).is_none());
+    }
+
+    #[test]
+    fn a_full_table_evicts_the_oldest_address_instead_of_ignoring_new_ones() {
+        let throttle = LoginThrottle::default();
+        let t0 = Instant::now();
+        for n in 0..MAX_TRACKED as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(n + 1));
+            throttle.fail(ip, t0 + Duration::from_millis(u64::from(n)));
+        }
+        let newcomer: IpAddr = "203.0.113.7".parse().unwrap();
+        let now = t0 + Duration::from_secs(1);
+        assert_eq!(
+            throttle.fail(newcomer, now),
+            1,
+            "the new address is tracked"
+        );
+        for _ in 1..MAX_FAILURES {
+            throttle.fail(newcomer, now);
+        }
+        assert!(throttle.blocked(newcomer, now).is_some());
+        assert!(
+            throttle.seen.lock().unwrap().len() <= MAX_TRACKED,
+            "the table stays bounded"
+        );
+        let first: IpAddr = IpAddr::from(std::net::Ipv4Addr::from(1u32));
+        assert!(
+            !throttle.seen.lock().unwrap().contains_key(&first),
+            "the oldest entry was evicted"
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ Peer support is the `peers` cargo feature, which is in the default feature set l
 [peers]
 enabled = false                    # master switch; the table can exist and do nothing
 publish = false                    # serve GET /v1/health on `listen`
-listen = "127.0.0.1:4099"          # required to publish; its own socket
+listen = "127.0.0.1:4099"          # required to publish; its own socket; loopback unless TLS is on
+# tls_cert = "/etc/reiki/peers/listener.pem"   # serve HTTPS: PEM chain, leaf first
+# tls_key = "/etc/reiki/peers/listener.key"    # its PEM key, mode 0600
+# tls_key_permissions = "error"    # or "warn" to load a key group or others can access
 peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; this or [[peers.tokens]] to publish
 # instance = "ct-1"                # published name; the host name by default
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
@@ -42,10 +45,34 @@ Validation, at startup, on reload and in `reiki check`:
 - With `enabled` and `publish`, `listen` must be an `IP:port` that differs from the client, admin and tunnel listeners, and `peer_token_sha256` is required.
 - Every peer token hash (`peer_token_sha256` and each `[[peers.tokens]]` `token_sha256`) must be 64 hex characters and must differ from the admin token hash, from every stream token hash and from every other peer token, so a peer token can never act as a stronger credential and a name always identifies one token.
 - A `[[peers.tokens]]` `name` is lowercase letters, digits and `-`, 1 to 32 bytes, and unique; `peer_token_sha256` takes the name `default`.
-- The peer listener serves plain HTTP, so `listen` must be a loopback address. Reach it from another host through a tunnel you control (WireGuard, `ssh -L`) or a TLS-terminating proxy.
+- `tls_cert` and `tls_key` go together: both or neither.
+- Without them the peer listener serves plain HTTP, so `listen` must be a loopback address; any other address is refused. Reach it from another host through a tunnel you control (WireGuard, `ssh -L`) or a TLS-terminating proxy, or turn TLS on.
 - A peer `url` uses https, or plain http only on a loopback address, and carries no credentials, query or fragment. An https peer needs `ca_file`.
 
 `instance` (optional) sets the name published as `instance`, with the same character rules as a peer name; without it the host name is used. A change to `listen`, or turning publishing on or off, needs a restart and shows in a reload's `restart_needed` as `peers.listen`. The tokens and the other settings apply on reload, and a reload that turns publishing off makes the listener answer 404 at once.
+
+## TLS on the peer listener
+
+With `tls_cert` and `tls_key` the peer listener serves HTTPS (rustls, TLS 1.2 and 1.3, HTTP/1.1) and may listen on any address. Any CA may issue the certificate: a private one made for the peers, an internal company CA or a public one. Each reader trusts only the CA in its own `ca_file` for this peer, so a private CA kept for this purpose is the tightest choice.
+
+- `tls_cert` holds the PEM chain, leaf first. `tls_key` holds its PEM key (PKCS#8, PKCS#1 or SEC1) and must not be readable or writable by group or others, the same rule as the interception CA key: refused by default, loaded with a warning under `tls_key_permissions = "warn"`.
+- The certificate must not have expired and the key must match it; otherwise startup, `reiki check` and a reload fail. `reiki check` prints `peers TLS certificate valid for N more day(s)`.
+- A reload reads both files again. New contents (a renewed certificate) or new paths are swapped in without a restart and show in the reload's `changed` as `peers.tls`; connections already open keep the old certificate. Turning TLS on or off needs a restart and shows in `restart_needed` as `peers.tls`. Both files are watched like the key files, so a renewal on disk triggers the reload.
+
+A private CA and a listener certificate with openssl, for a peer reached as `10.0.6.153`:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj "/CN=reiki peers CA" -keyout peers-ca.key -out peers-ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj "/CN=ct-4" -keyout listener.key -out listener.csr
+openssl x509 -req -in listener.csr -CA peers-ca.pem -CAkey peers-ca.key -CAcreateserial \
+  -days 365 -out listener.pem \
+  -extfile <(printf 'subjectAltName=IP:10.0.6.153,DNS:ct-4\nextendedKeyUsage=serverAuth')
+chmod 600 listener.key peers-ca.key
+```
+
+Give `listener.pem` and `listener.key` to the publishing instance, and `peers-ca.pem` to each reader as its `ca_file` for that peer. Keep `peers-ca.key` off the peers.
 
 ## Publish: GET /v1/health
 
@@ -54,6 +81,7 @@ With `enabled = true` and `publish = true`, Reiki opens one more listener on `[p
 ```bash
 printf '%s' "$PEER_TOKEN" | reiki hash-token     # goes in peer_token_sha256
 curl -s -H "Authorization: Bearer $PEER_TOKEN" http://127.0.0.1:4099/v1/health
+curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://10.0.6.153:4099/v1/health
 ```
 
 ```json

@@ -19,7 +19,7 @@ use crate::auth::{
 };
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
-use crate::config::Config;
+use crate::config::{Config, PeersConfig};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
 use crate::rewrite::rewrite_body;
@@ -503,6 +503,16 @@ impl App {
             paths.push(PathBuf::from(&intercept.ca_cert));
             paths.push(PathBuf::from(&intercept.ca_key));
         }
+        if let Some((cert, key)) = snapshot
+            .config
+            .peers
+            .as_ref()
+            .filter(|peers| peers.publishing())
+            .and_then(PeersConfig::tls_files)
+        {
+            paths.push(PathBuf::from(cert));
+            paths.push(PathBuf::from(key));
+        }
         paths.extend(self.plugins().watched_paths());
         paths.sort();
         paths.dedup();
@@ -634,6 +644,22 @@ impl App {
         if peer_listen(&current.config) != peer_listen(&config) {
             restart_needed.push("peers.listen".to_owned());
         }
+        #[cfg(feature = "peers")]
+        let peer_tls = match self.peer_publisher.get() {
+            Some(publisher) => publisher
+                .plan_tls(config.peers.as_ref())
+                .map_err(|e| format!("peers: {e}"))?,
+            None => crate::peers::TlsReload::default(),
+        };
+        #[cfg(feature = "peers")]
+        {
+            if peer_tls.restart {
+                restart_needed.push("peers.tls".to_owned());
+            }
+            if peer_tls.swaps() {
+                changed.push("peers.tls".to_owned());
+            }
+        }
         let tunnel_listen = |c: &Config| c.tunnel.as_ref().map(|t| t.listen.clone());
         if tunnel_listen(&current.config) != tunnel_listen(&config) {
             restart_needed.push("tunnel.listen".to_owned());
@@ -675,6 +701,10 @@ impl App {
         *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
         if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
             tunnel.apply_reload(plan);
+        }
+        #[cfg(feature = "peers")]
+        if let Some(publisher) = self.peer_publisher.get() {
+            publisher.apply_tls(peer_tls);
         }
         Ok(crate::reload::ReloadReport {
             generation,

@@ -250,6 +250,12 @@ pub struct PeersConfig {
     pub max_subscribers_per_peer: u32,
     /// Open stream connections allowed for one peer token.
     pub max_subscribers_per_token: u32,
+    /// PEM certificate chain the peer listener serves HTTPS with; set with `tls_key`.
+    pub tls_cert: Option<String>,
+    /// PEM private key for `tls_cert`, private to its owner.
+    pub tls_key: Option<String>,
+    /// How a `tls_key` that group or others can access is treated.
+    pub tls_key_permissions: CaKeyPermissions,
     pub peers: BTreeMap<String, PeerEntry>,
 }
 
@@ -298,6 +304,12 @@ struct PeersSettings {
     max_subscribers_per_token: u32,
     #[serde(default)]
     tokens: Vec<PeerToken>,
+    #[serde(default)]
+    tls_cert: Option<String>,
+    #[serde(default)]
+    tls_key: Option<String>,
+    #[serde(default)]
+    tls_key_permissions: CaKeyPermissions,
 }
 
 fn default_max_subscribers_per_token() -> u32 {
@@ -388,6 +400,9 @@ impl TryFrom<toml::Table> for PeersConfig {
             max_subscribers: settings.max_subscribers,
             max_subscribers_per_peer: settings.max_subscribers_per_peer,
             max_subscribers_per_token: settings.max_subscribers_per_token,
+            tls_cert: settings.tls_cert,
+            tls_key: settings.tls_key,
+            tls_key_permissions: settings.tls_key_permissions,
             peers,
         })
     }
@@ -399,14 +414,24 @@ impl PeersConfig {
         self.enabled && self.publish
     }
 
+    /// The certificate and key files when the peer listener serves HTTPS.
+    pub fn tls_files(&self) -> Option<(&str, &str)> {
+        Some((self.tls_cert.as_deref()?, self.tls_key.as_deref()?))
+    }
+
     /// The `peers:` line `reiki check` prints.
     pub fn check_line(peers: Option<&Self>) -> String {
         let Some(peers) = peers.filter(|p| p.enabled) else {
             return "peers: disabled".to_owned();
         };
+        let tls = if peers.tls_files().is_some() {
+            " over https"
+        } else {
+            ""
+        };
         let publish = match (&peers.listen, peers.publish) {
             (Some(listen), true) => format!(
-                "publishing on {listen} (key labels {})",
+                "publishing on {listen}{tls} (key labels {})",
                 if peers.expose_key_labels {
                     "shown"
                 } else {
@@ -1283,6 +1308,15 @@ impl Config {
         if let Some(reason) = self.peer_tokens_problem(peers) {
             return Some(reason);
         }
+        match (&peers.tls_cert, &peers.tls_key) {
+            (Some(cert), Some(key)) if cert.trim().is_empty() || key.trim().is_empty() => {
+                return Some("tls_cert and tls_key must not be empty".to_owned());
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Some("tls_cert and tls_key go together: set both or neither".to_owned());
+            }
+            _ => {}
+        }
         for (name, peer) in &peers.peers {
             if let Some(reason) = peer_entry_problem(name, peer) {
                 return Some(reason);
@@ -1314,9 +1348,9 @@ impl Config {
         if peers.tokens.is_empty() {
             return Some("publish needs peer_token_sha256 or a [[peers.tokens]] entry".to_owned());
         }
-        if !addr.ip().is_loopback() {
+        if !addr.ip().is_loopback() && peers.tls_files().is_none() {
             return Some(format!(
-                "listen `{listen}` is not a loopback address; the peer listener serves plain HTTP"
+                "listen `{listen}` is not a loopback address; without tls_cert and tls_key the peer listener serves plain HTTP, so it may only listen on loopback"
             ));
         }
         None

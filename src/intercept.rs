@@ -56,7 +56,7 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -170,9 +170,18 @@ struct Authority {
     key_matches: bool,
 }
 
-/// Refuses, or warns about, a CA key file that its group or other users can read or write.
-#[cfg(unix)]
 fn check_key_mode(path: &str, policy: CaKeyPermissions) -> Result<(), String> {
+    check_private_key_mode("CA key", path, policy)
+}
+
+/// Refuses, or warns about, a private key file (`what`) that its group or other users can read
+/// or write.
+#[cfg(unix)]
+pub(crate) fn check_private_key_mode(
+    what: &str,
+    path: &str,
+    policy: CaKeyPermissions,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path)
         .map_err(|e| format!("cannot read {path}: {e}"))?
@@ -182,7 +191,7 @@ fn check_key_mode(path: &str, policy: CaKeyPermissions) -> Result<(), String> {
     if mode & 0o077 == 0 {
         return Ok(());
     }
-    let message = format!("CA key {path} has mode {mode:03o}; it must not be accessible to group or others (chmod 600)");
+    let message = format!("{what} {path} has mode {mode:03o}; it must not be accessible to group or others (chmod 600)");
     match policy {
         CaKeyPermissions::Error => Err(message),
         CaKeyPermissions::Warn => {
@@ -193,7 +202,11 @@ fn check_key_mode(path: &str, policy: CaKeyPermissions) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn check_key_mode(_path: &str, _policy: CaKeyPermissions) -> Result<(), String> {
+pub(crate) fn check_private_key_mode(
+    _what: &str,
+    _path: &str,
+    _policy: CaKeyPermissions,
+) -> Result<(), String> {
     Ok(())
 }
 

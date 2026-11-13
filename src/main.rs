@@ -511,6 +511,14 @@ async fn main() {
                 Err(e) => fail(&format!("intercept: {e}")),
             }
         }
+        #[cfg(feature = "peers")]
+        if let Some(peers) = config.peers.as_ref().filter(|p| p.publishing()) {
+            match reiki::peers::tls::check(peers) {
+                Ok(Some(days)) => println!("peers TLS certificate valid for {days} more day(s)"),
+                Ok(None) => {}
+                Err(e) => fail(&format!("peers: {e}")),
+            }
+        }
         for text in reiki::forward::socket_warnings(&config) {
             println!("warning: {text}");
         }
@@ -585,12 +593,11 @@ async fn main() {
             .await
             .unwrap_or_else(|e| fail(&format!("cannot bind peers {addr}: {e}")));
         tracing::info!(%addr, "reiki peer health listening");
-        let peer_router = reiki::peers::router(Arc::clone(&app));
         // Room for every stream subscriber plus plain health polls.
         let max_open = config_subscribers + 16;
-        tokio::spawn(async move {
-            reiki::serve::serve(peer_listener, peer_router, max_open, std::future::pending()).await;
-        });
+        let served = reiki::peers::serve(peer_listener, Arc::clone(&app), max_open)
+            .unwrap_or_else(|e| fail(&format!("peers: {e}")));
+        tokio::spawn(served);
     }
     if let Some(tunnel) = &tunnel_config {
         let tunnel_listener = tokio::net::TcpListener::bind(&tunnel.listen)

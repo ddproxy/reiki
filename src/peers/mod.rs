@@ -8,6 +8,8 @@ mod openapi;
 mod publisher;
 mod sessions;
 mod stream;
+pub mod tls;
 
 pub use openapi::openapi_paths;
-pub use publisher::{router, Publisher};
+pub(crate) use publisher::TlsReload;
+pub use publisher::{router, serve, Publisher};

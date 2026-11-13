@@ -1,7 +1,7 @@
 //! The peer listener: `GET /v1/health` for holders of the peer token, 404 for everything else.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -25,6 +25,24 @@ pub struct Publisher {
     logins: LoginThrottle,
     sessions: Sessions,
     hub: Arc<Hub>,
+    /// Whether the running listener serves HTTPS, set once when it starts.
+    listener_tls: OnceLock<bool>,
+    /// The certificate the HTTPS listener hands each new connection, and its fingerprint.
+    tls: RwLock<Option<(String, Arc<rustls::ServerConfig>)>>,
+}
+
+/// What a reload does to the peer listener's TLS.
+#[derive(Default)]
+pub(crate) struct TlsReload {
+    /// Switching between HTTP and HTTPS needs a new listener.
+    pub(crate) restart: bool,
+    swap: Option<super::tls::Loaded>,
+}
+
+impl TlsReload {
+    pub(crate) fn swaps(&self) -> bool {
+        self.swap.is_some()
+    }
 }
 
 impl Publisher {
@@ -33,7 +51,59 @@ impl Publisher {
             logins: LoginThrottle::new(throttle),
             sessions: Sessions::new(),
             hub: Hub::new(),
+            listener_tls: OnceLock::new(),
+            tls: RwLock::new(None),
         })
+    }
+
+    fn current_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(_, config)| Arc::clone(config))
+    }
+
+    fn set_tls(&self, loaded: super::tls::Loaded) {
+        *self.tls.write().unwrap_or_else(PoisonError::into_inner) =
+            Some((loaded.fingerprint, loaded.config));
+    }
+
+    /// Loads the TLS files a reload asks for, without applying them; an error fails the reload.
+    pub(crate) fn plan_tls(&self, next: Option<&PeersConfig>) -> Result<TlsReload, String> {
+        let Some(&running) = self.listener_tls.get() else {
+            return Ok(TlsReload::default());
+        };
+        // Stopping or moving the listener is a `peers.listen` restart already.
+        let Some(peers) = next.filter(|p| p.publishing()) else {
+            return Ok(TlsReload::default());
+        };
+        if peers.tls_files().is_some() != running {
+            return Ok(TlsReload {
+                restart: true,
+                swap: None,
+            });
+        }
+        let Some(loaded) = super::tls::load(peers)? else {
+            return Ok(TlsReload::default());
+        };
+        let same = self
+            .tls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(fingerprint, _)| *fingerprint == loaded.fingerprint);
+        Ok(TlsReload {
+            restart: false,
+            swap: (!same).then_some(loaded),
+        })
+    }
+
+    /// Hands new connections the certificate a planned reload loaded; open ones keep theirs.
+    pub(crate) fn apply_tls(&self, plan: TlsReload) {
+        if let Some(loaded) = plan.swap {
+            self.set_tls(loaded);
+        }
     }
 
     pub(crate) fn logins(&self) -> &LoginThrottle {
@@ -58,6 +128,45 @@ impl Publisher {
         let window = Duration::from_secs(peers.session_window_secs);
         self.sessions.observe(stream, id, window, Instant::now());
     }
+}
+
+/// Serves the peer listener on `listener`: HTTPS when `[peers]` has `tls_cert` and `tls_key`,
+/// plain HTTP otherwise. Fails when the certificate or key cannot be used.
+pub fn serve(
+    listener: tokio::net::TcpListener,
+    app: Arc<App>,
+    max_connections: usize,
+) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>, String> {
+    let loaded = match app.snapshot().config.peers.as_ref() {
+        Some(peers) => super::tls::load(peers)?,
+        None => None,
+    };
+    let publisher = Arc::clone(app.peer_publisher());
+    let _ = publisher.listener_tls.set(loaded.is_some());
+    let routes = router(app);
+    let shutdown = std::future::pending();
+    let Some(loaded) = loaded else {
+        return Ok(Box::pin(crate::serve::serve(
+            listener,
+            routes,
+            max_connections,
+            shutdown,
+        )));
+    };
+    let fallback = Arc::clone(&loaded.config);
+    publisher.set_tls(loaded);
+    let source: crate::serve::TlsSource = Arc::new(move || {
+        publisher
+            .current_tls()
+            .unwrap_or_else(|| Arc::clone(&fallback))
+    });
+    Ok(Box::pin(crate::serve::serve_tls(
+        listener,
+        routes,
+        max_connections,
+        source,
+        shutdown,
+    )))
 }
 
 /// The peer listener's routes, for its own socket and never the client or admin one.

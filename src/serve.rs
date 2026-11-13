@@ -1,4 +1,4 @@
-//! The HTTP listener for the client and admin sockets.
+//! The HTTP listener for the client, admin and peer sockets.
 //!
 //! `axum::serve` gives hyper no timer, so a client that never finishes its headers holds a
 //! connection open forever. This loop adds a header-read timeout and a cap on open connections.
@@ -16,6 +16,7 @@ use tower_service::Service;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serves `router` until `shutdown` completes, refusing connections beyond `max_connections`.
 pub async fn serve(
@@ -34,12 +35,54 @@ pub async fn serve(
     .await;
 }
 
+/// The server configuration a TLS listener uses for each new connection, read per connection so
+/// a reload can swap it.
+pub type TlsSource = Arc<dyn Fn() -> Arc<rustls::ServerConfig> + Send + Sync>;
+
+/// [`serve`] over TLS: every connection first completes a handshake with `tls()`.
+pub async fn serve_tls(
+    listener: TcpListener,
+    router: Router,
+    max_connections: usize,
+    tls: TlsSource,
+    shutdown: impl Future<Output = ()>,
+) {
+    run(
+        listener,
+        router,
+        max_connections,
+        HEADER_READ_TIMEOUT,
+        Some(tls),
+        shutdown,
+    )
+    .await;
+}
+
 /// [`serve`] with an explicit header-read timeout.
 pub async fn serve_with(
     listener: TcpListener,
     router: Router,
     max_connections: usize,
     header_read_timeout: Duration,
+    shutdown: impl Future<Output = ()>,
+) {
+    run(
+        listener,
+        router,
+        max_connections,
+        header_read_timeout,
+        None,
+        shutdown,
+    )
+    .await;
+}
+
+async fn run(
+    listener: TcpListener,
+    router: Router,
+    max_connections: usize,
+    header_read_timeout: Duration,
+    tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()>,
 ) {
     let slots = Arc::new(Semaphore::new(max_connections));
@@ -58,20 +101,29 @@ pub async fn serve_with(
             continue;
         };
         let router = router.clone();
+        let tls = tls.as_ref().map(|source| source());
         tokio::spawn(async move {
             let _slot = slot;
-            let service =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let mut router = router.clone();
-                    let mut req = req.map(Body::new);
-                    req.extensions_mut().insert(crate::auth::Peer(peer.ip()));
-                    async move { router.call(req).await }
-                });
-            let connection = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(header_read_timeout)
-                .serve_connection(TokioIo::new(stream), service);
-            if let Err(error) = connection.await {
+            let result = match tls {
+                None => connection(stream, router, peer, header_read_timeout).await,
+                Some(config) => {
+                    let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, accept).await {
+                        Ok(Ok(stream)) => {
+                            connection(stream, router, peer, header_read_timeout).await
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(%peer, %error, "TLS handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!(%peer, "TLS handshake timed out");
+                            return;
+                        }
+                    }
+                }
+            };
+            if let Err(error) = result {
                 tracing::debug!(%peer, %error, "connection ended with an error");
             }
         });
@@ -79,4 +131,26 @@ pub async fn serve_with(
     // Let in-flight requests finish, but not forever.
     let all = u32::try_from(max_connections).unwrap_or(u32::MAX);
     let _ = tokio::time::timeout(DRAIN_TIMEOUT, slots.acquire_many(all)).await;
+}
+
+async fn connection<IO>(
+    io: IO,
+    router: Router,
+    peer: std::net::SocketAddr,
+    header_read_timeout: Duration,
+) -> Result<(), hyper::Error>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let mut router = router.clone();
+        let mut req = req.map(Body::new);
+        req.extensions_mut().insert(crate::auth::Peer(peer.ip()));
+        async move { router.call(req).await }
+    });
+    hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .serve_connection(TokioIo::new(io), service)
+        .await
 }

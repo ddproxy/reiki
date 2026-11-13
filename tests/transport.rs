@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use async_compression::tokio::write::GzipEncoder;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -11,17 +12,28 @@ use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
 use reiki::proxy::{router, App, Secret};
+use tokio::io::AsyncWriteExt;
 
 const CLIENT_TOKEN: &str = "client-token";
 const CLIENT_ENCODING: &str = "gzip, deflate, br, zstd";
 
-#[derive(Default)]
-struct Seen(Mutex<Vec<(String, String)>>);
+struct Seen {
+    calls: Mutex<Vec<(String, String)>>,
+    /// A valid gzip stream that expands to a mebibyte of `a`, small on the wire.
+    huge: Vec<u8>,
+}
 
 impl Seen {
+    fn new(huge: Vec<u8>) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            huge,
+        }
+    }
+
     /// The `(key, accept-encoding)` of every call, in order.
     fn calls(&self) -> Vec<(String, String)> {
-        self.0.lock().unwrap().clone()
+        self.calls.lock().unwrap().clone()
     }
 }
 
@@ -64,7 +76,22 @@ async fn mock(State(seen): State<Arc<Seen>>, req: Request) -> Response {
         .trim_start_matches("Bearer ")
         .to_owned();
     let encoding = header("accept-encoding");
-    seen.0.lock().unwrap().push((key.clone(), encoding.clone()));
+    seen.calls
+        .lock()
+        .unwrap()
+        .push((key.clone(), encoding.clone()));
+
+    // A body that compresses to a tiny fraction of its expanded size.
+    if req.uri().path().ends_with("/huge") {
+        let mut builder = Response::builder().status(StatusCode::OK);
+        let body = if encoding.contains("gzip") {
+            builder = builder.header("content-encoding", "gzip");
+            seen.huge.clone()
+        } else {
+            vec![b'a'; 1024 * 1024]
+        };
+        return builder.body(Body::from(body)).unwrap();
+    }
 
     // Only compress when the caller offered it, as a real server does.
     let compress = encoding.contains("gzip");
@@ -99,7 +126,10 @@ async fn serve(router: Router) -> String {
 
 /// A relay in front of the mock. `options` goes in the upstream table.
 async fn relay(options: &str) -> (String, Arc<Seen>) {
-    let seen = Arc::new(Seen::default());
+    let mut encoder = GzipEncoder::new(Vec::new());
+    encoder.write_all(&vec![b'a'; 1024 * 1024]).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    let seen = Arc::new(Seen::new(encoder.into_inner()));
     let mock_url = serve(Router::new().fallback(mock).with_state(Arc::clone(&seen))).await;
     let text = format!(
         "[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{options}\n\
@@ -192,6 +222,43 @@ async fn forwarding_with_no_client_encoding_asks_for_identity() {
         .unwrap();
     assert_eq!(response.status(), 200);
     assert!(seen.calls().iter().all(|(_, enc)| enc == "identity"));
+}
+
+#[tokio::test]
+async fn a_compressed_body_within_the_cap_arrives_decoded() {
+    let (base, _seen) = relay("forward_accept_encoding = true\nmax_decoded_bytes = 2000000").await;
+    let response = client()
+        .post(format!("{base}/zen/huge"))
+        .bearer_auth(CLIENT_TOKEN)
+        .header("accept-encoding", CLIENT_ENCODING)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-encoding"), None);
+    assert_eq!(response.bytes().await.unwrap().len(), 1024 * 1024);
+}
+
+#[tokio::test]
+async fn a_compressed_body_past_the_decoded_cap_becomes_a_clean_502() {
+    let (base, seen) = relay("forward_accept_encoding = true\nmax_decoded_bytes = 1024").await;
+    let response = client()
+        .post(format!("{base}/zen/huge"))
+        .bearer_auth(CLIENT_TOKEN)
+        .header("accept-encoding", CLIENT_ENCODING)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    // The body expanded past a cap that its compressed form is far below. The head is
+    // replaced by an error rather than streaming a 200 and failing halfway through.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("exceeds the size limit"), "{body}");
+    assert!(body.len() < 4096, "leaked {} bytes", body.len());
+    // One successful upstream answer, so failover did not hide the limit.
+    assert_eq!(seen.calls().len(), 1);
 }
 
 #[tokio::test]

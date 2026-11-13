@@ -37,6 +37,10 @@ pub enum ConfigError {
         upstream: String,
         reason: String,
     },
+    BadUpstream {
+        upstream: String,
+        reason: String,
+    },
     PassthroughKey {
         key: String,
         upstream: String,
@@ -109,6 +113,9 @@ impl fmt::Display for ConfigError {
             }
             Self::BadForward { upstream, reason } => {
                 write!(f, "upstream `{upstream}` has an invalid forward: {reason}")
+            }
+            Self::BadUpstream { upstream, reason } => {
+                write!(f, "upstream `{upstream}` has an invalid setting: {reason}")
             }
             Self::FallbackWithoutKeys {
                 stream,
@@ -308,6 +315,17 @@ pub struct Upstream {
     /// Reiki decodes compressed responses itself so errors can still be read.
     #[serde(default)]
     pub forward_accept_encoding: bool,
+    /// Most bytes a response body may hold after decoding. An over-limit body becomes a 502
+    /// before a buffered response is sent, so a small compressed body cannot expand without bound.
+    #[serde(default = "default_max_decoded_bytes")]
+    pub max_decoded_bytes: u64,
+    /// Longest gap between response body chunks before the body is abandoned. Defaults to 300.
+    #[serde(default = "default_response_idle_timeout_secs")]
+    pub response_idle_timeout_secs: u64,
+    /// Longest the whole response body may take after its head arrives. Unset means no total
+    /// limit; the idle timeout still applies.
+    #[serde(default)]
+    pub response_timeout_secs: Option<u64>,
     /// Send header names in Title-Case (`Content-Type`) on HTTP/1.1. Ignored with `http2`.
     #[serde(default)]
     pub title_case_headers: bool,
@@ -361,6 +379,14 @@ pub struct Fallback {
     /// Applied to the request before the target upstream's own `model_aliases`; `"*"` matches any model.
     #[serde(default)]
     pub model_aliases: BTreeMap<String, String>,
+}
+
+fn default_max_decoded_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_response_idle_timeout_secs() -> u64 {
+    300
 }
 
 fn default_auth_header() -> String {
@@ -663,6 +689,24 @@ impl Config {
             }
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
+            }
+            if upstream.max_decoded_bytes == 0 {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: "max_decoded_bytes must be at least 1".to_owned(),
+                });
+            }
+            if upstream.response_idle_timeout_secs == 0 {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: "response_idle_timeout_secs must be at least 1".to_owned(),
+                });
+            }
+            if upstream.response_timeout_secs == Some(0) {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: "response_timeout_secs must be at least 1".to_owned(),
+                });
             }
             if let Some(forward) = &upstream.forward {
                 let has_command = forward.command.is_some();
@@ -973,8 +1017,58 @@ file = "/etc/reiki/keys/zen-b"
         assert_eq!(config.listen, "127.0.0.1:4097");
         assert_eq!(config.upstream["zen"].auth_header, "authorization");
         assert_eq!(config.upstream["zen"].auth_format, "Bearer {key}");
+        assert_eq!(config.upstream["zen"].max_decoded_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.upstream["zen"].response_idle_timeout_secs, 300);
+        assert_eq!(config.upstream["zen"].response_timeout_secs, None);
         assert_eq!(config.streams["client-a"].strategy, StrategyConfig::Sticky);
         assert_eq!(config.streams["client-a"].rate_limit_per_minute, None);
+    }
+
+    #[test]
+    fn an_upstream_body_cap_must_be_at_least_one_byte() {
+        let zero = base("").replace(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\nmax_decoded_bytes = 0",
+        );
+        let error = Config::parse(&zero).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::BadUpstream { ref upstream, .. } if upstream == "zen"),
+            "{error}"
+        );
+        let text = base("").replace(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\nmax_decoded_bytes = 1",
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().upstream["zen"].max_decoded_bytes,
+            1
+        );
+    }
+
+    #[test]
+    fn response_timeouts_must_be_positive() {
+        let with = |line: &str| {
+            base("").replace(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+                &format!("[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{line}"),
+            )
+        };
+        for line in [
+            "response_idle_timeout_secs = 0",
+            "response_timeout_secs = 0",
+        ] {
+            let error = Config::parse(&with(line)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::BadUpstream { ref upstream, .. } if upstream == "zen"),
+                "{line}: {error}"
+            );
+        }
+        let config = Config::parse(&with(
+            "response_idle_timeout_secs = 7\nresponse_timeout_secs = 30",
+        ))
+        .unwrap();
+        assert_eq!(config.upstream["zen"].response_idle_timeout_secs, 7);
+        assert_eq!(config.upstream["zen"].response_timeout_secs, Some(30));
     }
 
     #[test]

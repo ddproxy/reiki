@@ -787,17 +787,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         if let Some(ip) = peer {
             app.logins.succeed(ip);
         }
-        let stream = stream.to_owned();
-
-        // A stream's own rate limit is checked before any key is picked, so a
-        // rejected request never reaches the upstream or touches key health.
-        if let Some(wait) = snapshot.rate_limit_retry_after(&stream, Instant::now()) {
-            tracing::warn!(stream = %stream, "stream rate limit exceeded");
-            app.plugins()
-                .on_event(&Event::RateLimited { stream: &stream });
-            return rate_limited_response(wait);
-        }
-        stream
+        stream.to_owned()
     };
 
     let Some((upstream_name, rest)) = split_upstream(parts.uri.path()) else {
@@ -874,12 +864,6 @@ pub(crate) async fn handle_intercepted(
         (Some(name), false) => name.as_str(),
         _ => PASSTHROUGH_STREAM,
     };
-    if !upstream.passthrough {
-        if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
-            app.plugins().on_event(&Event::RateLimited { stream });
-            return rate_limited_response(wait);
-        }
-    }
     dispatch(
         app,
         &snapshot,
@@ -962,6 +946,52 @@ async fn dispatch(
     .await
 }
 
+/// Emits `RequestDone` exactly once. If the request task is dropped before it can finish
+/// (a client disconnect or an early return), it reports 499, the conventional status for a
+/// client closing the request, so plugins can release per-request accounting.
+struct RequestDone<'a> {
+    plugins: Arc<PluginChain>,
+    stream: &'a str,
+    upstream: String,
+    status: Option<u16>,
+}
+
+impl<'a> RequestDone<'a> {
+    fn new(plugins: Arc<PluginChain>, stream: &'a str, upstream: &str) -> Self {
+        Self {
+            plugins,
+            stream,
+            upstream: upstream.to_owned(),
+            status: None,
+        }
+    }
+
+    fn set_upstream(&mut self, upstream: &str) {
+        self.upstream = upstream.to_owned();
+    }
+
+    fn finish(mut self, status: u16) {
+        self.status = Some(status);
+        self.emit(status);
+    }
+
+    fn emit(&self, status: u16) {
+        self.plugins.on_event(&Event::RequestDone {
+            stream: self.stream,
+            upstream: &self.upstream,
+            status,
+        });
+    }
+}
+
+impl Drop for RequestDone<'_> {
+    fn drop(&mut self) {
+        if self.status.is_none() {
+            self.emit(499);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_inner(
     app: &App,
@@ -977,6 +1007,7 @@ async fn dispatch_inner(
     plugin_session: PluginSession,
 ) -> Response {
     let rest = rest.as_str();
+    let mut request_done = RequestDone::new(plugin_session.chain().clone(), stream, upstream_name);
     if has_path_trick(parts.uri.path()) {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1029,7 +1060,6 @@ async fn dispatch_inner(
     // bytes. reqwest sets content-length from the rewritten body on each send.
     let rewritten = rewrite_body(body.clone(), &upstream.model_aliases, &upstream.drop_params);
 
-    let mut used = upstream_name;
     let first = Forward {
         snapshot,
         stream,
@@ -1067,7 +1097,8 @@ async fn dispatch_inner(
             });
             let body = rewrite_body(body, &fallback.model_aliases, &[]);
             let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
-            used = fallback.upstream.as_str();
+            let used = fallback.upstream.as_str();
+            request_done.set_upstream(used);
             result = forward(
                 app,
                 Forward {
@@ -1095,11 +1126,7 @@ async fn dispatch_inner(
             None => exhausted(snapshot, &app.health, stream),
         },
     };
-    app.plugins().on_event(&Event::RequestDone {
-        stream,
-        upstream: used,
-        status: response.status().as_u16(),
-    });
+    request_done.finish(response.status().as_u16());
     response
 }
 
@@ -1178,6 +1205,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         let Some(secret) = snapshot.keys.get(&key_name) else {
             break;
         };
+        // Count every selected-key attempt, so a failover or fallback cannot spend more
+        // upstream calls than the stream's limit allows.
+        if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
+            tracing::warn!(stream = %stream, "stream rate limit exceeded");
+            app.plugins().on_event(&Event::RateLimited { stream });
+            return Ok(rate_limited_response(wait));
+        }
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
 
         // For a forward upstream this bounds the whole exchange, not only response headers.
@@ -1206,6 +1240,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     plugin_states.on_attempt(&key_name, None, &[]);
                     return Err(forwarder_failed(key_name, plugin_states));
                 }
+                let timed_out = failed.is_err();
+                let pre_send = matches!(&failed, Ok(Err(error)) if is_pre_send(error));
                 plugin_states.on_attempt(&key_name, None, &[]);
                 record(
                     app,
@@ -1215,6 +1251,30 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     FailureClass::Transient,
                     None,
                 );
+                // A POST or PATCH may already have reached the upstream, so replaying it
+                // could duplicate a side effect. Only a connect failure is unambiguously
+                // before the request; an explicit upstream response is handled below.
+                if !is_idempotent(&parts.method) && !pre_send {
+                    tracing::warn!(
+                        stream = %stream,
+                        key = %key_name,
+                        method = %parts.method,
+                        "not replaying a non-idempotent request after an ambiguous transport failure"
+                    );
+                    return Ok(if timed_out {
+                        json_error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "gateway_timeout",
+                            "the upstream did not answer in time",
+                        )
+                    } else {
+                        json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "bad_gateway",
+                            "the upstream could not be reached",
+                        )
+                    });
+                }
                 pending_failover = Some((key_name, FailureKind::Transient));
                 continue;
             }
@@ -1245,6 +1305,10 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 app.persist_state();
             }
             let secrets = [secret.0.as_str(), auth_value.as_str()];
+            let response = match settle_body(response).await {
+                Ok(response) => response,
+                Err(response) => return Ok(*response),
+            };
             return Ok(stream_response(
                 plugin_states,
                 &key_name,
@@ -1365,6 +1429,10 @@ async fn forward_passthrough(
             let status = response.status;
             tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version, "passed through");
             plugin_states.on_attempt(PASSTHROUGH_KEY, Some(status.as_u16()), &[]);
+            let response = match settle_body(response).await {
+                Ok(response) => response,
+                Err(response) => return Ok(*response),
+            };
             Ok(stream_response(
                 plugin_states,
                 PASSTHROUGH_KEY,
@@ -1520,6 +1588,21 @@ fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Res
     response
 }
 
+/// Methods RFC 9110 defines as idempotent, so replaying them after an ambiguous
+/// transport failure cannot duplicate a side effect.
+fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+/// True for a transport failure that happened while connecting, before any request
+/// bytes could be sent. The transports map that case to `ConnectionRefused`.
+fn is_pre_send(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ConnectionRefused
+}
+
 async fn read_limited(mut response: UpstreamResponse) -> Bytes {
     let mut collected = Vec::new();
     while let Some(Ok(chunk)) = response.chunk().await {
@@ -1530,6 +1613,47 @@ async fn read_limited(mut response: UpstreamResponse) -> Bytes {
         }
     }
     Bytes::from(collected)
+}
+
+/// True for a response the client consumes incrementally, so it must not be held back.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Reads a decoded, non-streaming body whole, so an expansion past `max_decoded_bytes`
+/// becomes a clean 502 before the client sees any of it. SSE and plain bodies keep streaming.
+async fn settle_body(response: UpstreamResponse) -> Result<UpstreamResponse, Box<Response>> {
+    if !response.is_decoded() || is_event_stream(&response.headers) {
+        return Ok(response);
+    }
+    response.buffer().await.map_err(|error| {
+        Box::new(if crate::upstream::is_body_limit_error(&error) {
+            tracing::warn!("decoded response body exceeded the configured size limit");
+            json_error(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the upstream response body exceeds the size limit",
+            )
+        } else if error.kind() == std::io::ErrorKind::TimedOut {
+            tracing::warn!(%error, "the upstream response body timed out");
+            json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "gateway_timeout",
+                "the upstream response body timed out",
+            )
+        } else {
+            tracing::warn!(%error, "could not read the decoded response body");
+            json_error(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the upstream response body could not be read",
+            )
+        })
+    })
 }
 
 /// Headers that identify the account behind a shared key, or set state in the client.
@@ -1680,6 +1804,19 @@ struct PluginBody {
     done: bool,
 }
 
+impl Drop for PluginBody {
+    fn drop(&mut self) {
+        // A client disconnect or a cancelled request drops the body before EOF. Give
+        // plugins the same final call they would get from a normal end, so counters and
+        // buffers do not leak; any bytes they would release are no longer deliverable.
+        if !self.done {
+            self.done = true;
+            let mut tail = Bytes::new();
+            self.session.on_response_chunk(&mut tail, true);
+        }
+    }
+}
+
 impl Stream for PluginBody {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -1732,6 +1869,8 @@ fn buffered_response(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::Registration;
+    use reiki_plugin::{ChunkCtx, Plugin};
 
     #[test]
     fn json_escape_produces_text_a_json_parser_gives_back_unchanged() {
@@ -1766,6 +1905,27 @@ mod tests {
         assert_eq!(split_upstream("/zen"), Some(("zen", "")));
         assert_eq!(split_upstream("/"), None);
         assert_eq!(split_upstream("//x"), None);
+    }
+
+    #[test]
+    fn only_idempotent_methods_may_replay_an_ambiguous_failure() {
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::TRACE,
+        ] {
+            assert!(is_idempotent(&method), "{method}");
+        }
+        for method in [Method::POST, Method::PATCH] {
+            assert!(!is_idempotent(&method), "{method}");
+        }
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(is_pre_send(&refused));
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        assert!(!is_pre_send(&timed_out));
     }
 
     #[test]
@@ -1953,5 +2113,117 @@ mod tests {
         assert!(to.get("openai-organization").is_none());
         assert!(to.get("set-cookie").is_none());
         assert!(to.get("x-ratelimit-remaining").is_some());
+    }
+
+    #[test]
+    fn request_done_emits_499_when_the_request_task_is_dropped() {
+        static EVENTS: Mutex<Vec<(String, String, u16)>> = Mutex::new(Vec::new());
+
+        struct Recorder;
+        impl reiki_plugin::Plugin for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+            fn on_event(&self, event: &Event<'_>) {
+                if let Event::RequestDone {
+                    stream,
+                    upstream,
+                    status,
+                } = event
+                {
+                    EVENTS.lock().unwrap().push((
+                        (*stream).to_owned(),
+                        (*upstream).to_owned(),
+                        *status,
+                    ));
+                }
+            }
+        }
+        fn chain() -> PluginChain {
+            let registry = vec![crate::plugins::Registration {
+                name: "recorder",
+                build: |_| Ok(Box::new(Recorder) as Box<dyn reiki_plugin::Plugin>),
+            }];
+            let configured: std::collections::BTreeMap<String, toml::Table> =
+                toml::from_str("[recorder]\n").unwrap();
+            PluginChain::build(&configured, &registry).unwrap()
+        }
+
+        // A task dropped before it finishes reports 499, exactly once.
+        let dropped = RequestDone::new(Arc::new(chain()), "ct", "zen");
+        drop(dropped);
+        assert_eq!(*EVENTS.lock().unwrap(), [("ct".into(), "zen".into(), 499)]);
+
+        // A finished request keeps its own status; the drop must not add another event.
+        let finished = RequestDone::new(Arc::new(chain()), "ct", "zen");
+        finished.finish(200);
+        assert_eq!(
+            *EVENTS.lock().unwrap(),
+            [
+                ("ct".to_owned(), "zen".to_owned(), 499),
+                ("ct".to_owned(), "zen".to_owned(), 200),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dropped_response_body_still_gives_plugins_their_final_chunk_call() {
+        static CHUNKS: Mutex<Vec<(Vec<u8>, bool)>> = Mutex::new(Vec::new());
+
+        struct ChunkRecorder;
+        impl Plugin for ChunkRecorder {
+            fn name(&self) -> &str {
+                "chunk-recorder"
+            }
+            fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+                CHUNKS
+                    .lock()
+                    .unwrap()
+                    .push((ctx.chunk.to_vec(), ctx.is_last));
+            }
+        }
+        let registry = vec![Registration {
+            name: "chunk-recorder",
+            build: |_| Ok(Box::new(ChunkRecorder) as Box<dyn Plugin>),
+        }];
+        let chain = Arc::new(
+            PluginChain::build(&toml::from_str("[chunk-recorder]\n").unwrap(), &registry).unwrap(),
+        );
+        let mut session = chain.session();
+        let method = Method::GET;
+        let meta = RequestMeta {
+            id: "",
+            stream: "ct",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/x",
+        };
+        let mut headers = HeaderMap::new();
+        let mut body = Bytes::new();
+        session.on_request(&meta, &mut headers, &mut body).unwrap();
+
+        // A stream that has more to give, like one cut short by a client disconnect.
+        struct Stuck;
+        impl futures_core::Stream for Stuck {
+            type Item = Result<Bytes, std::io::Error>;
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"partial"))))
+            }
+        }
+        let plugin_body = PluginBody {
+            session,
+            inner: Box::pin(Stuck),
+            done: false,
+        };
+        drop(plugin_body);
+        let seen = CHUNKS.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[(Vec::new(), true)],
+            "the disconnect must balance with exactly one final call"
+        );
     }
 }

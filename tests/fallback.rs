@@ -67,6 +67,16 @@ async fn start(fallback: &str, chain: &str) -> Rig {
 }
 
 async fn start_refusing(fallback: &str, chain: &str, status: u16, text: &'static str) -> Rig {
+    start_refusing_with_limit(fallback, chain, status, text, None).await
+}
+
+async fn start_refusing_with_limit(
+    fallback: &str,
+    chain: &str,
+    status: u16,
+    text: &'static str,
+    rate_limit: Option<u32>,
+) -> Rig {
     let zen = Arc::new(Seen::default());
     let other = Arc::new(Seen::default());
     let zen_url = serve(
@@ -81,12 +91,15 @@ async fn start_refusing(fallback: &str, chain: &str, status: u16, text: &'static
             .with_state((Arc::clone(&other), None)),
     )
     .await;
+    let limit = rate_limit
+        .map(|limit| format!("rate_limit_per_minute = {limit}\n"))
+        .unwrap_or_default();
     let text = format!(
         "[upstream.zen]\nbase_url = \"{zen_url}/v1\"\n{fallback}\n\
          [upstream.router]\nbase_url = \"{other_url}/api\"\nmodel_aliases = {{ \"mapped\" = \"final-model\" }}\n\
          [keys.z]\nupstream = \"zen\"\nfile = \"/unused/z\"\n\
          [keys.r]\nupstream = \"router\"\nfile = \"/unused/r\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = {chain}\n",
+         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = {chain}\n{limit}",
         reiki::auth::sha256_hex(CLIENT_TOKEN),
     );
     let config = Config::parse(&text).unwrap();
@@ -177,6 +190,27 @@ async fn a_refusal_from_every_key_also_falls_back() {
 
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, "{\"model\":\"final-model\"}");
+}
+
+#[tokio::test]
+async fn a_fallback_cannot_bypass_the_stream_rate_limit() {
+    let rig = start_refusing_with_limit(
+        FALLBACK,
+        "[\"z\", \"r\"]",
+        402,
+        "{\"error\":\"Insufficient account funds\"}",
+        Some(1),
+    )
+    .await;
+
+    // The failed attempt on zen spends the only allowed call, so the fallback
+    // upstream must not be reached even though it has a usable key.
+    let (status, body) = post(&rig, "{\"model\":\"a\"}").await;
+
+    assert_eq!(status, 429, "{body}");
+    assert!(body.contains("rate_limited"), "{body}");
+    assert_eq!(rig.zen.0.lock().unwrap().len(), 1);
+    assert!(rig.other.0.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

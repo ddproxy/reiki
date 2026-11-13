@@ -75,10 +75,10 @@ token_sha256 = "<sha256 of the admin token>"
 ```
 
 - A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
-- `rate_limit_per_minute` caps a stream's requests per minute. Reiki answers over-limit requests with 429 and `Retry-After` before picking a key, so the upstream and key state are untouched. The counter is in memory and resets on reload.
+- `rate_limit_per_minute` caps a stream's upstream attempts per minute. Every selected-key attempt counts, including retries and a fallback upstream. Reiki answers an over-limit attempt with 429 and `Retry-After` before sending it, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` of a JSON body and `drop_params` removes top-level keys, once before the first attempt so every key replay sends the same body. See [docs/providers.md](docs/providers.md#rewriting-the-request-body).
-- `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` tune the transport per upstream. See [docs/providers.md](docs/providers.md#transport-options).
+- `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` tune the transport per upstream, while `max_decoded_bytes`, `response_idle_timeout_secs` and `response_timeout_secs` bound response bodies. See [docs/providers.md](docs/providers.md#transport-options).
 - `[upstream.X.forward]` hands each request to a Unix socket or a spawned command that speaks HTTP/1.1; `streaming = true` relays the answer as it arrives. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
 - `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
@@ -110,11 +110,14 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 | 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
 | 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
 | 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until you rotate the key file and reload |
-| Other 5xx, connection error, timeout | Retry once on the same key, then cool it for 30 s after the second failure in a row |
+| Other 5xx | Retry once on the same key, then cool it for 30 s after the second failure in a row |
+| Connection failure before anything was sent | Retry once on the same key, whichever the method |
+| Timeout or broken connection on GET, HEAD, PUT, DELETE, OPTIONS or TRACE | Retry once on the same key |
+| Timeout or broken connection on POST or PATCH | Do not replay; answer 502, or 504 for a timeout |
 | 403 that is a CDN block page | Pass through unchanged |
 | Other 4xx | Pass through unchanged |
 
-A failed request replays on the next key as long as no response bytes have reached the client. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
+An upstream response such as a 429 or 5xx moves the request to the next key as long as no response bytes have reached the client. A transport failure is different: only an idempotent method, or any method when the connection could not be established, is replayed, so an uncertain POST or PATCH is not sent twice. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
 
 `Retry-After` is read as delta-seconds or as an HTTP-date (IMF-fixdate, such as `Sun, 06 Nov 1994 08:49:37 GMT`); a cooldown taken from it is capped at 24 h.
 

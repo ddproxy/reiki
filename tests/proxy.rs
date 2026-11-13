@@ -786,6 +786,26 @@ async fn a_limited_stream_gets_429_while_an_unlimited_one_shares_the_key_unchang
 }
 
 #[tokio::test]
+async fn a_failover_cannot_spend_more_attempts_than_the_limit_allows() {
+    let h = harness_with_limits(&one_stream(), &[("ct", 1)], Policy::default()).await;
+    // The first key fails, so the relay would normally try key b. The one allowed
+    // attempt is already spent, and key b must not be called.
+    h.mock
+        .script("up-a", vec![Reply::Status(500, "upstream broke", None)]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    let retry: u64 = res.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry >= 1, "retry-after was {retry}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("rate_limited"), "body was {body}");
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
 async fn rejects_unknown_tokens_and_unknown_upstreams_without_calling_upstream() {
     let h = harness(&one_stream(), Policy::default()).await;
     assert_eq!(
@@ -975,7 +995,7 @@ async fn rejects_a_request_body_over_the_size_limit_without_calling_upstream() {
 }
 
 #[tokio::test]
-async fn an_upstream_that_never_sends_headers_is_retried_as_a_transient_failure() {
+async fn an_idempotent_request_that_never_gets_headers_is_retried_as_a_transient_failure() {
     let h = harness_with_timeout(
         &[("ct", "tok-a", &["a"][..])],
         Policy::default(),
@@ -984,9 +1004,34 @@ async fn an_upstream_that_never_sends_headers_is_retried_as_a_transient_failure(
     .await;
     h.mock
         .script("up-a", vec![Reply::Delay(Duration::from_secs(5))]);
-    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    let res = h
+        .client
+        .get(format!("{}/zen/x", h.relay))
+        .bearer_auth("tok-a")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+#[tokio::test]
+async fn a_post_that_times_out_is_not_replayed_on_the_same_or_another_key() {
+    let h = harness_with_timeout(
+        &[("ct", "tok-a", &["a", "b"][..])],
+        Policy::default(),
+        Duration::from_millis(200),
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Delay(Duration::from_secs(5))]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    // The request may have reached the upstream, so a second key is not tried either.
+    assert_eq!(res.status(), 504);
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("gateway_timeout"), "body was {body}");
+    assert!(!body.contains("up-a"), "body leaked a key: {body}");
 }
 
 fn imf_date(epoch_secs: u64) -> String {

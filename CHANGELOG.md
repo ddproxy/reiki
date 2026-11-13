@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- An optional `[peers]` table for health sharing between instances, behind a new `peers` cargo feature that is in the default set. It is off unless `enabled = true`: without the table, or with it disabled, no listener is opened, no peer is contacted, and `/status` and `/v1/openapi.json` are unchanged (golden and socket-table tests check this). A binary built without the feature refuses a `[peers]` table. See [peers](docs/peers.md).
+- `[peers]` validation: unknown keys are refused, publishing needs its own loopback `listen` and a `peer_token_sha256` that differs from the admin token and every stream token, and a peer `url` must be https with a `ca_file`, or http on loopback.
+- `reiki check` prints a `peers:` line with the effective settings, or `peers: disabled`.
+
 ## 0.8.2
 
 ### Added

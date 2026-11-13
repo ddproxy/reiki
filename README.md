@@ -81,6 +81,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` tune the transport per upstream, while `max_decoded_bytes`, `response_idle_timeout_secs` and `response_timeout_secs` bound response bodies. See [docs/providers.md](docs/providers.md#transport-options).
 - `[upstream.X.forward]` hands each request to a Unix socket or a spawned command that speaks HTTP/1.1; `streaming = true` relays the answer as it arrives. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
+- `[peers]` (off by default) shares a read-only key-health summary between instances. See [docs/peers.md](docs/peers.md).
 - `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
 - `[reload]` with `watch = true` reloads the config when the config or key files change, so a deploy only has to write the file. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).
 - `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).

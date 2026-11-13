@@ -464,6 +464,14 @@ async fn main() {
     if admin_listen.as_deref() == Some(listen.as_str()) {
         fail("admin listen must differ from the client listen address");
     }
+    let peer_listen = config
+        .peers
+        .as_ref()
+        .filter(|peers| peers.publishing())
+        .and_then(|peers| peers.listen.clone());
+    if peer_listen.as_deref() == Some(listen.as_str()) {
+        fail("peers listen must differ from the client listen address");
+    }
 
     if let Some(Command::Check) = cli.command {
         if let Some(intercept) = config.tunnel.as_ref().and_then(|t| t.intercept.as_ref()) {
@@ -503,6 +511,10 @@ async fn main() {
         } else {
             format!(", {} plugin(s)[{}]", names.len(), names.join(", "))
         };
+        println!(
+            "{}",
+            reiki::config::PeersConfig::check_line(config.peers.as_ref())
+        );
         println!(
             "ok: {} upstream(s), {} key(s), {} stream(s){plugin_part}, listening on {listen}{admin}",
             config.upstream.len(),

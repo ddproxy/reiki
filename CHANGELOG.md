@@ -8,6 +8,8 @@
 
 - `reiki_plugin_rejections_total{plugin,stream}` counts requests a plugin rejected, or skipped under `on_error = "reject"`. The plugin API gains `Event::PluginRejected`.
 
+- `hold_unauthorized = true` on an upstream (default `false`) holds the disable of the first key that answers 401 until a later key serves the same request, so a request every key refuses cannot take a good key out of rotation.
+
 ### Fixed
 
 - `requestlog` keeps writing to the current file when a log rotation fails (a rename error), warns once and retries after a growing pause. The failed record used to be lost and every record retried the rotation.

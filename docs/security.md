@@ -56,7 +56,7 @@ Plugins are compiled into the binary and run inside the Reiki process, so a plug
 - A stream's `rate_limit_per_minute`, when set, caps that stream's upstream attempts. Every selected-key attempt counts, including retries and a fallback upstream, so a failover cannot spend more calls than the limit allows. A rejected attempt does not reach the upstream or change key health.
 - The optional admin listener (`[admin]`) is a second socket guarded by its own bearer token, compared by hash in constant time. Keep it on loopback. It exposes key names, upstream names and stream routing, but never key values, token hashes or file paths.
 
-**Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
+**Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. With `hold_unauthorized = true` on the upstream, the disable waits until a later key serves the same request, so a request that every key refuses disables none. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
 
 ## Hardening
 

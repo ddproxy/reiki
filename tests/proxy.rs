@@ -653,6 +653,24 @@ async fn a_request_body_that_stalls_is_timed_out() {
 }
 
 #[tokio::test]
+async fn without_hold_unauthorized_the_first_refusing_key_is_disabled_at_once() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    h.mock
+        .script("up-b", vec![Reply::Status(401, "invalid api key", None)]);
+    h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    h.mock.script(
+        "up-b",
+        vec![Reply::Status(429, "slow down", Some(("retry-after", "45")))],
+    );
+    let res = h.post("tok-a", "/zen/x", "3").send().await.unwrap();
+    assert_ne!(res.status(), 200, "the first key is out of rotation");
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b", "up-b"]);
+}
+
+#[tokio::test]
 async fn one_request_disables_at_most_one_key() {
     let h = harness(&one_stream(), Policy::default()).await;
     h.mock
@@ -668,6 +686,68 @@ async fn one_request_disables_at_most_one_key() {
     // Only the first key was disabled, so the second still serves the next request.
     let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
     assert_eq!(res.status(), 200);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
+}
+
+#[tokio::test]
+async fn hold_unauthorized_keeps_a_key_in_rotation_when_every_key_refuses_the_request() {
+    let h = harness_with_upstream(
+        &one_stream(),
+        "hold_unauthorized = true\n",
+        Policy::default(),
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    h.mock
+        .script("up-b", vec![Reply::Status(401, "invalid api key", None)]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(
+        res.status(),
+        401,
+        "the upstream's own answer is handed back"
+    );
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    // With the second key cooling, the first still serves: it was never disabled.
+    h.mock.script(
+        "up-b",
+        vec![Reply::Status(429, "slow down", Some(("retry-after", "45")))],
+    );
+    let res = h.post("tok-a", "/zen/x", "3").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a", "up-b", "up-b", "up-b", "up-a"]
+    );
+}
+
+#[tokio::test]
+async fn hold_unauthorized_disables_the_key_once_a_later_key_serves_the_request() {
+    let h = harness_with_upstream(
+        &one_stream(),
+        "hold_unauthorized = true\n",
+        Policy::default(),
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
 }
 

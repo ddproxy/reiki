@@ -87,6 +87,17 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Read each `[peers.<name>]` instance's `/v1/health` and print what it reports.
+    ///
+    /// A peer that cannot be reached, refuses the token or answers with data older than three
+    /// poll intervals shows as `unknown`. Exits 0 when a peer gave fresh data, 1 when none did and
+    /// 2 on a config problem.
+    #[cfg(feature = "peers")]
+    Peers {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -412,6 +423,17 @@ async fn main() {
         std::process::exit(
             run_keys(&cli.config, url.as_deref(), token_file.as_deref(), *json).await,
         );
+    }
+    #[cfg(feature = "peers")]
+    if let Some(Command::Peers { json }) = &cli.command {
+        let config = std::fs::read_to_string(&cli.config)
+            .map_err(|e| format!("cannot read {}: {e}", cli.config.display()))
+            .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")));
+        let config = config.unwrap_or_else(|e| {
+            eprintln!("reiki: {e}");
+            std::process::exit(2);
+        });
+        std::process::exit(reiki::peers::client::run(config.peers.as_ref(), *json).await);
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();

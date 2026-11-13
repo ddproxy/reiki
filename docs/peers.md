@@ -97,6 +97,29 @@ The summary is coarse, but it still tells a reader which of this instance's upst
 
 The route is listed in the admin `GET /v1/openapi.json` while publishing, with the peer listener as its `servers` entry and a separate `peerAuth` security scheme. Without publishing the document is unchanged.
 
+## Read: reiki peers
+
+`reiki peers` fetches `/v1/health` from every `[peers.<name>]` in the config and prints one row per peer upstream:
+
+```bash
+reiki peers                 # table
+reiki peers --json          # {"peers":[{"name","state","error","instance","age_seconds","upstreams"}]}
+```
+
+```text
+PEER  INSTANCE  UPSTREAM  STATE    HEALTHY  COOLING  DISABLED  WAIT  AGE
+ct-4  ct-4      zen       cooling  0        1        0         42s   3s
+ct-5  -         -         unknown  -        -        -         -     -
+```
+
+- It needs `[peers] enabled = true` and at least one peer. Nothing else in the config is used, and the proxy itself never reads peer data.
+- Each peer gets its own HTTP client. The built-in and system roots are off, so only the certificates in that peer's `ca_file` are trusted for it (put two in the file to overlap a CA rotation). The provider clients are never touched, so a peer CA can never vouch for a provider. Proxies from the environment are ignored.
+- Only the peer token from `token_file` is sent, as `Authorization: Bearer`. A token file that its group or others can read is refused before any request; keep it mode 0600.
+- Redirects are not followed: a 3xx is a failure, so the token never goes to a second host. Each fetch has 5 s to finish, connect included, and a body over 64 KiB is refused rather than cut.
+- A peer shows as `unknown`, with no counts, when it cannot be reached, fails the TLS check, refuses the token, answers anything but 200, sends a body that is too big or not a health document, or reports an `observed_at` more than three `poll_interval_secs` away from this host's clock (in either direction). The reason goes to stderr. Unknown never means healthy.
+- `STATE` is `ok` while a key is usable, else `cooling`, `disabled` or `no_keys`. `WAIT` is `soonest_cooldown_seconds` and `AGE` the age of the data.
+- Exit status: 0 when at least one peer gave fresh data, 1 when none did, 2 on a config problem.
+
 ## Check
 
 `reiki check` prints a `peers:` line: `peers: disabled`, or the effective settings, for example `peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 1 peer(s)[ct-4], poll every 30s`.

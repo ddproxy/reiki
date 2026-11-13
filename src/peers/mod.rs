@@ -1,6 +1,7 @@
 //! Health sharing between Reiki instances, only built with the `peers` feature and only active
 //! with an enabled `[peers]` table.
 
+pub mod client;
 mod health;
 mod host;
 mod openapi;

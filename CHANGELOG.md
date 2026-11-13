@@ -11,6 +11,7 @@
 - `[peers] instance` names the published instance; the host name otherwise. Changing the peer listener shows as `peers.listen` in a reload's `restart_needed`.
 - `[peers] expose_host_stats` (off by default) adds `host` (load average, cores, memory and swap, disk use per role for the config, state, log and request log directories, never paths) and `sessions` to `/v1/health`. `active_sessions` counts distinct values of `session_header` (default `x-opencode-session`) over `session_window_secs` (default 300), once per client request, kept only as salted hashes in a bounded table. A per-stream breakdown needs `expose_key_labels` too.
 - The `peers` feature adds the `rustix` crate (unix only) for `statvfs`.
+- `reiki peers` (and `--json`) reads `/v1/health` from each `[peers.<name>]`. Every peer gets its own client that trusts only its `ca_file`, sends only the peer bearer token, follows no redirect, gives up after 5 s and refuses a body over 64 KiB. A failure, or data more than three poll intervals old, shows as `unknown` and never as healthy. It exits 1 when no peer gave fresh data. A token file that group or others can read is refused.
 
 ## 0.8.2
 

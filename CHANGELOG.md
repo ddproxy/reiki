@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- An optional `[peers]` table for health sharing between instances, behind a new `peers` cargo feature that is in the default set. It is off unless `enabled = true`: without the table, or with it disabled, no listener is opened, no peer is contacted, and `/status` and `/v1/openapi.json` are unchanged (golden and socket-table tests check this). A binary built without the feature refuses a `[peers]` table. See [peers](docs/peers.md).
+- `[peers]` validation: unknown keys are refused, publishing needs its own loopback `listen` and a `peer_token_sha256` that differs from the admin token and every stream token, and a peer `url` must be https with a `ca_file`, or http on loopback.
+- `reiki check` prints a `peers:` line with the effective settings, or `peers: disabled`.
+- `GET /v1/health` on a separate peer listener (`[peers] listen`), served only with `enabled` and `publish`. Per upstream it reports `healthy_keys`, `cooling_keys`, `disabled_keys`, `soonest_cooldown_seconds` and `last_status_class`, plus `instance` and `observed_at`; key labels only with `expose_key_labels`. Only the peer bearer token opens it, failures are logged with the peer address and throttled per address with counts of their own, and every other path is 404. The route is in `/v1/openapi.json` while publishing, with the peer listener as its server and a `peerAuth` scheme.
+- `[peers] instance` names the published instance; the host name otherwise. Changing the peer listener shows as `peers.listen` in a reload's `restart_needed`.
+- `[peers] expose_host_stats` (off by default) adds `host` (load average, cores, memory and swap, disk use per role for the config, state, log and request log directories, never paths) and `sessions` to `/v1/health`. `active_sessions` counts distinct values of `session_header` (default `x-opencode-session`) over `session_window_secs` (default 300), once per client request, kept only as salted hashes in a bounded table. A per-stream breakdown needs `expose_key_labels` too.
+- The `peers` feature adds the `rustix` crate (unix only) for `statvfs`.
+- `reiki peers` (and `--json`) reads `/v1/health` from each `[peers.<name>]`. Every peer gets its own client that trusts only its `ca_file`, sends only the peer bearer token, follows no redirect, gives up after 5 s and refuses a body over 64 KiB. A failure, or data more than three poll intervals old, shows as `unknown` and never as healthy. It exits 1 when no peer gave fresh data. A token file that group or others can read is refused.
+- `GET /v1/health/stream` on the peer listener, with the same token: Server-Sent Events with a `snapshot` on connect, `key` when an upstream's key counts or states change, `host` every `stream_interval_secs` (default 5) and `sessions` on change with `expose_host_stats`, and a heartbeat comment every 15 s. Events go through one bounded broadcast; a subscriber that stops reading is dropped. `max_subscribers` (default 16) and `max_subscribers_per_peer` (default 4) cap open streams. In `/v1/openapi.json` while publishing.
+- `reiki peers --watch` follows each peer's stream and reprints on every change, polling `/v1/health` while a stream is down.
+
 ## 0.8.3
 
 ### Fixed

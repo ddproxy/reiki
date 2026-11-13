@@ -117,12 +117,28 @@ async fn openapi(
         format!("{V1}/openapi.json"),
         serde_json::json!({"get": operation("This document")}),
     );
-    let document = serde_json::json!({
+    #[cfg(feature = "peers")]
+    let peer_routes = crate::peers::openapi_paths(&app.snapshot().config);
+    #[cfg(feature = "peers")]
+    paths.extend(
+        peer_routes
+            .iter()
+            .map(|(p, item)| (p.clone(), item.clone())),
+    );
+    #[allow(unused_mut)]
+    let mut document = serde_json::json!({
         "openapi": "3.1.0",
         "info": {"title": "Reiki admin API", "version": VERSION},
         "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
         "paths": paths,
     });
+    #[cfg(feature = "peers")]
+    if !peer_routes.is_empty() {
+        document["components"]["securitySchemes"]["peerAuth"] = serde_json::json!({
+            "type": "http", "scheme": "bearer",
+            "description": "The read-only peer token; accepted on the peer listener only",
+        });
+    }
     text_response(StatusCode::OK, "application/json", document.to_string())
 }
 
@@ -393,19 +409,19 @@ fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
 
 /// The credential of an `Authorization: Bearer <token>` value. The scheme name is
 /// case-insensitive.
-fn bearer_token(value: &str) -> Option<&str> {
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
-fn unauthorized() -> Response {
+pub(crate) fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response
 }
 
 /// A refused client waiting out a login lockout, with the remaining seconds.
-fn throttled(wait: Duration) -> Response {
+pub(crate) fn throttled(wait: Duration) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
@@ -415,7 +431,11 @@ fn throttled(wait: Duration) -> Response {
     response
 }
 
-fn text_response(status: StatusCode, content_type: &'static str, body: String) -> Response {
+pub(crate) fn text_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Response {
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response

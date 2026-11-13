@@ -248,6 +248,9 @@ pub struct App {
     /// Write-held while a reload swaps the snapshot, plugin chain and tunnel policy; a request
     /// takes its snapshot and plugin session under a read hold so it sees one config.
     swap: std::sync::RwLock<()>,
+    /// Set only when the peer listener is started.
+    #[cfg(feature = "peers")]
+    peer_publisher: OnceLock<Arc<crate::peers::Publisher>>,
 }
 
 impl App {
@@ -297,6 +300,8 @@ impl App {
             reload_state: Mutex::new(crate::reload::ReloadState::new()),
             reload_lock: Mutex::new(()),
             swap: std::sync::RwLock::new(()),
+            #[cfg(feature = "peers")]
+            peer_publisher: OnceLock::new(),
         })
     }
 
@@ -343,6 +348,25 @@ impl App {
         &self.admin_logins
     }
 
+    /// The peer publisher, created on first use by the peer listener.
+    #[cfg(feature = "peers")]
+    pub(crate) fn peer_publisher(&self) -> &Arc<crate::peers::Publisher> {
+        self.peer_publisher.get_or_init(|| {
+            let throttle = ThrottleSettings::from(&self.snapshot().config.auth);
+            crate::peers::Publisher::new(throttle)
+        })
+    }
+
+    #[cfg(feature = "peers")]
+    pub(crate) fn config_path(&self) -> Option<&PathBuf> {
+        self.config_path.get()
+    }
+
+    #[cfg(feature = "peers")]
+    pub(crate) fn state_path(&self) -> Option<&PathBuf> {
+        self.state_path.get()
+    }
+
     /// Point the app at the file it persists key health in. Set once at startup.
     pub fn set_state_path(&self, path: PathBuf) {
         let _ = self.state_path.set(path);
@@ -367,7 +391,7 @@ impl App {
         let _ = self.wall_clock.set(now);
     }
 
-    fn wall_now(&self) -> SystemTime {
+    pub(crate) fn wall_now(&self) -> SystemTime {
         self.wall_clock
             .get()
             .copied()
@@ -448,6 +472,10 @@ impl App {
         *current = next;
         self.logins.configure(throttle);
         self.admin_logins.configure(throttle);
+        #[cfg(feature = "peers")]
+        if let Some(publisher) = self.peer_publisher.get() {
+            publisher.logins().configure(throttle);
+        }
     }
 
     /// Hands the app the running tunnel so a reload can change its policy.
@@ -596,6 +624,15 @@ impl App {
         let admin_listen = |c: &Config| c.admin.as_ref().map(|a| a.listen.clone());
         if admin_listen(&current.config) != admin_listen(&config) {
             restart_needed.push("admin.listen".to_owned());
+        }
+        let peer_listen = |c: &Config| {
+            c.peers
+                .as_ref()
+                .filter(|p| p.publishing())
+                .and_then(|p| p.listen.clone())
+        };
+        if peer_listen(&current.config) != peer_listen(&config) {
+            restart_needed.push("peers.listen".to_owned());
         }
         let tunnel_listen = |c: &Config| c.tunnel.as_ref().map(|t| t.listen.clone());
         if tunnel_listen(&current.config) != tunnel_listen(&config) {
@@ -959,6 +996,12 @@ async fn dispatch(
     plugin_session: PluginSession,
 ) -> Response {
     use tracing::Instrument;
+    #[cfg(feature = "peers")]
+    if let (Some(publisher), Some(peers)) = (app.peer_publisher.get(), &snapshot.config.peers) {
+        if stream != PASSTHROUGH_STREAM {
+            publisher.observe_session(peers, stream, &parts.headers);
+        }
+    }
     let id = reiki_plugin::new_request_id();
     let span = tracing::info_span!("req", id = %id);
     dispatch_inner(

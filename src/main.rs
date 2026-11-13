@@ -87,6 +87,21 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Read each `[peers.<name>]` instance's `/v1/health` and print what it reports.
+    ///
+    /// A peer that cannot be reached, refuses the token or answers with data older than three
+    /// poll intervals shows as `unknown`. Exits 0 when a peer gave fresh data, 1 when none did and
+    /// 2 on a config problem.
+    #[cfg(feature = "peers")]
+    Peers {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Follow each peer's `/v1/health/stream` and print on every change, polling while a
+        /// stream is down.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -413,6 +428,17 @@ async fn main() {
             run_keys(&cli.config, url.as_deref(), token_file.as_deref(), *json).await,
         );
     }
+    #[cfg(feature = "peers")]
+    if let Some(Command::Peers { json, watch }) = &cli.command {
+        let config = std::fs::read_to_string(&cli.config)
+            .map_err(|e| format!("cannot read {}: {e}", cli.config.display()))
+            .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")));
+        let config = config.unwrap_or_else(|e| {
+            eprintln!("reiki: {e}");
+            std::process::exit(2);
+        });
+        std::process::exit(reiki::peers::client::run(config.peers.as_ref(), *json, *watch).await);
+    }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();
         if std::io::stdin().read_to_string(&mut token).is_err() {
@@ -464,6 +490,19 @@ async fn main() {
     if admin_listen.as_deref() == Some(listen.as_str()) {
         fail("admin listen must differ from the client listen address");
     }
+    let peer_listen = config
+        .peers
+        .as_ref()
+        .filter(|peers| peers.publishing())
+        .and_then(|peers| peers.listen.clone());
+    #[cfg(feature = "peers")]
+    let config_subscribers = config
+        .peers
+        .as_ref()
+        .map_or(0, |peers| peers.max_subscribers as usize);
+    if peer_listen.as_deref() == Some(listen.as_str()) {
+        fail("peers listen must differ from the client listen address");
+    }
 
     if let Some(Command::Check) = cli.command {
         if let Some(intercept) = config.tunnel.as_ref().and_then(|t| t.intercept.as_ref()) {
@@ -504,6 +543,10 @@ async fn main() {
             format!(", {} plugin(s)[{}]", names.len(), names.join(", "))
         };
         println!(
+            "{}",
+            reiki::config::PeersConfig::check_line(config.peers.as_ref())
+        );
+        println!(
             "ok: {} upstream(s), {} key(s), {} stream(s){plugin_part}, listening on {listen}{admin}",
             config.upstream.len(),
             keys.len(),
@@ -534,6 +577,19 @@ async fn main() {
         let admin_router = reiki::admin::router(Arc::clone(&app));
         tokio::spawn(async move {
             reiki::serve::serve(admin_listener, admin_router, 64, std::future::pending()).await;
+        });
+    }
+    #[cfg(feature = "peers")]
+    if let Some(addr) = &peer_listen {
+        let peer_listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| fail(&format!("cannot bind peers {addr}: {e}")));
+        tracing::info!(%addr, "reiki peer health listening");
+        let peer_router = reiki::peers::router(Arc::clone(&app));
+        // Room for every stream subscriber plus plain health polls.
+        let max_open = config_subscribers + 16;
+        tokio::spawn(async move {
+            reiki::serve::serve(peer_listener, peer_router, max_open, std::future::pending()).await;
         });
     }
     if let Some(tunnel) = &tunnel_config {

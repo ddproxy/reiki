@@ -58,6 +58,7 @@ pub enum ConfigError {
     BadLog(String),
     BadReload(String),
     BadAuth(String),
+    BadPeers(String),
     UnknownPlugin {
         name: String,
         known: Vec<String>,
@@ -151,6 +152,7 @@ impl fmt::Display for ConfigError {
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
             Self::BadReload(reason) => write!(f, "invalid [reload]: {reason}"),
             Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
+            Self::BadPeers(reason) => write!(f, "invalid [peers]: {reason}"),
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -209,6 +211,192 @@ pub struct Config {
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
     pub plugins: BTreeMap<String, toml::Table>,
+    /// Health sharing between Reiki instances; absent means off.
+    #[serde(default)]
+    pub peers: Option<PeersConfig>,
+}
+
+/// `[peers]`: scalar keys are settings, each `[peers.<name>]` sub-table is a peer to read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "toml::Table")]
+pub struct PeersConfig {
+    /// Master switch, so the table can exist and do nothing.
+    pub enabled: bool,
+    /// Serve `GET /v1/health` on `listen` to holders of the peer token.
+    pub publish: bool,
+    /// Address of the peer listener, never the client, admin or tunnel one.
+    pub listen: Option<String>,
+    /// SHA-256 of the read-only peer token, required to publish.
+    pub peer_token_sha256: Option<String>,
+    /// Name published as `instance`; the host name when unset.
+    pub instance: Option<String>,
+    /// Reader poll period; data older than three of them counts as unknown.
+    pub poll_interval_secs: u64,
+    /// Publish per-key labels and states, not only counts per upstream.
+    pub expose_key_labels: bool,
+    /// Publish load, memory, disk use and active sessions.
+    pub expose_host_stats: bool,
+    /// Client header whose distinct values count as active sessions.
+    pub session_header: String,
+    /// How long a session id counts as active after its last request.
+    pub session_window_secs: u64,
+    /// Period of `host` events on `/v1/health/stream`.
+    pub stream_interval_secs: u64,
+    /// Open `/v1/health/stream` connections allowed at once.
+    pub max_subscribers: u32,
+    /// Open stream connections allowed from one client address.
+    pub max_subscribers_per_peer: u32,
+    pub peers: BTreeMap<String, PeerEntry>,
+}
+
+/// Kept apart from the peer sub-tables so a misspelt setting is refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeersSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    publish: bool,
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    peer_token_sha256: Option<String>,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default = "default_poll_interval_secs")]
+    poll_interval_secs: u64,
+    #[serde(default)]
+    expose_key_labels: bool,
+    #[serde(default)]
+    expose_host_stats: bool,
+    #[serde(default = "default_session_header")]
+    session_header: String,
+    #[serde(default = "default_session_window_secs")]
+    session_window_secs: u64,
+    #[serde(default = "default_stream_interval_secs")]
+    stream_interval_secs: u64,
+    #[serde(default = "default_max_subscribers")]
+    max_subscribers: u32,
+    #[serde(default = "default_max_subscribers_per_peer")]
+    max_subscribers_per_peer: u32,
+}
+
+fn default_stream_interval_secs() -> u64 {
+    5
+}
+
+fn default_max_subscribers() -> u32 {
+    16
+}
+
+fn default_max_subscribers_per_peer() -> u32 {
+    4
+}
+
+fn default_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_session_header() -> String {
+    "x-opencode-session".to_owned()
+}
+
+fn default_session_window_secs() -> u64 {
+    300
+}
+
+/// One `[peers.<name>]`: another instance whose health `reiki peers` reads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEntry {
+    /// Base URL of the peer listener: https, or http on loopback only.
+    pub url: String,
+    /// File holding the token that peer issued to this instance.
+    pub token_file: String,
+    /// PEM CA certificates trusted for this peer and nothing else; required for https.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+}
+
+impl TryFrom<toml::Table> for PeersConfig {
+    type Error = String;
+
+    fn try_from(mut table: toml::Table) -> Result<Self, Self::Error> {
+        let names: Vec<String> = table
+            .iter()
+            .filter(|(_, value)| value.is_table())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut peers = BTreeMap::new();
+        for name in names {
+            let Some(value) = table.remove(&name) else {
+                continue;
+            };
+            let entry: PeerEntry = value
+                .try_into()
+                .map_err(|e| format!("[peers.{name}]: {e}"))?;
+            peers.insert(name, entry);
+        }
+        let settings: PeersSettings = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e| format!("[peers]: {e}"))?;
+        Ok(Self {
+            enabled: settings.enabled,
+            publish: settings.publish,
+            listen: settings.listen,
+            peer_token_sha256: settings.peer_token_sha256,
+            instance: settings.instance,
+            poll_interval_secs: settings.poll_interval_secs,
+            expose_key_labels: settings.expose_key_labels,
+            expose_host_stats: settings.expose_host_stats,
+            session_header: settings.session_header,
+            session_window_secs: settings.session_window_secs,
+            stream_interval_secs: settings.stream_interval_secs,
+            max_subscribers: settings.max_subscribers,
+            max_subscribers_per_peer: settings.max_subscribers_per_peer,
+            peers,
+        })
+    }
+}
+
+impl PeersConfig {
+    /// True when the peer listener should run and answer.
+    pub fn publishing(&self) -> bool {
+        self.enabled && self.publish
+    }
+
+    /// The `peers:` line `reiki check` prints.
+    pub fn check_line(peers: Option<&Self>) -> String {
+        let Some(peers) = peers.filter(|p| p.enabled) else {
+            return "peers: disabled".to_owned();
+        };
+        let publish = match (&peers.listen, peers.publish) {
+            (Some(listen), true) => format!(
+                "publishing on {listen} (key labels {})",
+                if peers.expose_key_labels {
+                    "shown"
+                } else {
+                    "hidden"
+                }
+            ),
+            _ => "not publishing".to_owned(),
+        };
+        let names = peers.peers.keys().cloned().collect::<Vec<_>>();
+        let host = if peers.expose_host_stats {
+            format!(
+                ", host stats and sessions from `{}` over {}s",
+                peers.session_header, peers.session_window_secs
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "peers: enabled, {publish}, {} peer(s)[{}], poll every {}s{host}",
+            names.len(),
+            names.join(", "),
+            peers.poll_interval_secs
+        )
+    }
 }
 
 /// Reiki's service log, not the request log plugin.
@@ -977,8 +1165,210 @@ impl Config {
                 self.auth.window_secs
             )));
         }
+        if let Some(peers) = &self.peers {
+            if let Some(reason) = self.peers_problem(peers) {
+                return Err(ConfigError::BadPeers(reason));
+            }
+        }
         Ok(())
     }
+
+    /// What is wrong with a `[peers]` table, if anything.
+    fn peers_problem(&self, peers: &PeersConfig) -> Option<String> {
+        if cfg!(not(feature = "peers")) {
+            return Some(
+                "this binary was built without the `peers` feature; remove [peers] or rebuild with it"
+                    .to_owned(),
+            );
+        }
+        if !(1..=86_400).contains(&peers.poll_interval_secs) {
+            return Some(format!(
+                "poll_interval_secs must be between 1 and 86400, got {}",
+                peers.poll_interval_secs
+            ));
+        }
+        if !(10..=86_400).contains(&peers.session_window_secs) {
+            return Some(format!(
+                "session_window_secs must be between 10 and 86400, got {}",
+                peers.session_window_secs
+            ));
+        }
+        if !(1..=3600).contains(&peers.stream_interval_secs) {
+            return Some(format!(
+                "stream_interval_secs must be between 1 and 3600, got {}",
+                peers.stream_interval_secs
+            ));
+        }
+        if !(1..=256).contains(&peers.max_subscribers) {
+            return Some(format!(
+                "max_subscribers must be between 1 and 256, got {}",
+                peers.max_subscribers
+            ));
+        }
+        if !(1..=peers.max_subscribers).contains(&peers.max_subscribers_per_peer) {
+            return Some(format!(
+                "max_subscribers_per_peer must be between 1 and max_subscribers ({}), got {}",
+                peers.max_subscribers, peers.max_subscribers_per_peer
+            ));
+        }
+        let header = peers.session_header.as_str();
+        if axum::http::HeaderName::from_bytes(header.as_bytes())
+            .map_or(true, |name| name.as_str() != header)
+        {
+            return Some(format!(
+                "session_header `{header}` must be a lowercase header name"
+            ));
+        }
+        if matches!(
+            header,
+            "authorization" | "proxy-authorization" | "cookie" | "x-api-key" | "x-goog-api-key"
+        ) {
+            return Some(format!(
+                "session_header `{header}` carries credentials and cannot count sessions"
+            ));
+        }
+        if let Some(instance) = &peers.instance {
+            if !valid_peer_name(instance) {
+                return Some(format!(
+                    "instance `{instance}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
+                ));
+            }
+        }
+        if let Some(hash) = &peers.peer_token_sha256 {
+            if let Some(reason) = self.peer_token_problem(hash) {
+                return Some(reason);
+            }
+        }
+        for (name, peer) in &peers.peers {
+            if let Some(reason) = peer_entry_problem(name, peer) {
+                return Some(reason);
+            }
+        }
+        if !peers.publishing() {
+            return None;
+        }
+        let Some(listen) = &peers.listen else {
+            return Some("publish needs a listen address".to_owned());
+        };
+        let Ok(addr) = listen.parse::<std::net::SocketAddr>() else {
+            return Some(format!("listen `{listen}` is not an IP:port address"));
+        };
+        let others = [
+            Some(self.listen.as_str()),
+            self.admin.as_ref().map(|a| a.listen.as_str()),
+            self.tunnel.as_ref().map(|t| t.listen.as_str()),
+        ];
+        if others
+            .into_iter()
+            .flatten()
+            .any(|other| same_listener(other, addr))
+        {
+            return Some(
+                "listen must differ from the client, admin and tunnel listen addresses".to_owned(),
+            );
+        }
+        if peers.peer_token_sha256.is_none() {
+            return Some("publish needs peer_token_sha256".to_owned());
+        }
+        if !addr.ip().is_loopback() {
+            return Some(format!(
+                "listen `{listen}` is not a loopback address; the peer listener serves plain HTTP"
+            ));
+        }
+        None
+    }
+
+    /// Why a peer token hash cannot be used: wrong shape, or shared with a stronger credential.
+    fn peer_token_problem(&self, hash: &str) -> Option<String> {
+        if !is_sha256_hex(hash) {
+            return Some("peer_token_sha256 is not 64 hex characters".to_owned());
+        }
+        let hash = hash.to_ascii_lowercase();
+        if self
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.token_sha256.to_ascii_lowercase() == hash)
+        {
+            return Some("peer_token_sha256 is the same as the admin token".to_owned());
+        }
+        if let Some((name, _)) = self
+            .streams
+            .iter()
+            .find(|(_, stream)| stream.token_sha256.to_ascii_lowercase() == hash)
+        {
+            return Some(format!(
+                "peer_token_sha256 is the same as the token of stream `{name}`"
+            ));
+        }
+        None
+    }
+}
+
+/// True when the configured address `other` would bind the same socket as `addr`; port 0 asks
+/// the system for a free port, so two of those never collide.
+fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match other.parse::<std::net::SocketAddr>() {
+        Ok(other) => {
+            other.port() == addr.port()
+                && (other.ip() == addr.ip()
+                    || other.ip().is_unspecified()
+                    || addr.ip().is_unspecified())
+        }
+        Err(_) => {
+            other
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                == Some(addr.port())
+        }
+    }
+}
+
+fn valid_peer_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// What is wrong with one `[peers.<name>]`, if anything.
+fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
+    if !valid_peer_name(name) {
+        return Some(format!(
+            "peer name `{name}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
+        ));
+    }
+    let url = peer.url.as_str();
+    let https = url.starts_with("https://");
+    if !https && !is_loopback_http(url) {
+        return Some(format!(
+            "[peers.{name}] url must use https, or http on a loopback address"
+        ));
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Some(format!("[peers.{name}] url `{url}` is not a URL"));
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_none_or(str::is_empty)
+    {
+        return Some(format!(
+            "[peers.{name}] url must be a plain base URL without credentials, query or fragment"
+        ));
+    }
+    if peer.token_file.trim().is_empty() {
+        return Some(format!("[peers.{name}] token_file must not be empty"));
+    }
+    if https && peer.ca_file.as_deref().is_none_or(|f| f.trim().is_empty()) {
+        return Some(format!(
+            "[peers.{name}] needs ca_file: an https peer is trusted only through its own CA"
+        ));
+    }
+    None
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -1863,6 +2253,222 @@ socket = "/run/forwarder.sock"
                 }
             );
         }
+    }
+
+    #[cfg(feature = "peers")]
+    const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn with_peers(peers: &str) -> String {
+        base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n\
+             [admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{HASH_B}\"\n{peers}"
+        ))
+    }
+
+    fn peers_error(peers: &str) -> String {
+        match Config::parse(&with_peers(peers)) {
+            Err(ConfigError::BadPeers(reason)) => reason,
+            other => panic!("expected a [peers] error for {peers:?}, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peers_are_absent_by_default_and_off_when_present() {
+        assert!(Config::parse(&with_peers("")).unwrap().peers.is_none());
+        let peers = Config::parse(&with_peers("[peers]\n"))
+            .unwrap()
+            .peers
+            .unwrap();
+        assert!(!peers.enabled && !peers.publish && !peers.expose_key_labels);
+        assert!(!peers.publishing());
+        assert_eq!(peers.poll_interval_secs, 30);
+        assert!(peers.peers.is_empty() && peers.listen.is_none());
+        assert!(!peers.expose_host_stats);
+        assert_eq!(peers.session_header, "x-opencode-session");
+        assert_eq!(peers.session_window_secs, 300);
+        assert_eq!(peers.stream_interval_secs, 5);
+        assert_eq!(peers.max_subscribers, 16);
+        assert_eq!(peers.max_subscribers_per_peer, 4);
+        assert_eq!(
+            PeersConfig::check_line(Some(&peers)),
+            "peers: disabled",
+            "a present but disabled table is reported as disabled"
+        );
+        assert_eq!(PeersConfig::check_line(None), "peers: disabled");
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peers_parse_settings_and_peer_tables() {
+        let config = Config::parse(&with_peers(&format!(
+            "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
+             peer_token_sha256 = \"{HASH_C}\"\npoll_interval_secs = 10\nexpose_key_labels = true\n\
+             [peers.ct-4]\nurl = \"https://10.0.6.153:4099\"\ntoken_file = \"/etc/reiki/peers/ct-4.token\"\n\
+             ca_file = \"/etc/reiki/peers/ca.pem\"\n\
+             [peers.local]\nurl = \"http://127.0.0.1:5099\"\ntoken_file = \"/t\"\n"
+        )))
+        .unwrap();
+        let peers = config.peers.unwrap();
+        assert!(peers.publishing() && peers.expose_key_labels);
+        assert_eq!(peers.poll_interval_secs, 10);
+        assert_eq!(peers.peers.len(), 2);
+        assert_eq!(peers.peers["ct-4"].url, "https://10.0.6.153:4099");
+        assert_eq!(peers.peers["local"].ca_file, None);
+        assert_eq!(
+            PeersConfig::check_line(Some(&peers)),
+            "peers: enabled, publishing on 127.0.0.1:4099 (key labels shown), 2 peer(s)[ct-4, local], poll every 10s"
+        );
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peers_refuse_unknown_fields_in_settings_and_peer_tables() {
+        for bad in [
+            "[peers]\nenable = true\n",
+            "[peers.x]\nurl = \"http://127.0.0.1:1\"\ntoken_file = \"/t\"\ntoken = \"oops\"\n",
+            "[peers.x]\ntoken_file = \"/t\"\n",
+        ] {
+            assert!(
+                matches!(Config::parse(&with_peers(bad)), Err(ConfigError::Parse(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn publishing_needs_a_separate_loopback_listener_and_a_distinct_token() {
+        let publish = |listen: &str, hash: &str| {
+            format!(
+                "[peers]\nenabled = true\npublish = true\nlisten = \"{listen}\"\npeer_token_sha256 = \"{hash}\"\n"
+            )
+        };
+        assert!(Config::parse(&with_peers(&publish("127.0.0.1:4099", HASH_C))).is_ok());
+        assert!(
+            Config::parse(&with_peers(&publish("127.0.0.1:0", HASH_C))).is_ok(),
+            "port 0 is a fresh port"
+        );
+        for (peers, needle) in [
+            (
+                "[peers]\nenabled = true\npublish = true\n".to_owned(),
+                "listen address",
+            ),
+            (
+                "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n".to_owned(),
+                "peer_token_sha256",
+            ),
+            (publish("127.0.0.1:4097", HASH_C), "must differ"),
+            (publish("127.0.0.1:4098", HASH_C), "must differ"),
+            (publish("0.0.0.0:4098", HASH_C), "must differ"),
+            (publish("localhost:4099", HASH_C), "IP:port"),
+            (publish("10.0.0.5:4099", HASH_C), "loopback"),
+            (publish("127.0.0.1:4099", "short"), "64 hex"),
+            (publish("127.0.0.1:4099", HASH_B), "admin token"),
+            (
+                publish("127.0.0.1:4099", &HASH_A.to_ascii_uppercase()),
+                "stream `s`",
+            ),
+            (
+                format!("[peers]\npeer_token_sha256 = \"{HASH_B}\"\n"),
+                "admin token",
+            ),
+            (
+                "[peers]\npoll_interval_secs = 0\n".to_owned(),
+                "poll_interval_secs",
+            ),
+            (
+                "[peers]\nsession_window_secs = 5\n".to_owned(),
+                "session_window_secs",
+            ),
+            (
+                "[peers]\nsession_header = \"X-Session\"\n".to_owned(),
+                "lowercase",
+            ),
+            (
+                "[peers]\nsession_header = \"bad header\"\n".to_owned(),
+                "lowercase",
+            ),
+            (
+                "[peers]\nsession_header = \"authorization\"\n".to_owned(),
+                "credentials",
+            ),
+            ("[peers]\ninstance = \"a b\"\n".to_owned(), "instance"),
+            (
+                "[peers]\nstream_interval_secs = 0\n".to_owned(),
+                "stream_interval_secs",
+            ),
+            (
+                "[peers]\nmax_subscribers = 0\n".to_owned(),
+                "max_subscribers",
+            ),
+            (
+                "[peers]\nmax_subscribers = 2\nmax_subscribers_per_peer = 3\n".to_owned(),
+                "max_subscribers_per_peer",
+            ),
+        ] {
+            let reason = peers_error(&peers);
+            assert!(reason.contains(needle), "{peers}: {reason}");
+        }
+        assert!(
+            Config::parse(&with_peers("[peers]\npublish = true\n")).is_ok(),
+            "publish without enabled does nothing and needs nothing"
+        );
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peer_tables_need_a_safe_url_a_token_file_and_a_ca_for_https() {
+        let peer = |name: &str, body: &str| format!("[peers.{name}]\n{body}\n");
+        assert!(Config::parse(&with_peers(&peer(
+            "a",
+            "url = \"https://peer.example:4099\"\ntoken_file = \"/t\"\nca_file = \"/ca.pem\""
+        )))
+        .is_ok());
+        for (peers, needle) in [
+            (
+                peer("a", "url = \"http://10.0.0.5:4099\"\ntoken_file = \"/t\""),
+                "https",
+            ),
+            (
+                peer("a", "url = \"https://peer.example\"\ntoken_file = \"/t\""),
+                "ca_file",
+            ),
+            (
+                peer(
+                    "a",
+                    "url = \"https://u:p@peer.example\"\ntoken_file = \"/t\"\nca_file = \"/c\"",
+                ),
+                "credentials",
+            ),
+            (
+                peer(
+                    "a",
+                    "url = \"https://peer.example/?x=1\"\ntoken_file = \"/t\"\nca_file = \"/c\"",
+                ),
+                "query",
+            ),
+            (
+                peer("a", "url = \"http://127.0.0.1:1\"\ntoken_file = \" \""),
+                "token_file",
+            ),
+            (
+                peer(
+                    "\"a b\"",
+                    "url = \"http://127.0.0.1:1\"\ntoken_file = \"/t\"",
+                ),
+                "peer name",
+            ),
+        ] {
+            let reason = peers_error(&peers);
+            assert!(reason.contains(needle), "{peers}: {reason}");
+        }
+    }
+
+    #[cfg(not(feature = "peers"))]
+    #[test]
+    fn a_build_without_the_feature_refuses_a_peers_table() {
+        assert!(peers_error("[peers]\n").contains("built without"));
     }
 
     #[test]

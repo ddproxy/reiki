@@ -84,8 +84,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 time = "0.3"
 x509-parser = { version = "0.18", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+# Safe statvfs for the peer host stats; std has none and unsafe code is forbidden.
+rustix = { version = "1", default-features = false, features = ["fs", "std"], optional = true }
+
 [features]
-default = ["plugin-phi", "plugin-finance", "plugin-controlled", "plugin-placeholders", "plugin-requestlog", "plugin-metrics"]
+default = ["plugin-phi", "plugin-finance", "plugin-controlled", "plugin-placeholders", "plugin-requestlog", "plugin-metrics", "peers"]
 # Each compiled-in plugin is an optional dependency enabled by a feature of the same name.
 plugin-phi = ["dep:reiki-phi"]
 plugin-finance = ["dep:reiki-finance"]
@@ -94,6 +98,8 @@ plugin-gov = ["plugin-controlled"]
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]
+# Health sharing between instances; inert unless the config has an enabled `[peers]` table.
+peers = ["dep:rustix"]
 
 [dev-dependencies]
 futures-util = "0.3"

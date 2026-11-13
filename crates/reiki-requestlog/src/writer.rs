@@ -10,9 +10,9 @@ use serde_json::{json, Map, Value};
 use crate::config::{BodyMode, Config, LogFormat, SseMode};
 use crate::redact;
 use crate::shape;
-use crate::sink::FileSink;
 #[cfg(unix)]
 use crate::sink::SocketHub;
+use crate::sink::{FileSink, Notice};
 use crate::syslog::{Meta, Syslog, SEVERITY_INFO, SEVERITY_WARNING};
 use crate::timefmt::rfc3339_millis;
 
@@ -56,6 +56,8 @@ pub struct AttemptEvent {
     pub status: Option<u16>,
     /// The upstream's error body, only in `response = "body"` mode.
     pub body: Option<Vec<u8>>,
+    /// The capture stopped before the end of the body.
+    pub body_cut: bool,
 }
 
 pub struct ResponseEvent {
@@ -182,6 +184,14 @@ fn emit(sinks: &mut Sinks, line: &str, meta: &Meta, file_failing: &mut bool) -> 
             }
             Err(_) => {}
         }
+        match file.take_notice() {
+            Some(Notice::RotateFailed(error)) => tracing::warn!(
+                error = %error,
+                "requestlog: cannot rotate the log file; still writing to it and retrying"
+            ),
+            Some(Notice::RotateRecovered) => tracing::info!("requestlog: log rotation recovered"),
+            None => {}
+        }
     }
     #[cfg(unix)]
     if let Some(socket) = sinks.socket.as_ref() {
@@ -247,7 +257,7 @@ fn render_response(config: &Config, response: ResponseEvent) -> String {
                 entry.insert("key".into(), json!(a.key));
                 entry.insert("status".into(), json!(a.status));
                 if let Some(body) = a.body.as_deref().filter(|b| !b.is_empty()) {
-                    entry.insert("body".into(), full_body(config, body).value);
+                    entry.insert("body".into(), full_body(config, body, a.body_cut).value);
                 }
                 Value::Object(entry)
             })
@@ -262,7 +272,7 @@ fn render_response(config: &Config, response: ResponseEvent) -> String {
                 record.insert("body_truncated".into(), json!(true));
             }
         } else {
-            let shaped = full_body(config, &body);
+            let shaped = full_body(config, &body, response.body_truncated);
             record.insert("body".into(), shaped.value);
             if !shaped.excluded.is_empty() {
                 record.insert("body_excluded".into(), json!(shaped.excluded));
@@ -318,12 +328,13 @@ fn render_request(config: &Config, request: RequestEvent) -> String {
                 }
             }
             BodyMode::Full => {
-                let shaped = full_body(config, &body);
+                let cut = body.len() < request.body_bytes;
+                let shaped = full_body(config, &body, cut);
                 record.insert("body".into(), shaped.value);
                 if !shaped.excluded.is_empty() {
                     record.insert("body_excluded".into(), json!(shaped.excluded));
                 }
-                if shaped.truncated {
+                if shaped.truncated || cut {
                     record.insert("body_truncated".into(), json!(true));
                 }
             }
@@ -340,10 +351,12 @@ struct Shaped {
     excluded: Vec<String>,
 }
 
-fn full_body(config: &Config, body: &[u8]) -> Shaped {
+/// `cut` is set when the capture stopped before the end of the body, so a credential may have been
+/// cut off at the end; it is masked before the text is cut again to `max_body_bytes`.
+fn full_body(config: &Config, body: &[u8], cut: bool) -> Shaped {
     let masked = |text: &str| {
         if config.redact {
-            redact::secrets(text).into_owned()
+            redact::secrets_cut(text, cut).into_owned()
         } else {
             text.to_owned()
         }
@@ -394,7 +407,10 @@ fn sse_body(config: &Config, body: &[u8], cut: bool) -> Option<Value> {
         // The capture stopped mid-line, so the last event is incomplete.
         text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
     }
-    let events = shape::sse_events(&text)?;
+    let mut events = shape::sse_events(&text)?;
+    if config.redact {
+        redact::stream_deltas(&mut events, cut);
+    }
     let mut value = match config.sse {
         SseMode::Assembled => shape::assemble(&events),
         _ => Value::Array(events),
@@ -601,11 +617,13 @@ mod tests {
                         key: "zen-first".to_owned(),
                         status: Some(403),
                         body: Some(br#"{"error":"refused"}"#.to_vec()),
+                        body_cut: false,
                     },
                     AttemptEvent {
                         key: "zen-primary".to_owned(),
                         status: Some(200),
                         body: None,
+                        body_cut: false,
                     },
                 ],
                 body: None,
@@ -906,5 +924,71 @@ mod tests {
         assert_eq!(config("format = \"ocsf\"").format, LogFormat::Ocsf);
         let bad: toml::Table = "file = \"/x\"\nformat = \"xml\"".parse().unwrap();
         assert!(Config::parse(&bad).unwrap_err().contains("format"));
+    }
+
+    fn sse(contents: &[&str]) -> String {
+        contents
+            .iter()
+            .map(|c| {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices": [{"delta": {"content": c}}]})
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_split_across_streamed_deltas_is_masked_in_events_and_assembled_modes() {
+        let key = ["sk-", "0123456789abcdef0123456789"].concat();
+        let (a, b) = key.split_at(11);
+        let body = sse(&[&format!("key {a}"), &format!("{b} end")]);
+        for mode in ["events", "assembled"] {
+            let config = config(&format!("response = \"body\"\nsse = \"{mode}\""));
+            let line = render(
+                &config,
+                Event::Response(response_with(Some(body.as_bytes()), false)),
+            );
+            assert!(!line.contains("sk-0"), "{mode}: {line}");
+            assert!(!line.contains("abcdef0123456789"), "{mode}: {line}");
+            assert!(line.contains("[REDACTED]"), "{mode}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_response_cut_inside_a_secret_never_logs_half_of_it() {
+        let cut = r#"{"text":"key sk-0123456"#;
+        let line = render(
+            &config("response = \"body\""),
+            Event::Response(response_with(Some(cut.as_bytes()), true)),
+        );
+        assert!(!line.contains("sk-0123"), "{line}");
+        assert!(
+            line.contains("[REDACTED]") && line.contains("\"body_truncated\":true"),
+            "{line}"
+        );
+        let line = render(
+            &config("response = \"body\"\nsse = \"assembled\""),
+            Event::Response(response_with(
+                Some(sse(&["key ", "sk-0123456"]).as_bytes()),
+                true,
+            )),
+        );
+        assert!(!line.contains("sk-0123"), "{line}");
+    }
+
+    #[test]
+    fn a_request_cut_at_the_capture_cap_is_flagged_and_masked_before_it_is_cut_again() {
+        let full = format!(
+            r#"{{"content":"{}","k":"sk-0123456789abcdef0123456789"}}"#,
+            "x".repeat(20)
+        );
+        let cap = full.find("sk-").unwrap() + 9;
+        let mut event = request(&full[..cap]);
+        event.body_bytes = full.len();
+        let record = parsed(&config(""), event);
+        assert_eq!(record["body_truncated"], true);
+        assert!(!record.to_string().contains("sk-0123"), "{record}");
+        assert_eq!(record["body_bytes"], full.len());
     }
 }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
+use bytes::Bytes;
 use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
 pub use config::{
@@ -221,7 +222,10 @@ impl Plugin for RequestLog {
             bytes: 0,
             requested: false,
             response: self.config.response,
-            max_body: self.config.max_body_bytes,
+            max_body: self
+                .config
+                .max_body_bytes
+                .min(self.config.max_capture_bytes),
             key: None,
             attempts: Vec::new(),
             body: Vec::new(),
@@ -252,7 +256,13 @@ impl Plugin for RequestLog {
                 ))
             })
             .collect();
-        let body = (self.config.body != BodyMode::None).then(|| ctx.body.clone());
+        let body = (self.config.body != BodyMode::None).then(|| {
+            if ctx.body.len() > self.config.max_capture_bytes {
+                Bytes::copy_from_slice(&ctx.body[..self.config.max_capture_bytes])
+            } else {
+                ctx.body.clone()
+            }
+        });
         self.send(Event::Request(RequestEvent {
             id,
             at: SystemTime::now(),
@@ -275,6 +285,7 @@ impl Plugin for RequestLog {
                 key: ctx.key.to_owned(),
                 status: ctx.status,
                 body,
+                body_cut: ctx.body.len() > state.max_body,
             });
         }
     }
@@ -599,6 +610,34 @@ mod tests {
             records.iter().all(|r| r["event"] != "dropped"),
             "syslog losses leaked into the file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bytes_captured_per_request_are_capped() {
+        let dir = dir("capture");
+        let path = dir.join("req.jsonl");
+        let plugin = plugin("max_capture_bytes = 64", &path);
+        let body = format!(r#"{{"content":"{}"}}"#, "y".repeat(10_000));
+        drive(plugin.as_ref(), &[], &body, 200);
+        drop(plugin);
+        let records = lines(&path);
+        assert_eq!(records[0]["body_bytes"], body.len());
+        assert_eq!(records[0]["body_truncated"], true);
+        assert!(records[0]["body"].as_str().unwrap().len() <= 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_within_the_cap_is_logged_whole() {
+        let dir = dir("capture-ok");
+        let path = dir.join("req.jsonl");
+        let plugin = plugin("max_capture_bytes = 64", &path);
+        drive(plugin.as_ref(), &[], r#"{"a":1}"#, 200);
+        drop(plugin);
+        let records = lines(&path);
+        assert_eq!(records[0]["body"]["a"], 1);
+        assert!(records[0].get("body_truncated").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

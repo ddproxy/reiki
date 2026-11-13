@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -12,6 +13,29 @@ pub struct FileSink {
     size: u64,
     max_bytes: u64,
     keep: u32,
+    rotation: Rotation,
+}
+
+/// What a caller should tell the operator about rotation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Notice {
+    /// Rotation failed; records still go to the current file and rotation is retried.
+    RotateFailed(String),
+    RotateRecovered,
+}
+
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Retry state after a failed rotation.
+struct Rotation {
+    failing: bool,
+    retry_at: Option<Instant>,
+    backoff: Duration,
+    base: Duration,
+    /// The old file was renamed but the new one could not be opened yet.
+    reopen: bool,
+    notice: Option<Notice>,
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -41,13 +65,28 @@ impl FileSink {
             size,
             max_bytes,
             keep,
+            rotation: Rotation {
+                failing: false,
+                retry_at: None,
+                backoff: RETRY_BASE,
+                base: RETRY_BASE,
+                reopen: false,
+                notice: None,
+            },
         })
+    }
+
+    /// The report a failed or recovered rotation left, once.
+    pub fn take_notice(&mut self) -> Option<Notice> {
+        self.rotation.notice.take()
     }
 
     pub fn write_line(&mut self, line: &str) -> io::Result<()> {
         let needed = line.len() as u64 + 1;
-        if self.max_bytes > 0 && self.size > 0 && self.size + needed > self.max_bytes {
-            self.rotate()?;
+        let due = self.rotation.reopen
+            || (self.max_bytes > 0 && self.size > 0 && self.size + needed > self.max_bytes);
+        if due && self.rotation.retry_at.is_none_or(|at| Instant::now() >= at) {
+            self.try_rotate();
         }
         let mut buf = String::with_capacity(line.len() + 1);
         buf.push_str(line);
@@ -58,9 +97,38 @@ impl FileSink {
         Ok(())
     }
 
+    /// A failed rotation leaves the current file in use and is retried after a growing pause.
+    fn try_rotate(&mut self) {
+        let result = self.rotate();
+        let state = &mut self.rotation;
+        match result {
+            Ok(()) => {
+                state.retry_at = None;
+                state.backoff = state.base;
+                if std::mem::take(&mut state.failing) {
+                    state.notice = Some(Notice::RotateRecovered);
+                }
+            }
+            Err(error) => {
+                state.retry_at = Some(Instant::now() + state.backoff);
+                state.backoff = (state.backoff * 2).min(RETRY_MAX);
+                if !state.failing {
+                    state.failing = true;
+                    state.notice = Some(Notice::RotateFailed(error.to_string()));
+                }
+            }
+        }
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
+        if self.rotation.reopen {
+            self.file = open_append(&self.path)?;
+            self.size = self.file.metadata()?.len();
+            self.rotation.reopen = false;
+            return Ok(());
+        }
         if self.keep == 0 {
-            std::fs::remove_file(&self.path)?;
+            self.file.set_len(0)?;
         } else {
             for n in (1..self.keep).rev() {
                 let from = numbered(&self.path, n);
@@ -69,8 +137,10 @@ impl FileSink {
                 }
             }
             std::fs::rename(&self.path, numbered(&self.path, 1))?;
+            self.rotation.reopen = true;
+            self.file = open_append(&self.path)?;
+            self.rotation.reopen = false;
         }
-        self.file = open_append(&self.path)?;
         self.size = 0;
         Ok(())
     }
@@ -300,6 +370,94 @@ mod tests {
         sink.write_line("line-00000002").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "line-00000002\n");
         assert!(!numbered(&path, 1).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn blocked_rotation(tag: &str, keep: u32) -> (PathBuf, PathBuf, FileSink) {
+        let dir = temp(tag);
+        let path = dir.join("req.jsonl");
+        let mut sink = FileSink::open(&path, 20, keep).unwrap();
+        sink.rotation.base = Duration::from_secs(3600);
+        sink.rotation.backoff = Duration::from_secs(3600);
+        // A directory at the target makes the rename of the log file fail.
+        let blocker = numbered(&path, 1);
+        std::fs::create_dir_all(blocker.join("occupied")).unwrap();
+        (dir, blocker, sink)
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_logging_to_the_current_file_and_reports_once() {
+        let (dir, blocker, mut sink) = blocked_rotation("rotfail", 1);
+        let path = dir.join("req.jsonl");
+        for n in 1..=5 {
+            sink.write_line(&format!("line-{n:08}")).unwrap();
+        }
+        let all: String = (1..=5).map(|n| format!("line-{n:08}\n")).collect();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), all);
+        assert!(matches!(sink.take_notice(), Some(Notice::RotateFailed(_))));
+        assert_eq!(sink.take_notice(), None, "reported once, not per record");
+        // Fix the cause: still no retry before the backoff has passed.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        sink.write_line("line-00000006").unwrap();
+        assert!(!numbered(&path, 1).exists());
+        // Past the backoff the rotation goes through; every record is in exactly one file.
+        sink.rotation.retry_at = Some(Instant::now());
+        sink.write_line("line-00000007").unwrap();
+        assert_eq!(sink.take_notice(), Some(Notice::RotateRecovered));
+        let rotated = std::fs::read_to_string(numbered(&path, 1)).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(rotated, format!("{all}line-00000006\n"));
+        assert_eq!(current, "line-00000007\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rotation_that_fails_partway_neither_loses_nor_repeats_records() {
+        let dir = temp("rotpartway");
+        let path = dir.join("req.jsonl");
+        let mut sink = FileSink::open(&path, 20, 3).unwrap();
+        sink.rotation.base = Duration::ZERO;
+        sink.rotation.backoff = Duration::ZERO;
+        for n in 1..=3 {
+            sink.write_line(&format!("line-{n:08}")).unwrap();
+        }
+        // .3 is a non-empty directory, so shifting .2 to .3 fails before anything has moved.
+        std::fs::create_dir_all(numbered(&path, 3).join("occupied")).unwrap();
+        sink.write_line("line-00000004").unwrap();
+        sink.write_line("line-00000005").unwrap();
+        assert!(matches!(sink.take_notice(), Some(Notice::RotateFailed(_))));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line-00000003\nline-00000004\nline-00000005\n"
+        );
+        std::fs::remove_dir_all(numbered(&path, 3)).unwrap();
+        sink.write_line("line-00000006").unwrap();
+        assert_eq!(sink.take_notice(), Some(Notice::RotateRecovered));
+        let read = |n: u32| std::fs::read_to_string(numbered(&path, n)).unwrap_or_default();
+        let mut seen: Vec<String> = [
+            std::fs::read_to_string(&path).unwrap(),
+            read(1),
+            read(2),
+            read(3),
+        ]
+        .iter()
+        .flat_map(|t| t.lines().map(str::to_owned).collect::<Vec<_>>())
+        .collect();
+        seen.sort();
+        let want: Vec<String> = (1..=6).map(|n| format!("line-{n:08}")).collect();
+        assert_eq!(seen, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keep_zero_rotation_failure_cannot_lose_the_file() {
+        let dir = temp("keep0fail");
+        let path = dir.join("req.jsonl");
+        let mut sink = FileSink::open(&path, 20, 0).unwrap();
+        sink.write_line("line-00000001").unwrap();
+        sink.write_line("line-00000002").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line-00000002\n");
+        assert_eq!(sink.take_notice(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

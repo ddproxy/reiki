@@ -37,6 +37,13 @@ pub trait Plugin: Send + Sync {
     /// Stable name used in config and logs.
     fn name(&self) -> &str;
 
+    /// True when a failure of this plugin must stop the request, because letting it through
+    /// would send data the plugin was meant to mask. The host rejects a request that this
+    /// plugin fails unless the operator sets `on_error = "pass_through"` explicitly.
+    fn fails_closed(&self) -> bool {
+        false
+    }
+
     /// Builds the per-request state that every hook for this request receives.
     fn new_state(&self) -> Box<dyn Any + Send> {
         Box::new(())

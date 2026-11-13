@@ -72,6 +72,10 @@ impl Plugin for Placeholders {
         NAME
     }
 
+    fn fails_closed(&self) -> bool {
+        true
+    }
+
     fn watched_files(&self) -> Vec<std::path::PathBuf> {
         self.config.terms_file.iter().cloned().collect()
     }

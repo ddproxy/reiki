@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A plugin that masks data now fails closed. `Plugin::fails_closed()` (default `false`) lets a plugin say that a failure must stop the request, and the `placeholders` plugin returns `true`. Without an explicit `on_error`, such a plugin now rejects the request with a 503 when it skips or panics; before, the request went through unmasked. Set `on_error = "pass_through"` to restore the old behaviour; Reiki then warns at startup and on reload.
+
 ## 0.8.1
 
 ### Added

@@ -223,13 +223,14 @@ impl PluginChain {
             if !enabled(reg.name, table)? {
                 continue;
             }
-            let on_error = on_error(reg.name, table)?;
+            let explicit = on_error(reg.name, table)?;
             let streams = streams_of(reg.name, table)?;
             let plugin = (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
                 name: reg.name.to_string(),
                 message,
             })?;
             let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+            let on_error = resolve_on_error(reg.name, explicit, plugin.as_ref());
             entries.push(Entry {
                 stamps: stamps_of(plugin.as_ref()),
                 plugin,
@@ -310,7 +311,7 @@ impl PluginChain {
                     entries.push(old.share(streams));
                 }
                 (_, Some(table)) => {
-                    let on_error = on_error(reg.name, table)?;
+                    let explicit = on_error(reg.name, table)?;
                     changed.push(reg.name.to_owned());
                     // A preview builds a plugin that is already running (so it is safe to build
                     // again) and drops it, so a bad file path fails the preview as it would the reload.
@@ -324,6 +325,7 @@ impl PluginChain {
                         if !build {
                             continue;
                         }
+                        let on_error = resolve_on_error(reg.name, explicit, plugin.as_ref());
                         entries.push(Entry {
                             stamps: stamps_of(plugin.as_ref()),
                             plugin,
@@ -707,12 +709,13 @@ fn enabled(name: &str, table: &toml::Table) -> Result<bool, ConfigError> {
     }
 }
 
-fn on_error(name: &str, table: &toml::Table) -> Result<OnError, ConfigError> {
+/// The operator's explicit `on_error`, or `None` when the table does not set one.
+fn on_error(name: &str, table: &toml::Table) -> Result<Option<OnError>, ConfigError> {
     match table.get("on_error") {
-        None => Ok(OnError::PassThrough),
+        None => Ok(None),
         Some(Value::String(value)) => match value.as_str() {
-            "pass_through" => Ok(OnError::PassThrough),
-            "reject" => Ok(OnError::Reject),
+            "pass_through" => Ok(Some(OnError::PassThrough)),
+            "reject" => Ok(Some(OnError::Reject)),
             other => Err(ConfigError::PluginConfig {
                 name: name.to_owned(),
                 message: format!(
@@ -724,6 +727,23 @@ fn on_error(name: &str, table: &toml::Table) -> Result<OnError, ConfigError> {
             name: name.to_owned(),
             message: format!("`on_error` must be a string, got {}", other.type_str()),
         }),
+    }
+}
+
+/// The failure policy for a built plugin: an explicit setting wins; otherwise a plugin that
+/// masks data fails closed and every other plugin passes the request through.
+fn resolve_on_error(name: &str, explicit: Option<OnError>, plugin: &dyn Plugin) -> OnError {
+    match explicit {
+        Some(OnError::PassThrough) if plugin.fails_closed() => {
+            tracing::warn!(
+                plugin = name,
+                "on_error = \"pass_through\" lets a request through unmasked when this plugin fails"
+            );
+            OnError::PassThrough
+        }
+        Some(policy) => policy,
+        None if plugin.fails_closed() => OnError::Reject,
+        None => OnError::PassThrough,
     }
 }
 
@@ -813,6 +833,19 @@ mod tests {
         }
     }
 
+    struct Masker;
+    impl Plugin for Masker {
+        fn name(&self) -> &str {
+            "masker"
+        }
+        fn fails_closed(&self) -> bool {
+            true
+        }
+        fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+            Err(PluginError::Skip("cannot mask this body".into()))
+        }
+    }
+
     struct Refuse;
     impl Plugin for Refuse {
         fn name(&self) -> &str {
@@ -848,6 +881,10 @@ mod tests {
             Registration {
                 name: "refuse",
                 build: |_| Ok(Box::new(Refuse) as Box<dyn Plugin>),
+            },
+            Registration {
+                name: "masker",
+                build: |_| Ok(Box::new(Masker) as Box<dyn Plugin>),
             },
         ]
     }
@@ -1325,6 +1362,23 @@ mod tests {
         let mut body = Bytes::new();
         let blocked = request(&chain, &mut states, &mut body).unwrap_err();
         assert_eq!(blocked.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_masking_plugin_fails_closed_unless_the_operator_says_otherwise() {
+        let run = |source: &str| {
+            let chain = PluginChain::build(&configured(source), &registry()).unwrap();
+            let mut states = chain.states();
+            let mut body = Bytes::new();
+            request(&chain, &mut states, &mut body)
+        };
+        let blocked = run("[masker]\n").unwrap_err();
+        assert_eq!(blocked.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(run("[masker]\non_error = \"pass_through\"\n").is_ok());
+        assert!(
+            run("[decline]\n").is_ok(),
+            "other plugins keep the pass-through default"
+        );
     }
 
     #[test]

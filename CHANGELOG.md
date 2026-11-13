@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- A non-streamed JSON response that carries tool calls is no longer re-serialised by the `placeholders` plugin. Only the strings that change are rewritten, so key order and formatting are kept.
+
 ### Security
 
 - The scrub of an upstream key echoed in a response now also replaces its JSON-escaped, percent-encoded and base64 (standard and URL-safe) forms, in headers, error bodies and streamed chunks, including when a form is split across chunks.

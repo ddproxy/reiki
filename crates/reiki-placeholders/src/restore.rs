@@ -162,13 +162,30 @@ impl Restorer {
         if self.tool_args || !TOOL_CALL_MARKERS.iter().any(|m| text.contains(m)) {
             return restore_text(text, reverse);
         }
-        match serde_json::from_str::<Value>(text) {
-            Ok(mut value) => {
-                walk_whole("", &mut value, reverse);
-                value.to_string()
-            }
-            Err(_) => restore(text, reverse, false),
+        if serde_json::from_str::<Value>(text).is_err() {
+            return restore(text, reverse, false);
         }
+        let mut spans = Vec::new();
+        let mut at = 0;
+        if collect_strings(text, &mut at, "", &mut spans, 0).is_none() {
+            return restore(text, reverse, false);
+        }
+        // Only the strings that change are rewritten, so key order and layout survive.
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for (start, end, path) in spans {
+            let Ok(decoded) = serde_json::from_str::<String>(&text[start..end]) else {
+                continue;
+            };
+            let restored = restore(&decoded, reverse, !in_tool_call(&path));
+            if restored != decoded {
+                out.push_str(&text[last..start]);
+                out.push_str(&serde_json::to_string(&restored).unwrap_or_default());
+                last = end;
+            }
+        }
+        out.push_str(&text[last..]);
+        out
     }
 
     fn feed_stream(&mut self, chunk: &mut Bytes, is_last: bool, reverse: &HashMap<String, String>) {
@@ -269,21 +286,88 @@ impl Restorer {
     }
 }
 
-fn walk_whole(path: &str, value: &mut Value, reverse: &HashMap<String, String>) {
-    match value {
-        Value::String(text) => *text = restore(text, reverse, !in_tool_call(path)),
-        Value::Array(items) => {
-            for (i, item) in items.iter_mut().enumerate() {
-                walk_whole(&format!("{path}[{i}]"), item, reverse);
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map.iter_mut() {
-                walk_whole(&format!("{path}.{key}"), item, reverse);
-            }
-        }
-        _ => {}
+/// Byte spans (quotes included) of every string value in valid JSON, with their field path.
+fn collect_strings(
+    text: &str,
+    at: &mut usize,
+    path: &str,
+    spans: &mut Vec<(usize, usize, String)>,
+    depth: usize,
+) -> Option<()> {
+    let bytes = text.as_bytes();
+    if depth > 128 {
+        return None;
     }
+    skip_space(bytes, at);
+    match *bytes.get(*at)? {
+        b'"' => {
+            let end = string_end(bytes, *at)?;
+            spans.push((*at, end, path.to_owned()));
+            *at = end;
+        }
+        open @ (b'{' | b'[') => {
+            let close = if open == b'{' { b'}' } else { b']' };
+            *at += 1;
+            let mut index = 0;
+            loop {
+                skip_space(bytes, at);
+                if *bytes.get(*at)? == close {
+                    *at += 1;
+                    break;
+                }
+                let child = if open == b'{' {
+                    let end = string_end(bytes, *at)?;
+                    let key: String = serde_json::from_str(&text[*at..end]).ok()?;
+                    *at = end;
+                    skip_space(bytes, at);
+                    if *bytes.get(*at)? != b':' {
+                        return None;
+                    }
+                    *at += 1;
+                    format!("{path}.{key}")
+                } else {
+                    format!("{path}[{index}]")
+                };
+                index += 1;
+                collect_strings(text, at, &child, spans, depth + 1)?;
+                skip_space(bytes, at);
+                if *bytes.get(*at)? == b',' {
+                    *at += 1;
+                }
+            }
+        }
+        _ => {
+            while bytes
+                .get(*at)
+                .is_some_and(|b| !matches!(b, b',' | b']' | b'}') && !b.is_ascii_whitespace())
+            {
+                *at += 1;
+            }
+        }
+    }
+    Some(())
+}
+
+fn skip_space(bytes: &[u8], at: &mut usize) {
+    while bytes.get(*at).is_some_and(u8::is_ascii_whitespace) {
+        *at += 1;
+    }
+}
+
+/// The offset just past the string that opens at `start`.
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if *bytes.get(start)? != b'"' {
+        return None;
+    }
+    let mut i = start + 1;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Length of the first complete event, delimiter included.
@@ -532,5 +616,30 @@ mod tests {
             open["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "tok-123"
         );
+    }
+
+    #[test]
+    fn a_rewritten_whole_body_keeps_key_order_and_layout() {
+        let body = format!(
+            "{{ \"zeta\" : 1.50,\n  \"alpha\": [ true, null,\t\"a\\/b \\u00e9\" ],\n  \"message\": {{\"tool_calls\": [{{\"arguments\": \"{SECRET}\"}}], \"content\": \"hi {FALCON} \\\"q\\\" {SECRET}\"}}\n}}"
+        );
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("application/json"), false);
+        let mut chunk = Bytes::from(body.clone());
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        let want = body
+            .replace(&format!("hi {FALCON}"), "hi Falcon")
+            .replace(&format!("\\\" {SECRET}\"}}"), "\\\" tok-123\"}");
+        assert_eq!(String::from_utf8(chunk.to_vec()).unwrap(), want);
+    }
+
+    #[test]
+    fn a_whole_body_with_nothing_to_restore_comes_back_byte_exact() {
+        let body = "{ \"b\" : 2,  \"a\":\"x\", \"tool_calls\" : [ ] }";
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("application/json"), false);
+        let mut chunk = Bytes::from(body);
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        assert_eq!(&chunk[..], body.as_bytes());
     }
 }

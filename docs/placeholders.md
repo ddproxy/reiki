@@ -32,7 +32,7 @@ A [reload](troubleshooting.md#reload) re-reads `terms_file` when the file change
 
 A masked value becomes `[[REIKI_TERM_9b2e41ff]]` (a term) or `[[REIKI_SECRET_3f9a1c07]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id.
 
-Responses are restored as they stream. JSON and other bodies are held until they end, then restored. A JSON body that carries tool calls is re-serialised so credential placeholders can stay masked in them; see `restore_tool_args`.
+Responses are restored as they stream. JSON and other bodies are held until they end, then restored. A JSON body that carries tool calls is walked as JSON so credential placeholders can stay masked in them (see `restore_tool_args`); only the string values that change are rewritten, so key order, spacing and number formatting survive byte for byte.
 
 For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41ff]]`, is held back from the first event and completed with the second. Events without `[[` keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
 

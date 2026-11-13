@@ -6,6 +6,8 @@
 
 - `requestlog` option `max_capture_bytes` (default 1048576, 1 to 67108864) caps the body bytes copied per request onto the writer queue, which bounds the queue's worst case. A request body over it is logged as masked text with `body_truncated`. Before, the whole body was queued; the response body and error body capture now also stop at it.
 
+- `reiki_plugin_rejections_total{plugin,stream}` counts requests a plugin rejected, or skipped under `on_error = "reject"`. The plugin API gains `Event::PluginRejected`.
+
 ### Fixed
 
 - `requestlog` keeps writing to the current file when a log rotation fails (a rename error), warns once and retries after a growing pause. The failed record used to be lost and every record retried the rotation.

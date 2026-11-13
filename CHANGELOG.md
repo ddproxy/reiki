@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- A `[profile.release]` with thin LTO, one codegen unit and stripped symbols. Panics still unwind, which plugin panic isolation needs.
+- `deny_private` also refuses 198.18.0.0/15, 192.0.0.0/24 and 6to4 and Teredo addresses that embed a private or local IPv4 address.
+
+### Fixed
+
+- A reload that adds an intercepted host now checks the running CA's name constraint for it, instead of failing when a client first connects.
+- The failed-login count for an IPv6 address is kept per /64, so a host rotating through its prefix cannot reset it.
+- The syslog exporter resolves the collector name on a helper thread with a timeout, so a hung resolver no longer stalls the log writer.
+
 ### Changed
 
 - A plugin that masks data now fails closed. `Plugin::fails_closed()` (default `false`) lets a plugin say that a failure must stop the request, and the `placeholders` plugin returns `true`. Without an explicit `on_error`, such a plugin now rejects the request with a 503 when it skips or panics; before, the request went through unmasked. Set `on_error = "pass_through"` to restore the old behaviour; Reiki then warns at startup and on reload.

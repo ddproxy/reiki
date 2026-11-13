@@ -104,3 +104,10 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+
+# Plugin panic isolation relies on unwinding, so panic must stay "unwind".
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

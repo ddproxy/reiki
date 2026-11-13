@@ -81,3 +81,7 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - A reload also swaps in a new CA when `ca_cert` or `ca_key` changes, or when the files are renewed in place. The new CA must have a key that matches its certificate, a DNS name constraint that covers every intercepted host, and no expiry in the past. A CA that fails a check refuses the whole reload, and the running CA keeps serving.
 - After a swap, new connections get certificates from the new CA, and clients must trust the new `ca.pem`. Connections already open keep their certificate until they close.
 - Adding or removing `[tunnel.intercept]` needs a restart. See [reload](troubleshooting.md#reload) and [security](security.md) for what to protect.
+
+## Trust boundary
+
+A plain CONNECT to a host on the `allow` list needs no credential: the list is the only gate, and `"*"` is a legal rule that opens every HTTPS site. Only intercepted hosts check the stream token. Put the tunnel listener on a network that only trusted clients can reach, keep `deny_private = true` so it cannot be used to reach the local network, and keep `allow` as short as the clients need. `deny_private` covers RFC 1918, shared address space, benchmarking and the IETF protocol block, unique-local IPv6, and the IPv4 forms embedded in IPv4-mapped, NAT64, 6to4 and Teredo addresses.

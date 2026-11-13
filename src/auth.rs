@@ -49,6 +49,19 @@ impl From<&crate::config::AuthConfig> for ThrottleSettings {
 /// characters); keep tokens at least this long.
 pub const MIN_TOKEN_LEN: usize = 16;
 
+/// The key a failure is counted under: an IPv4 address as is, an IPv6 address by its /64 so a
+/// host that rotates through its prefix shares one count.
+fn throttle_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(octets.into())
+        }
+    }
+}
+
 /// Counts failed token checks per address so token guessing is slowed and visible.
 pub struct LoginThrottle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -84,6 +97,7 @@ impl LoginThrottle {
 
     /// How long `ip` must wait, or `None` when it may try.
     pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let ip = throttle_key(ip);
         let settings = self.settings();
         if !settings.enabled {
             return None;
@@ -99,6 +113,7 @@ impl LoginThrottle {
 
     /// Records a failure and returns how many the address has inside the window.
     pub fn fail(&self, ip: IpAddr, now: Instant) -> u32 {
+        let ip = throttle_key(ip);
         let settings = self.settings();
         if !settings.enabled {
             return 0;
@@ -128,6 +143,7 @@ impl LoginThrottle {
 
     /// A good login clears the address's count.
     pub fn succeed(&self, ip: IpAddr) {
+        let ip = throttle_key(ip);
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         seen.remove(&ip);
     }
@@ -346,6 +362,28 @@ mod tests {
             !throttle.seen.lock().unwrap().contains_key(&first),
             "the oldest entry was evicted"
         );
+    }
+
+    #[test]
+    fn an_ipv6_prefix_shares_one_count() {
+        let throttle = LoginThrottle::default();
+        let t0 = Instant::now();
+        for n in 0..MAX_FAILURES {
+            let ip: IpAddr = format!("2001:db8:1:2::{:x}", n + 1).parse().unwrap();
+            throttle.fail(ip, t0);
+        }
+        let sibling: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert!(
+            throttle.blocked(sibling, t0).is_some(),
+            "same /64, same block"
+        );
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(
+            throttle.blocked(other, t0).is_none(),
+            "another /64 is unaffected"
+        );
+        throttle.succeed(sibling);
+        assert!(throttle.blocked(sibling, t0).is_none());
     }
 
     #[test]

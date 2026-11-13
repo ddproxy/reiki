@@ -230,8 +230,12 @@ impl Tunnel {
 }
 
 fn private_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, ..] = v4.octets();
-    v4.is_private() || (a == 100 && b & 0xc0 == 64)
+    let [a, b, c, _] = v4.octets();
+    v4.is_private()
+        || (a == 100 && b & 0xc0 == 64)
+        // Benchmarking (198.18.0.0/15) and the IETF protocol block (192.0.0.0/24).
+        || (a == 198 && b & 0xfe == 18)
+        || (a == 192 && b == 0 && c == 0)
 }
 
 /// RFC 1918, shared address space and IPv6 unique-local, including IPv4 forms embedded in IPv6.
@@ -242,7 +246,29 @@ fn private_ip(ip: IpAddr) -> bool {
             let seg = v6.segments();
             let embedded = (seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff))
                 || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4]);
-            (seg[0] & 0xfe00) == 0xfc00 || (embedded && private_v4(embedded_v4(&seg)))
+            // 6to4 carries the IPv4 address in the next 32 bits; Teredo carries the server in the
+            // same place and the client inverted in the last 32 bits.
+            let six_to_four = seg[0] == 0x2002 && {
+                let [a, b] = seg[1].to_be_bytes();
+                let [c, d] = seg[2].to_be_bytes();
+                let v4 = std::net::Ipv4Addr::new(a, b, c, d);
+                private_v4(v4) || local_v4(v4)
+            };
+            let teredo = seg[0] == 0x2001 && seg[1] == 0 && {
+                let [a, b] = seg[2].to_be_bytes();
+                let [c, d] = seg[3].to_be_bytes();
+                let server = std::net::Ipv4Addr::new(a, b, c, d);
+                let [e, f] = (!seg[6]).to_be_bytes();
+                let [g, h] = (!seg[7]).to_be_bytes();
+                let client = std::net::Ipv4Addr::new(e, f, g, h);
+                [server, client]
+                    .into_iter()
+                    .any(|v4| private_v4(v4) || local_v4(v4))
+            };
+            (seg[0] & 0xfe00) == 0xfc00
+                || (embedded && private_v4(embedded_v4(&seg)))
+                || six_to_four
+                || teredo
         }
     }
 }
@@ -612,6 +638,19 @@ mod tests {
         }
         let public = SocketAddr::new("93.184.216.34".parse().unwrap(), 443);
         assert!(t.reachable(&public));
+    }
+
+    #[test]
+    fn private_ip_covers_benchmarking_6to4_and_teredo_forms() {
+        let private = |text: &str| private_ip(text.parse().unwrap());
+        assert!(private("198.18.0.1") && private("198.19.255.1") && private("192.0.0.8"));
+        assert!(!private("198.20.0.1") && !private("8.8.8.8"));
+        // 6to4 around 10.0.0.1 and around a public address.
+        assert!(private("2002:0a00:0001::1"));
+        assert!(!private("2002:0808:0808::1"));
+        // Teredo with the client 10.0.0.1 (inverted in the last 32 bits) and a public pair.
+        assert!(private("2001:0:4136:e378:8000:63bf:f5ff:fffe"));
+        assert!(!private("2001:0:4136:e378:8000:63bf:f7f7:f7f7"));
     }
 
     #[test]

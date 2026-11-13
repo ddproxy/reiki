@@ -247,6 +247,21 @@ fn a_ca_that_misses_a_configured_host_refuses_the_reload() {
 }
 
 #[test]
+fn a_host_the_running_ca_may_not_sign_for_refuses_the_reload() {
+    let rig = rig();
+    let ca = rig.dir.join("ca").display().to_string();
+    let error = rig
+        .tunnel
+        .plan_reload(&rig.config(&["api.test", "other.test", "elsewhere.test"], "", &ca))
+        .err()
+        .unwrap_or_else(|| panic!("a new host outside the CA's name constraint is refused"));
+    assert!(error.contains("elsewhere.test"), "{error}");
+    rig.tunnel
+        .plan_reload(&rig.config(&["api.test", "other.test"], "", &ca))
+        .expect("hosts the CA covers still reload");
+}
+
+#[test]
 fn a_ca_key_that_does_not_match_its_certificate_refuses_the_reload() {
     let rig = rig();
     let (a, b, mixed) = (

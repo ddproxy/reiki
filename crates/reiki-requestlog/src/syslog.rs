@@ -208,8 +208,22 @@ impl Syslog {
     }
 }
 
+/// Name lookups have no timeout of their own, so one runs on a helper thread and a hung
+/// resolver costs the log writer at most `CONNECT_TIMEOUT` instead of blocking it.
 fn resolve(addr: &str) -> io::Result<SocketAddr> {
-    addr.to_socket_addrs()?
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let name = addr.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            name.to_socket_addrs()
+                .map(|found| found.collect::<Vec<_>>()),
+        );
+    });
+    let found = receiver.recv_timeout(CONNECT_TIMEOUT).map_err(|_| {
+        io::Error::new(io::ErrorKind::TimedOut, "resolving the collector timed out")
+    })??;
+    found
+        .into_iter()
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the host has no address"))
 }

@@ -393,19 +393,24 @@ impl Interceptor {
         let ca_changed = loaded.cert_path != running.cert_path
             || loaded.key_path != running.key_path
             || loaded.fingerprint != running.fingerprint;
-        let authority = if ca_changed {
-            let hosts: Vec<String> = next.hosts.keys().cloned().collect();
-            loaded.validate(&hosts)?;
-            changed.push("intercept ca".to_owned());
-            Some(Arc::new(loaded))
-        } else {
-            None
-        };
         let added = next
             .hosts
             .keys()
             .filter(|h| !current.hosts.contains_key(*h))
             .count();
+        let hosts: Vec<String> = next.hosts.keys().cloned().collect();
+        let authority = if ca_changed {
+            loaded.validate(&hosts)?;
+            changed.push("intercept ca".to_owned());
+            Some(Arc::new(loaded))
+        } else {
+            // A host added under the same CA must still be one the CA may sign for; fail at
+            // reload, not later when a client first connects to it.
+            if added > 0 {
+                running.validate(&hosts)?;
+            }
+            None
+        };
         let removed = current
             .hosts
             .keys()

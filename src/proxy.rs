@@ -1703,11 +1703,8 @@ fn is_account_header(name: &HeaderName) -> bool {
 /// Replaces a key (or its formatted credential) an upstream echoed back in text relayed to a client.
 fn scrub(bytes: Bytes, secrets: &[&str]) -> Bytes {
     let mut data = bytes;
-    let mut ordered: Vec<&str> = secrets.iter().copied().filter(|s| s.len() >= 8).collect();
-    // The formatted credential contains the raw key, so it has to go first.
-    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for secret in ordered {
-        let needle = secret.as_bytes();
+    for needle in crate::scrub::forms(secrets) {
+        let needle = needle.as_slice();
         if !data.windows(needle.len()).any(|w| w == needle) {
             continue;
         }
@@ -2132,6 +2129,22 @@ mod tests {
         headers.insert("x-echo", HeaderValue::from_static("sk-secret-1234"));
         let cleaned = scrub_headers(headers, &["sk-secret-1234"]);
         assert_eq!(cleaned["x-echo"], "[redacted]");
+    }
+
+    #[test]
+    fn encoded_forms_of_an_echoed_key_are_scrubbed_from_text_and_headers() {
+        let secrets = ["sk-a/b+c\"d-1234"];
+        let body = Bytes::from_static(
+            b"{\"k\":\"sk-a\\/b+c\\\"d-1234\"} sk-a%2Fb%2Bc%22d-1234 c2stYS9iK2MiZC0xMjM0 ok",
+        );
+        let out = scrub(body, &secrets);
+        assert_eq!(
+            out,
+            Bytes::from_static(b"{\"k\":\"[redacted]\"} [redacted] [redacted] ok")
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-echo", HeaderValue::from_static("sk-a%2Fb%2Bc%22d-1234"));
+        assert_eq!(scrub_headers(headers, &secrets)["x-echo"], "[redacted]");
     }
 
     #[test]

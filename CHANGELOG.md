@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- The scrub of an upstream key echoed in a response now also replaces its JSON-escaped, percent-encoded and base64 (standard and URL-safe) forms, in headers, error bodies and streamed chunks, including when a form is split across chunks.
+
 ## 0.8.2
 
 ### Added

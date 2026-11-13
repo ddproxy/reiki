@@ -203,7 +203,7 @@ pub async fn watch(app: Arc<App>) {
 }
 
 /// `2026-10-23T21:04:10Z` for a point in time, without a date library.
-fn rfc3339(time: SystemTime) -> String {
+pub(crate) fn rfc3339(time: SystemTime) -> String {
     let secs = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

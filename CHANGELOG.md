@@ -7,6 +7,8 @@
 - An optional `[peers]` table for health sharing between instances, behind a new `peers` cargo feature that is in the default set. It is off unless `enabled = true`: without the table, or with it disabled, no listener is opened, no peer is contacted, and `/status` and `/v1/openapi.json` are unchanged (golden and socket-table tests check this). A binary built without the feature refuses a `[peers]` table. See [peers](docs/peers.md).
 - `[peers]` validation: unknown keys are refused, publishing needs its own loopback `listen` and a `peer_token_sha256` that differs from the admin token and every stream token, and a peer `url` must be https with a `ca_file`, or http on loopback.
 - `reiki check` prints a `peers:` line with the effective settings, or `peers: disabled`.
+- `GET /v1/health` on a separate peer listener (`[peers] listen`), served only with `enabled` and `publish`. Per upstream it reports `healthy_keys`, `cooling_keys`, `disabled_keys`, `soonest_cooldown_seconds` and `last_status_class`, plus `instance` and `observed_at`; key labels only with `expose_key_labels`. Only the peer bearer token opens it, failures are logged with the peer address and throttled per address with counts of their own, and every other path is 404. The route is in `/v1/openapi.json` while publishing, with the peer listener as its server and a `peerAuth` scheme.
+- `[peers] instance` names the published instance; the host name otherwise. Changing the peer listener shows as `peers.listen` in a reload's `restart_needed`.
 
 ## 0.8.2
 

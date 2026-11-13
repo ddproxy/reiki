@@ -36,11 +36,14 @@ struct KeyHealth {
     disabled: bool,
     transient_failures: u32,
     last_status: Option<u16>,
+    /// Orders `last_status` across keys, so the latest attempt on an upstream can be found.
+    status_seq: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct KeyState {
     health: HashMap<String, KeyHealth>,
+    status_seq: u64,
 }
 
 /// Coarse view of a key's rotation state for operators.
@@ -95,7 +98,23 @@ impl KeyState {
     /// Remember the upstream status of an attempt, including a failed connection
     /// that produced none.
     pub fn record_status(&mut self, key: &str, status: Option<u16>) {
-        self.health.entry(key.to_owned()).or_default().last_status = status;
+        self.status_seq += 1;
+        let health = self.health.entry(key.to_owned()).or_default();
+        health.last_status = status;
+        health.status_seq = self.status_seq;
+    }
+
+    /// The status of the most recent attempt on any of `keys`: `None` when none was tried,
+    /// `Some(None)` when that attempt got no response.
+    pub fn latest_status<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Option<u16>> {
+        keys.into_iter()
+            .filter_map(|key| self.health.get(key))
+            .filter(|h| h.status_seq > 0)
+            .max_by_key(|h| h.status_seq)
+            .map(|h| h.last_status)
     }
 
     pub fn is_disabled(&self, key: &str) -> bool {
@@ -137,6 +156,7 @@ impl KeyState {
                 disabled: saved.disabled,
                 transient_failures: saved.transient_failures,
                 last_status: None,
+                status_seq: 0,
             },
         );
     }
@@ -294,6 +314,19 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn the_latest_status_is_the_most_recent_attempt_across_keys() {
+        let mut state = KeyState::default();
+        assert_eq!(state.latest_status(["a", "b"]), None);
+        state.record_status("a", Some(429));
+        state.record_status("b", Some(200));
+        assert_eq!(state.latest_status(["a", "b"]), Some(Some(200)));
+        state.record_status("a", None);
+        assert_eq!(state.latest_status(["a", "b"]), Some(None));
+        assert_eq!(state.latest_status(["b"]), Some(Some(200)));
+        assert_eq!(state.latest_status(["c"]), None);
     }
 
     #[test]

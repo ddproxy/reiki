@@ -548,6 +548,17 @@ async fn main() {
             reiki::serve::serve(admin_listener, admin_router, 64, std::future::pending()).await;
         });
     }
+    #[cfg(feature = "peers")]
+    if let Some(addr) = &peer_listen {
+        let peer_listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| fail(&format!("cannot bind peers {addr}: {e}")));
+        tracing::info!(%addr, "reiki peer health listening");
+        let peer_router = reiki::peers::router(Arc::clone(&app));
+        tokio::spawn(async move {
+            reiki::serve::serve(peer_listener, peer_router, 32, std::future::pending()).await;
+        });
+    }
     if let Some(tunnel) = &tunnel_config {
         let tunnel_listener = tokio::net::TcpListener::bind(&tunnel.listen)
             .await

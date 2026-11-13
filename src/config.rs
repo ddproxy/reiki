@@ -228,6 +228,8 @@ pub struct PeersConfig {
     pub listen: Option<String>,
     /// SHA-256 of the read-only peer token, required to publish.
     pub peer_token_sha256: Option<String>,
+    /// Name published as `instance`; the host name when unset.
+    pub instance: Option<String>,
     /// Reader poll period; data older than three of them counts as unknown.
     pub poll_interval_secs: u64,
     /// Publish per-key labels and states, not only counts per upstream.
@@ -247,6 +249,8 @@ struct PeersSettings {
     listen: Option<String>,
     #[serde(default)]
     peer_token_sha256: Option<String>,
+    #[serde(default)]
+    instance: Option<String>,
     #[serde(default = "default_poll_interval_secs")]
     poll_interval_secs: u64,
     #[serde(default)]
@@ -297,6 +301,7 @@ impl TryFrom<toml::Table> for PeersConfig {
             publish: settings.publish,
             listen: settings.listen,
             peer_token_sha256: settings.peer_token_sha256,
+            instance: settings.instance,
             poll_interval_secs: settings.poll_interval_secs,
             expose_key_labels: settings.expose_key_labels,
             peers,
@@ -1120,6 +1125,13 @@ impl Config {
                 peers.poll_interval_secs
             ));
         }
+        if let Some(instance) = &peers.instance {
+            if !valid_peer_name(instance) {
+                return Some(format!(
+                    "instance `{instance}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
+                ));
+            }
+        }
         if let Some(hash) = &peers.peer_token_sha256 {
             if let Some(reason) = self.peer_token_problem(hash) {
                 return Some(reason);
@@ -1212,15 +1224,18 @@ fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
     }
 }
 
-/// What is wrong with one `[peers.<name>]`, if anything.
-fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
-    if name.is_empty()
-        || !name
+fn valid_peer_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
+}
+
+/// What is wrong with one `[peers.<name>]`, if anything.
+fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
+    if !valid_peer_name(name) {
         return Some(format!(
-            "peer name `{name}` may only hold letters, digits, `-`, `_` and `.`"
+            "peer name `{name}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
         ));
     }
     let url = peer.url.as_str();
@@ -2138,6 +2153,7 @@ socket = "/run/forwarder.sock"
         }
     }
 
+    #[cfg(feature = "peers")]
     const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     fn with_peers(peers: &str) -> String {

@@ -294,6 +294,26 @@ fn a_disabled_peers_table_opens_nothing_either() {
     assert_eq!(outbound, 0);
 }
 
+#[cfg(all(target_os = "linux", feature = "peers"))]
+#[test]
+fn publishing_adds_exactly_the_peer_listener_and_no_outbound_connection() {
+    let ports = (free_port(), free_port());
+    let peer_port = free_port();
+    let running = start(
+        "publish",
+        ports,
+        &format!(
+            "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:{peer_port}\"\n\
+             peer_token_sha256 = \"{}\"\n",
+            sha("peer-token-for-tests")
+        ),
+        &[peer_port],
+    );
+    let (listening, outbound) = listening_and_outbound(running.child.id());
+    assert_eq!(listening, sorted(vec![ports.0, ports.1, peer_port]));
+    assert_eq!(outbound, 0);
+}
+
 #[cfg(feature = "peers")]
 #[test]
 fn check_reports_peers_as_disabled_without_a_table() {

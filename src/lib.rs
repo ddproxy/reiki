@@ -7,6 +7,8 @@ pub mod forward;
 pub mod intercept;
 pub mod keys;
 pub mod logging;
+#[cfg(feature = "peers")]
+pub mod peers;
 pub mod plugins;
 pub mod proxy;
 pub mod quota;

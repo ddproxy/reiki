@@ -72,8 +72,11 @@ enum Command {
     /// succeeded, 1 when the instance refused it and 2 when it could not be reached.
     Keys {
         /// Check the configured key files without contacting a running instance.
-        #[arg(long, conflicts_with_all = ["json", "url", "token_file"])]
+        #[arg(long, conflicts_with_all = ["json", "url", "token_file", "enable"])]
         check: bool,
+        /// Re-enable a disabled key by name.
+        #[arg(long, conflicts_with_all = ["check", "json"])]
+        enable: Option<String>,
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -247,6 +250,71 @@ async fn run_keys(
     }
 }
 
+/// Percent-encodes one query value, so a key name may contain any character.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The `reiki keys --enable <name>` command: asks the running instance over its admin
+/// listener. Exits 0 when the key was re-enabled, 1 when it was refused, and 2 when the
+/// listener could not be reached.
+async fn run_enable_key(
+    config: &std::path::Path,
+    key: &str,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+) -> i32 {
+    let target = match admin_target(config, url, token_file) {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return 2;
+        }
+    };
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/keys/enable?key={}",
+            target.base,
+            percent_encode_query(key)
+        ))
+        .bearer_auth(&target.token)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("reiki: cannot reach {}: {e}", target.base);
+            return 2;
+        }
+    };
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("reiki: cannot read the answer: {e}");
+            return 2;
+        }
+    };
+    if !status.is_success() {
+        if !body.is_empty() {
+            eprintln!("{body}");
+        }
+        eprintln!("reiki: the admin listener answered {status}");
+        return 1;
+    }
+    println!("{body}");
+    0
+}
+
 fn fail(message: &str) -> ! {
     eprintln!("reiki: {message}");
     std::process::exit(1);
@@ -317,6 +385,7 @@ async fn main() {
     }
     if let Some(Command::Keys {
         check,
+        enable,
         json,
         url,
         token_file,
@@ -335,6 +404,11 @@ async fn main() {
             print!("{}", reiki::keys::render_check(&checks));
             std::process::exit(i32::from(reiki::keys::check_has_problems(&checks)));
         }
+        if let Some(key) = enable {
+            std::process::exit(
+                run_enable_key(&cli.config, key, url.as_deref(), token_file.as_deref()).await,
+            );
+        }
         std::process::exit(
             run_keys(&cli.config, url.as_deref(), token_file.as_deref(), *json).await,
         );
@@ -344,7 +418,10 @@ async fn main() {
         if std::io::stdin().read_to_string(&mut token).is_err() {
             fail("cannot read stdin");
         }
-        println!("{}", reiki::auth::sha256_hex(token.trim()));
+        match reiki::auth::hash_token(&token) {
+            Ok(hash) => println!("{hash}"),
+            Err(error) => fail(&format!("hash-token: {error}")),
+        }
         return;
     }
 

@@ -57,6 +57,7 @@ pub enum ConfigError {
     BadTunnel(String),
     BadLog(String),
     BadReload(String),
+    BadAuth(String),
     UnknownPlugin {
         name: String,
         known: Vec<String>,
@@ -149,6 +150,7 @@ impl fmt::Display for ConfigError {
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
             Self::BadReload(reason) => write!(f, "invalid [reload]: {reason}"),
+            Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -200,6 +202,9 @@ pub struct Config {
     /// Reloading the config when its files change.
     #[serde(default)]
     pub reload: ReloadConfig,
+    /// Failed token checks on the client and admin listeners.
+    #[serde(default)]
+    pub auth: AuthConfig,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
@@ -274,6 +279,39 @@ impl Default for ReloadConfig {
 
 fn default_reload_interval() -> u64 {
     5
+}
+
+/// `[auth]`: how failed token checks on the client and admin listeners are slowed down.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Count failures per peer address and refuse that peer while the window lasts.
+    #[serde(default = "default_true")]
+    pub backoff: bool,
+    /// Failures one address may make inside `window_secs` before it is refused.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// How long a failure counts, and how long a refused address must wait.
+    #[serde(default = "default_failure_window_secs")]
+    pub window_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            backoff: true,
+            max_failures: default_max_failures(),
+            window_secs: default_failure_window_secs(),
+        }
+    }
+}
+
+fn default_max_failures() -> u32 {
+    10
+}
+
+fn default_failure_window_secs() -> u64 {
+    60
 }
 
 fn default_log_level() -> String {
@@ -909,6 +947,18 @@ impl Config {
                 self.reload.interval_secs
             )));
         }
+        if !(1..=10_000).contains(&self.auth.max_failures) {
+            return Err(ConfigError::BadAuth(format!(
+                "max_failures must be between 1 and 10000, got {}",
+                self.auth.max_failures
+            )));
+        }
+        if !(1..=86_400).contains(&self.auth.window_secs) {
+            return Err(ConfigError::BadAuth(format!(
+                "window_secs must be between 1 and 86400, got {}",
+                self.auth.window_secs
+            )));
+        }
         Ok(())
     }
 }
@@ -949,6 +999,30 @@ fn is_port(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_auth_backoff_defaults_and_validates() {
+        let config = Config::parse("").unwrap();
+        assert!(config.auth.backoff);
+        assert_eq!(config.auth.max_failures, 10);
+        assert_eq!(config.auth.window_secs, 60);
+
+        let config =
+            Config::parse("[auth]\nbackoff = false\nmax_failures = 3\nwindow_secs = 30\n").unwrap();
+        assert!(!config.auth.backoff);
+        assert_eq!(config.auth.max_failures, 3);
+        assert_eq!(config.auth.window_secs, 30);
+
+        for bad in [
+            "[auth]\nmax_failures = 0\n",
+            "[auth]\nmax_failures = 10001\n",
+            "[auth]\nwindow_secs = 0\n",
+            "[auth]\nwindow_secs = 86401\n",
+            "[auth]\nbogus = 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn the_reload_interval_is_checked() {
         let base = "[upstream.zen]\nbase_url = \"https://example.com\"\n";

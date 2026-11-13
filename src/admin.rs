@@ -1,14 +1,15 @@
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 
-use crate::auth::{constant_time_eq, sha256_hex};
+use crate::auth::{constant_time_eq, sha256_hex, Peer};
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::StrategyConfig;
 use crate::proxy::{App, Snapshot};
@@ -28,13 +29,14 @@ const ROUTES: &[(&str, &str, &str)] = &[
         "post",
         "Reload the config, or preview it with dry_run",
     ),
+    ("/keys/enable", "post", "Re-enable a disabled key"),
 ];
 
-fn handler(method: &str) -> MethodRouter<Arc<App>> {
-    if method == "post" {
-        post(reload)
-    } else {
-        get(status)
+fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
+    match (path, method) {
+        ("/reload", "post") => post(reload),
+        ("/keys/enable", "post") => post(enable_key),
+        _ => get(status),
     }
 }
 
@@ -43,9 +45,10 @@ fn handler(method: &str) -> MethodRouter<Arc<App>> {
 pub fn router(app: Arc<App>) -> Router {
     let mut router = Router::new();
     for (path, method, _) in ROUTES {
+        let route = handler(path, method);
         router = router
-            .route(path, handler(method))
-            .route(&format!("{V1}{path}"), handler(method));
+            .route(path, route.clone())
+            .route(&format!("{V1}{path}"), route);
     }
     router
         .route(&format!("{V1}/openapi.json"), get(openapi))
@@ -70,9 +73,14 @@ fn operation(summary: &str) -> serde_json::Value {
 }
 
 /// The OpenAPI 3.1 description of the v1 routes, including those plugins add.
-async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
+async fn openapi(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/v1/openapi.json", &headers) {
+        return *refusal;
     }
     let mut paths = serde_json::Map::new();
     for (path, method, summary) in ROUTES {
@@ -86,6 +94,16 @@ async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 serde_json::json!({"description": "Unreadable dry_run value; nothing changed"});
             op["responses"]["422"] =
                 serde_json::json!({"description": "The config was refused; nothing changed"});
+        }
+        if *path == "/keys/enable" {
+            op["parameters"] = serde_json::json!([{
+                "name": "key", "in": "query", "required": true,
+                "schema": {"type": "string"},
+            }]);
+            op["responses"]["400"] = serde_json::json!({
+                "description": "Missing key name, or a name that is not valid percent-encoding"
+            });
+            op["responses"]["404"] = serde_json::json!({"description": "No such key"});
         }
         paths.insert(format!("{V1}{path}"), serde_json::json!({ *method: op }));
     }
@@ -108,9 +126,14 @@ async fn openapi(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     text_response(StatusCode::OK, "application/json", document.to_string())
 }
 
-async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
+async fn status(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/status", &headers) {
+        return *refusal;
     }
     let snapshot = app.snapshot();
     let now = Instant::now();
@@ -142,9 +165,15 @@ async fn status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 }
 
 /// Re-reads the config and applies what can change live, like SIGHUP, and returns what changed.
-async fn reload(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
+async fn reload(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/reload", &headers) {
+        return *refusal;
     }
     let mut dry_run = false;
     for pair in uri.query().unwrap_or("").split('&') {
@@ -187,9 +216,99 @@ async fn reload(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Re
     }
 }
 
-async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap) -> Response {
-    if !access_allowed(&app, &headers) {
-        return unauthorized();
+/// Percent-decodes one query value. `+` is a space; an invalid escape or bytes that are not
+/// UTF-8 yields `None`, so the caller answers 400 instead of guessing the key name.
+fn decode_query_value(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Re-enables a key that was taken out of rotation, so its chain may pick it again. Sends
+/// the key's name as `?key=<name>`; an unknown name answers `404`.
+async fn enable_key(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/keys/enable", &headers) {
+        return *refusal;
+    }
+    let key = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("key="))
+        .filter(|key| !key.is_empty());
+    let Some(key) = key else {
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            "{\"ok\":false,\"error\":\"give the key name as ?key=<name>\"}".to_owned(),
+        );
+    };
+    let key = match decode_query_value(key).filter(|key| !key.is_empty()) {
+        Some(key) => key,
+        None => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                "{\"ok\":false,\"error\":\"the key name is not valid percent-encoding\"}"
+                    .to_owned(),
+            );
+        }
+    };
+    if app.enable_key(&key) {
+        tracing::info!(key, "key re-enabled through the admin listener");
+        text_response(
+            StatusCode::OK,
+            "application/json",
+            format!("{{\"ok\":true,\"key\":{}}}", json_string(&key)),
+        )
+    } else {
+        text_response(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            format!(
+                "{{\"ok\":false,\"error\":\"unknown key\",\"key\":{}}}",
+                json_string(&key)
+            ),
+        )
+    }
+}
+
+async fn plugin_route(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, uri.path(), &headers) {
+        return *refusal;
     }
     let snapshot = app.snapshot();
     let now = Instant::now();
@@ -219,24 +338,57 @@ async fn plugin_route(State(app): State<Arc<App>>, uri: Uri, headers: HeaderMap)
     }
 }
 
-/// Constant-time check of the `Authorization: Bearer <token>` header against the
-/// configured admin token hash. A missing config or header is a plain refusal.
-fn access_allowed(app: &App, headers: &HeaderMap) -> bool {
+/// Checks a request's bearer token against the configured admin token hash, logging each failure
+/// with the peer and path and counting it for the peer's lockout. The presented token is never
+/// logged. A missing config or header is a plain refusal.
+fn authorize(
+    app: &App,
+    peer: Option<IpAddr>,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<(), Box<Response>> {
+    if let Some(ip) = peer {
+        if let Some(wait) = app.admin_logins().blocked(ip, Instant::now()) {
+            tracing::warn!(?peer, path = %path, "too many failed admin logins, refusing");
+            return Err(Box::new(throttled(wait)));
+        }
+    }
+    match token_matches(app, headers) {
+        Ok(()) => {
+            if let Some(ip) = peer {
+                app.admin_logins().succeed(ip);
+            }
+            Ok(())
+        }
+        Err(reason) => {
+            let failures = peer.map(|ip| app.admin_logins().fail(ip, Instant::now()));
+            tracing::warn!(?peer, reason, ?failures, path = %path, "failed admin login");
+            Err(Box::new(unauthorized()))
+        }
+    }
+}
+
+/// Why a request's credential does not match, or `Ok` when it does.
+fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
     let snapshot = app.snapshot();
     let Some(admin) = snapshot.config.admin.as_ref() else {
-        return false;
+        return Err("no admin token configured");
     };
     let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
+        return Err("missing authorization header");
     };
     let Ok(value) = value.to_str() else {
-        return false;
+        return Err("authorization header is not text");
     };
     let Some(token) = bearer_token(value) else {
-        return false;
+        return Err("not a bearer credential");
     };
     let hash = sha256_hex(token);
-    constant_time_eq(&admin.token_sha256.to_ascii_lowercase(), &hash)
+    if constant_time_eq(&admin.token_sha256.to_ascii_lowercase(), &hash) {
+        Ok(())
+    } else {
+        Err("wrong token")
+    }
 }
 
 /// The credential of an `Authorization: Bearer <token>` value. The scheme name is
@@ -249,6 +401,17 @@ fn bearer_token(value: &str) -> Option<&str> {
 fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response
+}
+
+/// A refused client waiting out a login lockout, with the remaining seconds.
+fn throttled(wait: Duration) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }
 

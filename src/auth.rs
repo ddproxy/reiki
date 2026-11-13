@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -16,35 +16,102 @@ const MAX_TRACKED: usize = 4096;
 #[derive(Debug, Clone, Copy)]
 pub struct Peer(pub IpAddr);
 
+/// Limits for a [`LoginThrottle`], from the `[auth]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThrottleSettings {
+    pub enabled: bool,
+    pub max_failures: u32,
+    pub window: Duration,
+}
+
+impl Default for ThrottleSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_failures: MAX_FAILURES,
+            window: FAIL_WINDOW,
+        }
+    }
+}
+
+impl From<&crate::config::AuthConfig> for ThrottleSettings {
+    fn from(config: &crate::config::AuthConfig) -> Self {
+        Self {
+            enabled: config.backoff,
+            max_failures: config.max_failures,
+            window: Duration::from_secs(config.window_secs),
+        }
+    }
+}
+
+/// Tokens shorter than this are rejected by `reiki hash-token`. A hash cannot reveal how
+/// long the token behind it was, so config load can only check the hash shape (64 hex
+/// characters); keep tokens at least this long.
+pub const MIN_TOKEN_LEN: usize = 16;
+
 /// Counts failed token checks per address so token guessing is slowed and visible.
-#[derive(Default)]
 pub struct LoginThrottle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// Replaced on a reload so a new `[auth]` setting applies without a restart.
+    settings: RwLock<ThrottleSettings>,
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self::new(ThrottleSettings::default())
+    }
 }
 
 impl LoginThrottle {
+    pub fn new(settings: ThrottleSettings) -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+            settings: RwLock::new(settings),
+        }
+    }
+
+    /// Apply a reloaded `[auth]` table. Counts already collected are kept.
+    pub fn configure(&self, settings: ThrottleSettings) {
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = settings;
+    }
+
+    fn settings(&self) -> ThrottleSettings {
+        *self.settings.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// How long `ip` must wait, or `None` when it may try.
     pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let settings = self.settings();
+        if !settings.enabled {
+            return None;
+        }
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let (count, since) = seen.get(&ip)?;
         let elapsed = now.saturating_duration_since(*since);
-        if elapsed >= FAIL_WINDOW {
+        if elapsed >= settings.window {
             return None;
         }
-        (*count >= MAX_FAILURES).then(|| FAIL_WINDOW - elapsed)
+        (*count >= settings.max_failures).then(|| settings.window - elapsed)
     }
 
     /// Records a failure and returns how many the address has inside the window.
     pub fn fail(&self, ip: IpAddr, now: Instant) -> u32 {
+        let settings = self.settings();
+        if !settings.enabled {
+            return 0;
+        }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
-            seen.retain(|_, (_, since)| now.saturating_duration_since(*since) < FAIL_WINDOW);
+            seen.retain(|_, (_, since)| now.saturating_duration_since(*since) < settings.window);
             if seen.len() >= MAX_TRACKED {
                 return 0;
             }
         }
         let entry = seen.entry(ip).or_insert((0, now));
-        if now.saturating_duration_since(entry.1) >= FAIL_WINDOW {
+        if now.saturating_duration_since(entry.1) >= settings.window {
             *entry = (0, now);
         }
         entry.0 += 1;
@@ -61,6 +128,18 @@ impl LoginThrottle {
 pub fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hashes a token for `token_sha256`, refusing one shorter than [`MIN_TOKEN_LEN`].
+pub fn hash_token(token: &str) -> Result<String, String> {
+    let token = token.trim();
+    let length = token.chars().count();
+    if length < MIN_TOKEN_LEN {
+        return Err(format!(
+            "token must be at least {MIN_TOKEN_LEN} characters (got {length})"
+        ));
+    }
+    Ok(sha256_hex(token))
 }
 
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -184,11 +263,68 @@ mod tests {
     }
 
     #[test]
+    fn configured_limits_replace_the_defaults() {
+        let settings = ThrottleSettings {
+            enabled: true,
+            max_failures: 3,
+            window: Duration::from_secs(5),
+        };
+        let throttle = LoginThrottle::new(settings);
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..2 {
+            throttle.fail(ip, t0);
+        }
+        assert!(throttle.blocked(ip, t0).is_none());
+        throttle.fail(ip, t0);
+        assert_eq!(
+            throttle.blocked(ip, t0),
+            Some(Duration::from_secs(5)),
+            "a fresh block lasts the configured window"
+        );
+        assert!(throttle.blocked(ip, t0 + Duration::from_secs(5)).is_none());
+
+        throttle.configure(ThrottleSettings {
+            enabled: true,
+            max_failures: 1,
+            window: Duration::from_secs(10),
+        });
+        assert!(
+            throttle.blocked(ip, t0).is_some(),
+            "reconfigured limits apply to existing counts"
+        );
+    }
+
+    #[test]
+    fn a_disabled_backoff_records_and_blocks_nothing() {
+        let throttle = LoginThrottle::new(ThrottleSettings {
+            enabled: false,
+            max_failures: 1,
+            window: Duration::from_secs(60),
+        });
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(throttle.fail(ip, t0), 0);
+        }
+        assert!(throttle.blocked(ip, t0).is_none());
+    }
+
+    #[test]
     fn hashes_match_the_known_vector() {
         assert_eq!(
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn hash_token_refuses_short_tokens() {
+        let err = hash_token("shrt").unwrap_err();
+        assert!(err.contains("at least"), "{err}");
+        assert!(hash_token("a-sixteen-plus-char-token").is_ok());
+        let hash = hash_token("a-sixteen-plus-char-token").unwrap();
+        assert_eq!(hash, sha256_hex("a-sixteen-plus-char-token"));
     }
 
     #[test]

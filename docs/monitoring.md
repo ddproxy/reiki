@@ -4,7 +4,7 @@ Reiki can serve a small admin listener with `GET /status`, plus any paths a plug
 
 ## Admin API
 
-Routes: `GET /status`, `POST /reload`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API follows a stability promise: v1 only gains fields.
+Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API follows a stability promise: v1 only gains fields.
 
 ## Configure
 
@@ -18,7 +18,7 @@ Both fields are required. The admin address is bound at startup, so adding, remo
 
 ## Authenticate
 
-Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body. The token is hashed and compared in constant time. Anything other than `/status` and a path a configured plugin serves returns 404. The listener serves plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front of it.
+Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body. The token is hashed and compared in constant time. Anything other than `/status`, `/reload`, `/keys/enable` and a path a configured plugin serves returns 404. The listener serves plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front of it.
 
 ## GET /status
 
@@ -46,16 +46,38 @@ The response carries no key values, token hashes or file paths.
 
 ## Check key health
 
-`reiki keys` calls `GET /status` and prints one row per key: its name, upstream, state (`ok`, `cooling` or `disabled`), cooldown seconds remaining, last status code and the streams whose chain includes it. `reiki keys --json` prints a JSON document with a `keys` array instead.
+`reiki keys` calls `GET /status` and prints one row per key: its name, upstream, state (`ok`, `cooling` or `disabled`), cooldown seconds remaining, last status code and the streams whose chain includes it. `reiki keys --json` prints a JSON document with a `keys` array instead. `reiki keys --enable <name>` calls `POST /keys/enable` to re-enable a key that was taken out of rotation.
 
 ```bash
 reiki keys --token-file /etc/reiki/admin.token
 reiki keys --url http://127.0.0.1:4098 --token-file /etc/reiki/admin.token --json
 ```
 
-It takes `--url` and `--token-file` the same way as `reiki reload`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It exits 0 on success, 1 when the instance refuses the token or the answer, and 2 when it cannot reach the instance or resolve the admin address.
+It takes `--url` and `--token-file` the same way as `reiki reload`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It exits 0 on success, 1 when the instance refuses the token or the answer, and 2 when it cannot reach the instance or resolve the admin address. The same flags apply to `reiki keys --enable`, and `reiki keys --enable` conflicts with `--check` and `--json`.
 
 To check the key files from the config without a running instance, use `reiki keys --check`; see [troubleshooting](troubleshooting.md#key-health).
+
+## POST /keys/enable
+
+Re-enables a key that was taken out of rotation, so its chain may pick it again. The key's name is sent as `?key=<name>`, percent-encoded. Enabling clears the key's cooldown, its disabled flag and its consecutive-failure count, and persists the change like a reload does, so a restart does not undo it.
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "http://127.0.0.1:4098/v1/keys/enable?key=zen-a"
+```
+
+```bash
+reiki keys --enable zen-a --token-file /etc/reiki/admin.token
+```
+
+Responses:
+
+- `200`: `{"ok":true,"key":"<name>"}`.
+- `400`: no `key` name given, or a name that is not valid percent-encoding. Nothing changed.
+- `401`: missing or wrong token, as everywhere on the admin listener.
+- `404`: no key with that name is configured. Nothing changed.
+
+A key that was never out of rotation answers `200` and stays available. The endpoint does not reduce cooldown by itself beyond clearing it; see [key health](troubleshooting.md#key-health) for how keys are taken out and what `cooling` means.
 
 ## POST /reload
 

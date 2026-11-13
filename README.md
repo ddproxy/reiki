@@ -87,7 +87,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
 - `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
 - Keys live in files, never in the config. Keep them mode 0600.
-- Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`.
+- Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`. Tokens shorter than 16 characters are refused by `hash-token`.
 - Validate the setup with `reiki check`, then start Reiki with `reiki`.
 
 ## Use

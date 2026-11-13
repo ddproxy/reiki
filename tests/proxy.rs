@@ -1765,6 +1765,117 @@ async fn the_openapi_document_lists_exactly_the_v1_routes_that_answer() {
     }
 }
 
+/// The `state` one key reports in `/status`: available, cooling or out_of_rotation.
+async fn admin_key_state(h: &Harness, name: &str) -> String {
+    let admin = h.admin.as_ref().unwrap();
+    let body = h
+        .client
+        .get(format!("{admin}/status"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    doc["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == name)
+        .unwrap()["state"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn admin_keys_enable_re_enables_a_disabled_key() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "30")),
+        )],
+    );
+    // 429 cools the key and fails over to the next one.
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let admin = h.admin.as_ref().unwrap();
+    assert_eq!(admin_key_state(&h, "a").await, "cooling");
+
+    let post = |path: &'static str, token: Option<&'static str>| {
+        let mut req = h.client.post(format!("{admin}{path}"));
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    };
+
+    assert_eq!(
+        post("/v1/keys/enable?key=a", None).await.unwrap().status(),
+        401
+    );
+    assert_eq!(
+        post("/v1/keys/enable?key=a", Some("not-the-token"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        post("/v1/keys/enable", Some("admin-secret"))
+            .await
+            .unwrap()
+            .status(),
+        400,
+        "a missing key name answers 400"
+    );
+    assert_eq!(
+        post("/v1/keys/enable?key=%zz", Some("admin-secret"))
+            .await
+            .unwrap()
+            .status(),
+        400,
+        "an undecodable name answers 400"
+    );
+    assert_eq!(
+        post("/v1/keys/enable?key=zzz", Some("admin-secret"))
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "an unknown key answers 404"
+    );
+
+    let ok = post("/v1/keys/enable?key=a", Some("admin-secret"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.text().await.unwrap(), "{\"ok\":true,\"key\":\"a\"}");
+    assert_eq!(admin_key_state(&h, "a").await, "available");
+
+    // The key serves traffic again.
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
 #[tokio::test]
 async fn usage_needs_the_admin_token_and_answers_under_v1() {
     let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;

@@ -15,6 +15,7 @@ use futures_core::Stream;
 
 use crate::auth::{
     constant_time_eq, extract_token, sha256_hex, strip_query_key, LoginThrottle, Peer,
+    ThrottleSettings,
 };
 use crate::chain::{Chain, KeyState, Policy, SavedHealth};
 use crate::classify::{classify, FailureClass, Outcome};
@@ -233,6 +234,8 @@ pub struct App {
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: RwLock<Option<i64>>,
     logins: LoginThrottle,
+    /// Separate counts, so failed admin logins cannot lock out client requests from the same peer.
+    admin_logins: LoginThrottle,
     /// Replaced by a reload; a request holds the chain it started with through its [`PluginSession`].
     plugins: RwLock<Arc<PluginChain>>,
     /// The tunnel, once started, so a reload can change its policy.
@@ -273,6 +276,7 @@ impl App {
         header_timeout: Duration,
         plugins: PluginChain,
     ) -> Arc<Self> {
+        let throttle = ThrottleSettings::from(&config.auth);
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
@@ -285,7 +289,8 @@ impl App {
             persist_lock: Mutex::new(()),
             wall_clock: OnceLock::new(),
             ca_not_after: RwLock::new(None),
-            logins: LoginThrottle::default(),
+            logins: LoginThrottle::new(throttle),
+            admin_logins: LoginThrottle::new(throttle),
             plugins: RwLock::new(Arc::new(plugins)),
             tunnel: OnceLock::new(),
             config_path: OnceLock::new(),
@@ -331,6 +336,11 @@ impl App {
 
     pub(crate) fn health(&self) -> &Mutex<KeyState> {
         &self.health
+    }
+
+    /// Failed admin token checks, kept apart from the client listener's counts.
+    pub(crate) fn admin_logins(&self) -> &LoginThrottle {
+        &self.admin_logins
     }
 
     /// Point the app at the file it persists key health in. Set once at startup.
@@ -401,9 +411,25 @@ impl App {
         crate::state::save(path, &snapshot);
     }
 
+    /// Re-enables a key that was taken out of rotation and persists the change. Returns false
+    /// when no such key is configured.
+    pub fn enable_key(&self, name: &str) -> bool {
+        let snapshot = self.snapshot();
+        if !snapshot.config.keys.contains_key(name) {
+            return false;
+        }
+        {
+            let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+            health.enable(name);
+        }
+        self.persist_state();
+        true
+    }
+
     /// Swap in a new config and key set. A request keeps the snapshot it started
     /// with. Plugins are built at startup and are not rebuilt here.
     pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
+        let throttle = ThrottleSettings::from(&config.auth);
         let next = Arc::new(Snapshot::new(config, keys));
         // Health first, then the snapshot: `record` takes them in the same order, so a
         // failure from a request on the old snapshot cannot land after the re-enable.
@@ -420,6 +446,8 @@ impl App {
             }
         }
         *current = next;
+        self.logins.configure(throttle);
+        self.admin_logins.configure(throttle);
     }
 
     /// Hands the app the running tunnel so a reload can change its policy.
@@ -770,7 +798,11 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     } else {
         let peer = parts.extensions.get::<Peer>().map(|p| p.0);
         if let Some(wait) = peer.and_then(|ip| app.logins.blocked(ip, Instant::now())) {
-            tracing::warn!(?peer, "too many failed logins, refusing");
+            tracing::warn!(
+                ?peer,
+                path = %parts.uri.path(),
+                "too many failed logins, refusing"
+            );
             return rate_limited_response(wait);
         }
         let fail = |reason: &str| {

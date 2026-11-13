@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `requestlog` option `max_capture_bytes` (default 1048576, 1 to 67108864) caps the body bytes copied per request onto the writer queue, which bounds the queue's worst case. A request body over it is logged as masked text with `body_truncated`. Before, the whole body was queued; the response body and error body capture now also stop at it.
+
+- `reiki_plugin_rejections_total{plugin,stream}` counts requests a plugin rejected, or skipped under `on_error = "reject"`. The plugin API gains `Event::PluginRejected`.
+
+- `hold_unauthorized = true` on an upstream (default `false`) holds the disable of the first key that answers 401 until a later key serves the same request, so a request every key refuses cannot take a good key out of rotation.
+
+### Fixed
+
+- `requestlog` keeps writing to the current file when a log rotation fails (a rename error), warns once and retries after a growing pause. The failed record used to be lost and every record retried the rotation.
+- A non-streamed JSON response that carries tool calls is no longer re-serialised by the `placeholders` plugin. Only the strings that change are rewritten, so key order and formatting are kept.
+
+### Security
+
+- `requestlog` masks more: provider key prefixes (Stripe, Hugging Face, Groq, xAI, Perplexity, NVIDIA, npm, PyPI, Shopify, SendGrid and others), base64 and percent-encoded keys, string values of fields named like credentials, secrets split across stream deltas, and a secret cut at a capture or truncation point. The added prefixes also apply to the `placeholders` plugin, which shares the scanner.
+- The scrub of an upstream key echoed in a response now also replaces its JSON-escaped, percent-encoded and base64 (standard and URL-safe) forms, in headers, error bodies and streamed chunks, including when a form is split across chunks.
+
 ## 0.8.2
 
 ### Added

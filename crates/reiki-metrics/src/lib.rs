@@ -49,6 +49,9 @@ impl Plugin for MetricsPlugin {
             }
             Event::Cooldown { key, kind } => self.metrics.record_cooldown(key, kind),
             Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
+            Event::PluginRejected { stream, plugin } => {
+                self.metrics.record_plugin_rejection(stream, plugin);
+            }
             Event::Finding {
                 stream,
                 plugin,
@@ -280,6 +283,7 @@ struct Inner {
     failovers: BTreeMap<(String, String, &'static str), u64>,
     cooldowns: BTreeMap<(String, &'static str), u64>,
     rate_limit_rejections: BTreeMap<String, u64>,
+    plugin_rejections: BTreeMap<(String, String), u64>,
     findings: BTreeMap<(String, String, String, &'static str), u64>,
     tokens: BTreeMap<(String, String, &'static str), u64>,
     usage_requests: BTreeMap<(String, String), u64>,
@@ -365,6 +369,17 @@ impl Metrics {
         });
     }
 
+    /// Counts a request a plugin stopped. Labels are bounded by the configured streams and the
+    /// plugins built into the binary, never by request volume.
+    pub fn record_plugin_rejection(&self, stream: &str, plugin: &str) {
+        self.with(|inner| {
+            *inner
+                .plugin_rejections
+                .entry((stream.to_owned(), plugin.to_owned()))
+                .or_insert(0) += 1;
+        });
+    }
+
     pub fn record_tokens(&self, stream: &str, upstream: &str, direction: &'static str, count: u64) {
         self.with(|inner| {
             *inner
@@ -440,6 +455,20 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "reiki_rate_limit_rejections_total{{stream=\"{}\"}} {}",
+                escape_label(stream),
+                count
+            );
+        }
+
+        out.push_str(
+            "# HELP reiki_plugin_rejections_total Requests a plugin rejected, or skipped under on_error = reject.\n",
+        );
+        out.push_str("# TYPE reiki_plugin_rejections_total counter\n");
+        for ((stream, plugin), count) in &inner.plugin_rejections {
+            let _ = writeln!(
+                out,
+                "reiki_plugin_rejections_total{{plugin=\"{}\",stream=\"{}\"}} {}",
+                escape_label(plugin),
                 escape_label(stream),
                 count
             );
@@ -620,6 +649,33 @@ mod tests {
         assert!(text.contains(
             "reiki_findings_total{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"blocked\"} 3"
         ));
+    }
+
+    #[test]
+    fn plugin_rejections_are_counted_per_plugin_and_stream() {
+        let plugin = MetricsPlugin::default();
+        for _ in 0..2 {
+            plugin.on_event(&Event::PluginRejected {
+                stream: "s",
+                plugin: "phi",
+            });
+        }
+        plugin.on_event(&Event::PluginRejected {
+            stream: "t",
+            plugin: "placeholders",
+        });
+        let text = plugin
+            .on_admin(&AdminCtx::new("/metrics", KeyCounts::default()))
+            .unwrap()
+            .body;
+        assert!(text.contains("# TYPE reiki_plugin_rejections_total counter"));
+        assert!(text.contains("reiki_plugin_rejections_total{plugin=\"phi\",stream=\"s\"} 2"));
+        assert!(
+            text.contains("reiki_plugin_rejections_total{plugin=\"placeholders\",stream=\"t\"} 1")
+        );
+        let empty = Metrics::new().render(KeyCounts::default());
+        assert!(empty.contains("# TYPE reiki_plugin_rejections_total counter"));
+        assert!(!empty.contains("reiki_plugin_rejections_total{"));
     }
 
     #[test]

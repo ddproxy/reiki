@@ -1220,6 +1220,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     let mut last_refusal: Option<(String, StatusCode, HeaderMap, Bytes)> = None;
     let mut pending_failover: Option<(String, FailureKind)> = None;
     let mut disabled_one = false;
+    // The first key to answer 401 under `hold_unauthorized`, disabled once a later key succeeds.
+    let mut held: Option<(String, u16)> = None;
     let mut confirmed: Vec<String> = Vec::new();
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
@@ -1336,6 +1338,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             if had_failures {
                 app.persist_state();
             }
+            release_held(app, snapshot, stream, held.take());
             let secrets = [secret.0.as_str(), auth_value.as_str()];
             let response = match settle_body(response).await {
                 Ok(response) => response,
@@ -1369,6 +1372,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         };
         match outcome {
             Outcome::Success | Outcome::PassThrough => {
+                if matches!(outcome, Outcome::Success) {
+                    release_held(app, snapshot, stream, held.take());
+                }
                 return Ok(finish_buffered(
                     &mut plugin_states,
                     &key_name,
@@ -1398,9 +1404,18 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 confirmed.push(key_name);
                 tokio::time::sleep(QUOTA_CONFIRM_DELAY).await;
             }
-            Outcome::KeyFailure(FailureClass::Unauthorized) if disabled_one => {
+            Outcome::KeyFailure(FailureClass::Unauthorized)
+                if disabled_one || (upstream.hold_unauthorized && held.is_some()) =>
+            {
                 // A second key refusing the same request points at the request, not at the keys.
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request again, not disabling it");
+                skip.push(key_name.clone());
+                last_refusal = Some((key_name.clone(), status, response_headers, snippet));
+                pending_failover = Some((key_name, FailureKind::Unauthorized));
+            }
+            Outcome::KeyFailure(FailureClass::Unauthorized) if upstream.hold_unauthorized => {
+                tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, holding its disable until a later key serves it");
+                held = Some((key_name.clone(), status.as_u16()));
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::Unauthorized));
@@ -1546,6 +1561,20 @@ pub(crate) fn passthrough_headers(
         out.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     }
     out
+}
+
+/// Disables the key whose 401 was held back, now that a later key has served the request.
+fn release_held(app: &App, snapshot: &Snapshot, stream: &str, held: Option<(String, u16)>) {
+    if let Some((key, status)) = held {
+        record(
+            app,
+            snapshot,
+            stream,
+            &key,
+            FailureClass::Unauthorized,
+            Some(status),
+        );
+    }
 }
 
 fn record(
@@ -1703,11 +1732,8 @@ fn is_account_header(name: &HeaderName) -> bool {
 /// Replaces a key (or its formatted credential) an upstream echoed back in text relayed to a client.
 fn scrub(bytes: Bytes, secrets: &[&str]) -> Bytes {
     let mut data = bytes;
-    let mut ordered: Vec<&str> = secrets.iter().copied().filter(|s| s.len() >= 8).collect();
-    // The formatted credential contains the raw key, so it has to go first.
-    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for secret in ordered {
-        let needle = secret.as_bytes();
+    for needle in crate::scrub::forms(secrets) {
+        let needle = needle.as_slice();
         if !data.windows(needle.len()).any(|w| w == needle) {
             continue;
         }
@@ -2132,6 +2158,22 @@ mod tests {
         headers.insert("x-echo", HeaderValue::from_static("sk-secret-1234"));
         let cleaned = scrub_headers(headers, &["sk-secret-1234"]);
         assert_eq!(cleaned["x-echo"], "[redacted]");
+    }
+
+    #[test]
+    fn encoded_forms_of_an_echoed_key_are_scrubbed_from_text_and_headers() {
+        let secrets = ["sk-a/b+c\"d-1234"];
+        let body = Bytes::from_static(
+            b"{\"k\":\"sk-a\\/b+c\\\"d-1234\"} sk-a%2Fb%2Bc%22d-1234 c2stYS9iK2MiZC0xMjM0 ok",
+        );
+        let out = scrub(body, &secrets);
+        assert_eq!(
+            out,
+            Bytes::from_static(b"{\"k\":\"[redacted]\"} [redacted] [redacted] ok")
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-echo", HeaderValue::from_static("sk-a%2Fb%2Bc%22d-1234"));
+        assert_eq!(scrub_headers(headers, &secrets)["x-echo"], "[redacted]");
     }
 
     #[test]

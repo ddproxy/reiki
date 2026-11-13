@@ -212,6 +212,10 @@ base_url = "https://openrouter.ai/api/v1"
 
 Reiki decides whether a key failed from the status code, the `Retry-After` header and a few phrases in the error body. A provider that signals quota or key problems in a different way may need a new rule in `src/classify.rs`. These services have not been tested.
 
+## Unauthorized keys
+
+A 401 takes the key out of rotation at once, and one request disables at most one key: a second key that refuses the same request is tried but left alone. A request that every key refuses (a malformed credential header, a model the account cannot use) therefore still costs one good key. Set `hold_unauthorized = true` on the upstream to hold that disable back until a later key serves the same request: only then is the first refusing key disabled. If every key of the upstream refuses, or the request ends in a fallback upstream or an error, no key is disabled. The default is `false`. While a bad key waits for a request to succeed, each request that reaches it pays one extra attempt.
+
 ## Relaying errors as they are
 
 Reiki reads a 401, a 403 or a quota phrase as a key failure: it cools or disables the key and tries the next one. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.

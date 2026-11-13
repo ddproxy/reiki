@@ -141,6 +141,8 @@ pub enum Event<'a> {
     Cooldown { key: &'a str, kind: FailureKind },
     /// A stream's rate limit turned a request away before any key was picked.
     RateLimited { stream: &'a str },
+    /// A plugin stopped a request: it returned `Reject`, or it skipped under `on_error = "reject"`.
+    PluginRejected { stream: &'a str, plugin: &'a str },
     /// A detection plugin found identifiers in a request body: how many of one kind, and whether
     /// the request was blocked for it. The event never carries the matched text.
     Finding {

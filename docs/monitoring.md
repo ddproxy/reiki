@@ -105,10 +105,13 @@ Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape t
 | `reiki_failovers_total` | counter | `stream`, `key`, `class` |
 | `reiki_cooldowns_total` | counter | `key`, `class` |
 | `reiki_rate_limit_rejections_total` | counter | `stream` |
+| `reiki_plugin_rejections_total` | counter | `plugin`, `stream` |
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
 | `reiki_keys` | gauge | `state` |
 
 `reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value. The `detail` label that a plugin can attach to a finding is not a label here: `reiki_findings_total` ignores it so that the number of series does not grow with the names a plugin reports. Use the request log for per-name counts.
+
+`reiki_plugin_rejections_total` counts requests a plugin stopped: it returned a rejection (the `phi`, `finance` and `controlled` plugins do when they block), or it skipped or panicked under `on_error = "reject"`, which answers 503. `plugin` is the plugin's name and `stream` the stream the request came in on, so the series are bounded by the plugins built into the binary times the configured streams. A request rate-limited by the stream counts under `reiki_rate_limit_rejections_total` instead.
 
 `status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. The `reiki_keys` gauge always reports all three states, even at zero.
 

@@ -161,6 +161,7 @@ fn event_stream<'a>(event: &Event<'a>) -> Option<&'a str> {
         Event::RequestDone { stream, .. }
         | Event::Failover { stream, .. }
         | Event::RateLimited { stream }
+        | Event::PluginRejected { stream, .. }
         | Event::Finding { stream, .. } => Some(*stream),
         _ => None,
     }
@@ -485,6 +486,10 @@ impl PluginChain {
                         %message,
                         "plugin rejected the request"
                     );
+                    self.on_event(&Event::PluginRejected {
+                        stream: meta.stream,
+                        plugin: entry.plugin.name(),
+                    });
                     return Err(Blocked { status, message });
                 }
                 Err(other) => {
@@ -506,6 +511,10 @@ impl PluginChain {
                                 %message,
                                 "plugin skipped the request; rejecting per on_error"
                             );
+                            self.on_event(&Event::PluginRejected {
+                                stream: meta.stream,
+                                plugin: entry.plugin.name(),
+                            });
                             return Err(Blocked {
                                 status: StatusCode::SERVICE_UNAVAILABLE,
                                 message,
@@ -1181,6 +1190,44 @@ mod tests {
             .on_request(&mut states, &meta, &mut headers, &mut body)
             .unwrap();
         assert_eq!(*SEEN.lock().unwrap(), ["reporter ssn 2 false"]);
+    }
+
+    #[test]
+    fn a_rejection_and_a_skip_that_rejects_are_announced_but_a_pass_through_is_not() {
+        use std::sync::Mutex;
+
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        struct Listener;
+        impl Plugin for Listener {
+            fn name(&self) -> &str {
+                "listener"
+            }
+            fn on_event(&self, event: &Event<'_>) {
+                if let Event::PluginRejected { stream, plugin } = event {
+                    SEEN.lock().unwrap().push(format!("{plugin}@{stream}"));
+                }
+            }
+        }
+        let mut registry = registry();
+        registry.push(Registration {
+            name: "listener",
+            build: |_| Ok(Box::new(Listener) as Box<dyn Plugin>),
+        });
+        let run = |source: &str| {
+            let chain = PluginChain::build(&configured(source), &registry).unwrap();
+            let mut states = chain.states();
+            let mut body = Bytes::new();
+            request(&chain, &mut states, &mut body)
+        };
+        assert!(run("[listener]\n[decline]\n").is_ok());
+        assert!(
+            SEEN.lock().unwrap().is_empty(),
+            "a pass-through skip is no rejection"
+        );
+        assert!(run("[listener]\n[refuse]\n").is_err());
+        assert!(run("[listener]\n[decline]\non_error = \"reject\"\n").is_err());
+        assert_eq!(*SEEN.lock().unwrap(), ["refuse@default", "decline@default"]);
     }
 
     #[test]

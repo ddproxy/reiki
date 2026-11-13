@@ -23,6 +23,31 @@ const PREFIXES: &[(&str, usize)] = &[
     ("xoxa-", 20),
     ("xoxs-", 20),
     ("eyJ", 40),
+    ("sk_live_", 16),
+    ("sk_test_", 16),
+    ("rk_live_", 16),
+    ("whsec_", 16),
+    ("hf_", 30),
+    ("gsk_", 30),
+    ("xai-", 30),
+    ("pplx-", 30),
+    ("r8_", 30),
+    ("npm_", 30),
+    ("dop_v1_", 40),
+    ("SG.", 40),
+    ("shpat_", 30),
+    ("glptt-", 16),
+    ("nvapi-", 30),
+    ("lin_api_", 30),
+    ("sbp_", 30),
+    ("tvly-", 20),
+    ("csk-", 30),
+    ("jina_", 30),
+    ("ya29.", 30),
+    ("dckr_pat_", 20),
+    ("hvs.", 20),
+    ("pypi-", 50),
+    ("ATATT3", 30),
 ];
 
 const BEARER: &[u8] = b"bearer ";
@@ -114,6 +139,35 @@ pub fn scan(text: &str) -> Vec<Span> {
     spans
 }
 
+/// Where a credential that was cut off at the end of `text` begins.
+///
+/// A key cut by a size limit can fall short of its minimum length and escape [`scan`], so a
+/// caller that cut the text should hide everything from here on.
+pub fn partial_tail(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let from = bytes.len().saturating_sub(MAX_TAIL);
+    (from..bytes.len()).find(|&i| {
+        if !text.is_char_boundary(i) || (i > 0 && is_word(bytes[i - 1])) {
+            return false;
+        }
+        let rest = &bytes[i..];
+        let starts = |prefix: &[u8], min: usize| {
+            rest.starts_with(prefix) && rest.len() - prefix.len() < min && {
+                rest[prefix.len()..].iter().all(|b| is_token(*b))
+            }
+        };
+        if rest.len() >= BEARER.len() && rest[..BEARER.len()].eq_ignore_ascii_case(BEARER) {
+            return rest.len() > BEARER.len()
+                && rest[BEARER.len()..].iter().all(|b| is_token(*b))
+                && rest.len() - BEARER.len() < BEARER_MIN;
+        }
+        PREFIXES.iter().any(|(p, min)| starts(p.as_bytes(), *min))
+    })
+}
+
+/// The longest credential prefix plus its minimum tail, with room to spare.
+const MAX_TAIL: usize = 64;
+
 /// End of the private-key block at `start`, to the end of text if unclosed; `None` for other PEM blocks.
 fn private_key_end(text: &str, start: usize) -> Option<usize> {
     let rest = &text[start..];
@@ -171,6 +225,38 @@ mod tests {
     fn ordinary_words_and_short_tokens_are_left_alone() {
         assert!(scan("the sk-short and a plain sentence").is_empty());
         assert!(scan("public certificate -----BEGIN CERTIFICATE----- body").is_empty());
+    }
+
+    #[test]
+    fn newer_provider_prefixes_are_found() {
+        let keys = [
+            fake("sk_live_", "0123456789abcdef0123"),
+            fake("hf_", "0123456789abcdefABCDEFghijklmnopqr"),
+            fake("gsk_", "0123456789abcdefABCDEFghijklmnopqr"),
+            fake("xai-", "0123456789abcdefABCDEFghijklmnopqr"),
+            fake("npm_", "0123456789abcdefABCDEFghijklmnopqr"),
+            fake("ya29.", "a0AfH6SMBx0123456789abcdefABCDEFghij"),
+        ];
+        for key in keys {
+            let text = format!("k={key};");
+            assert_eq!(found(&text), vec![key.as_str()], "{key}");
+        }
+        assert!(
+            scan("hf_short and sk_live_x and half_0123456789abcdefABCDEFghijklmnopqr").is_empty()
+        );
+    }
+
+    #[test]
+    fn a_cut_credential_is_located_even_when_short() {
+        let cut = fake("sk-", "0123456");
+        let text = format!("say {cut}");
+        assert!(scan(&text).is_empty());
+        assert_eq!(partial_tail(&text), Some(4));
+        assert_eq!(partial_tail("see Bearer abcdef"), Some(4));
+        assert_eq!(partial_tail("plain words here"), None);
+        assert_eq!(partial_tail("ask-0123"), None);
+        assert_eq!(partial_tail("a Bearer of news"), None);
+        assert_eq!(partial_tail(""), None);
     }
 
     #[test]

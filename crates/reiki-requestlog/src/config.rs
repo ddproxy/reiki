@@ -20,6 +20,8 @@ const DEFAULT_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_FILE_KEEP: u32 = 5;
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_CAPTURE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
 /// Below the 104-byte limit of the smallest platform (macOS), leaving room for the terminator.
 const MAX_SOCKET_PATH: usize = 100;
@@ -89,6 +91,8 @@ pub struct Config {
     pub syslog_app_name: String,
     pub body: BodyMode,
     pub max_body_bytes: usize,
+    /// Most body bytes copied per request onto the writer queue.
+    pub max_capture_bytes: usize,
     pub headers: Vec<String>,
     pub response: ResponseMode,
     pub redact: bool,
@@ -116,6 +120,7 @@ impl Config {
             "syslog_app_name",
             "body",
             "max_body_bytes",
+            "max_capture_bytes",
             "headers",
             "response",
             "redact",
@@ -204,6 +209,13 @@ impl Config {
             1,
             MAX_BODY_BYTES_LIMIT as u64,
         )? as usize;
+        let max_capture_bytes = integer(
+            table,
+            "max_capture_bytes",
+            DEFAULT_MAX_CAPTURE_BYTES as u64,
+            1,
+            MAX_CAPTURE_BYTES_LIMIT as u64,
+        )? as usize;
         let queue = integer(table, "queue", DEFAULT_QUEUE as u64, 16, 65_536)? as usize;
 
         let headers = headers(table)?;
@@ -261,6 +273,7 @@ impl Config {
             syslog_app_name,
             body,
             max_body_bytes,
+            max_capture_bytes,
             headers,
             response,
             redact,
@@ -422,6 +435,7 @@ mod tests {
         assert!(config.redact);
         assert_eq!(config.file_keep, 5);
         assert_eq!(config.max_body_bytes, 65_536);
+        assert_eq!(config.max_capture_bytes, 1_048_576);
         assert!(config.headers.is_empty() && config.socket.is_none());
     }
 
@@ -587,6 +601,14 @@ mod tests {
         );
         assert!(parse("file = \"/x\"\nmax_body_bytes = 0").is_err());
         assert!(parse("file = \"/x\"\nmax_body_bytes = 99999999").is_err());
+        assert!(parse("file = \"/x\"\nmax_capture_bytes = 0").is_err());
+        assert!(parse("file = \"/x\"\nmax_capture_bytes = 99999999999").is_err());
+        assert_eq!(
+            parse("file = \"/x\"\nmax_capture_bytes = 4096")
+                .unwrap()
+                .max_capture_bytes,
+            4096
+        );
         assert!(parse("file = \"/x\"\nqueue = 4").is_err());
         assert!(parse("file = \"/x\"\nfile_keep = 500").is_err());
         assert!(parse("file = \"/x\"\nredact = \"yes\"").is_err());

@@ -43,7 +43,15 @@ jobs:
         run: |
           rustup toolchain install 1.99 --profile minimal -t ${{ matrix.target }}
           rustup default 1.99
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      - name: Run on a CPU without AVX
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y qemu-user
+          qemu-x86_64 -cpu Nehalem "target/${{ matrix.target }}/release/reiki" ca-init --dir "$RUNNER_TEMP/ca" --host example.com --days 1
       - name: Package
         run: |
           name="reiki-${GITHUB_REF_NAME}-${{ matrix.target }}"

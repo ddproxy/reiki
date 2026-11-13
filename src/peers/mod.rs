@@ -2,8 +2,10 @@
 //! with an enabled `[peers]` table.
 
 mod health;
+mod host;
 mod openapi;
 mod publisher;
+mod sessions;
 
 pub use openapi::openapi_paths;
 pub use publisher::{router, Publisher};

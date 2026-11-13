@@ -9,6 +9,8 @@
 - `reiki check` prints a `peers:` line with the effective settings, or `peers: disabled`.
 - `GET /v1/health` on a separate peer listener (`[peers] listen`), served only with `enabled` and `publish`. Per upstream it reports `healthy_keys`, `cooling_keys`, `disabled_keys`, `soonest_cooldown_seconds` and `last_status_class`, plus `instance` and `observed_at`; key labels only with `expose_key_labels`. Only the peer bearer token opens it, failures are logged with the peer address and throttled per address with counts of their own, and every other path is 404. The route is in `/v1/openapi.json` while publishing, with the peer listener as its server and a `peerAuth` scheme.
 - `[peers] instance` names the published instance; the host name otherwise. Changing the peer listener shows as `peers.listen` in a reload's `restart_needed`.
+- `[peers] expose_host_stats` (off by default) adds `host` (load average, cores, memory and swap, disk use per role for the config, state, log and request log directories, never paths) and `sessions` to `/v1/health`. `active_sessions` counts distinct values of `session_header` (default `x-opencode-session`) over `session_window_secs` (default 300), once per client request, kept only as salted hashes in a bounded table. A per-stream breakdown needs `expose_key_labels` too.
+- The `peers` feature adds the `rustix` crate (unix only) for `statvfs`.
 
 ## 0.8.2
 

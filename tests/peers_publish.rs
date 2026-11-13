@@ -418,3 +418,90 @@ async fn a_peer_token_hash_shared_with_another_credential_is_refused() {
         assert!(error.contains("peer_token_sha256 is the same"), "{error}");
     }
 }
+
+impl Rig {
+    async fn send(&self, session: Option<&str>) -> u16 {
+        let mut request = self
+            .client
+            .post(format!("{}/zen/chat/completions", self.relay))
+            .bearer_auth(STREAM_TOKEN)
+            .body("{}");
+        if let Some(id) = session {
+            request = request.header("x-opencode-session", id);
+        }
+        request.send().await.unwrap().status().as_u16()
+    }
+}
+
+#[tokio::test]
+async fn host_stats_and_sessions_stay_out_unless_exposed() {
+    let rig = Rig::new("").await;
+    rig.send(Some("ses_one")).await;
+    let doc = rig.health().await;
+    assert!(
+        doc.get("host").is_none() && doc.get("sessions").is_none(),
+        "{doc}"
+    );
+}
+
+#[tokio::test]
+async fn host_stats_report_load_memory_and_disks_by_role() {
+    let rig = Rig::new("expose_host_stats = true\n").await;
+    let dir = std::env::temp_dir().join(format!("reiki-peers-host-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    rig.app.set_config_path(dir.join("reiki.toml"));
+    rig.app.set_state_path(dir.join("reiki.toml.state"));
+    let doc = rig.health().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let host = &doc["host"];
+    assert!(host["cores"].as_u64().unwrap() >= 1);
+    if cfg!(target_os = "linux") {
+        assert_eq!(host["load_average"].as_array().unwrap().len(), 3);
+        let memory = &host["memory"];
+        assert!(memory["total_bytes"].as_u64().unwrap() > 0);
+        assert!(memory["available_bytes"].is_u64() && memory["swap_total_bytes"].is_u64());
+    }
+    let disks = host["disks"].as_array().unwrap();
+    assert_eq!(disks.len(), 1, "{disks:?}");
+    assert_eq!(disks[0]["roles"], serde_json::json!(["config", "state"]));
+    assert!(disks[0]["used_percent"].as_f64().unwrap() <= 100.0);
+    assert!(
+        !doc.to_string().contains(&*dir.to_string_lossy()),
+        "no paths are published"
+    );
+}
+
+#[tokio::test]
+async fn sessions_count_distinct_ids_once_per_request_whatever_the_retries() {
+    let rig = Rig::new("expose_host_stats = true\n").await;
+    // Each request fails over both keys before answering, which must not add sessions.
+    for _ in 0..3 {
+        rig.send(Some("ses_alpha")).await;
+    }
+    rig.send(Some("ses_beta")).await;
+    rig.send(None).await;
+    let doc = rig.health().await;
+    let sessions = &doc["sessions"];
+    assert_eq!(sessions["active_sessions"], 2, "{sessions}");
+    assert_eq!(sessions["window_seconds"], 300);
+    assert!(
+        sessions.get("streams").is_none(),
+        "stream names stay hidden"
+    );
+    let text = doc.to_string();
+    assert!(
+        !text.contains("ses_alpha") && !text.contains("laptop"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn per_stream_sessions_need_key_labels_too() {
+    let rig = Rig::new("expose_host_stats = true\nexpose_key_labels = true\n").await;
+    rig.send(Some("ses_alpha")).await;
+    let doc = rig.health().await;
+    assert_eq!(
+        doc["sessions"]["streams"],
+        serde_json::json!([{"stream": "laptop", "active_sessions": 1}])
+    );
+}

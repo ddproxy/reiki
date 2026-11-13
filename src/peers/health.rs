@@ -118,11 +118,69 @@ pub(crate) fn document(app: &App, peers: &PeersConfig) -> Value {
             peers.expose_key_labels,
         )
     };
-    json!({
+    let mut doc = json!({
         "instance": instance_name(peers),
         "observed_at": crate::reload::rfc3339(app.wall_now()),
         "upstreams": upstreams,
-    })
+    });
+    if peers.expose_host_stats {
+        doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config));
+        doc["sessions"] = sessions(app, peers);
+    }
+    doc
+}
+
+/// The directories Reiki writes to, by role: config and state, its own log, the request log.
+fn disk_dirs(app: &App, config: &Config) -> Vec<(&'static str, std::path::PathBuf)> {
+    let parent = |path: &std::path::Path| {
+        path.parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            )
+    };
+    let mut dirs = Vec::new();
+    if let Some(path) = app.config_path() {
+        dirs.push(("config", parent(path)));
+    }
+    if let Some(path) = app.state_path() {
+        dirs.push(("state", parent(path)));
+    }
+    if let Some(file) = &config.log.file {
+        dirs.push(("log", parent(std::path::Path::new(file))));
+    }
+    if let Some(file) = config
+        .plugins
+        .get("requestlog")
+        .and_then(|table| table.get("file"))
+        .and_then(toml::Value::as_str)
+    {
+        dirs.push(("requestlog", parent(std::path::Path::new(file))));
+    }
+    dirs
+}
+
+/// Distinct session ids in the window: a total, and per stream only with `expose_key_labels`,
+/// since stream names identify clients.
+pub(crate) fn sessions(app: &App, peers: &PeersConfig) -> Value {
+    let window = Duration::from_secs(peers.session_window_secs);
+    let counts = app
+        .peer_publisher()
+        .sessions()
+        .counts(window, Instant::now());
+    let total: usize = counts.values().sum();
+    let mut out = json!({
+        "window_seconds": peers.session_window_secs,
+        "active_sessions": total,
+    });
+    if peers.expose_key_labels {
+        out["streams"] = counts
+            .iter()
+            .map(|(stream, count)| json!({"stream": stream, "active_sessions": count}))
+            .collect();
+    }
+    out
 }
 
 #[cfg(test)]

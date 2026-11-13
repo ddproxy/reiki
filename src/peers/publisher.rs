@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -14,23 +14,46 @@ use crate::auth::{constant_time_eq, sha256_hex, LoginThrottle, Peer, ThrottleSet
 use crate::config::PeersConfig;
 use crate::proxy::App;
 
+use super::sessions::Sessions;
+
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
 
 /// State of the peer listener that outlives a reload.
 pub struct Publisher {
     /// Kept apart from the client and admin counts, so peer guessing locks out only peers.
     logins: LoginThrottle,
+    sessions: Sessions,
 }
 
 impl Publisher {
     pub(crate) fn new(throttle: ThrottleSettings) -> Arc<Self> {
         Arc::new(Self {
             logins: LoginThrottle::new(throttle),
+            sessions: Sessions::new(),
         })
     }
 
     pub(crate) fn logins(&self) -> &LoginThrottle {
         &self.logins
+    }
+
+    pub(crate) fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    /// Counts the session id of one client request, once per request so retries add nothing.
+    pub(crate) fn observe_session(&self, peers: &PeersConfig, stream: &str, headers: &HeaderMap) {
+        if !peers.publishing() || !peers.expose_host_stats {
+            return;
+        }
+        let Some(id) = headers
+            .get(peers.session_header.as_str())
+            .and_then(|value| value.to_str().ok())
+        else {
+            return;
+        };
+        let window = Duration::from_secs(peers.session_window_secs);
+        self.sessions.observe(stream, id, window, Instant::now());
     }
 }
 

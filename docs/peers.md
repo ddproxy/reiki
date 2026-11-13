@@ -59,6 +59,32 @@ curl -s -H "Authorization: Bearer $PEER_TOKEN" http://127.0.0.1:4099/v1/health
 - With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`.
 - The answer never holds key values, token hashes, key file paths, stream names or request counts, and is sent with `Cache-Control: no-store`.
 
+### Host stats and sessions
+
+`expose_host_stats = true` (off by default) adds two objects to the answer:
+
+```toml
+[peers]
+expose_host_stats = true
+# session_header = "x-opencode-session"   # client header that names a session
+# session_window_secs = 300               # a session is active this long after its last request
+```
+
+```json
+"host": {"load_average":[0.52,0.58,0.59],"cores":8,
+         "memory":{"total_bytes":16384000000,"available_bytes":8192000000,
+                   "swap_total_bytes":2048000000,"swap_free_bytes":2048000000},
+         "disks":[{"roles":["config","state"],"total_bytes":107374182400,
+                   "available_bytes":53687091200,"used_percent":50.0}]},
+"sessions": {"window_seconds":300,"active_sessions":3}
+```
+
+- `load_average` comes from `/proc/loadavg` and `memory` from `/proc/meminfo`; on a platform without them they are `null`. `cores` is the parallelism available to Reiki.
+- `disks` has one entry per filesystem behind the directories Reiki writes to, labelled by role and never by path: `config` (the config file), `state` (the key-health state file), `log` (`[log] file`) and `requestlog` (the request log plugin's `file`). Roles on the same filesystem share an entry. `used_percent` is computed as `df` does. Disk figures use `statvfs` from the `rustix` crate, the one dependency the `peers` feature adds.
+- `active_sessions` counts the distinct values of `session_header` seen on authenticated client requests in the last `session_window_secs`. It counts once per client request, so retries, failover and a fallback upstream do not add to it. Values are kept only as salted 64-bit hashes, at most 4096 per stream and 256 streams, least recently seen dropped first; ids are never logged or published. Requests without the header, on a passthrough upstream, or with an id over 256 bytes are not counted.
+- A per-stream breakdown (`sessions.streams`, with `stream` and `active_sessions`) appears only when `expose_key_labels` is also on, since stream names identify clients.
+- `session_header` must be a lowercase header name and may not be a credential header (`authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-goog-api-key`). `session_window_secs` is between 10 and 86400.
+
 ### Authentication
 
 - Only `Authorization: Bearer <peer token>` is accepted. The token is hashed and compared in constant time against `peer_token_sha256`, and only that hash: the admin token and the stream tokens are refused here, and the peer token is refused on the admin and client listeners because config validation keeps the three apart. `x-api-key` and `?key=` are not read.

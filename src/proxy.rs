@@ -357,6 +357,16 @@ impl App {
         })
     }
 
+    #[cfg(feature = "peers")]
+    pub(crate) fn config_path(&self) -> Option<&PathBuf> {
+        self.config_path.get()
+    }
+
+    #[cfg(feature = "peers")]
+    pub(crate) fn state_path(&self) -> Option<&PathBuf> {
+        self.state_path.get()
+    }
+
     /// Point the app at the file it persists key health in. Set once at startup.
     pub fn set_state_path(&self, path: PathBuf) {
         let _ = self.state_path.set(path);
@@ -986,6 +996,12 @@ async fn dispatch(
     plugin_session: PluginSession,
 ) -> Response {
     use tracing::Instrument;
+    #[cfg(feature = "peers")]
+    if let (Some(publisher), Some(peers)) = (app.peer_publisher.get(), &snapshot.config.peers) {
+        if stream != PASSTHROUGH_STREAM {
+            publisher.observe_session(peers, stream, &parts.headers);
+        }
+    }
     let id = reiki_plugin::new_request_id();
     let span = tracing::info_span!("req", id = %id);
     dispatch_inner(

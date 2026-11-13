@@ -37,6 +37,38 @@ fn health_schema() -> Value {
             "instance": {"type": "string"},
             "observed_at": {"type": "string", "format": "date-time"},
             "upstreams": {"type": "array", "items": upstream_schema()},
+            "host": {
+                "description": "Only with expose_host_stats",
+                "type": "object",
+                "properties": {
+                    "load_average": {"type": ["array", "null"], "items": {"type": "number"}},
+                    "cores": {"type": "integer"},
+                    "memory": {"type": ["object", "null"], "properties": {
+                        "total_bytes": {"type": "integer"},
+                        "available_bytes": {"type": "integer"},
+                        "swap_total_bytes": {"type": "integer"},
+                        "swap_free_bytes": {"type": "integer"},
+                    }},
+                    "disks": {"type": "array", "items": {"type": "object", "properties": {
+                        "roles": {"type": "array", "items": {"enum": ["config", "state", "log", "requestlog"]}},
+                        "total_bytes": {"type": "integer"},
+                        "available_bytes": {"type": "integer"},
+                        "used_percent": {"type": "number"},
+                    }}},
+                },
+            },
+            "sessions": {
+                "description": "Only with expose_host_stats; streams only with expose_key_labels too",
+                "type": "object",
+                "properties": {
+                    "window_seconds": {"type": "integer"},
+                    "active_sessions": {"type": "integer"},
+                    "streams": {"type": "array", "items": {"type": "object", "properties": {
+                        "stream": {"type": "string"},
+                        "active_sessions": {"type": "integer"},
+                    }}},
+                },
+            },
         },
     })
 }

@@ -234,6 +234,12 @@ pub struct PeersConfig {
     pub poll_interval_secs: u64,
     /// Publish per-key labels and states, not only counts per upstream.
     pub expose_key_labels: bool,
+    /// Publish load, memory, disk use and active sessions.
+    pub expose_host_stats: bool,
+    /// Client header whose distinct values count as active sessions.
+    pub session_header: String,
+    /// How long a session id counts as active after its last request.
+    pub session_window_secs: u64,
     pub peers: BTreeMap<String, PeerEntry>,
 }
 
@@ -255,10 +261,24 @@ struct PeersSettings {
     poll_interval_secs: u64,
     #[serde(default)]
     expose_key_labels: bool,
+    #[serde(default)]
+    expose_host_stats: bool,
+    #[serde(default = "default_session_header")]
+    session_header: String,
+    #[serde(default = "default_session_window_secs")]
+    session_window_secs: u64,
 }
 
 fn default_poll_interval_secs() -> u64 {
     30
+}
+
+fn default_session_header() -> String {
+    "x-opencode-session".to_owned()
+}
+
+fn default_session_window_secs() -> u64 {
+    300
 }
 
 /// One `[peers.<name>]`: another instance whose health `reiki peers` reads.
@@ -304,6 +324,9 @@ impl TryFrom<toml::Table> for PeersConfig {
             instance: settings.instance,
             poll_interval_secs: settings.poll_interval_secs,
             expose_key_labels: settings.expose_key_labels,
+            expose_host_stats: settings.expose_host_stats,
+            session_header: settings.session_header,
+            session_window_secs: settings.session_window_secs,
             peers,
         })
     }
@@ -332,8 +355,16 @@ impl PeersConfig {
             _ => "not publishing".to_owned(),
         };
         let names = peers.peers.keys().cloned().collect::<Vec<_>>();
+        let host = if peers.expose_host_stats {
+            format!(
+                ", host stats and sessions from `{}` over {}s",
+                peers.session_header, peers.session_window_secs
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "peers: enabled, {publish}, {} peer(s)[{}], poll every {}s",
+            "peers: enabled, {publish}, {} peer(s)[{}], poll every {}s{host}",
             names.len(),
             names.join(", "),
             peers.poll_interval_secs
@@ -1123,6 +1154,28 @@ impl Config {
             return Some(format!(
                 "poll_interval_secs must be between 1 and 86400, got {}",
                 peers.poll_interval_secs
+            ));
+        }
+        if !(10..=86_400).contains(&peers.session_window_secs) {
+            return Some(format!(
+                "session_window_secs must be between 10 and 86400, got {}",
+                peers.session_window_secs
+            ));
+        }
+        let header = peers.session_header.as_str();
+        if axum::http::HeaderName::from_bytes(header.as_bytes())
+            .map_or(true, |name| name.as_str() != header)
+        {
+            return Some(format!(
+                "session_header `{header}` must be a lowercase header name"
+            ));
+        }
+        if matches!(
+            header,
+            "authorization" | "proxy-authorization" | "cookie" | "x-api-key" | "x-goog-api-key"
+        ) {
+            return Some(format!(
+                "session_header `{header}` carries credentials and cannot count sessions"
             ));
         }
         if let Some(instance) = &peers.instance {
@@ -2182,6 +2235,9 @@ socket = "/run/forwarder.sock"
         assert!(!peers.publishing());
         assert_eq!(peers.poll_interval_secs, 30);
         assert!(peers.peers.is_empty() && peers.listen.is_none());
+        assert!(!peers.expose_host_stats);
+        assert_eq!(peers.session_header, "x-opencode-session");
+        assert_eq!(peers.session_window_secs, 300);
         assert_eq!(
             PeersConfig::check_line(Some(&peers)),
             "peers: disabled",
@@ -2269,6 +2325,23 @@ socket = "/run/forwarder.sock"
                 "[peers]\npoll_interval_secs = 0\n".to_owned(),
                 "poll_interval_secs",
             ),
+            (
+                "[peers]\nsession_window_secs = 5\n".to_owned(),
+                "session_window_secs",
+            ),
+            (
+                "[peers]\nsession_header = \"X-Session\"\n".to_owned(),
+                "lowercase",
+            ),
+            (
+                "[peers]\nsession_header = \"bad header\"\n".to_owned(),
+                "lowercase",
+            ),
+            (
+                "[peers]\nsession_header = \"authorization\"\n".to_owned(),
+                "credentials",
+            ),
+            ("[peers]\ninstance = \"a b\"\n".to_owned(), "instance"),
         ] {
             let reason = peers_error(&peers);
             assert!(reason.contains(needle), "{peers}: {reason}");

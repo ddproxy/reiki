@@ -28,7 +28,7 @@ expose_host_stats = false          # publish load, memory, disk use and active s
 cooldown_bucket_secs = 300         # published cooldowns round up to a multiple of this; 0 is exact
 # stream_interval_secs = 5         # period of `host` events on /v1/health/stream
 # max_subscribers = 16             # open streams in total
-# max_subscribers_per_peer = 4     # open streams per client address
+# max_subscribers_per_peer = 4     # open streams per client address, not counted from loopback
 # max_subscribers_per_token = 8    # open streams per peer token
 
 [[peers.tokens]]                   # more peer tokens, one per reader, each with a name
@@ -129,7 +129,11 @@ expose_host_stats = true
 ### Authentication
 
 - Only `Authorization: Bearer <peer token>` is accepted. The token is hashed and compared in constant time against every peer token hash, all of them on each request, so the timing does not tell which one matched. Only those hashes count: the admin token and the stream tokens are refused here, and the peer token is refused on the admin and client listeners because config validation keeps the three apart. `x-api-key` and `?key=` are not read.
-- A missing or wrong token gets a bare 401. Each failure is logged with the peer address and never the token, and counts towards the same per-address lockout as the other listeners (`[auth]`, default 10 failures in 60 s, then 429 with `Retry-After`). The peer listener keeps its own counts, so failed peer logins never lock an address out of the admin or client listener. When the table of tracked addresses is full, the address with the fewest failures, then the oldest, is dropped, so a flood of addresses cannot leave a new one untracked.
+- A missing or wrong token gets a bare 401, and each failure is logged with the peer address and never the token. How failures count depends on where the connection comes from:
+  - From a loopback address, which is where every peer arrives through `ssh -L`, a WireGuard forward or a local TLS-terminating proxy, the address tells callers apart from nothing. Failures go into one shared count, logged as `shared_failures`, and each failed attempt waits 500 ms for its 401. Nothing is locked out: a request with a valid token is always answered, so one peer with a stale token cannot shut the others out.
+  - From any other address (a TLS listener reached directly), failures count per address, an IPv6 address by its /64, towards the same lockout as the other listeners (`[auth]`, default 10 failures in 60 s, then 429 with `Retry-After`, even for a valid token). When the table of tracked addresses is full, the address with the fewest failures, then the oldest, is dropped, so a flood of addresses cannot leave a new one untracked.
+- A successful login does not clear a failure count on the peer listener, so valid requests between guesses do not reset it; counts expire with the `[auth]` window. The client and admin listeners are unchanged.
+- The peer listener keeps its own counts, so failed peer logins never lock an address out of the admin or client listener.
 - The matching token's name stays with the request: it counts towards `max_subscribers_per_token` and may appear in Reiki's log lines. The token itself is never logged and the name is never published.
 - The listener caps open connections at 32 and closes a connection that does not finish its headers within 30 s.
 
@@ -162,7 +166,7 @@ data: {"observed_at":"...","upstream":{"name":"zen","healthy_keys":0,"cooling_ke
 - With `expose_host_stats`, `host` comes every `stream_interval_secs` (default 5) and `sessions` whenever the session counts change.
 - A `: heartbeat` comment comes every 15 seconds, so a reader can tell a quiet stream from a dead one.
 - Changes are checked once a second and fed through one bounded broadcast. A subscriber that stops reading is dropped once 32 frames are queued for it, rather than buffered without limit, and so is one that falls behind the broadcast.
-- `max_subscribers` (default 16, at most 256) caps open streams in total, `max_subscribers_per_peer` (default 4) caps them per client address and `max_subscribers_per_token` (default 8, at most 256) per peer token; past the first the answer is 503, past the others 429, with `Retry-After`. A closed connection frees its place. The listener accepts `max_subscribers` plus 16 connections.
+- `max_subscribers` (default 16, at most 256) caps open streams in total, `max_subscribers_per_peer` (default 4) caps them per client address (not applied to loopback connections, which all share one address; the token cap tells those apart) and `max_subscribers_per_token` (default 8, at most 256) per peer token; past the first the answer is 503, past the others 429, with `Retry-After`. A closed connection frees its place. The listener accepts `max_subscribers` plus 16 connections.
 - The stream carries the same fields as `/v1/health` and nothing else: no bodies, no key labels unless `expose_key_labels`, no stream names. A reload that stops publishing ends every open stream; one that removes a peer token or changes its hash ends the streams opened with that token, within a second, and leaves the others open.
 
 ## Read: reiki peers

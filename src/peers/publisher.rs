@@ -18,6 +18,22 @@ use super::sessions::Sessions;
 use super::stream::{ensure_ticker, Frames, Hub, Limits, Refused, HEARTBEAT, STREAM_PATH};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
+/// How long a failed login waits for its 401 when every caller shares one source address.
+const SHARED_FAILURE_DELAY: Duration = Duration::from_millis(500);
+
+/// The address a caller is told apart by, or `None` for one arriving from loopback. Tunnels
+/// (`ssh -L`, WireGuard forwarding) and a local TLS-terminating proxy all connect from loopback,
+/// so on such a connection the source says nothing about which peer is calling.
+fn distinct_source(peer: Option<IpAddr>) -> Option<IpAddr> {
+    peer.filter(|ip| !ip.is_loopback() && !ipv4_mapped_loopback(*ip))
+}
+
+fn ipv4_mapped_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        IpAddr::V4(_) => false,
+    }
+}
 
 /// State of the peer listener that outlives a reload.
 pub struct Publisher {
@@ -190,7 +206,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return not_found();
     }
     let peer = req.extensions().get::<Peer>().map(|p| p.0);
-    let token = match authorize(&app, peers, peer, req.headers()) {
+    let token = match authorize(&app, peers, peer, req.headers()).await {
         Ok(token) => token,
         Err(refusal) => return *refusal,
     };
@@ -215,7 +231,8 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &
         per_peer: peers.max_subscribers_per_peer as usize,
         per_token: peers.max_subscribers_per_token as usize,
     };
-    let subscribed = hub.subscribe(peer, token, limits, HEARTBEAT, || {
+    // Behind a loopback tunnel every stream shares one address; the token cap tells them apart.
+    let subscribed = hub.subscribe(distinct_source(peer), token, limits, HEARTBEAT, || {
         super::stream::frame("snapshot", &super::health::document(app, peers))
     });
     match subscribed {
@@ -248,14 +265,21 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &
 /// Checks the bearer token against the peer token hashes alone, so no admin or stream token
 /// opens this listener, and returns the matching token's name. Failures are logged with the peer
 /// address, never the token.
-fn authorize<'a>(
+///
+/// From a distinct address, failures count per address (IPv6 by /64) and lock it out as on the
+/// other listeners. From loopback, where every tunnelled peer shares the address, they count in
+/// one shared bucket that only delays each failed attempt and never refuses a valid token, so
+/// one peer with a stale token cannot lock the others out. A success never clears a count here,
+/// so valid requests between guesses do not reset it.
+async fn authorize<'a>(
     app: &App,
     peers: &'a PeersConfig,
     peer: Option<IpAddr>,
     headers: &HeaderMap,
 ) -> Result<&'a str, Box<Response>> {
     let logins = app.peer_publisher().logins();
-    if let Some(ip) = peer {
+    let source = distinct_source(peer);
+    if let Some(ip) = source {
         if let Some(wait) = logins.blocked(ip, Instant::now()) {
             tracing::warn!(?peer, "too many failed peer logins, refusing");
             return Err(Box::new(throttled(wait)));
@@ -263,15 +287,23 @@ fn authorize<'a>(
     }
     match token_matches(peers, headers) {
         Ok(name) => {
-            if let Some(ip) = peer {
-                logins.succeed(ip);
-            }
             tracing::debug!(?peer, token = name, "peer authenticated");
             Ok(name)
         }
         Err(reason) => {
-            let failures = peer.map(|ip| logins.fail(ip, Instant::now()));
-            tracing::warn!(?peer, reason, ?failures, "failed peer login");
+            let key = source.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            let failures = logins.fail(key, Instant::now());
+            if source.is_some() {
+                tracing::warn!(?peer, reason, failures, "failed peer login");
+            } else {
+                tracing::warn!(
+                    ?peer,
+                    reason,
+                    shared_failures = failures,
+                    "failed peer login from loopback"
+                );
+                tokio::time::sleep(SHARED_FAILURE_DELAY).await;
+            }
             Err(Box::new(unauthorized()))
         }
     }
@@ -319,5 +351,114 @@ mod tests {
         assert_eq!(matching_token(&tokens, &sha256_hex("two")), Some("ct-5"));
         assert_eq!(matching_token(&tokens, &sha256_hex("three")), None);
         assert_eq!(matching_token(&[], &sha256_hex("one")), None);
+    }
+
+    const GOOD: &str = "good-peer-token-for-unit-tests";
+    const OTHER: &str = "other-peer-token-for-unit-tests";
+
+    fn app() -> Arc<App> {
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.com/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+             [peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
+             peer_token_sha256 = \"{}\"\n\
+             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+            sha256_hex(GOOD),
+            sha256_hex(OTHER)
+        );
+        App::new(
+            crate::config::Config::parse(&text).unwrap(),
+            [("a".to_owned(), crate::proxy::Secret::new("k"))].into(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        )
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    /// The status `token` gets from `ip`, or 200 when it is let in.
+    async fn status(app: &App, ip: &str, token: &str) -> u16 {
+        let snapshot = app.snapshot();
+        let peers = snapshot.config.peers.as_ref().unwrap();
+        let peer = Some(ip.parse().unwrap());
+        match authorize(app, peers, peer, &bearer(token)).await {
+            Ok(_) => 200,
+            Err(response) => response.status().as_u16(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_distinct_address_is_locked_out_per_address_and_by_ipv6_prefix() {
+        let app = app();
+        for _ in 0..10 {
+            assert_eq!(status(&app, "192.0.2.1", "wrong").await, 401);
+        }
+        assert_eq!(status(&app, "192.0.2.1", GOOD).await, 429);
+        assert_eq!(status(&app, "192.0.2.2", GOOD).await, 200);
+        for _ in 0..10 {
+            assert_eq!(status(&app, "2001:db8::1", "wrong").await, 401);
+        }
+        assert_eq!(status(&app, "2001:db8::ffff", GOOD).await, 429, "same /64");
+        assert_eq!(status(&app, "2001:db8:0:1::1", GOOD).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_does_not_reset_the_failure_count() {
+        let app = app();
+        for _ in 0..9 {
+            assert_eq!(status(&app, "192.0.2.7", "wrong").await, 401);
+        }
+        assert_eq!(status(&app, "192.0.2.7", GOOD).await, 200);
+        assert_eq!(status(&app, "192.0.2.7", "wrong").await, 401);
+        assert_eq!(
+            status(&app, "192.0.2.7", GOOD).await,
+            429,
+            "the tenth failure counts despite the success between"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_failures_are_shared_slowed_and_never_lock_out_a_valid_token() {
+        let app = app();
+        let started = Instant::now();
+        let failures: Vec<_> = (0..12)
+            .map(|i| {
+                let app = Arc::clone(&app);
+                let ip = if i % 2 == 0 { "127.0.0.1" } else { "::1" };
+                tokio::spawn(async move { status(&app, ip, "stale-token").await })
+            })
+            .collect();
+        for failure in failures {
+            assert_eq!(failure.await.unwrap(), 401);
+        }
+        assert!(
+            started.elapsed() >= SHARED_FAILURE_DELAY,
+            "each failure is delayed"
+        );
+        let started = Instant::now();
+        assert_eq!(status(&app, "127.0.0.1", GOOD).await, 200);
+        assert_eq!(status(&app, "127.0.0.1", OTHER).await, 200);
+        assert_eq!(status(&app, "::ffff:127.0.0.1", OTHER).await, 200);
+        assert!(
+            started.elapsed() < SHARED_FAILURE_DELAY,
+            "no delay for a valid token"
+        );
+        let shared = app
+            .peer_publisher()
+            .logins()
+            .fail(IpAddr::from([0, 0, 0, 0]), Instant::now());
+        assert_eq!(shared, 13, "every loopback failure went to one bucket");
+        assert_eq!(
+            status(&app, "192.0.2.9", GOOD).await,
+            200,
+            "and none to a distinct address"
+        );
     }
 }

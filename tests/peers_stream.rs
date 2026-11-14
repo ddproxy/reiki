@@ -313,12 +313,23 @@ async fn the_stream_needs_the_peer_token_and_a_get() {
 
 #[tokio::test]
 async fn subscriber_caps_refuse_extra_streams_until_one_closes() {
-    let rig = Rig::new("max_subscribers = 2\nmax_subscribers_per_peer = 1\n").await;
+    let rig = Rig::new(&format!(
+        "max_subscribers = 2\nmax_subscribers_per_peer = 1\nmax_subscribers_per_token = 1\n{}",
+        ct5_token()
+    ))
+    .await;
     let first = rig.open(PEER_TOKEN).await;
     assert_eq!(first.status(), 200);
     let second = rig.open(PEER_TOKEN).await;
-    assert_eq!(second.status(), 429, "one stream per address");
+    assert_eq!(second.status(), 429, "one stream per token");
     assert!(second.headers().contains_key("retry-after"));
+    let other = rig.open(CT5_TOKEN).await;
+    assert_eq!(
+        other.status(),
+        200,
+        "the per-address cap does not apply to the shared loopback address"
+    );
+    drop(other);
     drop(first);
     let mut status = 0;
     for _ in 0..100 {

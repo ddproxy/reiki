@@ -313,11 +313,18 @@ async fn key_labels_appear_only_when_exposed() {
 }
 
 #[tokio::test]
-async fn failed_peer_logins_are_throttled_per_address() {
+async fn failed_peer_logins_from_loopback_never_lock_out_a_valid_token() {
+    // Every tunnelled peer arrives from loopback; per-address lockout is a unit test in the
+    // publisher with distinct addresses.
     let rig = Rig::new("").await;
+    let started = std::time::Instant::now();
     for _ in 0..10 {
-        assert_eq!(rig.peer_get("/v1/health", Some("wrong")).await.0, 401);
+        assert_eq!(rig.peer_get("/v1/health", Some("stale")).await.0, 401);
     }
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "each failure is slowed"
+    );
     let res = rig
         .client
         .get(format!("{}/v1/health", rig.peer))
@@ -325,8 +332,7 @@ async fn failed_peer_logins_are_throttled_per_address() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 429, "locked out even with the right token");
-    assert!(res.headers().contains_key("retry-after"));
+    assert_eq!(res.status(), 200, "a valid token still gets in");
     let res = rig
         .client
         .get(format!("{}/v1/status", rig.admin))
@@ -335,6 +341,27 @@ async fn failed_peer_logins_are_throttled_per_address() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200, "peer failures do not lock out the admin");
+}
+
+#[tokio::test]
+async fn a_stale_token_behind_the_shared_address_does_not_lock_out_another_peer() {
+    let second = "second-peer-token-behind-the-tunnel";
+    let rig = Rig::new(&format!(
+        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+        sha(second)
+    ))
+    .await;
+    let stale = (0..12).map(|_| rig.peer_get("/v1/health", Some("revoked-token")));
+    for (code, _) in futures_util::future::join_all(stale).await {
+        assert_eq!(code, 401);
+    }
+    for token in [PEER_TOKEN, second] {
+        assert_eq!(
+            rig.peer_get("/v1/health", Some(token)).await.0,
+            200,
+            "{token}"
+        );
+    }
 }
 
 #[tokio::test]

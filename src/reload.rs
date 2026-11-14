@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::plugins::{stamp, FileStamp};
 use crate::proxy::{json_escape, App};
 
 /// The outcome of a successful reload.
@@ -40,15 +39,29 @@ impl ReloadReport {
         let changed = if self.changed.is_empty() {
             "no setting changed".to_owned()
         } else {
-            self.changed.join(", ")
+            single_line(&self.changed.join(", "))
         };
         format!(
             "{changed}; keys={} streams={}; restart needed=[{}]",
             self.keys,
             self.streams,
-            self.restart_needed.join(", ")
+            single_line(&self.restart_needed.join(", "))
         )
     }
+}
+
+/// `text` with control characters, which a quoted TOML table name can hold, written as escapes so
+/// one log line stays one line.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 /// The JSON body for a failed reload.
@@ -134,10 +147,29 @@ impl Default for ReloadState {
     }
 }
 
+/// What identifies a file's content cheaply: size, modification time to the nanosecond and, on
+/// Unix, the inode and change time, so a file replaced by a same-size copy that kept its
+/// modification time (`cp -p`, `rsync -t`) still differs.
+type FileStamp = (u64, Option<SystemTime>, u64, i128);
 type Stamps = Vec<(PathBuf, Option<FileStamp>)>;
 
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let (inode, changed) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            meta.ino(),
+            i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+        )
+    };
+    #[cfg(not(unix))]
+    let (inode, changed) = (0, 0);
+    Some((meta.len(), meta.modified().ok(), inode, changed))
+}
+
 fn stamps(paths: &[PathBuf]) -> Stamps {
-    paths.iter().map(|p| (p.clone(), stamp(p))).collect()
+    paths.iter().map(|p| (p.clone(), file_stamp(p))).collect()
 }
 
 /// Notices when a set of files changed and then held still, so a half-written file is not read.
@@ -315,6 +347,45 @@ mod tests {
             !detector.changed(&paths) && detector.changed(&paths),
             "a deleted file counts"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_replacement_that_keeps_its_mtime_is_noticed() {
+        let dir = std::env::temp_dir().join(format!("reiki-detect-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key");
+        std::fs::write(&file, "secret-one").unwrap();
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let pin = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+        };
+        pin(&file);
+        let paths = [file.clone()];
+        let mut detector = ChangeDetector::new(&paths);
+
+        let other = dir.join("incoming");
+        std::fs::write(&other, "secret-two").unwrap();
+        pin(&other);
+        std::fs::rename(&other, &file).unwrap();
+        assert!(!detector.changed(&paths), "first sight waits a tick");
+        assert!(detector.changed(&paths), "same size and mtime, new file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_line_never_carries_a_raw_newline() {
+        let mut r = report(1);
+        r.changed = vec!["plugins a\nforged line".to_owned()];
+        let line = r.summary();
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("a\\nforged"), "{line}");
     }
 
     #[test]

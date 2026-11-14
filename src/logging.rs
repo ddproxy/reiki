@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing_subscriber::fmt::MakeWriter;
@@ -25,8 +26,30 @@ impl FileState {
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o640);
-        let file = options.open(&self.path)?;
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // A symlink at the log path could aim lines at a file the service user can write.
+            options.mode(0o640).custom_flags(libc::O_NOFOLLOW);
+            let file = options.open(&self.path).map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    io::Error::other("the log path is a symbolic link; refusing to follow it")
+                } else {
+                    e
+                }
+            })?;
+            // `mode` only applies to a file this call creates; a file left by an older run keeps
+            // whatever it had. A file the service user does not own keeps its mode.
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o640));
+            self.adopt(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let file = options.open(&self.path)?;
+            self.adopt(file)
+        }
+    }
+
+    fn adopt(&mut self, file: File) -> io::Result<()> {
         self.size = file.metadata().map_or(0, |m| m.len());
         self.file = Some(file);
         Ok(())
@@ -73,6 +96,8 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
 /// The log file, shared by the subscriber and the SIGHUP handler.
 pub struct LogFile {
     state: Mutex<FileState>,
+    /// Lines that could not be written; the first is also reported on stderr.
+    failed: AtomicU64,
 }
 
 impl LogFile {
@@ -87,7 +112,13 @@ impl LogFile {
         state.open()?;
         Ok(Arc::new(Self {
             state: Mutex::new(state),
+            failed: AtomicU64::new(0),
         }))
+    }
+
+    /// How many lines could not be written to the file since start.
+    fn failures(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// Closes and reopens the file, so a log rotation tool can move it away.
@@ -102,9 +133,19 @@ pub struct FileWriter(Arc<LogFile>);
 
 impl Write for FileWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
-        // A log line must never take the service down, so a failed write is dropped.
-        let _ = state.write(data);
+        let result = {
+            let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.write(data)
+        };
+        // A log line must never take the service down, so a failed write is dropped, but counted.
+        // Reported on stderr: a tracing event would come straight back to this writer.
+        if let Err(error) = result {
+            if self.0.failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "reiki: cannot write to the log file: {error}; later failures are only counted"
+                );
+            }
+        }
         Ok(data.len())
     }
 
@@ -129,6 +170,8 @@ pub struct Logging {
     filter: reload::Handle<EnvFilter, Registry>,
     file: Option<Arc<LogFile>>,
     from_env: bool,
+    /// What the subscriber was built from; the settings a reload cannot change are compared to it.
+    started: LogConfig,
 }
 
 fn filter_from(level: &str) -> (EnvFilter, bool) {
@@ -175,15 +218,54 @@ pub fn init(config: &LogConfig, with_file: bool) -> Result<Logging, String> {
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(layers)
-        .init();
+        .try_init()
+        .map_err(|e| format!("cannot start logging: {e}"))?;
     Ok(Logging {
         filter,
         file,
         from_env,
+        started: config.clone(),
     })
 }
 
 impl Logging {
+    /// How many lines the log file failed to take since start.
+    pub fn file_write_failures(&self) -> u64 {
+        self.file.as_ref().map_or(0, |file| file.failures())
+    }
+
+    /// The `[log]` settings in `new` that differ from the running ones and only apply after a
+    /// restart, such as `log.format`.
+    pub fn restart_needed(&self, new: &LogConfig) -> Vec<String> {
+        let old = &self.started;
+        let mut out = Vec::new();
+        if old.file != new.file {
+            out.push("log.file".to_owned());
+        }
+        if old.format != new.format {
+            out.push("log.format".to_owned());
+        }
+        if old.stderr != new.stderr {
+            out.push("log.stderr".to_owned());
+        }
+        if old.file_max_bytes != new.file_max_bytes {
+            out.push("log.file_max_bytes".to_owned());
+        }
+        if old.file_keep != new.file_keep {
+            out.push("log.file_keep".to_owned());
+        }
+        out
+    }
+
+    /// Reopens the log file, so a rotation tool can move it away, without touching the level.
+    pub fn reopen(&self) {
+        if let Some(file) = &self.file {
+            if let Err(error) = file.reopen() {
+                tracing::warn!(%error, "cannot reopen the log file");
+            }
+        }
+    }
+
     /// Applies a changed level and reopens the file. A set `RUST_LOG` keeps winning.
     pub fn reload(&self, config: &LogConfig) {
         if !self.from_env {
@@ -196,11 +278,7 @@ impl Logging {
                 Err(error) => tracing::warn!(%error, "log level not applied"),
             }
         }
-        if let Some(file) = &self.file {
-            if let Err(error) = file.reopen() {
-                tracing::warn!(%error, "cannot reopen the log file");
-            }
-        }
+        self.reopen();
     }
 }
 
@@ -223,6 +301,103 @@ mod tests {
             file: None,
             size: 0,
         }
+    }
+
+    fn detached(started: LogConfig) -> (Logging, impl tracing::Subscriber + Send + Sync) {
+        let (layer, filter) = reload::Layer::new(EnvFilter::new("info"));
+        let logging = Logging {
+            filter,
+            file: None,
+            from_env: false,
+            started,
+        };
+        (logging, Registry::default().with(layer))
+    }
+
+    #[test]
+    fn only_the_settings_a_reload_cannot_change_need_a_restart() {
+        let (logging, _subscriber) = detached(LogConfig::default());
+        let mut next = LogConfig::default();
+        assert!(logging.restart_needed(&next).is_empty());
+        next.level = "debug".to_owned();
+        assert!(logging.restart_needed(&next).is_empty(), "level is live");
+        next.format = LogFormat::Json;
+        next.stderr = !next.stderr;
+        next.file_max_bytes += 1;
+        next.file_keep += 1;
+        next.file = Some("/var/log/reiki.log".to_owned());
+        assert_eq!(
+            logging.restart_needed(&next),
+            [
+                "log.file",
+                "log.format",
+                "log.stderr",
+                "log.file_max_bytes",
+                "log.file_keep"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reload_applies_the_level() {
+        let (logging, subscriber) = detached(LogConfig::default());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let next = LogConfig {
+            level: "debug".to_owned(),
+            ..LogConfig::default()
+        };
+        logging.reload(&next);
+        let level = logging.filter.with_current(ToString::to_string).unwrap();
+        assert_eq!(level, "debug");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_log_file_is_tightened_to_0640() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir("mode");
+        let path = dir.join("reiki.log");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut file = state(path.clone(), 0, 2);
+        file.write(b"new\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nnew\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_log_path_is_refused_and_its_target_untouched() {
+        let dir = dir("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, "keep\n").unwrap();
+        let path = dir.join("reiki.log");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let error = LogFile::open(&LogConfig::default(), path.to_str().unwrap())
+            .err()
+            .expect("refused");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+
+        let missing = dir.join("missing-target");
+        let dangling = dir.join("dangling.log");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        assert!(LogFile::open(&LogConfig::default(), dangling.to_str().unwrap()).is_err());
+        assert!(!missing.exists(), "no file was created through the link");
+    }
+
+    #[test]
+    fn failed_file_writes_are_counted_and_never_fail_the_caller() {
+        let dir = dir("failing");
+        let log = Arc::new(LogFile {
+            state: Mutex::new(state(dir.join("no-such-dir").join("reiki.log"), 0, 2)),
+            failed: AtomicU64::new(0),
+        });
+        let mut writer = FileWriter(Arc::clone(&log));
+        assert_eq!(writer.write(b"one\n").unwrap(), 4);
+        assert_eq!(writer.write(b"two\n").unwrap(), 4);
+        assert_eq!(log.failures(), 2);
     }
 
     #[test]

@@ -201,23 +201,15 @@ async fn reload(
     if let Err(refusal) = authorize(&app, peer, "/reload", &headers) {
         return *refusal;
     }
-    let mut dry_run = false;
-    for pair in uri.query().unwrap_or("").split('&') {
-        match pair {
-            "" => {}
-            "dry_run" | "dry_run=1" | "dry_run=true" => dry_run = true,
-            "dry_run=0" | "dry_run=false" => {}
-            other if other.starts_with("dry_run=") => {
-                // Fail closed: an unreadable preview flag must not apply a live reload.
-                return text_response(
-                    StatusCode::BAD_REQUEST,
-                    "application/json",
-                    "{\"ok\":false,\"error\":\"dry_run must be true, 1, false or 0\"}".to_owned(),
-                );
-            }
-            _ => {}
-        }
-    }
+    let Ok(dry_run) = parse_dry_run(uri.query().unwrap_or("")) else {
+        // Fail closed: an unreadable preview flag must not apply a live reload.
+        return text_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            "{\"ok\":false,\"error\":\"dry_run must be given once, as true, 1, false or 0\"}"
+                .to_owned(),
+        );
+    };
     let worker = Arc::clone(&app);
     let outcome = tokio::task::spawn_blocking(move || {
         if dry_run {
@@ -242,6 +234,30 @@ async fn reload(
     }
 }
 
+/// The `dry_run` flag of a reload query: absent is `false`; a bare name, an empty or unknown
+/// value, or a second `dry_run` is an error, so a flag that was not understood never applies a
+/// live reload.
+fn parse_dry_run(query: &str) -> Result<bool, ()> {
+    let mut found = None;
+    for pair in query.split('&') {
+        let (name, value) = pair
+            .split_once('=')
+            .map_or((pair, None), |(n, v)| (n, Some(v)));
+        if name != "dry_run" {
+            continue;
+        }
+        let parsed = match value {
+            Some("true" | "1") => true,
+            Some("false" | "0") => false,
+            _ => return Err(()),
+        };
+        if found.replace(parsed).is_some() {
+            return Err(());
+        }
+    }
+    Ok(found.unwrap_or(false))
+}
+
 /// Percent-decodes one query value. `+` is a space; an invalid escape or bytes that are not
 /// UTF-8 yields `None`, so the caller answers 400 instead of guessing the key name.
 fn decode_query_value(value: &str) -> Option<String> {
@@ -251,11 +267,10 @@ fn decode_query_value(value: &str) -> Option<String> {
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                if i + 2 >= bytes.len() {
-                    return None;
-                }
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
+                // `from_str_radix` would take a sign, so read the digits by hand.
+                let hi = hex_digit(*bytes.get(i + 1)?)?;
+                let lo = hex_digit(*bytes.get(i + 2)?)?;
+                out.push(hi << 4 | lo);
                 i += 3;
             }
             b'+' => {
@@ -269,6 +284,12 @@ fn decode_query_value(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|d| u8::try_from(d).ok())
 }
 
 /// Re-enables a key that was taken out of rotation, so its chain may pick it again. Sends
@@ -307,7 +328,19 @@ async fn enable_key(
             );
         }
     };
-    if app.enable_key(&key) {
+    // Persisting the state writes and syncs a file, which must not stall the runtime.
+    let enabled = {
+        let (worker, name) = (Arc::clone(&app), key.clone());
+        tokio::task::spawn_blocking(move || worker.enable_key(&name)).await
+    };
+    let Ok(enabled) = enabled else {
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            "{\"ok\":false,\"error\":\"the enable task failed\"}".to_owned(),
+        );
+    };
+    if enabled {
         tracing::info!(key, "key re-enabled through the admin listener");
         text_response(
             StatusCode::OK,
@@ -418,10 +451,13 @@ fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
 }
 
 /// The credential of an `Authorization: Bearer <token>` value. The scheme name is
-/// case-insensitive.
+/// case-insensitive, and the same surrounding whitespace is accepted as on the client listener.
 pub(crate) fn bearer_token(value: &str) -> Option<&str> {
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+    let (scheme, rest) = value
+        .trim_ascii()
+        .split_once(|c: char| c.is_ascii_whitespace())?;
+    let token = rest.trim_ascii();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 pub(crate) fn unauthorized() -> Response {
@@ -558,6 +594,45 @@ mod tests {
         assert_eq!(bearer_token("Bearer"), None);
         assert_eq!(bearer_token("Basic abc"), None);
         assert_eq!(bearer_token("Bearerabc"), None);
+        assert_eq!(bearer_token("  Bearer   abc  "), Some("abc"));
+        assert_eq!(bearer_token("Bearer\tabc"), Some("abc"));
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer   "), None);
+    }
+
+    #[test]
+    fn percent_decoding_takes_hex_digits_only() {
+        assert_eq!(decode_query_value("a%2Fb").as_deref(), Some("a/b"));
+        assert_eq!(decode_query_value("a%2fb+c").as_deref(), Some("a/b c"));
+        assert_eq!(decode_query_value("%41").as_deref(), Some("A"));
+        assert_eq!(decode_query_value("%+1"), None);
+        assert_eq!(decode_query_value("%1+"), None);
+        assert_eq!(decode_query_value("%-1"), None);
+        assert_eq!(decode_query_value("%4"), None);
+        assert_eq!(decode_query_value("%"), None);
+        assert_eq!(decode_query_value("%zz"), None);
+    }
+
+    #[test]
+    fn dry_run_is_read_strictly() {
+        assert_eq!(parse_dry_run(""), Ok(false));
+        assert_eq!(parse_dry_run("other=1"), Ok(false));
+        assert_eq!(parse_dry_run("dry_run=true"), Ok(true));
+        assert_eq!(parse_dry_run("a=b&dry_run=1&c"), Ok(true));
+        assert_eq!(parse_dry_run("dry_run=false"), Ok(false));
+        assert_eq!(parse_dry_run("dry_run=0"), Ok(false));
+        for bad in [
+            "dry_run",
+            "dry_run=",
+            "dry_run=yes",
+            "dry_run=TRUE",
+            "dry_run=true&dry_run=false",
+            "dry_run=false&dry_run=false",
+            "dry_run=true&dry_run",
+            "dry_run&x=1",
+        ] {
+            assert_eq!(parse_dry_run(bad), Err(()), "{bad}");
+        }
     }
 
     #[test]

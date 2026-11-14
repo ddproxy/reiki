@@ -85,6 +85,8 @@ time = { version = "0.3", features = ["parsing"] }
 x509-parser = { version = "0.18", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the log file; std has no constant for it.
+libc = "0.2"
 # Safe statvfs for the peer host stats; std has none and unsafe code is forbidden.
 rustix = { version = "1", default-features = false, features = ["fs", "std"], optional = true }
 

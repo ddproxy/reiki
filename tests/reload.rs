@@ -536,14 +536,22 @@ async fn a_preview_fails_when_a_running_plugin_would_fail_to_rebuild() {
 async fn an_unreadable_dry_run_value_is_refused_and_applies_nothing() {
     let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
     rig.rewrite("[plugins.phi]\nmode = \"block\"\n");
-    let answer = rig
-        .client
-        .post(format!("{}/reload?dry_run=yes", rig.admin))
-        .bearer_auth(ADMIN_TOKEN)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(answer.status(), 400);
+    for query in [
+        "dry_run=yes",
+        "dry_run",
+        "dry_run=",
+        "dry_run=true&dry_run=false",
+        "dry_run=false&dry_run=true",
+    ] {
+        let answer = rig
+            .client
+            .post(format!("{}/reload?{query}", rig.admin))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), 400, "{query}");
+    }
     assert_eq!(rig.send(SSN_BODY).await, 200, "nothing was applied");
     let status = rig.admin_get("/status").await;
     assert!(status.contains("\"generation\":0"), "{status}");

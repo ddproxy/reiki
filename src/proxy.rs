@@ -246,6 +246,8 @@ pub struct App {
     tunnel: OnceLock<Arc<crate::tunnel::Tunnel>>,
     /// Where the config was read from, for a reload that is not tied to a file argument.
     config_path: OnceLock<PathBuf>,
+    /// The service log, so a reload can apply the `[log]` level.
+    logging: OnceLock<Arc<crate::logging::Logging>>,
     reload_state: Mutex<crate::reload::ReloadState>,
     /// Held for the whole of a reload, so two reloads never interleave their steps.
     reload_lock: Mutex<()>,
@@ -301,6 +303,7 @@ impl App {
             plugins: RwLock::new(Arc::new(plugins)),
             tunnel: OnceLock::new(),
             config_path: OnceLock::new(),
+            logging: OnceLock::new(),
             reload_state: Mutex::new(crate::reload::ReloadState::new()),
             reload_lock: Mutex::new(()),
             swap: std::sync::RwLock::new(()),
@@ -436,18 +439,18 @@ impl App {
             Ok(health) => health.snapshot(Instant::now()),
             Err(_) => return,
         };
-        crate::state::save(path, &snapshot);
+        crate::state::save(path, &snapshot, &self.snapshot().config);
     }
 
     /// Re-enables a key that was taken out of rotation and persists the change. Returns false
     /// when no such key is configured.
     pub fn enable_key(&self, name: &str) -> bool {
-        let snapshot = self.snapshot();
-        if !snapshot.config.keys.contains_key(name) {
-            return false;
-        }
         {
+            // A reload prunes health under this lock, so a key removed meanwhile is not revived.
             let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.snapshot().config.keys.contains_key(name) {
+                return false;
+            }
             health.enable(name);
         }
         self.persist_state();
@@ -480,6 +483,11 @@ impl App {
         if let Some(publisher) = self.peer_publisher.get() {
             publisher.logins().configure(throttle);
         }
+    }
+
+    /// Hands the app the service log so a reload applies the `[log]` level.
+    pub fn set_logging(&self, logging: Arc<crate::logging::Logging>) {
+        let _ = self.logging.set(logging);
     }
 
     /// Hands the app the running tunnel so a reload can change its policy.
@@ -548,6 +556,10 @@ impl App {
             ),
             Err(error) => {
                 tracing::warn!(%error, "reload failed; keeping the current config");
+                // A rotation tool signals the process; the file must still move.
+                if let Some(logging) = self.logging.get() {
+                    logging.reopen();
+                }
             }
         }
     }
@@ -668,8 +680,12 @@ impl App {
         if tunnel_listen(&current.config) != tunnel_listen(&config) {
             restart_needed.push("tunnel.listen".to_owned());
         }
-        if current.config.log.file != config.log.file {
-            restart_needed.push("log.file".to_owned());
+        match self.logging.get() {
+            Some(logging) => restart_needed.extend(logging.restart_needed(&config.log)),
+            None if current.config.log.file != config.log.file => {
+                restart_needed.push("log.file".to_owned());
+            }
+            None => {}
         }
         match (self.tunnel.get(), &config.tunnel) {
             (Some(_), None) => restart_needed.push("tunnel removed".to_owned()),
@@ -700,7 +716,8 @@ impl App {
         }
         let generation = next_generation;
         // Nothing below can fail, so the new state lands whole or not at all.
-        let _swap = self.swap.write().unwrap_or_else(PoisonError::into_inner);
+        let log = config.log.clone();
+        let swap_guard = self.swap.write().unwrap_or_else(PoisonError::into_inner);
         self.reload(config, keys);
         *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
         if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
@@ -709,6 +726,10 @@ impl App {
         #[cfg(feature = "peers")]
         if let Some(publisher) = self.peer_publisher.get() {
             publisher.apply_tls(peer_tls);
+        }
+        drop(swap_guard);
+        if let Some(logging) = self.logging.get() {
+            logging.reload(&log);
         }
         Ok(crate::reload::ReloadReport {
             generation,

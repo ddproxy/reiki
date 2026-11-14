@@ -693,6 +693,21 @@ fn default_response_idle_timeout_secs() -> u64 {
     300
 }
 
+/// Why an upstream's `auth_header` / `auth_format` pair could not produce a request header, or
+/// `None` when it can. A bad pair would otherwise send no credential and look like a revoked key.
+fn credential_problem(header: &str, format: &str) -> Option<String> {
+    if axum::http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+        return Some(format!("auth_header `{header}` is not a valid header name"));
+    }
+    if format.matches("{key}").count() != 1 {
+        return Some("auth_format must contain `{key}` exactly once".to_owned());
+    }
+    if axum::http::HeaderValue::from_str(&format.replace("{key}", "k")).is_err() {
+        return Some("auth_format is not a valid header value".to_owned());
+    }
+    None
+}
+
 fn default_auth_header() -> String {
     "authorization".to_owned()
 }
@@ -732,7 +747,7 @@ pub struct AdminConfig {
     pub token_sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub listen: String,
@@ -758,7 +773,7 @@ fn default_connect_timeout() -> u64 {
 
 /// TLS interception for the tunnel: Reiki answers as the listed hosts using certificates
 /// signed by a CA the client trusts, then relays each request like any other.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct InterceptConfig {
     /// PEM certificate of the signing CA.
@@ -824,18 +839,94 @@ impl From<StrategyConfig> for Strategy {
     }
 }
 
+/// Something in a valid config worth telling the operator about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWarning {
+    /// A plugin table still uses the plugin's old name.
+    RenamedPlugin { old: String, new: String },
+}
+
+impl ConfigWarning {
+    pub fn emit(&self) {
+        match self {
+            Self::RenamedPlugin { old, new } => {
+                tracing::warn!(old, new, "plugin table uses an old name; rename it");
+            }
+        }
+    }
+}
+
+/// A TOML error as `line L, column C: message`. The error's own text quotes the offending source
+/// line, which can hold a secret, and it ends up in HTTP bodies, `/status` and logs; so the
+/// snippet is dropped and any value the message quotes ahead of "expected" is hidden.
+fn describe_parse_error(text: &str, error: &toml::de::Error) -> String {
+    let message = error.message();
+    let message = if message.starts_with("missing field") {
+        message.to_owned()
+    } else {
+        let (value_part, schema_part) = match message.find("expected") {
+            Some(at) => message.split_at(at),
+            None => (message, ""),
+        };
+        format!("{}{schema_part}", hide_quoted(value_part))
+    };
+    let Some(start) = error.span().map(|span| span.start.min(text.len())) else {
+        return message;
+    };
+    let before = text.get(..start).unwrap_or("");
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(1, |tail| tail.chars().count() + 1);
+    format!("line {line}, column {column}: {message}")
+}
+
+/// Replaces whatever sits between backticks or double quotes with an ellipsis.
+fn hide_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut closing: Option<char> = None;
+    for c in text.chars() {
+        match (closing, c) {
+            (None, '`' | '"') => {
+                closing = Some(c);
+                out.push(c);
+                out.push('\u{2026}');
+            }
+            (Some(end), c) if c == end => {
+                closing = None;
+                out.push(c);
+            }
+            (Some(_), _) => {}
+            (None, c) => out.push(c),
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut config: Config =
-            toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.rename_old_plugins()?;
-        config.resolve_quota_resets()?;
-        config.validate()?;
+        let (config, warnings) = Self::parse_with_warnings(text)?;
+        for warning in &warnings {
+            warning.emit();
+        }
         Ok(config)
     }
 
+    /// Like [`Config::parse`], but hands back the warnings instead of logging them, for a caller
+    /// that starts logging only after it has read the config.
+    pub fn parse_with_warnings(text: &str) -> Result<(Self, Vec<ConfigWarning>), ConfigError> {
+        let mut config: Config =
+            toml::from_str(text).map_err(|e| ConfigError::Parse(describe_parse_error(text, &e)))?;
+        let mut warnings = Vec::new();
+        config.rename_old_plugins(&mut warnings)?;
+        config.resolve_quota_resets()?;
+        config.validate()?;
+        Ok((config, warnings))
+    }
+
     /// Plugin tables under a name the plugin used to have move to the current one.
-    fn rename_old_plugins(&mut self) -> Result<(), ConfigError> {
+    fn rename_old_plugins(&mut self, warnings: &mut Vec<ConfigWarning>) -> Result<(), ConfigError> {
         for (old, new) in RENAMED_PLUGINS {
             let Some(table) = self.plugins.remove(*old) else {
                 continue;
@@ -848,7 +939,10 @@ impl Config {
                     ),
                 });
             }
-            tracing::warn!(old, new, "plugin table uses an old name; rename it");
+            warnings.push(ConfigWarning::RenamedPlugin {
+                old: (*old).to_owned(),
+                new: (*new).to_owned(),
+            });
             self.plugins.insert((*new).to_owned(), table);
         }
         Ok(())
@@ -1007,6 +1101,12 @@ impl Config {
             }
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
+            }
+            if let Some(reason) = credential_problem(&upstream.auth_header, &upstream.auth_format) {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason,
+                });
             }
             if upstream.max_decoded_bytes == 0 {
                 return Err(ConfigError::BadUpstream {
@@ -1421,18 +1521,25 @@ impl Config {
 }
 
 /// True when the configured address `other` would bind the same socket as `addr`; port 0 asks
-/// the system for a free port, so two of those never collide.
+/// the system for a free port, so two of those never collide. A host name is resolved like
+/// `bind` would; when it cannot be, only its port is compared, so an unknown host is not assumed
+/// to be elsewhere.
 fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
+    use std::net::ToSocketAddrs;
     if addr.port() == 0 {
         return false;
     }
-    match other.parse::<std::net::SocketAddr>() {
-        Ok(other) => {
-            other.port() == addr.port()
-                && (other.ip() == addr.ip()
-                    || other.ip().is_unspecified()
-                    || addr.ip().is_unspecified())
-        }
+    let collides = |other: std::net::SocketAddr| {
+        other.port() == addr.port()
+            && (other.ip() == addr.ip()
+                || other.ip().is_unspecified()
+                || addr.ip().is_unspecified())
+    };
+    if let Ok(literal) = other.parse::<std::net::SocketAddr>() {
+        return collides(literal);
+    }
+    match other.to_socket_addrs() {
+        Ok(mut resolved) => resolved.any(collides),
         Err(_) => {
             other
                 .rsplit_once(':')
@@ -1630,6 +1737,37 @@ file = "/etc/reiki/keys/zen-b"
     }
 
     #[test]
+    fn an_unusable_credential_header_or_format_is_refused() {
+        let with = |extra: &str| {
+            base("").replace(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+                &format!("[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{extra}"),
+            )
+        };
+        for bad in [
+            "auth_header = \"\"",
+            "auth_header = \"bad name\"",
+            "auth_header = \"x-api-key\\n\"",
+            "auth_format = \"Bearer\"",
+            "auth_format = \"{key} {key}\"",
+            "auth_format = \"{key}\\r\\nx: y\"",
+        ] {
+            let error = Config::parse(&with(bad)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::BadUpstream { ref upstream, .. } if upstream == "zen"),
+                "{bad}: {error}"
+            );
+        }
+        for good in [
+            "",
+            "auth_header = \"x-api-key\"\nauth_format = \"{key}\"",
+            "auth_header = \"x-goog-api-key\"\nauth_format = \"Key {key}\"",
+        ] {
+            assert!(Config::parse(&with(good)).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
     fn an_upstream_body_cap_must_be_at_least_one_byte() {
         let zero = base("").replace(
             "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
@@ -1757,6 +1895,30 @@ file = "/etc/reiki/keys/zen-b"
         );
         let local = "[upstream.x]\nbase_url = \"http://127.0.0.1:9000\"\n";
         assert!(Config::parse(local).is_ok());
+    }
+
+    #[test]
+    fn a_toml_error_names_the_place_but_never_quotes_the_source() {
+        const SENTINEL: &str = "SENTINEL-s3cr3t-value";
+        let cases = [
+            format!("listen = {SENTINEL}\n"),
+            format!("listen = 5 {SENTINEL}\n"),
+            format!("[streams.s]\nstrategy = \"{SENTINEL}\"\n"),
+            format!("[upstream.x]\nbase_url = 7\nbase_url = \"{SENTINEL}\"\n"),
+            format!("[log]\nlevel = {{ x = \"{SENTINEL}\" }}\n"),
+            format!("{SENTINEL} = 1\n"),
+        ];
+        for text in cases {
+            let error = Config::parse(&text).unwrap_err();
+            assert!(matches!(error, ConfigError::Parse(_)), "{text}: {error}");
+            let shown = error.to_string();
+            assert!(!shown.contains(SENTINEL), "{text}: {shown}");
+            assert!(shown.contains("line "), "{shown}");
+            assert!(shown.contains("column "), "{shown}");
+            assert!(!shown.contains('|'), "no source excerpt: {shown}");
+        }
+        let missing = Config::parse("[upstream.x]\n").unwrap_err().to_string();
+        assert!(missing.contains("`base_url`"), "{missing}");
     }
 
     #[test]
@@ -2464,6 +2626,29 @@ socket = "/run/forwarder.sock"
         }
     }
 
+    #[test]
+    fn a_host_name_listener_is_compared_by_what_it_resolves_to() {
+        let peer: std::net::SocketAddr = "127.0.0.1:4097".parse().unwrap();
+        assert!(same_listener("127.0.0.1:4097", peer));
+        assert!(same_listener("0.0.0.0:4097", peer));
+        assert!(!same_listener("127.0.0.1:4098", peer));
+        assert!(
+            same_listener("localhost:4097", peer),
+            "localhost is loopback"
+        );
+        let elsewhere: std::net::SocketAddr = "192.0.2.1:4097".parse().unwrap();
+        assert!(!same_listener("localhost:4097", elsewhere));
+        assert!(
+            same_listener("no-such-host.invalid:4097", elsewhere),
+            "an unresolvable host is compared by port alone"
+        );
+        assert!(!same_listener("no-such-host.invalid:4098", elsewhere));
+        assert!(!same_listener(
+            "localhost:4097",
+            "127.0.0.1:0".parse().unwrap()
+        ));
+    }
+
     #[cfg(feature = "peers")]
     #[test]
     fn publishing_needs_a_separate_loopback_listener_and_a_distinct_token() {
@@ -2713,5 +2898,21 @@ socket = "/run/forwarder.sock"
         let both = base("[plugins.gov]\n[plugins.controlled]\n");
         let err = Config::parse(&both).unwrap_err().to_string();
         assert!(err.contains("gov") && err.contains("controlled"), "{err}");
+    }
+
+    #[test]
+    fn parse_hands_back_a_renamed_plugin_warning_instead_of_logging_it() {
+        let (config, warnings) =
+            Config::parse_with_warnings(&base("[plugins.gov]\nmode = \"report\"\n")).unwrap();
+        assert!(config.plugins.contains_key("controlled"));
+        assert_eq!(
+            warnings,
+            [ConfigWarning::RenamedPlugin {
+                old: "gov".to_owned(),
+                new: "controlled".to_owned()
+            }]
+        );
+        let (_, none) = Config::parse_with_warnings(&base("")).unwrap();
+        assert!(none.is_empty());
     }
 }

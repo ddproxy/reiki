@@ -351,7 +351,7 @@ fn effective_listen(flag: Option<&str>, env: Option<&str>, config: &str) -> Resu
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reload(app: Arc<App>, config: PathBuf, logging: Arc<reiki::logging::Logging>) {
+fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
     let _handle = tokio::spawn(async move {
         let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -362,13 +362,13 @@ fn spawn_sighup_reload(app: Arc<App>, config: PathBuf, logging: Arc<reiki::loggi
             }
         };
         while hangup.recv().await.is_some() {
-            app.reload_on_hangup(&config);
-            match std::fs::read_to_string(&config)
-                .map_err(|e| e.to_string())
-                .and_then(|text| Config::parse(&text).map_err(|e| e.to_string()))
+            // The reload reads files and builds plugins, which must not block the runtime.
+            let (worker, path) = (Arc::clone(&app), config.clone());
+            if tokio::task::spawn_blocking(move || worker.reload_on_hangup(&path))
+                .await
+                .is_err()
             {
-                Ok(parsed) => logging.reload(&parsed.log),
-                Err(error) => tracing::warn!(%error, "log settings not reloaded"),
+                tracing::warn!("the SIGHUP reload task failed");
             }
         }
     });
@@ -471,10 +471,14 @@ async fn main() {
 
     let text = std::fs::read_to_string(&cli.config)
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
-    let mut config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
+    let (config, warnings) =
+        Config::parse_with_warnings(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let checking = matches!(cli.command, Some(Command::Check));
     let logging =
         Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
+    for warning in &warnings {
+        warning.emit();
+    }
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let plugin_tables = if checking {
         with_dry_run(&config.plugins)
@@ -563,17 +567,18 @@ async fn main() {
         return;
     }
 
-    let tunnel_config = config.tunnel.take();
+    let tunnel_config = config.tunnel.clone();
     for text in reiki::forward::socket_warnings(&config) {
         tracing::warn!("{text}");
     }
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.set_config_path(cli.config.clone());
+    app.set_logging(Arc::clone(&logging));
     tokio::spawn(reiki::reload::watch(Arc::clone(&app)));
     app.load_persisted_state();
     #[cfg(unix)]
-    spawn_sighup_reload(Arc::clone(&app), cli.config.clone(), Arc::clone(&logging));
+    spawn_sighup_reload(Arc::clone(&app), cli.config.clone());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot bind {listen}: {e}")));

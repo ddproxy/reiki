@@ -17,7 +17,7 @@ const MAX_RESTORED_COOLDOWN: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 /// The state file sits next to the config file. It records key health only:
 /// names, cooldowns, the disabled flag and consecutive failures. It never holds
 /// a key value or a hash of one, so a changed secret is detected from the key
-/// file's modified time instead.
+/// file's modified time and size instead.
 pub fn path_for(config_path: &Path) -> PathBuf {
     let mut name: OsString = config_path.as_os_str().to_owned();
     name.push(".state");
@@ -48,7 +48,7 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
         let Some(key) = config.keys.get(&name) else {
             continue;
         };
-        if secret_changed(&key.file, saved_at) {
+        if secret_changed(&key.file, saved_at, entry.key_len) {
             continue;
         }
         let cooling = if entry.recovery > now {
@@ -68,7 +68,7 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
     out
 }
 
-pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>) {
+pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, config: &Config) {
     let now = unix_millis(SystemTime::now());
     let keys = snapshot
         .iter()
@@ -82,6 +82,11 @@ pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>) {
                     disabled: health.disabled,
                     recovery,
                     failures: health.transient_failures,
+                    key_len: config
+                        .keys
+                        .get(name)
+                        .and_then(|key| std::fs::metadata(&key.file).ok())
+                        .map(|meta| meta.len()),
                 },
             )
         })
@@ -103,30 +108,58 @@ pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>) {
 }
 
 /// A key whose key file changed after the state was written holds a new secret,
-/// so its saved health no longer applies and it starts healthy.
-fn secret_changed(file: &str, saved_at: SystemTime) -> bool {
-    std::fs::metadata(file)
-        .and_then(|meta| meta.modified())
-        .map(|modified| modified > saved_at)
-        .unwrap_or(false)
+/// so its saved health no longer applies and it starts healthy. A file whose metadata cannot be
+/// read counts as changed: nothing proves it is the secret the state was recorded for. A size
+/// differing from the recorded one catches a replacement that kept its modified time.
+fn secret_changed(file: &str, saved_at: SystemTime, saved_len: Option<u64>) -> bool {
+    let Ok(meta) = std::fs::metadata(file) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    modified > saved_at || saved_len.is_some_and(|len| len != meta.len())
 }
 
-/// Write to a sibling temporary file, then rename over the target, so a reader
-/// never sees a partial file.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write to a sibling temporary file, then rename over the target and sync the directory, so a
+/// reader never sees a partial file and the rename survives a crash.
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
-    let mut name: OsString = path.as_os_str().to_owned();
-    name.push(format!(".tmp.{}", std::process::id()));
-    let temp = PathBuf::from(name);
-    // A stale or planted file at the temporary path is replaced, never followed or reused.
-    let _ = std::fs::remove_file(&temp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let mut attempts = 0;
+    let (temp, mut file) = loop {
+        let mut name: OsString = path.as_os_str().to_owned();
+        let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        name.push(format!(".tmp.{}.{n}", std::process::id()));
+        let temp = PathBuf::from(name);
+        // A file already at the temporary path is never followed or reused.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 8 => attempts += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&temp)?;
-    std::io::Write::write_all(&mut file, text.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&temp, path)
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn unix_millis(time: SystemTime) -> u64 {
@@ -150,6 +183,9 @@ struct Entry {
     recovery: u64,
     #[serde(default)]
     failures: u32,
+    /// Size of the key file when saved; absent in state written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_len: Option<u64>,
 }
 
 #[cfg(test)]
@@ -173,6 +209,16 @@ mod tests {
         std::env::temp_dir().join(format!("reiki-state-{}-{tag}.toml", std::process::id()))
     }
 
+    /// A key file last modified an hour ago, so state saved now is newer than it.
+    fn old_key_file(tag: &str) -> PathBuf {
+        let path = temp_path(&format!("{tag}-key"));
+        std::fs::write(&path, "sk-fake-secret").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        path
+    }
+
     fn write_state(path: &Path, saved_at: u64, entries: &[(&str, bool, u64, u32)]) {
         let mut keys = BTreeMap::new();
         for (name, disabled, recovery, failures) in entries {
@@ -182,6 +228,7 @@ mod tests {
                     disabled: *disabled,
                     recovery: *recovery,
                     failures: *failures,
+                    key_len: None,
                 },
             );
         }
@@ -193,7 +240,11 @@ mod tests {
     fn key_health_round_trips_through_the_file() {
         let path = temp_path("roundtrip");
         let _ = std::fs::remove_file(&path);
-        let config = config_with_keys(&[("a", "/unused/a"), ("b", "/unused/b")]);
+        let (key_a, key_b) = (old_key_file("rt-a"), old_key_file("rt-b"));
+        let config = config_with_keys(&[
+            ("a", key_a.to_str().unwrap()),
+            ("b", key_b.to_str().unwrap()),
+        ]);
         let mut state = KeyState::default();
         let now = Instant::now();
         let policy = Policy::default();
@@ -205,7 +256,7 @@ mod tests {
         );
         state.record_failure("b", FailureClass::Unauthorized, &policy, now);
 
-        save(&path, &state.snapshot(now));
+        save(&path, &state.snapshot(now), &config);
         let loaded = load(&path, &config);
 
         assert!(loaded["a"].cooling.unwrap() > Duration::from_secs(40));
@@ -271,7 +322,8 @@ mod tests {
             &Policy::default(),
             Instant::now(),
         );
-        save(&path, &state.snapshot(Instant::now()));
+        let config = config_with_keys(&[("a", "/unused/a")]);
+        save(&path, &state.snapshot(Instant::now()), &config);
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("sk-fake-secret"));
@@ -283,7 +335,8 @@ mod tests {
     #[test]
     fn an_absurd_recovery_time_is_capped_instead_of_overflowing() {
         let path = temp_path("absurd");
-        let config = config_with_keys(&[("a", "/unused/a")]);
+        let key_file = old_key_file("absurd");
+        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let now = unix_millis(SystemTime::now());
         write_state(&path, now, &[("a", false, i64::MAX as u64, 0)]);
 
@@ -301,7 +354,8 @@ mod tests {
     #[test]
     fn a_month_long_quota_cooldown_survives_a_restart() {
         let path = temp_path("month");
-        let config = config_with_keys(&[("a", "/unused/a")]);
+        let key_file = old_key_file("month");
+        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let now = unix_millis(SystemTime::now());
         let in_20_days = now + 20 * 86_400_000;
         write_state(&path, now, &[("a", false, in_20_days, 0)]);
@@ -309,5 +363,64 @@ mod tests {
         let cooling = load(&path, &config)["a"].cooling.unwrap();
         assert!(cooling > Duration::from_secs(19 * 86_400));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_file_that_cannot_be_read_starts_healthy() {
+        let path = temp_path("unreadable");
+        let config = config_with_keys(&[("a", "/unused/a")]);
+        let now = unix_millis(SystemTime::now());
+        write_state(&path, now, &[("a", true, now + 3_600_000, 3)]);
+        assert!(load(&path, &config).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_key_file_of_another_size_starts_healthy_even_with_an_old_mtime() {
+        let path = temp_path("resized");
+        let key_file = old_key_file("resized");
+        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
+        let mut state = KeyState::default();
+        state.record_failure(
+            "a",
+            FailureClass::Unauthorized,
+            &Policy::default(),
+            Instant::now(),
+        );
+        save(&path, &state.snapshot(Instant::now()), &config);
+        assert!(load(&path, &config)["a"].disabled, "same file is restored");
+
+        std::fs::write(&key_file, "a-longer-replacement-secret").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&key_file)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        assert!(load(&path, &config).is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn saving_survives_a_planted_temporary_file_and_leaves_none_behind() {
+        let dir = std::env::temp_dir().join(format!("reiki-state-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reiki.toml.state");
+        let planted = dir.join("planted");
+        std::fs::write(&planted, "x").unwrap();
+        #[cfg(unix)]
+        for n in TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+            ..TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed) + 3
+        {
+            let name = format!("reiki.toml.state.tmp.{}.{n}", std::process::id());
+            std::os::unix::fs::symlink(&planted, dir.join(name)).unwrap();
+        }
+        write_atomically(&path, "saved_at = 1\n").unwrap();
+        write_atomically(&path, "saved_at = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved_at = 2\n");
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

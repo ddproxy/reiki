@@ -291,6 +291,28 @@ async fn harness_with_admin(
     harness_with_admin_opts(streams, admin_token, policy, true).await
 }
 
+/// Key files that exist, so saved key health is restored (state for an unreadable key file is
+/// dropped). Their modified time is old, so state saved now is newer than they are.
+fn key_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("reiki-proxy-keys-{}", std::process::id()));
+        let dir = dir.join("unused");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("up-{name}\n")).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
+        }
+        dir
+    })
+}
+
 async fn harness_with_admin_opts(
     streams: &[(&str, &str, &[&str])],
     admin_token: &str,
@@ -310,7 +332,8 @@ async fn harness_with_admin_opts(
     let mut key_map = HashMap::new();
     for (name, secret) in keys {
         text.push_str(&format!(
-            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"{}/{name}\"\n",
+            key_dir().display()
         ));
         key_map.insert(name.to_owned(), Secret::new(secret));
     }

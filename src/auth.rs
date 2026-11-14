@@ -124,17 +124,27 @@ impl LoginThrottle {
         }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
-            seen.retain(|_, (_, since)| now.saturating_duration_since(*since) < settings.window);
-            if seen.len() >= MAX_TRACKED {
-                // Still full of live entries: drop the least-failed, then oldest, so a flood of fresh
-                // addresses cannot leave a new one untracked and does not release a blocked one.
-                if let Some(oldest) = seen
-                    .iter()
-                    .min_by_key(|(_, (count, since))| (*count, *since))
-                    .map(|(ip, _)| *ip)
-                {
-                    seen.remove(&oldest);
+            // One pass frees one slot: an expired entry if there is one, else the least-failed,
+            // then oldest, entry that is not blocked.
+            let mut expired = None;
+            let mut weakest: Option<(IpAddr, (u32, Instant))> = None;
+            for (key, (count, since)) in seen.iter() {
+                if now.saturating_duration_since(*since) >= settings.window {
+                    expired = Some(*key);
+                    break;
                 }
+                if *count < settings.max_failures
+                    && weakest.is_none_or(|(_, rank)| (*count, *since) < rank)
+                {
+                    weakest = Some((*key, (*count, *since)));
+                }
+            }
+            match expired.or(weakest.map(|(key, _)| key)) {
+                Some(victim) => {
+                    seen.remove(&victim);
+                }
+                // Every tracked address is blocked; releasing one would let it guess again.
+                None => return 1,
             }
         }
         let entry = seen.entry(ip).or_insert((0, now));
@@ -366,6 +376,48 @@ mod tests {
             !throttle.seen.lock().unwrap().contains_key(&first),
             "the oldest entry was evicted"
         );
+    }
+
+    #[test]
+    fn a_full_table_of_blocked_addresses_never_releases_one() {
+        let throttle = LoginThrottle::default();
+        let t0 = Instant::now();
+        for n in 0..MAX_TRACKED as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(n + 1));
+            for _ in 0..MAX_FAILURES {
+                throttle.fail(ip, t0 + Duration::from_millis(u64::from(n)));
+            }
+        }
+        let now = t0 + Duration::from_secs(1);
+        let newcomer: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            throttle.fail(newcomer, now);
+        }
+        assert_eq!(throttle.seen.lock().unwrap().len(), MAX_TRACKED);
+        assert!(throttle.blocked(newcomer, now).is_none(), "not tracked");
+        for n in 0..MAX_TRACKED as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(n + 1));
+            assert!(throttle.blocked(ip, now).is_some(), "{ip} stays blocked");
+        }
+    }
+
+    #[test]
+    fn a_full_table_keeps_the_blocked_and_evicts_a_failing_address() {
+        let throttle = LoginThrottle::default();
+        let t0 = Instant::now();
+        let blocked: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            throttle.fail(blocked, t0);
+        }
+        for n in 1..MAX_TRACKED as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+            throttle.fail(ip, t0 + Duration::from_millis(u64::from(n)));
+        }
+        let now = t0 + Duration::from_secs(1);
+        let newcomer: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(throttle.fail(newcomer, now), 1);
+        assert!(throttle.blocked(blocked, now).is_some());
+        assert_eq!(throttle.seen.lock().unwrap().len(), MAX_TRACKED);
     }
 
     #[test]

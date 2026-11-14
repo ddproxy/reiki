@@ -77,7 +77,7 @@ impl Rig {
             "[upstream.zen]\nbase_url = \"{mock}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
              [keys.b]\nupstream = \"zen\"\nfile = \"/unused/b\"\n\
-             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n\
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n\
              [plugins.requestlog]\n{plugin_table}\n",
             reiki::auth::sha256_hex(CLIENT_TOKEN)
         );
@@ -105,7 +105,7 @@ impl Rig {
         self.client
             .post(format!("{}{path}", self.relay))
             .bearer_auth(CLIENT_TOKEN)
-            .header("user-agent", "opencode/1.18.35")
+            .header("user-agent", "client/1.0")
             .body(body.to_owned())
     }
 }
@@ -146,11 +146,11 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     let records = records_when(&path, 2);
     assert_eq!(records.len(), 2, "{records:?}");
     assert_eq!(records[0]["event"], "request");
-    assert_eq!(records[0]["stream"], "ct");
+    assert_eq!(records[0]["stream"], "client-a");
     assert_eq!(records[0]["upstream"], "zen");
     assert_eq!(records[0]["method"], "POST");
     assert_eq!(records[0]["path"], "/zen/chat/completions");
-    assert_eq!(records[0]["headers"]["user-agent"], "opencode/1.18.35");
+    assert_eq!(records[0]["headers"]["user-agent"], "client/1.0");
     assert_eq!(records[0]["body"]["messages"][0]["content"], "hello there");
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["id"], records[0]["id"]);
@@ -243,7 +243,7 @@ async fn an_invalid_plugin_table_stops_the_chain_from_building() {
     let text = format!(
         "[upstream.zen]\nbase_url = \"{mock}/v1\"\n\
          [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n\
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n\
          [plugins.requestlog]\nheaders = [\"authorization\"]\nfile = \"/tmp/x.jsonl\"\n",
         reiki::auth::sha256_hex(CLIENT_TOKEN)
     );

@@ -179,7 +179,7 @@ impl Harness {
 }
 
 fn one_stream() -> Vec<(&'static str, &'static str, &'static [&'static str])> {
-    vec![("ct", "tok-a", &["a", "b"][..])]
+    vec![("client-a", "tok-a", &["a", "b"][..])]
 }
 const PLACEHOLDER: &str = "<SECRET>";
 const SECRET: &str = "sk-real";
@@ -606,13 +606,13 @@ async fn a_head_response_keeps_its_content_length_while_plugins_are_active() {
 #[tokio::test]
 async fn a_plugin_limited_to_one_stream_runs_only_for_that_stream() {
     let streams = [
-        ("ct", "tok-a", &["a", "b"][..]),
+        ("client-a", "tok-a", &["a", "b"][..]),
         ("other", "tok-b", &["c"][..]),
     ];
     let h = harness_with_plugins(
         &streams,
         Policy::default(),
-        "[plugins.marker]\nstreams = [\"ct\"]\n",
+        "[plugins.marker]\nstreams = [\"client-a\"]\n",
         marker_registry(),
     )
     .await;

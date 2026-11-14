@@ -45,7 +45,7 @@ async fn relay() -> String {
         "[upstream.direct]\nbase_url = \"{upstream}/zen/v1\"\npassthrough = true\n\
          [upstream.other]\nbase_url = \"{upstream}/o\"\n\
          [keys.k]\nupstream = \"other\"\nfile = \"/unused/k\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
         reiki::auth::sha256_hex("never-sent"),
     );
     let config = Config::parse(&text).unwrap();
@@ -68,7 +68,7 @@ async fn the_clients_own_credentials_and_headers_reach_the_upstream_untouched() 
     let body = reqwest::Client::new()
         .post(format!("{relay}/direct/chat/completions?x=1"))
         .header("authorization", "Bearer the-clients-own-key")
-        .header("user-agent", "opencode/1.18.35")
+        .header("user-agent", "client/1.0")
         .header("x-opencode-client", "cli")
         .header("x-api-key", "also-the-clients")
         .body("{}")
@@ -81,7 +81,7 @@ async fn the_clients_own_credentials_and_headers_reach_the_upstream_untouched() 
 
     assert_eq!(
         body,
-        "Bearer the-clients-own-key|opencode/1.18.35|cli|also-the-clients|/zen/v1/chat/completions?x=1"
+        "Bearer the-clients-own-key|client/1.0|cli|also-the-clients|/zen/v1/chat/completions?x=1"
     );
 }
 

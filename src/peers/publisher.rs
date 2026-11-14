@@ -361,9 +361,9 @@ mod tests {
             name: name.to_owned(),
             token_sha256: sha256_hex(secret).to_ascii_uppercase(),
         };
-        let tokens = [token("default", "one"), token("ct-5", "two")];
+        let tokens = [token("default", "one"), token("peer-b", "two")];
         assert_eq!(matching_token(&tokens, &sha256_hex("one")), Some("default"));
-        assert_eq!(matching_token(&tokens, &sha256_hex("two")), Some("ct-5"));
+        assert_eq!(matching_token(&tokens, &sha256_hex("two")), Some("peer-b"));
         assert_eq!(matching_token(&tokens, &sha256_hex("three")), None);
         assert_eq!(matching_token(&[], &sha256_hex("one")), None);
     }
@@ -377,7 +377,7 @@ mod tests {
              [keys.a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
              [peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
              peer_token_sha256 = \"{}\"\n\
-             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+             [[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
             sha256_hex(GOOD),
             sha256_hex(OTHER)
         );

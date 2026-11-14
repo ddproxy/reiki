@@ -524,10 +524,10 @@ mod tests {
 
     #[test]
     fn syslog_targets_parse_for_each_transport() {
-        let udp = parse("syslog = \"udp://collector.internal:514\"").unwrap();
+        let udp = parse("syslog = \"udp://collector.example.com:514\"").unwrap();
         assert_eq!(
             udp.syslog,
-            Some(SyslogTarget::Udp("collector.internal:514".to_owned()))
+            Some(SyslogTarget::Udp("collector.example.com:514".to_owned()))
         );
         let tcp = parse("syslog = \"tcp://[::1]:6514\"").unwrap();
         assert_eq!(tcp.syslog, Some(SyslogTarget::Tcp("[::1]:6514".to_owned())));

@@ -61,7 +61,7 @@ mod tests {
         let mut payload = Bytes::from(body.to_owned());
         let mut state = ();
         p.on_request(&mut RequestCtx::new(
-            "ct",
+            "client-a",
             upstream,
             &Method::POST,
             "/x",
@@ -110,7 +110,7 @@ mod tests {
             "{\"q\":\"hello\"}"
         )
         .is_ok());
-        assert!(send(p.as_ref(), "forgejo", &mut HeaderMap::new(), "CUI//SP-CTI").is_ok());
+        assert!(send(p.as_ref(), "git-host", &mut HeaderMap::new(), "CUI//SP-CTI").is_ok());
         assert!(send(p.as_ref(), "zen", &mut HeaderMap::new(), "CUI//SP-CTI").is_err());
     }
 
@@ -156,7 +156,7 @@ mod tests {
         let mut payload = Bytes::from(body.to_owned());
         let mut state = ();
         let mut ctx = RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/x",

@@ -100,15 +100,15 @@ mod tests {
         let sessions = Sessions::new();
         let t0 = Instant::now();
         for _ in 0..5 {
-            sessions.observe("ct", "ses_1", WINDOW, t0);
+            sessions.observe("client-a", "ses_1", WINDOW, t0);
         }
-        sessions.observe("ct", "ses_2", WINDOW, t0 + Duration::from_secs(100));
+        sessions.observe("client-a", "ses_2", WINDOW, t0 + Duration::from_secs(100));
         sessions.observe("other", "ses_1", WINDOW, t0);
         let counts = sessions.counts(WINDOW, t0 + Duration::from_secs(100));
-        assert_eq!(counts["ct"], 2);
+        assert_eq!(counts["client-a"], 2);
         assert_eq!(counts["other"], 1);
         let later = sessions.counts(WINDOW, t0 + Duration::from_secs(350));
-        assert_eq!(later.get("ct"), Some(&1), "ses_1 left the window");
+        assert_eq!(later.get("client-a"), Some(&1), "ses_1 left the window");
         assert_eq!(later.get("other"), None);
     }
 
@@ -116,10 +116,10 @@ mod tests {
     fn a_repeat_refreshes_the_window() {
         let sessions = Sessions::new();
         let t0 = Instant::now();
-        sessions.observe("ct", "ses_1", WINDOW, t0);
-        sessions.observe("ct", "ses_1", WINDOW, t0 + Duration::from_secs(250));
+        sessions.observe("client-a", "ses_1", WINDOW, t0);
+        sessions.observe("client-a", "ses_1", WINDOW, t0 + Duration::from_secs(250));
         assert_eq!(
-            sessions.counts(WINDOW, t0 + Duration::from_secs(400))["ct"],
+            sessions.counts(WINDOW, t0 + Duration::from_secs(400))["client-a"],
             1
         );
     }
@@ -128,8 +128,8 @@ mod tests {
     fn empty_and_oversized_ids_are_ignored() {
         let sessions = Sessions::new();
         let t0 = Instant::now();
-        sessions.observe("ct", "  ", WINDOW, t0);
-        sessions.observe("ct", &"x".repeat(MAX_ID_LEN + 1), WINDOW, t0);
+        sessions.observe("client-a", "  ", WINDOW, t0);
+        sessions.observe("client-a", &"x".repeat(MAX_ID_LEN + 1), WINDOW, t0);
         assert!(sessions.counts(WINDOW, t0).is_empty());
     }
 
@@ -139,10 +139,10 @@ mod tests {
         let t0 = Instant::now();
         for n in 0..MAX_PER_STREAM + 10 {
             let at = t0 + Duration::from_millis(n as u64);
-            sessions.observe("ct", &format!("ses_{n}"), WINDOW, at);
+            sessions.observe("client-a", &format!("ses_{n}"), WINDOW, at);
         }
         let now = t0 + Duration::from_secs(10);
-        assert_eq!(sessions.counts(WINDOW, now)["ct"], MAX_PER_STREAM);
+        assert_eq!(sessions.counts(WINDOW, now)["client-a"], MAX_PER_STREAM);
         for n in 0..MAX_STREAMS + 5 {
             sessions.observe(&format!("s{n}"), "id", WINDOW, now);
         }
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn the_table_holds_hashes_not_ids() {
         let sessions = Sessions::new();
-        sessions.observe("ct", "ses_secret_value", WINDOW, Instant::now());
+        sessions.observe("client-a", "ses_secret_value", WINDOW, Instant::now());
         let seen = sessions.seen.lock().unwrap();
         let text = format!("{seen:?}");
         assert!(!text.contains("ses_secret_value"), "{text}");

@@ -17,6 +17,7 @@ pub mod rewrite;
 pub mod scan;
 pub mod scrub;
 pub mod serve;
+pub mod shaper;
 pub mod state;
 pub mod tunnel;
 pub mod upstream;

@@ -47,7 +47,7 @@ fn http_date_delta(value: &str, now: SystemTime) -> Option<Duration> {
 }
 
 // IMF-fixdate, the only form RFC 9110 requires: `Sun, 06 Nov 1994 08:49:37 GMT`.
-fn parse_http_date(value: &str) -> Option<i64> {
+pub(crate) fn parse_http_date(value: &str) -> Option<i64> {
     let tokens: Vec<&str> = value.split_whitespace().collect();
     let [_, day, month, year, time, "GMT"] = tokens.as_slice() else {
         return None;

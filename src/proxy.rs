@@ -2406,18 +2406,21 @@ mod tests {
         }
 
         // A task dropped before it finishes reports 499, exactly once.
-        let dropped = RequestDone::new(Arc::new(chain()), "ct", "zen");
+        let dropped = RequestDone::new(Arc::new(chain()), "client-a", "zen");
         drop(dropped);
-        assert_eq!(*EVENTS.lock().unwrap(), [("ct".into(), "zen".into(), 499)]);
+        assert_eq!(
+            *EVENTS.lock().unwrap(),
+            [("client-a".into(), "zen".into(), 499)]
+        );
 
         // A finished request keeps its own status; the drop must not add another event.
-        let finished = RequestDone::new(Arc::new(chain()), "ct", "zen");
+        let finished = RequestDone::new(Arc::new(chain()), "client-a", "zen");
         finished.finish(200);
         assert_eq!(
             *EVENTS.lock().unwrap(),
             [
-                ("ct".to_owned(), "zen".to_owned(), 499),
-                ("ct".to_owned(), "zen".to_owned(), 200),
+                ("client-a".to_owned(), "zen".to_owned(), 499),
+                ("client-a".to_owned(), "zen".to_owned(), 200),
             ]
         );
     }
@@ -2449,7 +2452,7 @@ mod tests {
         let method = Method::GET;
         let meta = RequestMeta {
             id: "",
-            stream: "ct",
+            stream: "client-a",
             upstream: "zen",
             method: &method,
             path: "/zen/x",
@@ -2508,7 +2511,7 @@ mod tests {
         let method = Method::GET;
         let meta = RequestMeta {
             id: "",
-            stream: "ct",
+            stream: "client-a",
             upstream: "zen",
             method: &method,
             path: "/zen/x",

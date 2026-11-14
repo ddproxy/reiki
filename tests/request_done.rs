@@ -57,7 +57,7 @@ async fn rig(timeout: Duration) -> (String, Done) {
          [upstream.router]\nbase_url = \"{other}/api\"\n\
          [keys.z]\nupstream = \"zen\"\nfile = \"/unused/z\"\n\
          [keys.r]\nupstream = \"router\"\nfile = \"/unused/r\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"z\", \"r\"]\n",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"z\", \"r\"]\n",
         reiki::auth::sha256_hex(TOKEN),
     );
     let keys = [

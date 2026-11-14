@@ -297,8 +297,8 @@ mod tests {
         let parse = |text: &str| Config::parse(text).unwrap().peers.expect("a [peers] table");
         assert_eq!(instance_name(&parse("[peers]\n")), "reiki");
         assert_eq!(
-            instance_name(&parse("[peers]\ninstance = \"ct-4\"\n")),
-            "ct-4"
+            instance_name(&parse("[peers]\ninstance = \"peer-a\"\n")),
+            "peer-a"
         );
     }
 

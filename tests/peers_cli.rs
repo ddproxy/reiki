@@ -222,7 +222,11 @@ async fn fresh_data_over_tls_pinned_to_the_peer_ca() {
     let ca = dir.write("ca.pem", &pki.ca_pem, 0o644);
     let token = dir.write("token", &format!("{PEER_TOKEN}\n"), 0o600);
     let peer = mock_peer(Some(pki.server), ok_reply(&health_json(&now_rfc3339(-5)))).await;
-    let report = poll_one(("ct", format!("https://{}", peer.addr), Some(&ca)), &token).await;
+    let report = poll_one(
+        ("client-a", format!("https://{}", peer.addr), Some(&ca)),
+        &token,
+    )
+    .await;
     assert!(report.is_fresh(), "{report:?}");
     assert_eq!(report.instance.as_deref(), Some("mock"));
     assert!(report.age_seconds.unwrap() < 30);
@@ -247,7 +251,11 @@ async fn stale_data_is_unknown_and_shows_no_counts() {
     let token = dir.write("token", PEER_TOKEN, 0o600);
     let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(-3600)))).await;
     let report = poll_one(
-        ("ct", format!("http://127.0.0.1:{}", peer.addr.port()), None),
+        (
+            "client-a",
+            format!("http://127.0.0.1:{}", peer.addr.port()),
+            None,
+        ),
         &token,
     )
     .await;
@@ -265,7 +273,11 @@ async fn an_unreachable_peer_is_unknown() {
         .local_addr()
         .unwrap()
         .port();
-    let report = poll_one(("ct", format!("http://127.0.0.1:{port}"), None), &token).await;
+    let report = poll_one(
+        ("client-a", format!("http://127.0.0.1:{port}"), None),
+        &token,
+    )
+    .await;
     assert_eq!(report.state, "unknown");
     assert!(report.error.unwrap().contains("connect"));
 }
@@ -278,7 +290,11 @@ async fn a_certificate_from_another_ca_is_refused() {
     let ca = dir.write("ca.pem", &other.ca_pem, 0o644);
     let token = dir.write("token", PEER_TOKEN, 0o600);
     let peer = mock_peer(Some(served.server), ok_reply(&health_json(&now_rfc3339(0)))).await;
-    let report = poll_one(("ct", format!("https://{}", peer.addr), Some(&ca)), &token).await;
+    let report = poll_one(
+        ("client-a", format!("https://{}", peer.addr), Some(&ca)),
+        &token,
+    )
+    .await;
     assert_eq!(report.state, "unknown");
     let error = report.error.unwrap().to_ascii_lowercase();
     assert!(error.contains("certificate"), "{error}");
@@ -297,7 +313,11 @@ async fn a_redirect_is_refused_and_not_followed() {
     )
     .await;
     let report = poll_one(
-        ("ct", format!("http://127.0.0.1:{}", peer.addr.port()), None),
+        (
+            "client-a",
+            format!("http://127.0.0.1:{}", peer.addr.port()),
+            None,
+        ),
         &token,
     )
     .await;
@@ -323,7 +343,11 @@ async fn an_oversized_body_is_refused_with_or_without_a_length() {
     let without_length = mock_peer(None, close_delimited).await;
     for peer in [with_length, without_length] {
         let report = poll_one(
-            ("ct", format!("http://127.0.0.1:{}", peer.addr.port()), None),
+            (
+                "client-a",
+                format!("http://127.0.0.1:{}", peer.addr.port()),
+                None,
+            ),
             &token,
         )
         .await;
@@ -339,7 +363,11 @@ async fn a_token_file_others_can_read_is_refused_before_any_request() {
     let token = dir.write("token", PEER_TOKEN, 0o644);
     let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(0)))).await;
     let report = poll_one(
-        ("ct", format!("http://127.0.0.1:{}", peer.addr.port()), None),
+        (
+            "client-a",
+            format!("http://127.0.0.1:{}", peer.addr.port()),
+            None,
+        ),
         &token,
     )
     .await;
@@ -383,11 +411,11 @@ async fn a_real_publisher_answers_and_refuses_a_bad_token() {
     let good = dir.write("good", PEER_TOKEN, 0o600);
     let bad = dir.write("bad", "a-token-the-peer-never-issued", 0o600);
     let url = format!("http://{addr}");
-    let report = poll_one(("ct", url.clone(), None), &good).await;
+    let report = poll_one(("client-a", url.clone(), None), &good).await;
     assert!(report.is_fresh(), "{report:?}");
     assert_eq!(report.instance.as_deref(), Some("real"));
     assert_eq!(report.upstreams[0].healthy_keys, 1);
-    let report = poll_one(("ct", url, None), &bad).await;
+    let report = poll_one(("client-a", url, None), &bad).await;
     assert_eq!(report.state, "unknown");
     assert!(report.error.unwrap().contains("refused the token"));
 }

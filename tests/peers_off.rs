@@ -26,7 +26,7 @@ fn config_text(extra: &str) -> String {
          [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
          [keys.zen-b]\nupstream = \"zen\"\nfile = \"/unused/b\"\n\
          [keys.other-a]\nupstream = \"other\"\nfile = \"/unused/c\"\n\
-         [streams.laptop]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\", \"other-a\"]\n\
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\", \"other-a\"]\n\
          [admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n\
          [plugins.metrics]\n{extra}",
         sha(STREAM_TOKEN),

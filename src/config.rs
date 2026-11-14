@@ -2584,7 +2584,7 @@ socket = "/run/forwarder.sock"
         let config = Config::parse(&with_peers(&format!(
             "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
              peer_token_sha256 = \"{HASH_C}\"\npoll_interval_secs = 10\nexpose_key_labels = true\n\
-             [peers.ct-4]\nurl = \"https://10.0.6.153:4099\"\ntoken_file = \"/etc/reiki/peers/ct-4.token\"\n\
+             [peers.peer-a]\nurl = \"https://192.0.2.10:4099\"\ntoken_file = \"/etc/reiki/peers/peer-a.token\"\n\
              ca_file = \"/etc/reiki/peers/ca.pem\"\n\
              [peers.local]\nurl = \"http://127.0.0.1:5099\"\ntoken_file = \"/t\"\n"
         )))
@@ -2593,11 +2593,11 @@ socket = "/run/forwarder.sock"
         assert!(peers.publishing() && peers.expose_key_labels);
         assert_eq!(peers.poll_interval_secs, 10);
         assert_eq!(peers.peers.len(), 2);
-        assert_eq!(peers.peers["ct-4"].url, "https://10.0.6.153:4099");
+        assert_eq!(peers.peers["peer-a"].url, "https://192.0.2.10:4099");
         assert_eq!(peers.peers["local"].ca_file, None);
         assert_eq!(
             PeersConfig::check_line(Some(&peers)),
-            "peers: enabled, publishing on 127.0.0.1:4099 (key labels shown), 2 peer(s)[ct-4, local], poll every 10s"
+            "peers: enabled, publishing on 127.0.0.1:4099 (key labels shown), 2 peer(s)[local, peer-a], poll every 10s"
         );
     }
 
@@ -2718,21 +2718,21 @@ socket = "/run/forwarder.sock"
         let config = Config::parse(&with_peers(&format!(
             "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
              peer_token_sha256 = \"{HASH_C}\"\nmax_subscribers_per_token = 3\n\
-             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{HASH_D}\"\n"
+             [[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{HASH_D}\"\n"
         )))
         .unwrap();
         let peers = config.peers.unwrap();
         let names: Vec<&str> = peers.tokens.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["default", "ct-5"]);
+        assert_eq!(names, ["default", "peer-b"]);
         assert_eq!(peers.tokens[1].token_sha256, HASH_D);
         assert_eq!(peers.max_subscribers_per_token, 3);
         assert_eq!(
             PeersConfig::check_line(Some(&peers)),
-            "peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 2 token(s)[default, ct-5], 0 peer(s)[], poll every 30s"
+            "peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 2 token(s)[default, peer-b], 0 peer(s)[], poll every 30s"
         );
         let only_list = Config::parse(&with_peers(&format!(
             "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
-             [[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{HASH_D}\"\n"
+             [[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{HASH_D}\"\n"
         )))
         .unwrap();
         assert_eq!(

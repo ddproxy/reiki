@@ -105,7 +105,7 @@ The status must be 200-599. Unless `streaming` is set, the body is buffered whol
 ```toml
 [upstream.zen.forward]
 command = "/usr/local/bin/bun"
-args = ["/usr/local/lib/reiki/bun-forward.ts", "--allow", "opencode.ai"]
+args = ["/usr/local/lib/reiki/forwarder.ts", "--allow", "opencode.ai"]
 streaming = true
 ```
 
@@ -158,7 +158,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Verified live with invalid keys: a 401 takes the key out of rotation and the request moves to the next key. A 429 `insufficient_quota` body cools the key for the quota period; other 429s cool it for `Retry-After`. Both are covered by unit tests but not exercised with a real exhausted key.
+Covered by tests with invalid keys: a 401 takes the key out of rotation and the request moves to the next key. A 429 `insufficient_quota` body cools the key for the quota period; other 429s cool it for `Retry-After`. Both are covered by unit tests but not exercised with a real exhausted key.
 
 ## OpenCode Zen
 
@@ -169,7 +169,7 @@ base_url = "https://opencode.ai/zen/v1"
 
 Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.opencode.options.baseURL` to that URL and `apiKey` to the stream token.
 
-Zen sometimes answers a usable key with a quota 429 (`FreeUsageLimitError`) and accepts the very next request. Set `confirm_quota = true` on the upstream to send such a 429 once more on the same key, after a 3-second pause, before cooling it; only a repeated quota 429 takes the key out of rotation. It costs a genuinely exhausted key one extra request and 3 seconds per request.
+Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the very next request. Set `confirm_quota = true` on the upstream to send such a 429 once more on the same key, after a 3-second pause, before cooling it; only a repeated quota 429 takes the key out of rotation. It costs a genuinely exhausted key one extra request and 3 seconds per request.
 
 Zen's free models only accept requests that carry OpenCode's own headers. Reiki forwards every header except the credential, so the free tier keeps working.
 
@@ -199,7 +199,7 @@ auth_format = "{key}"
 
 Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`. Reiki treats that as a rejected key. A client that sends the key as a `?key=` query parameter is accepted when no credential header is present, and Reiki removes the parameter before forwarding.
 
-Verified live with an invalid key, including a client authenticating with `x-goog-api-key`.
+Covered by tests with an invalid key, including a client authenticating with `x-goog-api-key`.
 
 ## Other providers
 

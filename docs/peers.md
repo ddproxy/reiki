@@ -1,6 +1,6 @@
 # Peers
 
-Reiki instances can share a coarse, read-only summary of their own key health, so an operator or a delegation tool can see which instance has a usable key for an upstream. No request is routed by it: the proxy never reads or acts on peer data.
+Reiki instances can share a coarse, read-only summary of their own key health, so an operator or a monitoring tool can see which instance has a usable key for an upstream. No request is routed by it: the proxy never reads or acts on peer data.
 
 Everything here is off by default. Without a `[peers]` table, or with `enabled = false`, Reiki opens no extra listener, makes no outbound peer connection, and its admin documents (`/status`, `/v1/openapi.json`) are unchanged.
 
@@ -21,7 +21,7 @@ listen = "127.0.0.1:4099"          # required to publish; its own socket; loopba
 # tls_key = "/etc/reiki/peers/listener.key"    # its PEM key, mode 0600
 # tls_key_permissions = "error"    # or "warn" to load a key group or others can access
 peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; this or [[peers.tokens]] to publish
-# instance = "ct-1"                # published name; "reiki" by default
+# instance = "edge-1"                # published name; "reiki" by default
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
 expose_host_stats = false          # publish load, memory, disk use and active sessions
@@ -32,13 +32,13 @@ cooldown_bucket_secs = 300         # published cooldowns round up to a multiple 
 # max_subscribers_per_token = 8    # open streams per peer token
 
 [[peers.tokens]]                   # more peer tokens, one per reader, each with a name
-name = "ct-5"
-token_sha256 = "<sha256 of the token issued to ct-5>"
+name = "peer-b"
+token_sha256 = "<sha256 of the token issued to peer-b>"
 
-[peers.ct-4]                       # one table per instance to read
-url = "https://10.0.6.153:4099"    # https, or http on a loopback address
-token_file = "/etc/reiki/peers/ct-4.token"   # the token ct-4 issued to this instance
-ca_file = "/etc/reiki/peers/ct-4-ca.pem"     # required for https; the only CA trusted for ct-4
+[peers.peer-a]                       # one table per instance to read
+url = "https://192.0.2.10:4099"    # https, or http on a loopback address
+token_file = "/etc/reiki/peers/peer-a.token"   # the token peer-a issued to this instance
+ca_file = "/etc/reiki/peers/peer-a-ca.pem"     # required for https; the only CA trusted for peer-a
 ```
 
 Validation, at startup, on reload and in `reiki check`:
@@ -62,16 +62,16 @@ With `tls_cert` and `tls_key` the peer listener serves HTTPS (rustls, TLS 1.2 an
 - The certificate must not have expired and the key must match it; otherwise startup, `reiki check` and a reload fail. `reiki check` prints `peers TLS certificate valid for N more day(s)`.
 - A reload reads both files again. New contents (a renewed certificate) or new paths are swapped in without a restart and show in the reload's `changed` as `peers.tls`; connections already open keep the old certificate. Turning TLS on or off needs a restart and shows in `restart_needed` as `peers.tls`. Both files are watched like the key files, so a renewal on disk triggers the reload.
 
-A private CA and a listener certificate with openssl, for a peer reached as `10.0.6.153`:
+A private CA and a listener certificate with openssl, for a peer reached as `192.0.2.10`:
 
 ```bash
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
   -subj "/CN=reiki peers CA" -keyout peers-ca.key -out peers-ca.pem
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -subj "/CN=ct-4" -keyout listener.key -out listener.csr
+  -subj "/CN=peer-a" -keyout listener.key -out listener.csr
 openssl x509 -req -in listener.csr -CA peers-ca.pem -CAkey peers-ca.key -CAcreateserial \
   -days 365 -out listener.pem \
-  -extfile <(printf 'subjectAltName=IP:10.0.6.153,DNS:ct-4\nextendedKeyUsage=serverAuth')
+  -extfile <(printf 'subjectAltName=IP:192.0.2.10,DNS:peer-a\nextendedKeyUsage=serverAuth')
 chmod 600 listener.key peers-ca.key
 ```
 
@@ -84,11 +84,11 @@ With `enabled = true` and `publish = true`, Reiki opens one more listener on `[p
 ```bash
 printf '%s' "$PEER_TOKEN" | reiki hash-token     # goes in peer_token_sha256
 curl -s -H "Authorization: Bearer $PEER_TOKEN" http://127.0.0.1:4099/v1/health
-curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://10.0.6.153:4099/v1/health
+curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192.0.2.10:4099/v1/health
 ```
 
 ```json
-{"instance":"ct-4","observed_at":"2026-11-13T09:30:00Z","upstreams":[
+{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z","upstreams":[
   {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
    "soonest_cooldown_seconds":42,"last_status_class":"4xx"}]}
 ```
@@ -154,7 +154,7 @@ curl -N -H "Authorization: Bearer $PEER_TOKEN" http://127.0.0.1:4099/v1/health/s
 
 ```text
 event: snapshot
-data: {"instance":"ct-4","observed_at":"...","upstreams":[...]}
+data: {"instance":"peer-a","observed_at":"...","upstreams":[...]}
 
 event: key
 data: {"observed_at":"...","upstream":{"name":"zen","healthy_keys":0,"cooling_keys":2,...}}
@@ -182,8 +182,8 @@ reiki peers --json          # {"peers":[{"name","state","error","instance","age_
 
 ```text
 PEER  INSTANCE  UPSTREAM  STATE    HEALTHY  COOLING  DISABLED  WAIT  AGE
-ct-4  ct-4      zen       cooling  0        1        0         42s   3s
-ct-5  -         -         unknown  -        -        -         -     -
+peer-a  peer-a      zen       cooling  0        1        0         42s   3s
+peer-b  -         -         unknown  -        -        -         -     -
 ```
 
 - It needs `[peers] enabled = true` and at least one peer. Nothing else in the config is used, and the proxy itself never reads peer data.
@@ -198,4 +198,4 @@ ct-5  -         -         unknown  -        -        -         -     -
 
 ## Check
 
-`reiki check` prints a `peers:` line: `peers: disabled`, or the effective settings, for example `peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 1 peer(s)[ct-4], poll every 30s`. With more than one peer token it names them, as `2 token(s)[default, ct-5]`, after the listener.
+`reiki check` prints a `peers:` line: `peers: disabled`, or the effective settings, for example `peers: enabled, publishing on 127.0.0.1:4099 (key labels hidden), 1 peer(s)[peer-a], poll every 30s`. With more than one peer token it names them, as `2 token(s)[default, peer-b]`, after the listener.

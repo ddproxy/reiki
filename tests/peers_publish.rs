@@ -58,11 +58,11 @@ fn config_text(upstream: &str, peer_addr: SocketAddr, peers_extra: &str) -> Stri
         "[upstream.zen]\nbase_url = \"{upstream}/v1\"\n\
          [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused/zen-a\"\n\
          [keys.zen-b]\nupstream = \"zen\"\nfile = \"/unused/zen-b\"\n\
-         [streams.laptop]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\"]\n\
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\"]\n\
          [admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n\
          [plugins.metrics]\n\
          [peers]\nenabled = true\npublish = true\nlisten = \"{peer_addr}\"\n\
-         peer_token_sha256 = \"{}\"\ninstance = \"ct-test\"\n{peers_extra}",
+         peer_token_sha256 = \"{}\"\ninstance = \"peer-test\"\n{peers_extra}",
         sha(STREAM_TOKEN),
         sha(ADMIN_TOKEN),
         sha(PEER_TOKEN),
@@ -256,7 +256,7 @@ async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
     // Exact cooldowns here; the default bucketing has its own test.
     let rig = Rig::new("cooldown_bucket_secs = 0\n").await;
     let doc = rig.health().await;
-    assert_eq!(doc["instance"], "ct-test");
+    assert_eq!(doc["instance"], "peer-test");
     let observed = doc["observed_at"].as_str().unwrap();
     assert!(
         observed.len() == 20 && observed.ends_with('Z'),
@@ -290,7 +290,7 @@ async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
 
     let text = doc.to_string();
     for secret in [
-        "laptop",
+        "client-a",
         "zen-a",
         "/unused",
         "upstream-zen-a",
@@ -309,7 +309,7 @@ async fn key_labels_appear_only_when_exposed() {
     let names: Vec<&str> = keys.iter().map(|k| k["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["zen-a", "zen-b"]);
     assert!(keys.iter().all(|k| k["state"] == "available"));
-    assert!(!doc.to_string().contains("laptop"), "streams stay hidden");
+    assert!(!doc.to_string().contains("client-a"), "streams stay hidden");
 }
 
 #[tokio::test]
@@ -347,7 +347,7 @@ async fn failed_peer_logins_from_loopback_never_lock_out_a_valid_token() {
 async fn a_stale_token_behind_the_shared_address_does_not_lock_out_another_peer() {
     let second = "second-peer-token-behind-the-tunnel";
     let rig = Rig::new(&format!(
-        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+        "[[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
         sha(second)
     ))
     .await;
@@ -479,7 +479,7 @@ async fn cooldowns_are_rounded_up_to_the_bucket_by_default() {
 async fn any_of_several_named_peer_tokens_opens_health() {
     let second = "second-peer-token-for-peer-tests";
     let rig = Rig::new(&format!(
-        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+        "[[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
         sha(second)
     ))
     .await;
@@ -487,7 +487,7 @@ async fn any_of_several_named_peer_tokens_opens_health() {
         let (code, body) = rig.peer_get("/v1/health", Some(token)).await;
         assert_eq!(code, 200, "{token}: {body}");
         assert!(
-            !body.contains("ct-5"),
+            !body.contains("peer-b"),
             "token names are never published: {body}"
         );
     }
@@ -503,22 +503,22 @@ async fn a_second_peer_token_equal_to_another_credential_is_refused() {
     for (reused, needle) in [
         (
             ADMIN_TOKEN,
-            "peer token `ct-5` is the same as the admin token",
+            "peer token `peer-b` is the same as the admin token",
         ),
         (
             STREAM_TOKEN,
-            "peer token `ct-5` is the same as the token of stream",
+            "peer token `peer-b` is the same as the token of stream",
         ),
         (
             PEER_TOKEN,
-            "peer token `ct-5` is the same as peer token `default`",
+            "peer token `peer-b` is the same as peer token `default`",
         ),
     ] {
         let text = config_text(
             "http://127.0.0.1:9",
             addr,
             &format!(
-                "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
+                "[[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
                 sha(reused)
             ),
         );
@@ -598,7 +598,7 @@ async fn sessions_count_distinct_ids_once_per_request_whatever_the_retries() {
     );
     let text = doc.to_string();
     assert!(
-        !text.contains("ses_alpha") && !text.contains("laptop"),
+        !text.contains("ses_alpha") && !text.contains("client-a"),
         "{text}"
     );
 }
@@ -610,6 +610,6 @@ async fn per_stream_sessions_need_key_labels_too() {
     let doc = rig.health().await;
     assert_eq!(
         doc["sessions"]["streams"],
-        serde_json::json!([{"stream": "laptop", "active_sessions": 1}])
+        serde_json::json!([{"stream": "client-a", "active_sessions": 1}])
     );
 }

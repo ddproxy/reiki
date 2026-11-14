@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.
+
 ## 0.9.1
 
 ### Added
@@ -103,7 +109,7 @@
 
 ### Fixed
 
-- The x86-64 Linux release binaries 0.8.0 to 0.8.2 used AVX instructions in the TLS library's CPU detection and crashed with an illegal instruction on CPUs without them (a Nehalem Xeon and a Sandy Bridge Core i3 were affected). The release now builds the C code for baseline x86-64 and the workflow runs `ca-init` on an emulated Nehalem CPU before publishing.
+- The x86-64 Linux release binaries 0.8.0 to 0.8.2 used AVX instructions in the TLS library's CPU detection and crashed with an illegal instruction on CPUs without them (older x86-64 CPUs without AVX were affected). The release now builds the C code for baseline x86-64 and the workflow runs `ca-init` on an emulated Nehalem CPU before publishing.
 
 ### Added
 

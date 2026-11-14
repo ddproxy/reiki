@@ -88,7 +88,7 @@ impl Rig {
         let text = format!(
             "[upstream.zen]\nbase_url = \"{mock}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
-             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n\
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n\
              [plugins.placeholders]\nterms = [\"Falcon\"]\n\
              [plugins.requestlog]\nfile = \"{}/req.jsonl\"\nresponse = \"body\"\n",
             reiki::auth::sha256_hex(CLIENT_TOKEN),

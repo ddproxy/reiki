@@ -745,7 +745,7 @@ mod tests {
 
     fn doc(observed_at: &str) -> HealthDoc {
         HealthDoc {
-            instance: "ct-4".to_owned(),
+            instance: "peer-a".to_owned(),
             observed_at: observed_at.to_owned(),
             age_seconds: None,
             upstreams: vec![UpstreamHealth {
@@ -815,17 +815,17 @@ mod tests {
             ..doc(observed_at)
         };
         for skewed in ["2026-11-13T07:00:00Z", "2026-11-13T13:00:00Z"] {
-            let report = assess("ct-4", aged(skewed, 0), poll, now);
+            let report = assess("peer-a", aged(skewed, 0), poll, now);
             assert!(report.is_fresh(), "a peer clock off by hours: {report:?}");
             assert_eq!(report.age_seconds, Some(0));
         }
-        let report = assess("ct-4", aged("2026-11-13T10:00:00Z", 90), poll, now);
+        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 90), poll, now);
         assert!(report.is_fresh());
         assert_eq!(report.age_seconds, Some(90));
-        let report = assess("ct-4", aged("2026-11-13T10:00:00Z", 91), poll, now);
+        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 91), poll, now);
         assert_eq!(report.state, "unknown", "too old by its own account");
         assert!(report.error.unwrap().contains("stale"));
-        let report = assess("ct-4", aged("not a time", 0), poll, now);
+        let report = assess("peer-a", aged("not a time", 0), poll, now);
         assert!(report.is_fresh(), "observed_at is not needed with an age");
     }
 
@@ -833,20 +833,20 @@ mod tests {
     fn data_older_or_newer_than_three_intervals_is_unknown() {
         let poll = Duration::from_secs(30);
         let now = at("2026-11-13T10:00:00Z");
-        let fresh = assess("ct-4", doc("2026-11-13T09:58:31Z"), poll, now);
+        let fresh = assess("peer-a", doc("2026-11-13T09:58:31Z"), poll, now);
         assert!(fresh.is_fresh());
         assert_eq!(fresh.age_seconds, Some(89));
         assert_eq!(fresh.upstreams.len(), 1);
-        let stale = assess("ct-4", doc("2026-11-13T09:58:29Z"), poll, now);
+        let stale = assess("peer-a", doc("2026-11-13T09:58:29Z"), poll, now);
         assert_eq!(stale.state, "unknown");
         assert!(
             stale.upstreams.is_empty(),
             "stale data is never shown as health"
         );
         assert!(stale.error.unwrap().contains("stale"));
-        let ahead = assess("ct-4", doc("2026-11-13T10:05:00Z"), poll, now);
+        let ahead = assess("peer-a", doc("2026-11-13T10:05:00Z"), poll, now);
         assert_eq!(ahead.state, "unknown");
-        let garbled = assess("ct-4", doc("yesterday"), poll, now);
+        let garbled = assess("peer-a", doc("yesterday"), poll, now);
         assert_eq!(garbled.state, "unknown");
     }
 
@@ -855,20 +855,23 @@ mod tests {
         let poll = Duration::from_secs(30);
         let now = at("2026-11-13T10:00:00Z");
         let reports = vec![
-            assess("ct-4", doc("2026-11-13T09:59:58Z"), poll, now),
-            PeerReport::unknown("ct-5", "cannot connect".to_owned()),
+            assess("peer-a", doc("2026-11-13T09:59:58Z"), poll, now),
+            PeerReport::unknown("peer-b", "cannot connect".to_owned()),
         ];
         let table = render_table(&reports);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 3, "{table}");
         assert!(lines[0].starts_with("PEER"));
-        let ct4: Vec<&str> = lines[1].split_whitespace().collect();
+        let peer_a: Vec<&str> = lines[1].split_whitespace().collect();
         assert_eq!(
-            ct4,
-            ["ct-4", "ct-4", "zen", "cooling", "0", "1", "0", "42s", "2s"]
+            peer_a,
+            ["peer-a", "peer-a", "zen", "cooling", "0", "1", "0", "42s", "2s"]
         );
-        let ct5: Vec<&str> = lines[2].split_whitespace().collect();
-        assert_eq!(ct5, ["ct-5", "-", "-", "unknown", "-", "-", "-", "-", "-"]);
+        let peer_b: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(
+            peer_b,
+            ["peer-b", "-", "-", "unknown", "-", "-", "-", "-", "-"]
+        );
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&reports).unwrap()).unwrap();
         assert_eq!(json["peers"][1]["state"], "unknown");

@@ -180,7 +180,7 @@ mod tests {
         let mut payload = Bytes::from(body.to_owned());
         plugin
             .on_request(&mut RequestCtx::new(
-                "ct",
+                "client-a",
                 "zen",
                 &Method::POST,
                 "/zen/chat/completions",
@@ -352,7 +352,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut binary = Bytes::from_static(&[0xff, 0xfe, 0x00]);
         let refused = p.on_request(&mut RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/zen/x",
@@ -368,7 +368,7 @@ mod tests {
         headers.insert("content-encoding", HeaderValue::from_static("gzip"));
         let mut text = Bytes::from_static(b"{}");
         let refused = p.on_request(&mut RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/zen/x",
@@ -410,7 +410,7 @@ mod tests {
             headers.insert("content-encoding", HeaderValue::from_str(value).unwrap());
             let mut payload = Bytes::from_static(b"{\"q\":\"Falcon\"}");
             let refused = p.on_request(&mut RequestCtx::new(
-                "ct",
+                "client-a",
                 "zen",
                 &Method::POST,
                 "/zen/x",
@@ -448,7 +448,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut payload = Bytes::from_static(b"{\"q\":\"Falcon \xff\"}");
         let refused = p.on_request(&mut RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/zen/x",

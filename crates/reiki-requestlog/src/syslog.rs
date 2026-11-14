@@ -329,14 +329,14 @@ mod tests {
         let line = message(
             16,
             &meta("response", SEVERITY_WARNING),
-            "gw-1",
+            "host-1",
             "reiki",
             4242,
             "{\"event\":\"response\"}",
         );
         assert_eq!(
             line,
-            "<132>1 2000-02-29T00:00:00.123Z gw-1 reiki 4242 response - {\"event\":\"response\"}"
+            "<132>1 2000-02-29T00:00:00.123Z host-1 reiki 4242 response - {\"event\":\"response\"}"
         );
     }
 

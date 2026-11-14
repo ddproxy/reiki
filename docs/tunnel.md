@@ -50,7 +50,7 @@ ca_key_permissions = "error"   # refuse a CA key that group or others can access
 [[tunnel.intercept.hosts]]
 host = "api.example.com"
 upstream = "example"      # an [upstream.*] whose base_url is on this host
-stream = "laptop"         # the stream whose key chain serves it; omit for a passthrough upstream
+stream = "client-a"         # the stream whose key chain serves it; omit for a passthrough upstream
 ```
 
 Create the CA, name-constrained to the hosts it may sign for, and give only `ca.pem` to clients:

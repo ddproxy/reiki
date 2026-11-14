@@ -526,7 +526,7 @@ mod tests {
             upstream: "zen".to_owned(),
             method: "POST".to_owned(),
             path: "/zen/chat/completions".to_owned(),
-            headers: vec![("user-agent".to_owned(), "opencode/1.18.35".to_owned())],
+            headers: vec![("user-agent".to_owned(), "client/1.0".to_owned())],
             body_bytes: body.len(),
             body: Some(Bytes::from(body.to_owned())),
         }
@@ -544,7 +544,7 @@ mod tests {
         let record = parsed(&config(""), request(&body));
         assert_eq!(record["event"], "request");
         assert_eq!(record["ts"], "2000-02-29T00:00:00.000Z");
-        assert_eq!(record["headers"]["user-agent"], "opencode/1.18.35");
+        assert_eq!(record["headers"]["user-agent"], "client/1.0");
         assert_eq!(record["body"]["model"], "big-pickle");
         assert_eq!(
             record["body"]["messages"][0]["content"],
@@ -883,7 +883,7 @@ mod tests {
             event["http_request"]["url"]["path"],
             "/zen/chat/completions"
         );
-        assert_eq!(event["http_request"]["user_agent"], "opencode/1.18.35");
+        assert_eq!(event["http_request"]["user_agent"], "client/1.0");
         assert_eq!(event["src_endpoint"]["name"], "zen");
     }
 

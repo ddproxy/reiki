@@ -621,23 +621,23 @@ mod tests {
             per_token: 2,
         };
         let first = hub
-            .subscribe(ip(1), "ct-5", caps, HEARTBEAT, snapshot)
+            .subscribe(ip(1), "peer-b", caps, HEARTBEAT, snapshot)
             .unwrap();
         let _second = hub
-            .subscribe(ip(2), "ct-5", caps, HEARTBEAT, snapshot)
+            .subscribe(ip(2), "peer-b", caps, HEARTBEAT, snapshot)
             .unwrap();
         assert_eq!(
-            hub.subscribe(ip(3), "ct-5", caps, HEARTBEAT, snapshot)
+            hub.subscribe(ip(3), "peer-b", caps, HEARTBEAT, snapshot)
                 .unwrap_err(),
             Refused::TokenFull
         );
         let _other = hub
-            .subscribe(ip(3), "ct-6", caps, HEARTBEAT, snapshot)
+            .subscribe(ip(3), "peer-c", caps, HEARTBEAT, snapshot)
             .expect("another token has its own count");
         drop(first);
         settle(&hub, 2).await;
         assert!(hub
-            .subscribe(ip(3), "ct-5", caps, HEARTBEAT, snapshot)
+            .subscribe(ip(3), "peer-b", caps, HEARTBEAT, snapshot)
             .is_ok());
     }
 
@@ -645,12 +645,12 @@ mod tests {
     async fn closing_a_token_ends_only_its_streams() {
         let hub = Hub::new();
         let mut gone = hub
-            .subscribe(ip(1), "ct-5", limits(4, 4), HEARTBEAT, snapshot)
+            .subscribe(ip(1), "peer-b", limits(4, 4), HEARTBEAT, snapshot)
             .unwrap();
         let mut kept = hub
-            .subscribe(ip(1), "ct-6", limits(4, 4), HEARTBEAT, snapshot)
+            .subscribe(ip(1), "peer-c", limits(4, 4), HEARTBEAT, snapshot)
             .unwrap();
-        hub.close_tokens(vec!["ct-5".to_owned()]);
+        hub.close_tokens(vec!["peer-b".to_owned()]);
         hub.publish(frame("key", &json!({"n": 1})));
         assert_eq!(next(&mut gone).await.unwrap(), snapshot());
         assert_eq!(next(&mut gone).await, None);

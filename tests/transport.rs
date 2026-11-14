@@ -129,7 +129,7 @@ async fn relay(options: &str) -> (String, Arc<Seen>) {
         "[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{options}\n\
          [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
          [keys.b]\nupstream = \"zen\"\nfile = \"/unused/b\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
         reiki::auth::sha256_hex(CLIENT_TOKEN)
     );
     let config = Config::parse(&text).unwrap();

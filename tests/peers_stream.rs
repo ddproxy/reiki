@@ -17,7 +17,7 @@ use reiki::proxy::{router, App, Secret};
 const ADMIN_TOKEN: &str = "admin-token-for-stream-tests";
 const STREAM_TOKEN: &str = "stream-token-for-stream-tests";
 const PEER_TOKEN: &str = "peer-token-for-stream-tests";
-const CT5_TOKEN: &str = "ct-5-token-for-stream-tests";
+const PEER_B_TOKEN: &str = "peer-b-token-for-stream-tests";
 
 fn sha(token: &str) -> String {
     reiki::auth::sha256_hex(token)
@@ -69,7 +69,7 @@ impl Rig {
             "[upstream.zen]\nbase_url = \"{upstream}/v1\"\n\
              [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused/zen-a\"\n\
              [keys.zen-b]\nupstream = \"zen\"\nfile = \"/unused/zen-b\"\n\
-             [streams.laptop]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\"]\n\
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\"]\n\
              [admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n\
              [peers]\nenabled = true\npublish = true\nlisten = \"{peer_addr}\"\n\
              peer_token_sha256 = \"{}\"\ninstance = \"streamer\"\n{peers_extra}",
@@ -228,7 +228,7 @@ async fn a_stream_starts_with_a_snapshot_then_sends_key_changes() {
         change["upstream"].get("keys").is_none(),
         "no labels by default"
     );
-    for hidden in ["laptop", "zen-a", "upstream-zen", "ses_stream"] {
+    for hidden in ["client-a", "zen-a", "upstream-zen", "ses_stream"] {
         assert!(!data.contains(hidden), "{hidden} in {data}");
     }
 }
@@ -315,7 +315,7 @@ async fn the_stream_needs_the_peer_token_and_a_get() {
 async fn subscriber_caps_refuse_extra_streams_until_one_closes() {
     let rig = Rig::new(&format!(
         "max_subscribers = 2\nmax_subscribers_per_peer = 1\nmax_subscribers_per_token = 1\n{}",
-        ct5_token()
+        peer_b_token()
     ))
     .await;
     let first = rig.open(PEER_TOKEN).await;
@@ -323,7 +323,7 @@ async fn subscriber_caps_refuse_extra_streams_until_one_closes() {
     let second = rig.open(PEER_TOKEN).await;
     assert_eq!(second.status(), 429, "one stream per token");
     assert!(second.headers().contains_key("retry-after"));
-    let other = rig.open(CT5_TOKEN).await;
+    let other = rig.open(PEER_B_TOKEN).await;
     assert_eq!(
         other.status(),
         200,
@@ -343,17 +343,17 @@ async fn subscriber_caps_refuse_extra_streams_until_one_closes() {
     assert_eq!(status, 200, "a closed stream frees its place");
 }
 
-fn ct5_token() -> String {
+fn peer_b_token() -> String {
     format!(
-        "[[peers.tokens]]\nname = \"ct-5\"\ntoken_sha256 = \"{}\"\n",
-        sha(CT5_TOKEN)
+        "[[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
+        sha(PEER_B_TOKEN)
     )
 }
 
 #[tokio::test]
 async fn every_configured_peer_token_opens_a_stream() {
-    let rig = Rig::new(&ct5_token()).await;
-    for token in [PEER_TOKEN, CT5_TOKEN] {
+    let rig = Rig::new(&peer_b_token()).await;
+    for token in [PEER_TOKEN, PEER_B_TOKEN] {
         let mut reader = Reader::new(rig.open(token).await);
         assert_eq!(reader.next().await.0, "snapshot", "{token}");
     }
@@ -364,14 +364,14 @@ async fn every_configured_peer_token_opens_a_stream() {
 
 #[tokio::test]
 async fn removing_a_token_on_reload_ends_its_streams_and_keeps_the_others() {
-    let rig = Rig::new(&ct5_token()).await;
-    let mut removed = Reader::new(rig.open(CT5_TOKEN).await);
+    let rig = Rig::new(&peer_b_token()).await;
+    let mut removed = Reader::new(rig.open(PEER_B_TOKEN).await);
     let mut kept = Reader::new(rig.open(PEER_TOKEN).await);
     assert_eq!(removed.next().await.0, "snapshot");
     assert_eq!(kept.next().await.0, "snapshot");
-    rig.reload("remove", |text| text.replace(&ct5_token(), ""));
+    rig.reload("remove", |text| text.replace(&peer_b_token(), ""));
     assert!(removed.ends().await, "the removed token's stream ends");
-    assert_eq!(rig.open(CT5_TOKEN).await.status(), 401);
+    assert_eq!(rig.open(PEER_B_TOKEN).await.status(), 401);
     rig.cool_both_keys().await;
     let (event, _) = kept.next_change().await;
     assert_eq!(event, "key", "the remaining token's stream stays open");
@@ -380,21 +380,21 @@ async fn removing_a_token_on_reload_ends_its_streams_and_keeps_the_others() {
 #[tokio::test]
 async fn a_token_added_on_reload_works_at_once() {
     let rig = Rig::new("").await;
-    assert_eq!(rig.open(CT5_TOKEN).await.status(), 401);
-    rig.reload("add", |text| format!("{text}{}", ct5_token()));
-    assert_eq!(rig.open(CT5_TOKEN).await.status(), 200);
+    assert_eq!(rig.open(PEER_B_TOKEN).await.status(), 401);
+    rig.reload("add", |text| format!("{text}{}", peer_b_token()));
+    assert_eq!(rig.open(PEER_B_TOKEN).await.status(), 200);
 }
 
 #[tokio::test]
 async fn the_per_token_cap_counts_one_token_whatever_the_address() {
     let rig = Rig::new(&format!(
         "max_subscribers = 8\nmax_subscribers_per_peer = 8\nmax_subscribers_per_token = 1\n{}",
-        ct5_token()
+        peer_b_token()
     ))
     .await;
-    let first = rig.open(CT5_TOKEN).await;
+    let first = rig.open(PEER_B_TOKEN).await;
     assert_eq!(first.status(), 200);
-    let second = rig.open(CT5_TOKEN).await;
+    let second = rig.open(PEER_B_TOKEN).await;
     assert_eq!(second.status(), 429, "one stream for this token");
     assert!(second.headers().contains_key("retry-after"));
     assert_eq!(
@@ -406,7 +406,7 @@ async fn the_per_token_cap_counts_one_token_whatever_the_address() {
     let mut status = 0;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        status = rig.open(CT5_TOKEN).await.status().as_u16();
+        status = rig.open(PEER_B_TOKEN).await.status().as_u16();
         if status == 200 {
             break;
         }
@@ -439,7 +439,7 @@ impl Drop for TokenFile {
 fn reader_config(url: &str, token: &TokenFile) -> Config {
     Config::parse(&format!(
         "[peers]\nenabled = true\npoll_interval_secs = 1\n\
-         [peers.ct]\nurl = \"{url}\"\ntoken_file = \"{}\"\n",
+         [peers.peer-a]\nurl = \"{url}\"\ntoken_file = \"{}\"\n",
         token.0.display()
     ))
     .unwrap()
@@ -476,10 +476,10 @@ async fn watch_prints_the_snapshot_then_each_change() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    assert_eq!(row(&seen[0]), ["ct", "streamer", "zen", "ok", "2", "0"]);
+    assert_eq!(row(&seen[0]), ["peer-a", "streamer", "zen", "ok", "2", "0"]);
     assert_eq!(
         row(&seen[1]),
-        ["ct", "streamer", "zen", "cooling", "0", "2"]
+        ["peer-a", "streamer", "zen", "cooling", "0", "2"]
     );
 }
 

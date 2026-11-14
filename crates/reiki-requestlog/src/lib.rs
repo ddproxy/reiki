@@ -472,7 +472,7 @@ mod tests {
         drive(
             plugin.as_ref(),
             &[
-                ("user-agent", "opencode/1.18.35"),
+                ("user-agent", "client/1.0"),
                 ("authorization", "Bearer client-secret-token"),
             ],
             r#"{"model":"m","messages":[{"content":"hi"}]}"#,

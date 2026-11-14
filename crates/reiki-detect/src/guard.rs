@@ -267,7 +267,7 @@ mod tests {
         let mut payload = Bytes::copy_from_slice(body);
         let mut state = ();
         p.on_request(&mut RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/x",
@@ -285,7 +285,7 @@ mod tests {
         let mut payload = Bytes::copy_from_slice(body);
         let mut state = ();
         let mut ctx = RequestCtx::new(
-            "ct",
+            "client-a",
             "zen",
             &Method::POST,
             "/x",

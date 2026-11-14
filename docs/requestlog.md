@@ -10,7 +10,7 @@ Compiled in by the default `plugin-requestlog` feature; inactive until a `[plugi
 [plugins.requestlog]
 file = "/var/lib/reiki/requests.jsonl"     # JSON lines, rotated by size
 socket = "/run/reiki/requests.sock"        # live feed, one JSON line per record
-# syslog = "tcp://collector.internal:514"  # RFC 5424 messages, see Syslog output
+# syslog = "tcp://collector.example.com:514"  # RFC 5424 messages, see Syslog output
 body = "full"                              # "full", "summary" or "none"
 headers = ["user-agent", "x-session-id"]
 ```
@@ -49,7 +49,7 @@ Stopping Reiki with a signal leaves the socket file behind; the next start repla
 Every record is one line with `"v":1`. A request produces two records that share an `id`.
 
 ```json
-{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"ct","upstream":"example","method":"POST","headers":{"user-agent":"client/1.0"},"body_bytes":75,"body":{"model":"small","messages":[{"role":"user","content":"hello there"}]}}
+{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"client-a","upstream":"example","method":"POST","headers":{"user-agent":"client/1.0"},"body_bytes":75,"body":{"model":"small","messages":[{"role":"user","content":"hello there"}]}}
 {"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2025-01-01T12:00:00.000Z","status":200,"duration_ms":249,"bytes":11,"key":"example-primary","attempts":[{"key":"example-primary","status":200}]}
 ```
 
@@ -120,7 +120,7 @@ Every event carries `metadata.correlation_uid`, the request id, so a SIEM can jo
 
 ```toml
 [plugins.requestlog]
-syslog = "tcp://collector.internal:514"
+syslog = "tcp://collector.example.com:514"
 syslog_facility = "local0"
 syslog_app_name = "reiki"
 ```
@@ -154,7 +154,7 @@ A response that Reiki generates itself has no upstream status, so it is logged a
 Example message:
 
 ```
-<134>1 2026-10-23T23:27:24.291Z gw-1 reiki 4242 request - {"v":1,"event":"request","id":"d87b738bb70ccae6",...}
+<134>1 2026-10-23T23:27:24.291Z host-1 reiki 4242 request - {"v":1,"event":"request","id":"d87b738bb70ccae6",...}
 ```
 
 ### Delivery

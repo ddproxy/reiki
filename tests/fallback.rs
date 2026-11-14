@@ -93,7 +93,7 @@ async fn start_refusing_with_limit(
          [upstream.router]\nbase_url = \"{other_url}/api\"\nmodel_aliases = {{ \"mapped\" = \"final-model\" }}\n\
          [keys.z]\nupstream = \"zen\"\nfile = \"/unused/z\"\n\
          [keys.r]\nupstream = \"router\"\nfile = \"/unused/r\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = {chain}\n{limit}",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = {chain}\n{limit}",
         reiki::auth::sha256_hex(CLIENT_TOKEN),
     );
     let config = Config::parse(&text).unwrap();
@@ -233,7 +233,7 @@ fn a_fallback_needs_a_key_for_the_target_in_every_stream_that_uses_the_source() 
         "[upstream.zen]\nbase_url = \"https://a.example/v1\"\n{FALLBACK}\n\
          [upstream.router]\nbase_url = \"https://b.example/v1\"\n\
          [keys.z]\nupstream = \"zen\"\nfile = \"/unused/z\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"z\"]\n",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"z\"]\n",
         reiki::auth::sha256_hex(CLIENT_TOKEN),
     );
     let error = Config::parse(&text).unwrap_err().to_string();
@@ -247,7 +247,7 @@ fn a_fallback_cannot_name_itself_or_an_unknown_upstream() {
             "[upstream.zen]\nbase_url = \"https://a.example/v1\"\n\
              [upstream.zen.fallback]\nupstream = \"{target}\"\n\
              [keys.z]\nupstream = \"zen\"\nfile = \"/unused/z\"\n\
-             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"z\"]\n",
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"z\"]\n",
             reiki::auth::sha256_hex(CLIENT_TOKEN),
         );
         let error = Config::parse(&text).unwrap_err().to_string();

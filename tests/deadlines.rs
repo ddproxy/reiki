@@ -101,7 +101,7 @@ async fn rig(upstream_extra: &str) -> Rig {
     let text = format!(
         "[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{upstream_extra}\n\
          [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
-         [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n",
+         [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n",
         reiki::auth::sha256_hex(CLIENT_TOKEN),
     );
     let config = Config::parse(&text).unwrap();

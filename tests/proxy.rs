@@ -464,7 +464,7 @@ impl Harness {
         self.client
             .post(format!("{}{path}", self.relay))
             .bearer_auth(token)
-            .header("user-agent", "opencode/1.18.35")
+            .header("user-agent", "client/1.0")
             .header("x-opencode-session", "ses_123")
             .body(body.to_owned())
     }
@@ -476,7 +476,7 @@ impl Harness {
 }
 
 fn one_stream() -> Vec<(&'static str, &'static str, &'static [&'static str])> {
-    vec![("ct", "tok-a", &["a", "b"][..])]
+    vec![("client-a", "tok-a", &["a", "b"][..])]
 }
 
 #[tokio::test]
@@ -493,7 +493,7 @@ async fn forwards_path_query_body_and_headers_and_swaps_only_the_credential() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].path_and_query, "/v1/chat/completions?stream=false");
     assert_eq!(calls[0].authorization, "Bearer up-a");
-    assert_eq!(calls[0].user_agent, "opencode/1.18.35");
+    assert_eq!(calls[0].user_agent, "client/1.0");
     assert_eq!(calls[0].custom, "ses_123");
     assert_eq!(calls[0].body, b"{\"m\":1}");
 }
@@ -807,7 +807,7 @@ async fn a_bad_request_is_passed_through_without_failover() {
 
 #[tokio::test]
 async fn a_transient_upstream_error_is_not_replayed_on_the_same_key() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     h.mock
         .script("up-a", vec![Reply::Status(502, "bad gateway", None)]);
     let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
@@ -818,7 +818,8 @@ async fn a_transient_upstream_error_is_not_replayed_on_the_same_key() {
 
 #[tokio::test]
 async fn every_key_in_the_chain_is_tried_once_before_the_last_refusal_is_returned() {
-    let streams: Vec<(&str, &str, &[&str])> = vec![("ct", "tok-a", &["a", "b", "c", "d"][..])];
+    let streams: Vec<(&str, &str, &[&str])> =
+        vec![("client-a", "tok-a", &["a", "b", "c", "d"][..])];
     let h = harness(&streams, Policy::default()).await;
     for (key, text) in [
         ("up-a", "a broke"),
@@ -904,7 +905,7 @@ async fn a_limited_stream_gets_429_while_an_unlimited_one_shares_the_key_unchang
 
 #[tokio::test]
 async fn a_failover_cannot_spend_more_attempts_than_the_limit_allows() {
-    let h = harness_with_limits(&one_stream(), &[("ct", 1)], Policy::default()).await;
+    let h = harness_with_limits(&one_stream(), &[("client-a", 1)], Policy::default()).await;
     // The first key fails, so the relay would normally try key b. The one allowed
     // attempt is already spent, and key b must not be called.
     h.mock
@@ -1058,7 +1059,7 @@ const DISABLED: &str = "{\"error\":{\"type\":\"server_error\",\"message\":\"Upst
 
 #[tokio::test]
 async fn an_endpoint_specific_refusal_does_not_cool_the_key_for_other_endpoints() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     h.mock.script_path(
         "up-a",
         "/v1/responses",
@@ -1114,7 +1115,7 @@ async fn rejects_a_request_body_over_the_size_limit_without_calling_upstream() {
 #[tokio::test]
 async fn an_idempotent_request_that_never_gets_headers_is_retried_as_a_transient_failure() {
     let h = harness_with_timeout(
-        &[("ct", "tok-a", &["a"][..])],
+        &[("client-a", "tok-a", &["a"][..])],
         Policy::default(),
         Duration::from_millis(200),
     )
@@ -1135,7 +1136,7 @@ async fn an_idempotent_request_that_never_gets_headers_is_retried_as_a_transient
 #[tokio::test]
 async fn a_post_that_times_out_is_not_replayed_on_the_same_or_another_key() {
     let h = harness_with_timeout(
-        &[("ct", "tok-a", &["a", "b"][..])],
+        &[("client-a", "tok-a", &["a", "b"][..])],
         Policy::default(),
         Duration::from_millis(200),
     )
@@ -1182,7 +1183,7 @@ fn imf_date(epoch_secs: u64) -> String {
 
 #[tokio::test]
 async fn a_429_with_an_http_date_retry_after_cools_the_key_for_that_long() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1205,10 +1206,10 @@ async fn a_429_with_an_http_date_retry_after_cools_the_key_for_that_long() {
 
 #[tokio::test]
 async fn reload_adds_a_stream_and_a_key() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     h.reload(
         &[("a", "up-a"), ("e", "up-e")],
-        &[("ct", "tok-a", &["a"]), ("new", "tok-new", &["e"])],
+        &[("client-a", "tok-a", &["a"]), ("new", "tok-new", &["e"])],
     );
     let res = h.post("tok-new", "/zen/x", "1").send().await.unwrap();
     assert_eq!(res.status(), 200);
@@ -1244,7 +1245,7 @@ async fn reload_keeps_health_for_an_unchanged_key() {
 
     h.reload(
         &[("a", "up-a"), ("b", "up-b")],
-        &[("ct", "tok-a", &["a", "b"])],
+        &[("client-a", "tok-a", &["a", "b"])],
     );
     assert_eq!(
         h.post("tok-a", "/zen/x", "2")
@@ -1274,7 +1275,7 @@ async fn reload_resets_health_when_a_key_secret_changes() {
 
     h.reload(
         &[("a", "up-a-rotated"), ("b", "up-b")],
-        &[("ct", "tok-a", &["a", "b"])],
+        &[("client-a", "tok-a", &["a", "b"])],
     );
     assert_eq!(
         h.post("tok-a", "/zen/x", "2")
@@ -1306,7 +1307,7 @@ async fn an_in_flight_request_finishes_against_the_snapshot_it_started_with() {
     let first = res.chunk().await.unwrap().unwrap();
     assert_eq!(&first[..], b"data: one\n\n");
 
-    h.reload(&[("b", "up-b")], &[("ct", "tok-a", &["b"])]);
+    h.reload(&[("b", "up-b")], &[("client-a", "tok-a", &["b"])]);
 
     let mut rest = Vec::new();
     while let Some(chunk) = res.chunk().await.unwrap() {
@@ -1419,7 +1420,7 @@ async fn admin_status_reports_key_and_stream_state_without_secrets() {
         .await
         .unwrap();
 
-    assert!(body.contains("\"name\":\"ct\""), "body was {body}");
+    assert!(body.contains("\"name\":\"client-a\""), "body was {body}");
     assert!(body.contains("\"state\":\"available\""), "body was {body}");
     assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
     assert!(body.contains("\"retry_after_seconds\":"), "body was {body}");
@@ -1469,11 +1470,15 @@ async fn admin_metrics_increment_after_a_failover_without_leaking() {
         .unwrap();
 
     assert!(
-        text.contains("reiki_requests_total{stream=\"ct\",upstream=\"zen\",status=\"success\"} 1"),
+        text.contains(
+            "reiki_requests_total{stream=\"client-a\",upstream=\"zen\",status=\"success\"} 1"
+        ),
         "text was {text}"
     );
     assert!(
-        text.contains("reiki_failovers_total{stream=\"ct\",key=\"a\",class=\"rate_limited\"} 1"),
+        text.contains(
+            "reiki_failovers_total{stream=\"client-a\",key=\"a\",class=\"rate_limited\"} 1"
+        ),
         "text was {text}"
     );
     assert!(
@@ -1569,7 +1574,7 @@ async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
     // 2026-01-01T23:59:57Z, so the next `daily 00:00 UTC` reset is 3 seconds out.
     let now = UNIX_EPOCH + Duration::from_secs(1_767_311_997);
     let h = harness_with_quota_resets(
-        &[("ct", "tok-a", &["a", "b"][..])],
+        &[("client-a", "tok-a", &["a", "b"][..])],
         &[("a", "daily 00:00 UTC")],
         now,
     )
@@ -1628,7 +1633,7 @@ async fn a_sighup_reload_does_not_revive_the_old_state_of_a_rotated_key() {
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
              [keys.b]\nupstream = \"zen\"\nfile = \"{}\"\n\
-             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
             h.mock_url,
             dir.join("a").display(),
             dir.join("b").display(),
@@ -1685,7 +1690,7 @@ async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_s
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
              [keys.b]\nupstream = \"zen\"\nfile = \"{}\"\n\
-             [streams.ct]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n{extra}",
+             [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n{extra}",
             h.mock_url,
             dir.join("a").display(),
             dir.join("b").display(),
@@ -1805,7 +1810,7 @@ async fn pass_errors_relays_a_403_without_taking_the_key_out_of_rotation() {
 
 #[tokio::test]
 async fn a_generic_403_does_not_permanently_disable_a_key() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     h.mock.script(
         "up-a",
         vec![Reply::Status(
@@ -1827,7 +1832,7 @@ async fn a_generic_403_does_not_permanently_disable_a_key() {
 
 #[tokio::test]
 async fn a_403_naming_an_invalid_key_still_disables_it() {
-    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    let h = harness(&[("client-a", "tok-a", &["a"][..])], Policy::default()).await;
     h.mock.script(
         "up-a",
         vec![Reply::Status(

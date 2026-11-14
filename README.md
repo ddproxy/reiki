@@ -63,7 +63,7 @@ file = "/etc/reiki/keys/example-a"            # file holding the key
 upstream = "example"
 file = "/etc/reiki/keys/example-b"
 
-[streams.laptop]
+[streams.client-a]
 token_sha256 = "<sha256 of the client token>"
 chain = ["example-a", "example-b"]                # tried in order
 strategy = "sticky"                       # or "round_robin"

@@ -86,6 +86,8 @@ struct State {
     last_event: Option<SystemTime>,
     day: Quota,
     month: Quota,
+    /// Latest time seen; a clock that steps back is held here so a window cannot reopen.
+    high_water: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -120,6 +122,8 @@ impl Bucket {
     pub fn try_acquire(&self, now: SystemTime, estimate: u64) -> Decision {
         let w = &self.window;
         let mut s = lock(&self.state);
+        let now = s.high_water.map_or(now, |seen| seen.max(now));
+        s.high_water = Some(now);
         let reset = reset_secs(w);
         s.day.roll(Period::Day, secs(now), reset);
         s.month.roll(Period::Month, secs(now), reset);
@@ -437,6 +441,29 @@ mod tests {
         assert_eq!(wait(&b, plus(t0, 59), 0), Duration::from_secs(1));
         grant(&b, plus(t0, 60), 0);
         assert_eq!(wait(&b, plus(t0, 60), 0), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_does_not_reopen_a_quota() {
+        let w = Window {
+            daily_requests: 2,
+            ..Window::default()
+        };
+        let b = Bucket::new(w);
+        let t = UNIX_EPOCH + Duration::from_secs(10 * 86_400 + 100);
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            match b.try_acquire(t, 0) {
+                Decision::Granted(p) => permits.push(p),
+                other => panic!("{other:?}"),
+            }
+        }
+        let before_midnight = t - Duration::from_secs(200);
+        assert!(matches!(
+            b.try_acquire(before_midnight, 0),
+            Decision::Closed(_)
+        ));
+        assert!(matches!(b.try_acquire(t, 0), Decision::Closed(_)));
     }
 
     #[test]

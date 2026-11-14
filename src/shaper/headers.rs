@@ -10,6 +10,8 @@ use crate::classify::{parse_http_date, parse_retry_after};
 const MAX_RESET: Duration = Duration::from_secs(24 * 60 * 60);
 /// Epoch seconds reach this only in the year 5138, so a larger value must be milliseconds.
 const EPOCH_MILLIS_FLOOR: u64 = 100_000_000_000;
+/// Below this a value cannot be a current epoch in seconds.
+const EPOCH_SECONDS_FLOOR: u64 = 1_000_000_000;
 
 /// Limits one response reported. `None` means absent or unusable.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +94,10 @@ fn rfc3339_reset(headers: &HeaderMap, name: &str, clock: i64) -> Option<Duration
 
 fn epoch_reset(headers: &HeaderMap, name: &str, clock: i64) -> Option<Duration> {
     let value: u64 = text(headers, name)?.parse().ok()?;
+    // A small number is a delta in seconds, not an epoch: epoch seconds passed 1e9 in 2001.
+    if value < EPOCH_SECONDS_FLOOR {
+        return within_cap(Duration::from_secs(value));
+    }
     let millis = if value >= EPOCH_MILLIS_FLOOR {
         value
     } else {
@@ -188,6 +194,15 @@ impl Preset {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_small_generic_reset_is_a_delta_in_seconds() {
+        let h = headers(&[("x-ratelimit-reset", "30"), ("date", DATE)]);
+        assert_eq!(
+            observe_at(&h, 0).requests_reset,
+            Some(Duration::from_secs(30))
+        );
+    }
+
     use super::*;
     use axum::http::{HeaderName, HeaderValue};
 

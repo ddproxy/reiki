@@ -1618,8 +1618,8 @@ impl Config {
         if entry.token_file.trim().is_empty() {
             return Some("token_file must not be empty".to_owned());
         }
-        if entry.timeout_secs == 0 {
-            return Some("timeout_secs must be at least 1".to_owned());
+        if !(1..=3600).contains(&entry.timeout_secs) {
+            return Some("timeout_secs must be between 1 and 3600".to_owned());
         }
         for label in &entry.accounts {
             if !self.has_account(label) {
@@ -1637,6 +1637,20 @@ impl Config {
         };
         if !addr.ip().is_loopback() {
             return Some(format!("listen `{listen}` must be a loopback address"));
+        }
+        let others = [
+            Some(self.listen.as_str()),
+            self.admin.as_ref().map(|a| a.listen.as_str()),
+            self.tunnel.as_ref().map(|t| t.listen.as_str()),
+        ];
+        if others
+            .into_iter()
+            .flatten()
+            .any(|other| same_listener(other, addr))
+        {
+            return Some(
+                "listen must differ from the client, admin and tunnel listen addresses".to_owned(),
+            );
         }
         for (name, edge) in &hub.edges {
             if !valid_label(name) {
@@ -1705,8 +1719,28 @@ impl Config {
 
     /// Why an edge token cannot be used, because it repeats a stronger credential.
     fn edge_token_problem(&self, hub: &HubConfig) -> Option<String> {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
         for (name, edge) in &hub.edges {
             let hash = edge.token_sha256.as_str();
+            if let Some((other, _)) = seen.iter().find(|(_, h)| h.eq_ignore_ascii_case(hash)) {
+                return Some(format!(
+                    "[hub.edges.{name}] token_sha256 is the same as the token of edge `{other}`"
+                ));
+            }
+            seen.push((name, hash));
+            #[cfg(feature = "peers")]
+            if let Some(peers) = &self.peers {
+                let shorthand = peers.peer_token_sha256.iter().map(String::as_str);
+                let listed = peers.tokens.iter().map(|t| t.token_sha256.as_str());
+                if shorthand
+                    .chain(listed)
+                    .any(|h| h.eq_ignore_ascii_case(hash))
+                {
+                    return Some(format!(
+                        "[hub.edges.{name}] token_sha256 is the same as a peer token"
+                    ));
+                }
+            }
             if let Some(admin) = &self.admin {
                 if admin.token_sha256.eq_ignore_ascii_case(hash) {
                     return Some(format!(
@@ -1749,7 +1783,7 @@ fn loopback_target(url: &str) -> Option<(std::net::IpAddr, u16)> {
     let ip: std::net::IpAddr = if host == "localhost" {
         std::net::Ipv4Addr::LOCALHOST.into()
     } else {
-        host.parse().ok()?
+        host.parse::<std::net::IpAddr>().ok()?.to_canonical()
     };
     ip.is_loopback()
         .then_some((ip, parsed.port_or_known_default()?))
@@ -3338,6 +3372,26 @@ socket = "/run/forwarder.sock"
         }
 
         #[test]
+        fn edge_tokens_are_distinct_and_the_hub_listener_is_its_own() {
+            let two = edit(
+                "allow_from = [\"acct-a\"]\n",
+                &format!(
+                    "allow_from = [\"acct-a\"]\n[hub.edges.peer-b]\ntoken_sha256 = \"{HASH_D}\"\nallow_from = [\"acct-a\"]\n"
+                ),
+            );
+            let reason = hub_error(&two);
+            assert!(reason.contains("same as the token of edge"), "{reason}");
+            let clash = hub_error(&edit("127.0.0.1:4443", "127.0.0.1:4098"));
+            assert!(clash.contains("must differ"), "{clash}");
+        }
+
+        #[test]
+        fn a_mapped_loopback_hub_url_is_seen_as_itself() {
+            let text = edit(HUB_URL, "https://[::ffff:127.0.0.1]:4443");
+            assert!(hub_error(&text).contains("lists itself"));
+        }
+
+        #[test]
         fn an_https_hub_needs_no_ca_file() {
             let text = edit("ca_file = \"/etc/reiki/hub/ca.pem\"\n", "");
             assert!(Config::parse(&text).is_ok());
@@ -3355,7 +3409,7 @@ socket = "/run/forwarder.sock"
                 "accounts = [\"acct-a\"]\n",
                 "accounts = [\"acct-a\"]\ntimeout_secs = 0\n",
             );
-            assert!(hub_error(&text).contains("timeout_secs must be at least 1"));
+            assert!(hub_error(&text).contains("timeout_secs must be between 1 and 3600"));
         }
 
         #[test]

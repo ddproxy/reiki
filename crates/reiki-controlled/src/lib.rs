@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn block_mode_rejects_and_names_kinds_without_values() {
         let p = plugin("mode = \"block\"").unwrap();
-        let body = "{\"q\":\"CUI//SP-CTI NOFORN\"}";
+        let body = "CUI//SP-CTI\nNOFORN\n";
         let err = send(p.as_ref(), "zen", &mut HeaderMap::new(), body).unwrap_err();
         let PluginError::Reject(status, message) = err else {
             panic!("{err}")
@@ -85,6 +85,13 @@ mod tests {
             "controlled: request blocked, it contains cui x1, dissemination x1"
         );
         assert!(!message.contains("SP-CTI"));
+    }
+
+    #[test]
+    fn prose_mentions_are_not_markings_in_block_mode() {
+        let p = plugin("mode = \"block\"").unwrap();
+        let body = "{\"q\":\"what does the CUI spec and the NOFORN rule say?\"}";
+        assert!(send(p.as_ref(), "zen", &mut HeaderMap::new(), body).is_ok());
     }
 
     #[test]

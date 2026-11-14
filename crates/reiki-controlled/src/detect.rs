@@ -135,7 +135,153 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     hits
 }
 
-/// A stand-alone `CUI` banner or a `CUI//SP-...` marker.
+/// Characters that may surround a banner token: whitespace and Markdown or outline decoration.
+fn banner_leading(c: u8) -> bool {
+    c.is_ascii_whitespace() || matches!(c, b'*' | b'-' | b'_' | b'#' | b'>' | b'+' | b'~' | b'|')
+}
+
+/// Like [`banner_leading`], plus sentence punctuation that may trail a whole-line banner.
+fn banner_trailing(c: u8) -> bool {
+    banner_leading(c) || matches!(c, b'.' | b':' | b';' | b',' | b'!' | b'?')
+}
+
+/// The length of a marking word at the start of a banner line.
+fn banner_lead(line: &[u8], start: usize) -> Option<usize> {
+    const LEADS: [&[u8]; 7] = [
+        b"TOP SECRET",
+        b"SECRET",
+        b"CONFIDENTIAL",
+        b"CUI",
+        b"NOFORN",
+        b"ORCON",
+        b"U",
+    ];
+    for word in LEADS {
+        let end = start + word.len();
+        if end <= line.len() && !word_at(line, end) && &line[start..end] == word {
+            return Some(word.len());
+        }
+    }
+    None
+}
+
+fn caveat_char(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, b' ' | b'-' | b',' | b'_')
+}
+
+/// The end of a marking chain that starts at `start`, or `None` when no marking word starts it.
+fn marking_end(line: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + banner_lead(line, start)?;
+    loop {
+        let sep = if line[i..].starts_with(b"//") {
+            2
+        } else if line.get(i) == Some(&b'/') {
+            1
+        } else {
+            break;
+        };
+        let segment = i + sep;
+        let mut j = segment;
+        while j < line.len() && caveat_char(line[j]) {
+            j += 1;
+        }
+        while j > segment && line[j - 1] == b' ' {
+            j -= 1;
+        }
+        if j == segment {
+            break;
+        }
+        i = j;
+    }
+    Some(i)
+}
+
+/// True when `token` at `rel` is a banner or a portion marking in one line.
+fn marking_in_line(line: &[u8], rel: usize, token: &[u8]) -> bool {
+    let mut a = 0;
+    while a < line.len() && banner_leading(line[a]) {
+        a += 1;
+    }
+    if a >= line.len() {
+        return false;
+    }
+    let portion = line[a] == b'(';
+    if portion {
+        a += 1;
+        while a < line.len() && line[a] == b' ' {
+            a += 1;
+        }
+    }
+    let start = a;
+    let Some(end) = marking_end(line, start) else {
+        return false;
+    };
+    if rel < start || rel + token.len() > end {
+        return false;
+    }
+    if token == b"CUI" {
+        if rel != start {
+            return false;
+        }
+    } else {
+        if rel > start && !matches!(line.get(rel - 1), Some(&b'/') | Some(&b' ') | Some(&b'\t')) {
+            return false;
+        }
+        if let Some(&c) = line.get(rel + token.len()) {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+                return false;
+            }
+        }
+    }
+    if portion {
+        let mut b = end;
+        while b < line.len() && line[b] == b' ' {
+            b += 1;
+        }
+        return line.get(b) == Some(&b')');
+    }
+    let mut b = end;
+    while b < line.len() && banner_trailing(line[b]) {
+        b += 1;
+    }
+    b == line.len()
+}
+
+/// Longest line that can be a banner. The bound keeps a body that is one huge line of marking
+/// words from making every candidate rescan the whole line.
+const MAX_BANNER_LINE: usize = 1024;
+
+/// True when `token` at `at` is a whole-line banner, the start of a caveat chain or a portion
+/// marking at the start of a line.
+fn marking_banner(bytes: &[u8], at: usize, token: &[u8]) -> bool {
+    let window_start = at.saturating_sub(MAX_BANNER_LINE);
+    let Some(start) = bytes[window_start..at]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map(|p| window_start + p + 1)
+        .or((window_start == 0).then_some(0))
+    else {
+        return false;
+    };
+    let window_end = (at + MAX_BANNER_LINE).min(bytes.len());
+    let Some(mut end) = bytes[at..window_end]
+        .iter()
+        .position(|&c| c == b'\n')
+        .map(|p| at + p)
+        .or((window_end == bytes.len()).then_some(bytes.len()))
+    else {
+        return false;
+    };
+    if end - start > MAX_BANNER_LINE {
+        return false;
+    }
+    if end > start && bytes[end - 1] == b'\r' {
+        end -= 1;
+    }
+    at + token.len() <= end && marking_in_line(&bytes[start..end], at - start, token)
+}
+
+/// A `CUI` banner, a `CUI//SP-...` marker or a `(CUI)` portion marking.
 fn cui(bytes: &[u8], hits: &mut Vec<Hit>) {
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -157,12 +303,16 @@ fn cui(bytes: &[u8], hits: &mut Vec<Hit>) {
                 end = j;
             }
         }
-        hits.push(Hit {
-            kind: Kind::Cui,
-            start: i,
-            end,
-        });
-        i = end;
+        if marking_banner(bytes, i, b"CUI") {
+            hits.push(Hit {
+                kind: Kind::Cui,
+                start: i,
+                end,
+            });
+            i = end;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -271,7 +421,7 @@ fn release_list(bytes: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// Stand-alone `NOFORN` and `ORCON` controls.
+/// `NOFORN` and `ORCON` banners, caveat-chain segments and portion markings.
 fn dissemination(bytes: &[u8], hits: &mut Vec<Hit>) {
     for word in [b"NOFORN".as_slice(), b"ORCON".as_slice()] {
         let mut i = 0;
@@ -281,7 +431,7 @@ fn dissemination(bytes: &[u8], hits: &mut Vec<Hit>) {
             .map(|p| p + i)
         {
             i = p + word.len();
-            if !word_before(bytes, p) && !word_at(bytes, i) {
+            if !word_before(bytes, p) && !word_at(bytes, i) && marking_banner(bytes, p, word) {
                 hits.push(Hit {
                     kind: Kind::Dissemination,
                     start: p,
@@ -441,6 +591,7 @@ mod tests {
         assert_eq!(kinds("CUI"), [Kind::Cui]);
         assert_eq!(kinds("CUI//SP-CTI"), [Kind::Cui]);
         assert_eq!(kinds("CUI//SP-EXPT"), [Kind::Cui]);
+        assert_eq!(kinds("CUI//SP-PRVCY"), [Kind::Cui]);
         assert!(kinds("cui").is_empty(), "lowercase is not a banner");
         assert!(kinds("xCUI").is_empty(), "inside a word");
         assert!(kinds("CUISINE").is_empty(), "a longer word");
@@ -449,6 +600,31 @@ mod tests {
             [Kind::Cui],
             "the bare banner is still a CUI marking"
         );
+    }
+
+    #[test]
+    fn cui_needs_a_banner_or_portion_marking() {
+        for text in [
+            "what does the CUI spec say?",
+            "The marking is \"CUI\" here.",
+            "\"CUI\"",
+            "{\"q\":\"tell me about CUI\"}",
+            "CUI is a marking",
+            "prefix CUI",
+            "CUI//SP-CTI is a marking",
+        ] {
+            assert!(kinds(text).is_empty(), "{text}");
+        }
+        assert_eq!(kinds("* CUI"), [Kind::Cui]);
+        assert_eq!(kinds("**CUI**"), [Kind::Cui]);
+        assert_eq!(kinds("- CUI"), [Kind::Cui]);
+        assert_eq!(kinds("(CUI) paragraph"), [Kind::Cui]);
+    }
+
+    #[test]
+    fn a_banner_inside_a_longer_prompt_is_found() {
+        let text = "Please summarize this record.\n\n* CUI\n\nThen keep the answer short.";
+        assert_eq!(kinds(text), [Kind::Cui]);
     }
 
     #[test]
@@ -481,6 +657,40 @@ mod tests {
         assert!(kinds("noforn").is_empty());
         assert!(kinds("NOFORNX").is_empty());
         assert!(kinds("xNOFORN").is_empty());
+    }
+
+    #[test]
+    fn dissemination_controls_need_a_banner_or_caveat_chain() {
+        for text in [
+            "what does NOFORN mean?",
+            "The control \"NOFORN\" is common.",
+            "\"ORCON\"",
+            "{\"q\":\"explain ORCON\"}",
+            "NOFORN is a control",
+            "prefix ORCON",
+        ] {
+            assert!(kinds(text).is_empty(), "{text}");
+        }
+        assert_eq!(kinds("* NOFORN"), [Kind::Dissemination]);
+        assert_eq!(kinds("(ORCON) paragraph"), [Kind::Dissemination]);
+        assert_eq!(
+            kinds("SECRET//NOFORN"),
+            [Kind::Classification, Kind::Dissemination]
+        );
+        assert_eq!(
+            kinds("TOP SECRET//SI//ORCON/NOFORN"),
+            [
+                Kind::Classification,
+                Kind::Dissemination,
+                Kind::Dissemination
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dissemination_banner_inside_a_longer_prompt_is_found() {
+        let text = "Summarize this record.\n\nNOFORN\n\nThen keep the answer short.";
+        assert_eq!(kinds(text), [Kind::Dissemination]);
     }
 
     #[test]
@@ -563,7 +773,7 @@ mod tests {
 
     #[test]
     fn hits_report_positions_and_never_text() {
-        let text = "x CUI y";
+        let text = "* CUI *";
         let hit = scan(text, &all())[0];
         assert_eq!((hit.start, hit.end), (2, 5));
     }

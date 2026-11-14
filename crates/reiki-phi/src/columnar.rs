@@ -201,7 +201,8 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     let want = |k: Kind| kinds.contains(&k);
     let mut i = 0;
     while i < all.len() {
-        let Some((delim, map, width)) = header(&all[i], &want) else {
+        let prev = i.checked_sub(1).map(|p| &all[p]);
+        let Some((delim, map, width)) = header(&all[i], prev, &want) else {
             i += 1;
             continue;
         };
@@ -231,21 +232,50 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     hits
 }
 
+/// True when `delim` starts a table on this line: the line is the first one in the document or
+/// follows a blank line or a line without that delimiter.
+fn starts_table(prev: Option<&Line<'_>>, delim: u8) -> bool {
+    match prev {
+        None => true,
+        Some(p) => p.text.trim().is_empty() || split_cells(p.text, delim, 0).len() < 2,
+    }
+}
+
 /// The delimiter, the kind of each column and the column count when `line` is a table header.
+///
+/// A header starts its table and, when it maps to [`Kind::Column`], which accepts almost any
+/// cell, at least half of its non-empty cells must be known column names. Without that, a data
+/// row such as `alice,address` would be read as a header and the next row flagged as a column.
 #[allow(clippy::type_complexity)]
-fn header(line: &Line<'_>, want: &dyn Fn(Kind) -> bool) -> Option<(u8, Vec<Option<Kind>>, usize)> {
+fn header(
+    line: &Line<'_>,
+    prev: Option<&Line<'_>>,
+    want: &dyn Fn(Kind) -> bool,
+) -> Option<(u8, Vec<Option<Kind>>, usize)> {
     for delim in DELIMITERS {
         let cells = split_cells(line.text, delim, 0);
-        if cells.len() < 2 {
+        if cells.len() < 2 || !starts_table(prev, delim) {
             continue;
         }
+        let known = cells
+            .iter()
+            .filter(|(s, e)| column_kind(&line.text[*s..*e]).is_some())
+            .count();
+        let nonempty = cells
+            .iter()
+            .filter(|(s, e)| !line.text[*s..*e].is_empty())
+            .count();
         let map: Vec<Option<Kind>> = cells
             .iter()
             .map(|(s, e)| column_kind(&line.text[*s..*e]).filter(|k| want(*k)))
             .collect();
-        if map.iter().any(Option::is_some) {
-            return Some((delim, map, cells.len()));
+        if !map.iter().any(Option::is_some) {
+            continue;
         }
+        if map.contains(&Some(Kind::Column)) && known * 2 < nonempty {
+            continue;
+        }
+        return Some((delim, map, cells.len()));
     }
     None
 }
@@ -499,6 +529,31 @@ mod tests {
         assert_eq!(
             found(copy),
             [Kind::Ssn, Kind::Ssn, Kind::Column, Kind::Column]
+        );
+    }
+
+    #[test]
+    fn a_data_row_is_not_a_table_header() {
+        let csv = "name,notes\nalice,address\nbob,phone\n";
+        assert!(
+            scan(csv, &Kind::DEFAULT).is_empty(),
+            "the data row must not become a header"
+        );
+    }
+
+    #[test]
+    fn a_header_after_a_blank_line_still_names_its_columns() {
+        let text = "Some notes about the export.\n\nid,ssn,notes\n1,123456789,ok\n";
+        assert_eq!(found(text), [Kind::Ssn]);
+    }
+
+    #[test]
+    fn a_header_may_have_unmapped_columns_when_most_cells_are_known() {
+        let csv = "id,ssn,first_name,dob,notes\n1,123456789,Jane,02/03/1980,seen\n";
+        assert_eq!(
+            found(csv),
+            [Kind::Ssn, Kind::Dob, Kind::Column],
+            "three of five header cells are known, so the table is read"
         );
     }
 

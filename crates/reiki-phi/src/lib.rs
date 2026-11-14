@@ -93,6 +93,16 @@ mod tests {
     }
 
     #[test]
+    fn a_csv_data_row_is_not_a_header_in_block_mode() {
+        let p = plugin("mode = \"block\"").unwrap();
+        let body = "name,notes\nalice,address\nbob,phone\n";
+        assert!(
+            send(p.as_ref(), "zen", &mut HeaderMap::new(), body).is_ok(),
+            "ordinary data must not be blocked as a table"
+        );
+    }
+
+    #[test]
     fn clean_bodies_and_other_upstreams_pass() {
         let p = plugin("mode = \"block\"\nupstreams = [\"zen\"]").unwrap();
         assert!(send(

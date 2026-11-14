@@ -102,6 +102,8 @@ plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]
 # Health sharing between instances; inert unless the config has an enabled `[peers]` table.
 peers = ["dep:rustix"]
+# Hub config: `[hubs]`, `[hub]` and `[accounts]` parse and validate; no listener or client is built.
+hub = []
 
 [dev-dependencies]
 futures-util = "0.3"

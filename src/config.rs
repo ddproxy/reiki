@@ -59,6 +59,18 @@ pub enum ConfigError {
     BadReload(String),
     BadAuth(String),
     BadPeers(String),
+    /// The config has a `[hubs]`, `[hub]` or `[accounts]` table, but this binary was built without
+    /// the `hub` feature.
+    HubFeatureOff,
+    BadHub(String),
+    BadHubs {
+        name: String,
+        reason: String,
+    },
+    BadAccounts {
+        label: String,
+        reason: String,
+    },
     UnknownPlugin {
         name: String,
         known: Vec<String>,
@@ -153,6 +165,17 @@ impl fmt::Display for ConfigError {
             Self::BadReload(reason) => write!(f, "invalid [reload]: {reason}"),
             Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
             Self::BadPeers(reason) => write!(f, "invalid [peers]: {reason}"),
+            Self::HubFeatureOff => {
+                write!(
+                    f,
+                    "this binary was built without the `hub` feature; remove [hubs], [hub] and [accounts] or rebuild with it"
+                )
+            }
+            Self::BadHub(reason) => write!(f, "invalid [hub]: {reason}"),
+            Self::BadHubs { name, reason } => write!(f, "invalid [hubs.{name}]: {reason}"),
+            Self::BadAccounts { label, reason } => {
+                write!(f, "invalid [accounts.{label}]: {reason}")
+            }
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
@@ -214,6 +237,15 @@ pub struct Config {
     /// Health sharing between Reiki instances; absent means off.
     #[serde(default)]
     pub peers: Option<PeersConfig>,
+    /// `[hubs.NAME]`: remote hubs this instance reaches as an edge.
+    #[serde(default)]
+    pub hubs: Option<BTreeMap<String, HubEntry>>,
+    /// `[hub]`: this instance is a hub, serving edge streams on its own listener.
+    #[serde(default)]
+    pub hub: Option<HubConfig>,
+    /// `[accounts.LABEL]`: one account's key(s) on one upstream.
+    #[serde(default)]
+    pub accounts: Option<BTreeMap<String, AccountConfig>>,
 }
 
 /// `[peers]`: scalar keys are settings, each `[peers.<name>]` sub-table is a peer to read.
@@ -1333,6 +1365,11 @@ impl Config {
                 return Err(ConfigError::BadPeers(reason));
             }
         }
+        if self.hubs.is_some() || self.hub.is_some() || self.accounts.is_some() {
+            if let Some(err) = self.hub_problem() {
+                return Err(err);
+            }
+        }
         Ok(())
     }
 
@@ -1507,6 +1544,215 @@ impl Config {
         }
         None
     }
+
+    /// What is wrong with the hub tables; called only when one of them is present.
+    fn hub_problem(&self) -> Option<ConfigError> {
+        if cfg!(not(feature = "hub")) {
+            return Some(ConfigError::HubFeatureOff);
+        }
+        if let Some(hubs) = &self.hubs {
+            for (name, entry) in hubs {
+                if let Some(reason) = self.hub_entry_problem(name, entry) {
+                    return Some(ConfigError::BadHubs {
+                        name: name.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        if let Some(hub) = &self.hub {
+            if let Some(reason) = self.hub_table_problem(hub) {
+                return Some(ConfigError::BadHub(reason));
+            }
+            let problem = self
+                .edge_token_problem(hub)
+                .or_else(|| self.hub_self_listing_problem(hub));
+            if let Some(reason) = problem {
+                return Some(ConfigError::BadHub(reason));
+            }
+        }
+        if let Some(accounts) = &self.accounts {
+            for (label, account) in accounts {
+                if let Some(reason) = self.account_problem(label, account) {
+                    return Some(ConfigError::BadAccounts {
+                        label: label.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn has_account(&self, label: &str) -> bool {
+        self.accounts
+            .as_ref()
+            .is_some_and(|accounts| accounts.contains_key(label))
+    }
+
+    /// What is wrong with one `[hubs.NAME]`, if anything.
+    fn hub_entry_problem(&self, name: &str, entry: &HubEntry) -> Option<String> {
+        if !valid_label(name) {
+            return Some(
+                "hub name may only hold lowercase letters, digits and `-` (at most 63)".to_owned(),
+            );
+        }
+        let url = entry.url.as_str();
+        let https = url.starts_with("https://");
+        if !https && !is_loopback_http(url) {
+            return Some("url must use https, or http on a loopback address".to_owned());
+        }
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return Some(format!("url `{url}` is not a URL"));
+        };
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.host_str().is_none_or(str::is_empty)
+        {
+            return Some(
+                "url must be a plain base URL without credentials, query or fragment".to_owned(),
+            );
+        }
+        if entry.token_file.trim().is_empty() {
+            return Some("token_file must not be empty".to_owned());
+        }
+        if entry.timeout_secs == 0 {
+            return Some("timeout_secs must be at least 1".to_owned());
+        }
+        for label in &entry.accounts {
+            if !self.has_account(label) {
+                return Some(format!("accounts names an unknown account `{label}`"));
+            }
+        }
+        None
+    }
+
+    /// What is wrong with the `[hub]` table itself, if anything.
+    fn hub_table_problem(&self, hub: &HubConfig) -> Option<String> {
+        let listen = hub.listen.as_str();
+        let Ok(addr) = listen.parse::<std::net::SocketAddr>() else {
+            return Some(format!("listen `{listen}` is not an IP:port address"));
+        };
+        if !addr.ip().is_loopback() {
+            return Some(format!("listen `{listen}` must be a loopback address"));
+        }
+        for (name, edge) in &hub.edges {
+            if !valid_label(name) {
+                return Some(format!(
+                    "[hub.edges.{name}] name may only hold lowercase letters, digits and `-` (at most 63)"
+                ));
+            }
+            if !is_sha256_hex(&edge.token_sha256) {
+                return Some(format!(
+                    "[hub.edges.{name}] token_sha256 is not 64 hex characters"
+                ));
+            }
+            for label in &edge.allow_from {
+                if !self.has_account(label) {
+                    return Some(format!(
+                        "[hub.edges.{name}] allow_from names an unknown account `{label}`"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// What is wrong with one `[accounts.LABEL]`, if anything.
+    fn account_problem(&self, label: &str, account: &AccountConfig) -> Option<String> {
+        if !valid_label(label) {
+            return Some(
+                "label may only hold lowercase letters, digits and `-` (at most 63)".to_owned(),
+            );
+        }
+        if !self.upstream.contains_key(&account.upstream) {
+            return Some(format!("refers to unknown upstream `{}`", account.upstream));
+        }
+        if account.keys.is_empty() {
+            return Some("needs at least one key".to_owned());
+        }
+        for (i, key) in account.keys.iter().enumerate() {
+            if !self.keys.contains_key(key) {
+                return Some(format!("refers to unknown key `{key}`"));
+            }
+            if account.keys[..i].contains(key) {
+                return Some(format!("lists key `{key}` twice"));
+            }
+        }
+        if let Some(accounts) = &self.accounts {
+            let others = accounts.iter().filter(|(other, _)| other.as_str() != label);
+            for (other, entry) in others {
+                if let Some(key) = account.keys.iter().find(|key| entry.keys.contains(key)) {
+                    return Some(format!("key `{key}` is already used by account `{other}`"));
+                }
+            }
+        }
+        let preset = account
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.preset.as_deref());
+        if let Some(preset) = preset {
+            if !HUB_PRESETS.contains(&preset) {
+                return Some(format!(
+                    "limits preset `{preset}` is not one of zen-free, openrouter-free"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Why an edge token cannot be used, because it repeats a stronger credential.
+    fn edge_token_problem(&self, hub: &HubConfig) -> Option<String> {
+        for (name, edge) in &hub.edges {
+            let hash = edge.token_sha256.as_str();
+            if let Some(admin) = &self.admin {
+                if admin.token_sha256.eq_ignore_ascii_case(hash) {
+                    return Some(format!(
+                        "[hub.edges.{name}] token_sha256 is the same as the admin token"
+                    ));
+                }
+            }
+            let stream = self
+                .streams
+                .iter()
+                .find(|(_, stream)| stream.token_sha256.eq_ignore_ascii_case(hash));
+            if let Some((stream, _)) = stream {
+                return Some(format!(
+                    "[hub.edges.{name}] token_sha256 is the same as the token of stream `{stream}`"
+                ));
+            }
+        }
+        None
+    }
+
+    /// Why a hub may not list itself, since an edge pointing at its own listener loops.
+    fn hub_self_listing_problem(&self, hub: &HubConfig) -> Option<String> {
+        let addr: std::net::SocketAddr = hub.listen.parse().ok()?;
+        for (name, entry) in self.hubs.as_ref()? {
+            if loopback_target(&entry.url) == Some((addr.ip(), addr.port())) {
+                return Some(format!("lists itself through [hubs.{name}] at {addr}"));
+            }
+        }
+        None
+    }
+}
+
+/// The loopback address and port a hub URL reaches, if it names one.
+fn loopback_target(url: &str) -> Option<(std::net::IpAddr, u16)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let ip: std::net::IpAddr = if host == "localhost" {
+        std::net::Ipv4Addr::LOCALHOST.into()
+    } else {
+        host.parse().ok()?
+    };
+    ip.is_loopback()
+        .then_some((ip, parsed.port_or_known_default()?))
 }
 
 /// True when the configured address `other` would bind the same socket as `addr`; port 0 asks
@@ -1535,6 +1781,14 @@ fn valid_peer_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Hub, edge and account names: lowercase letters, digits and `-`, at most 63 bytes.
+fn valid_label(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// What is wrong with one `[peers.<name>]`, if anything.
@@ -1607,6 +1861,100 @@ fn is_loopback_http(url: &str) -> bool {
 
 fn is_port(text: &str) -> bool {
     !text.is_empty() && text.len() <= 5 && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn default_hub_timeout_secs() -> u64 {
+    300
+}
+
+/// One `[hubs.NAME]`: a remote hub this instance reaches as an edge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubEntry {
+    /// Hub base URL: `https`, or `http` on a loopback address.
+    pub url: String,
+    /// File holding the raw token the hub issued to this instance; mode 0400.
+    pub token_file: String,
+    /// PEM CA certificates to trust for this hub instead of the built-in roots.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Account labels whose traffic goes through this hub.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+    /// Longest one round trip to the hub may take; defaults to 300.
+    #[serde(default = "default_hub_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+/// `[hub]`: this instance is a hub, serving edge streams on its own listener.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// Address of the hub listener; loopback only, since no TLS is supported yet.
+    pub listen: String,
+    /// `[hub.edges.NAME]`: edge streams this hub answers.
+    #[serde(default)]
+    pub edges: BTreeMap<String, HubEdge>,
+}
+
+/// One `[hub.edges.NAME]`: an edge stream this hub answers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubEdge {
+    /// SHA-256 of the token this edge uses to authenticate to the hub.
+    pub token_sha256: String,
+    /// Account labels this edge may send traffic for.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    /// Requests this edge may have in flight at once; 0 means unlimited.
+    #[serde(default)]
+    pub max_concurrent: u32,
+    /// Tokens this edge may use per day; 0 means unlimited.
+    #[serde(default)]
+    pub max_tokens_per_day: u64,
+}
+
+/// Names a `limits.preset` may take.
+const HUB_PRESETS: [&str; 2] = ["zen-free", "openrouter-free"];
+
+/// One `[accounts.LABEL]`: one account's key(s) on one upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
+    /// The upstream the account's keys authenticate to.
+    pub upstream: String,
+    /// The keys of this account, tried in order; a second one is used only during rotation.
+    pub keys: Vec<String>,
+    /// Whether this account is shared between edges; off by default.
+    #[serde(default)]
+    pub shared: bool,
+    /// Outbound shaping for this account; absent means no shaping.
+    #[serde(default)]
+    pub limits: Option<AccountLimits>,
+}
+
+/// Outbound shaping for one account; every field is 0 when unset, which means unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountLimits {
+    /// Requests per minute; 0 means unlimited.
+    #[serde(default)]
+    pub rpm: u32,
+    /// Estimated tokens per minute; 0 means unlimited.
+    #[serde(default)]
+    pub tpm: u32,
+    /// Requests in flight at once; 0 means unlimited.
+    #[serde(default)]
+    pub concurrent: u32,
+    /// Requests per day; 0 means unlimited.
+    #[serde(default)]
+    pub daily_requests: u32,
+    /// Tokens per day; 0 means unlimited.
+    #[serde(default)]
+    pub daily_tokens: u32,
+    /// Named preset, one of `HUB_PRESETS`.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 #[cfg(test)]
@@ -2891,5 +3239,252 @@ socket = "/run/forwarder.sock"
         );
         let (_, none) = Config::parse_with_warnings(&base("")).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn hub_tables_are_absent_by_default() {
+        let config = Config::parse(&base("")).unwrap();
+        assert!(config.hubs.is_none() && config.hub.is_none() && config.accounts.is_none());
+    }
+
+    #[cfg(not(feature = "hub"))]
+    #[test]
+    fn a_build_without_the_hub_feature_refuses_each_hub_table() {
+        for table in [
+            "[hubs.main]\nurl = \"https://hub.example.net:4443\"\ntoken_file = \"/x\"\n",
+            "[hub]\nlisten = \"127.0.0.1:4443\"\n",
+            "[accounts.a]\nupstream = \"zen\"\nkeys = [\"zen-a\"]\n",
+        ] {
+            let text = base(table);
+            assert_eq!(
+                Config::parse(&text).unwrap_err(),
+                ConfigError::HubFeatureOff,
+                "{table}"
+            );
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    mod hub_on {
+        use super::*;
+
+        const HUB_URL: &str = "https://hub.example.net:4443";
+        const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        /// A valid config: one account, one hub reaching it, one edge the hub serves.
+        fn hub_text() -> String {
+            base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n\
+                 [admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{HASH_B}\"\n\
+                 [accounts.acct-a]\nupstream = \"zen\"\nkeys = [\"zen-a\"]\n\
+                 [hubs.main]\nurl = \"{HUB_URL}\"\nca_file = \"/etc/reiki/hub/ca.pem\"\n\
+                 token_file = \"/etc/reiki/hub/edge.token\"\naccounts = [\"acct-a\"]\n\
+                 [hub]\nlisten = \"127.0.0.1:4443\"\n\
+                 [hub.edges.peer-a]\ntoken_sha256 = \"{HASH_D}\"\nallow_from = [\"acct-a\"]\n"
+            ))
+        }
+
+        /// `hub_text()` with one snippet replaced; the snippet must be present.
+        fn edit(old: &str, new: &str) -> String {
+            let text = hub_text();
+            assert!(text.contains(old), "snippet not in config: {old}");
+            text.replace(old, new)
+        }
+
+        fn hub_error(text: &str) -> String {
+            match Config::parse(text) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("expected a hub error for:\n{text}"),
+            }
+        }
+
+        #[test]
+        fn a_valid_hub_config_parses_with_defaults() {
+            let config = Config::parse(&hub_text()).unwrap();
+            let hub = &config.hubs.as_ref().unwrap()["main"];
+            assert_eq!(hub.timeout_secs, 300);
+            assert_eq!(hub.accounts, ["acct-a"]);
+            let edge = &config.hub.as_ref().unwrap().edges["peer-a"];
+            assert_eq!((edge.max_concurrent, edge.max_tokens_per_day), (0, 0));
+            let account = &config.accounts.as_ref().unwrap()["acct-a"];
+            assert!(account.limits.is_none() && !account.shared);
+        }
+
+        #[test]
+        fn unknown_fields_in_hub_tables_are_refused() {
+            for text in [
+                edit("[hub]\nlisten", "[hub]\nbogus = 1\nlisten"),
+                edit(
+                    "token_file = \"/etc/reiki/hub/edge.token\"",
+                    "token_file = \"/etc/reiki/hub/edge.token\"\nbogus = 1",
+                ),
+            ] {
+                assert!(
+                    matches!(Config::parse(&text), Err(ConfigError::Parse(_))),
+                    "{text}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_hub_url_is_https_or_loopback_http_without_credentials() {
+            assert!(Config::parse(&edit(HUB_URL, "http://127.0.0.1:4444")).is_ok());
+            let plain = hub_error(&edit(HUB_URL, "http://hub.example.net:4443"));
+            assert!(plain.contains("must use https"), "{plain}");
+            let creds = hub_error(&edit(HUB_URL, "https://user:pw@hub.example.net:4443"));
+            assert!(creds.contains("credentials"), "{creds}");
+            let query = hub_error(&edit(HUB_URL, "https://hub.example.net:4443/?x=1"));
+            assert!(query.contains("query"), "{query}");
+        }
+
+        #[test]
+        fn an_https_hub_needs_no_ca_file() {
+            let text = edit("ca_file = \"/etc/reiki/hub/ca.pem\"\n", "");
+            assert!(Config::parse(&text).is_ok());
+        }
+
+        #[test]
+        fn a_hub_name_is_lowercase_digits_and_dash() {
+            let reason = hub_error(&edit("[hubs.main]", "[hubs.Main]"));
+            assert!(reason.contains("may only hold"), "{reason}");
+        }
+
+        #[test]
+        fn a_hub_timeout_is_at_least_one_second() {
+            let text = edit(
+                "accounts = [\"acct-a\"]\n",
+                "accounts = [\"acct-a\"]\ntimeout_secs = 0\n",
+            );
+            assert!(hub_error(&text).contains("timeout_secs must be at least 1"));
+        }
+
+        #[test]
+        fn a_hub_entry_may_only_name_known_accounts() {
+            let text = edit("accounts = [\"acct-a\"]\n", "accounts = [\"ghost\"]\n");
+            assert!(hub_error(&text).contains("unknown account `ghost`"));
+        }
+
+        #[test]
+        fn an_account_must_name_a_known_upstream() {
+            let text = edit(
+                "upstream = \"zen\"\nkeys = [\"zen-a\"]",
+                "upstream = \"nope\"\nkeys = [\"zen-a\"]",
+            );
+            assert!(hub_error(&text).contains("unknown upstream `nope`"));
+        }
+
+        #[test]
+        fn an_account_must_name_known_keys_and_at_least_one() {
+            let unknown = edit("keys = [\"zen-a\"]", "keys = [\"nope\"]");
+            assert!(hub_error(&unknown).contains("unknown key `nope`"));
+            let none = edit("keys = [\"zen-a\"]", "keys = []");
+            assert!(hub_error(&none).contains("needs at least one key"));
+        }
+
+        #[test]
+        fn an_account_label_is_unique() {
+            let text = format!(
+                "{}[accounts.acct-a]\nupstream = \"zen\"\nkeys = [\"zen-b\"]\n",
+                hub_text()
+            );
+            assert!(matches!(Config::parse(&text), Err(ConfigError::Parse(_))));
+        }
+
+        #[test]
+        fn an_account_label_is_lowercase_digits_and_dash_up_to_63() {
+            let bad = format!(
+                "{}[accounts.Ct_4]\nupstream = \"zen\"\nkeys = [\"zen-b\"]\n",
+                hub_text()
+            );
+            assert!(hub_error(&bad).contains("may only hold"));
+            let long = "a".repeat(64);
+            let too_long = format!(
+                "{}[accounts.{long}]\nupstream = \"zen\"\nkeys = [\"zen-b\"]\n",
+                hub_text()
+            );
+            assert!(hub_error(&too_long).contains("at most 63"));
+            let max = "a".repeat(63);
+            let at_max = format!(
+                "{}[accounts.{max}]\nupstream = \"zen\"\nkeys = [\"zen-b\"]\n",
+                hub_text()
+            );
+            assert!(Config::parse(&at_max).is_ok());
+        }
+
+        #[test]
+        fn a_key_belongs_to_one_account() {
+            let text = format!(
+                "{}[accounts.acct-z]\nupstream = \"zen\"\nkeys = [\"zen-a\"]\n",
+                hub_text()
+            );
+            let reason = hub_error(&text);
+            assert!(
+                reason.contains("already used by account `acct-z`"),
+                "{reason}"
+            );
+        }
+
+        #[test]
+        fn an_edge_may_only_allow_known_accounts() {
+            let text = edit("allow_from = [\"acct-a\"]", "allow_from = [\"ghost\"]");
+            assert!(hub_error(&text).contains("unknown account `ghost`"));
+        }
+
+        #[test]
+        fn a_hub_token_is_not_the_admin_token_or_a_stream_token() {
+            assert!(hub_error(&edit(HASH_D, HASH_B)).contains("admin token"));
+            assert!(hub_error(&edit(HASH_D, HASH_A)).contains("stream `s`"));
+        }
+
+        #[test]
+        fn an_edge_token_hash_is_64_hex_characters() {
+            assert!(hub_error(&edit(HASH_D, "xyz")).contains("64 hex characters"));
+        }
+
+        #[test]
+        fn zero_limits_mean_unlimited() {
+            let text = edit(
+                "keys = [\"zen-a\"]\n",
+                "keys = [\"zen-a\"]\n[accounts.acct-a.limits]\nrpm = 0\ntpm = 0\n\
+                 concurrent = 0\ndaily_requests = 0\ndaily_tokens = 0\n",
+            );
+            let config = Config::parse(&text).unwrap();
+            let limits = config.accounts.as_ref().unwrap()["acct-a"]
+                .limits
+                .as_ref()
+                .unwrap();
+            assert_eq!(*limits, AccountLimits::default());
+        }
+
+        #[test]
+        fn a_limits_preset_is_one_of_the_shipped_names() {
+            let with = |preset: &str| {
+                edit(
+                    "keys = [\"zen-a\"]\n",
+                    &format!(
+                        "keys = [\"zen-a\"]\n[accounts.acct-a.limits]\npreset = \"{preset}\"\n"
+                    ),
+                )
+            };
+            assert!(Config::parse(&with("zen-free")).is_ok());
+            assert!(Config::parse(&with("openrouter-free")).is_ok());
+            assert!(hub_error(&with("nope")).contains("not one of"));
+        }
+
+        #[test]
+        fn the_hub_listener_is_loopback_only() {
+            let text = edit("listen = \"127.0.0.1:4443\"", "listen = \"10.0.0.40:4443\"");
+            assert!(hub_error(&text).contains("must be a loopback address"));
+            let text = edit("listen = \"127.0.0.1:4443\"", "listen = \"nonsense\"");
+            assert!(hub_error(&text).contains("IP:port"));
+        }
+
+        #[test]
+        fn a_hub_may_not_list_its_own_listener() {
+            let at = |url: &str| edit(HUB_URL, url);
+            assert!(hub_error(&at("http://127.0.0.1:4443")).contains("lists itself"));
+            assert!(hub_error(&at("http://localhost:4443")).contains("lists itself"));
+            assert!(Config::parse(&at("http://localhost:4444")).is_ok());
+        }
     }
 }

@@ -5,6 +5,7 @@
 ### Added
 
 - Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.
+- An optional `[hubs]`, `[hub]` and `[accounts]` config, behind a `hub` cargo feature, is parsed and validated only; no hub is contacted or served yet. See [hub](docs/hub.md).
 
 ## 0.9.1
 

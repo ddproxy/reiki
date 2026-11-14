@@ -1270,6 +1270,7 @@ dependencies = [
 name = "reiki-placeholders"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "bytes",
  "http",
  "reiki-plugin",

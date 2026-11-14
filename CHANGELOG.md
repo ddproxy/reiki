@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The `placeholders` plugin masks configured terms in one Aho-Corasick pass over the folded text instead of one scan per term, so the cost no longer grows with the number of terms. Matching, case folding, overlap rules and placeholders are unchanged.
+
 ## 0.9.0
 
 ### Added

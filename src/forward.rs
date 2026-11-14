@@ -533,6 +533,34 @@ file = "/etc/reiki/keys/zen-a"
     }
 
     #[test]
+    fn a_forward_request_always_closes_the_connection() {
+        let text = minimal_base(&format!(
+            "send_keep_alive = true\n[upstream.zen.forward]\nsocket = \"/run/x.sock\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ))
+        .replace("send_keep_alive = true\n", "")
+        .replace("[upstream.zen]\n", "[upstream.zen]\nsend_keep_alive = true\n");
+        let config = Config::parse(&text).unwrap();
+        let upstream = &config.upstream["zen"];
+        let (parts, _) = Request::builder()
+            .method(Method::POST)
+            .uri("/x")
+            .header("connection", "keep-alive")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let call = Call {
+            parts: &parts,
+            url: "http://example.test/v1/x",
+            credential: Some(("authorization", "Bearer k")),
+            body: Bytes::new(),
+            upstream,
+        };
+        let request = super::build_request(&call).unwrap();
+        assert_eq!(request.headers()["connection"], "close");
+        assert_eq!(request.headers().get_all("connection").iter().count(), 1);
+    }
+
+    #[test]
     fn missing_path_warns() {
         let dir = temp_dir();
         let path = dir.join("missing.sock");

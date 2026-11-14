@@ -8,6 +8,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+aho-corasick = "1"
 reiki-plugin = { path = "../reiki-plugin" }
 reiki-redact = { path = "../reiki-redact" }
 bytes = "1"

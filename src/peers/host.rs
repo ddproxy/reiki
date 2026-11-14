@@ -1,9 +1,22 @@
 //! Host stats for `/v1/health` behind `expose_host_stats`: load, cores, memory and disk use of
 //! the filesystems Reiki writes to, labelled by role and never by path.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+
+/// How long the filesystem queries of one answer may take before their roles read as unavailable.
+const DISK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A filesystem query: `statvfs` in production, a stand-in in tests.
+type Probe = fn(&Path) -> Option<Usage>;
+
+/// Directories whose query has not returned. A hung mount gets no second blocking thread until
+/// the first one comes back, so repeated answers cannot pile threads up behind it.
+static IN_FLIGHT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
 /// The 1, 5 and 15 minute load averages from `/proc/loadavg` text.
 fn parse_loadavg(text: &str) -> Option<[f64; 3]> {
@@ -31,6 +44,7 @@ fn parse_meminfo(text: &str) -> Option<Value> {
     }))
 }
 
+#[derive(Clone)]
 struct Usage {
     fsid: u64,
     total: u64,
@@ -72,11 +86,75 @@ fn used_percent(used: u64, available: u64) -> f64 {
     tenths / 10.0
 }
 
-/// One entry per filesystem behind the given `(role, directory)` pairs, roles merged.
-fn disks(dirs: &[(&'static str, PathBuf)]) -> Vec<Value> {
+/// Runs `probe` for each directory on the blocking pool, all at once, and waits at most
+/// `timeout` for them together; `None` for a directory that failed, timed out or is still stuck.
+async fn probe_all(
+    dirs: &[(&'static str, PathBuf)],
+    probe: Probe,
+    timeout: Duration,
+) -> Vec<Option<Usage>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut unique: Vec<&PathBuf> = Vec::new();
+    for (_, dir) in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    let mut pending = Vec::new();
+    for dir in &unique {
+        let started = {
+            let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+            in_flight
+                .get_or_insert_with(HashSet::new)
+                .insert((*dir).clone())
+        };
+        if !started {
+            pending.push(None);
+            continue;
+        }
+        let dir = (*dir).clone();
+        pending.push(Some(tokio::task::spawn_blocking(move || {
+            let found = probe(&dir);
+            if let Some(in_flight) = IN_FLIGHT
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                in_flight.remove(&dir);
+            }
+            found
+        })));
+    }
+    let mut found = Vec::new();
+    for task in pending {
+        found.push(match task {
+            Some(task) => tokio::time::timeout_at(deadline, task)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten(),
+            None => None,
+        });
+    }
+    dirs.iter()
+        .map(|(_, dir)| {
+            let index = unique.iter().position(|d| *d == dir)?;
+            found[index].clone()
+        })
+        .collect()
+}
+
+/// One entry per filesystem behind the given `(role, directory)` pairs, roles merged; a role
+/// whose filesystem could not be queried gets an entry of its own with `null` figures.
+async fn disks(dirs: &[(&'static str, PathBuf)], probe: Probe, timeout: Duration) -> Vec<Value> {
+    let found = probe_all(dirs, probe, timeout).await;
     let mut seen: Vec<(Usage, Vec<&'static str>)> = Vec::new();
-    for (role, dir) in dirs {
-        let Some(found) = usage(dir) else {
+    let mut unavailable: Vec<&'static str> = Vec::new();
+    for ((role, _), found) in dirs.iter().zip(found) {
+        let Some(found) = found else {
+            if !unavailable.contains(role) {
+                unavailable.push(role);
+            }
             continue;
         };
         match seen
@@ -91,7 +169,8 @@ fn disks(dirs: &[(&'static str, PathBuf)]) -> Vec<Value> {
             None => seen.push((found, vec![role])),
         }
     }
-    seen.into_iter()
+    let mut out: Vec<Value> = seen
+        .into_iter()
         .map(|(u, roles)| {
             json!({
                 "roles": roles,
@@ -100,11 +179,15 @@ fn disks(dirs: &[(&'static str, PathBuf)]) -> Vec<Value> {
                 "used_percent": used_percent(u.used, u.available),
             })
         })
-        .collect()
+        .collect();
+    out.extend(unavailable.into_iter().map(|role| {
+        json!({"roles": [role], "total_bytes": null, "available_bytes": null, "used_percent": null})
+    }));
+    out
 }
 
 /// The `host` object of `/v1/health`; a figure the platform cannot give is `null`.
-pub(crate) fn stats(dirs: &[(&'static str, PathBuf)]) -> Value {
+pub(crate) async fn stats(dirs: &[(&'static str, PathBuf)]) -> Value {
     let load = std::fs::read_to_string("/proc/loadavg")
         .ok()
         .as_deref()
@@ -118,7 +201,7 @@ pub(crate) fn stats(dirs: &[(&'static str, PathBuf)]) -> Value {
         "load_average": load,
         "cores": cores,
         "memory": memory,
-        "disks": disks(dirs),
+        "disks": disks(dirs, usage, DISK_TIMEOUT).await,
     })
 }
 
@@ -156,19 +239,84 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn roles_on_one_filesystem_share_an_entry_and_paths_never_appear() {
+    #[tokio::test]
+    async fn roles_on_one_filesystem_share_an_entry_and_paths_never_appear() {
         let dir = std::env::temp_dir();
-        let out = disks(&[
-            ("config", dir.clone()),
-            ("state", dir.clone()),
-            ("log", PathBuf::from("/nonexistent/reiki/dir")),
-        ]);
-        assert_eq!(out.len(), 1, "{out:?}");
+        let out = disks(
+            &[
+                ("config", dir.clone()),
+                ("state", dir.clone()),
+                ("log", PathBuf::from("/nonexistent/reiki/dir")),
+            ],
+            usage,
+            DISK_TIMEOUT,
+        )
+        .await;
+        assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0]["roles"], json!(["config", "state"]));
         assert!(out[0]["total_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            out[1],
+            json!({"roles": ["log"], "total_bytes": null, "available_bytes": null, "used_percent": null}),
+            "a directory that cannot be queried is unavailable"
+        );
         assert!(!Value::Array(out)
             .to_string()
             .contains(&*dir.to_string_lossy()));
+    }
+
+    fn slow(dir: &Path) -> Option<Usage> {
+        if dir.ends_with("hung") {
+            std::thread::sleep(Duration::from_millis(1_500));
+        }
+        Some(Usage {
+            fsid: 7,
+            total: 100,
+            available: 40,
+            used: 60,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_hung_filesystem_reads_as_unavailable_and_is_not_queried_twice() {
+        let dirs = [
+            ("state", PathBuf::from("/probe-test/ok")),
+            ("log", PathBuf::from("/probe-test/hung")),
+        ];
+        let started = std::time::Instant::now();
+        let out = disks(&dirs, slow, Duration::from_millis(200)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "it did not wait for the hung one"
+        );
+        assert_eq!(out[0]["roles"], json!(["state"]));
+        assert_eq!(out[0]["used_percent"], 60.0);
+        assert_eq!(out[1]["roles"], json!(["log"]));
+        assert!(out[1]["total_bytes"].is_null());
+        let again = probe_all(&dirs[1..], slow, Duration::from_secs(5)).await;
+        assert!(again[0].is_none(), "still stuck, so not started again");
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        let later = probe_all(&dirs[1..], slow, Duration::from_secs(5)).await;
+        assert!(
+            later[0].is_some(),
+            "queried again once the first call returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_stats_run_off_the_runtime_thread() {
+        // A current-thread runtime: an inline blocking query would stall this timer too.
+        let ticks = tokio::spawn(async {
+            let mut n = 0;
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                n += 1;
+            }
+            n
+        });
+        let dirs = [("config", PathBuf::from("/probe-test/stats/hung"))];
+        let out = disks(&dirs, slow, Duration::from_millis(400)).await;
+        assert!(out[0]["total_bytes"].is_null());
+        assert_eq!(ticks.await.unwrap(), 5);
     }
 }

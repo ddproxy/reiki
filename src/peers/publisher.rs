@@ -211,9 +211,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         Err(refusal) => return *refusal,
     };
     let mut response = if path == STREAM_PATH {
-        subscribe(&app, peers, peer, token)
+        subscribe(&app, peers, peer, token).await
     } else {
-        let body = super::health::document(&app, peers).to_string();
+        let body = super::health::document(&app, peers).await.to_string();
         text_response(StatusCode::OK, "application/json", body)
     };
     response
@@ -223,7 +223,12 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
 }
 
 /// Opens one event stream, or refuses it when the subscriber caps are reached.
-fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &str) -> Response {
+async fn subscribe(
+    app: &Arc<App>,
+    peers: &PeersConfig,
+    peer: Option<IpAddr>,
+    token: &str,
+) -> Response {
     let hub = Arc::clone(&app.peer_publisher().hub);
     ensure_ticker(app, &hub);
     let limits = Limits {
@@ -232,9 +237,14 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &
         per_token: peers.max_subscribers_per_token as usize,
     };
     // Behind a loopback tunnel every stream shares one address; the token cap tells them apart.
-    let subscribed = hub.subscribe(distinct_source(peer), token, limits, HEARTBEAT, || {
-        super::stream::frame("snapshot", &super::health::document(app, peers))
-    });
+    // Joined before the snapshot is built, so a change while it is built still reaches the stream.
+    let subscribed = match hub.join(distinct_source(peer), token, limits) {
+        Ok(joined) => {
+            let snapshot = super::health::document(app, peers).await;
+            Ok(joined.start(super::stream::frame("snapshot", &snapshot), HEARTBEAT))
+        }
+        Err(refused) => Err(refused),
+    };
     if subscribed.is_ok() {
         ensure_ticker(app, &hub);
     }

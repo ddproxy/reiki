@@ -111,7 +111,7 @@ pub(crate) fn instance_name(peers: &PeersConfig) -> String {
 }
 
 /// The whole `/v1/health` answer for the current snapshot and key health.
-pub(crate) fn document(app: &App, peers: &PeersConfig) -> Value {
+pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
     let snapshot = app.snapshot();
     let upstreams = {
         let health = app
@@ -132,7 +132,7 @@ pub(crate) fn document(app: &App, peers: &PeersConfig) -> Value {
         "upstreams": upstreams,
     });
     if peers.expose_host_stats {
-        doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config));
+        doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config)).await;
         doc["sessions"] = sessions(app, peers);
     }
     doc

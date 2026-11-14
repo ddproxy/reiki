@@ -50,11 +50,13 @@ fn health_schema() -> Value {
                         "swap_total_bytes": {"type": "integer"},
                         "swap_free_bytes": {"type": "integer"},
                     }},
-                    "disks": {"type": "array", "items": {"type": "object", "properties": {
+                    "disks": {"type": "array", "items": {"type": "object",
+                        "description": "Figures are null for a role whose filesystem could not be queried in time",
+                        "properties": {
                         "roles": {"type": "array", "items": {"enum": ["config", "state", "log", "requestlog"]}},
-                        "total_bytes": {"type": "integer"},
-                        "available_bytes": {"type": "integer"},
-                        "used_percent": {"type": "number"},
+                        "total_bytes": {"type": ["integer", "null"]},
+                        "available_bytes": {"type": ["integer", "null"]},
+                        "used_percent": {"type": ["number", "null"]},
                     }}},
                 },
             },

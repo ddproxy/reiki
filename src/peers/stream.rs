@@ -99,6 +99,22 @@ fn release<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, usize>, key: &K) {
     }
 }
 
+/// A subscriber that holds its place and its broadcast receiver but gets no frames yet.
+pub(crate) struct Joined {
+    events: broadcast::Receiver<Event>,
+    slot: Slot,
+}
+
+impl Joined {
+    /// Queues `snapshot` ahead of every event since [`Hub::join`] and starts forwarding.
+    pub(crate) fn start(self, snapshot: Bytes, heartbeat: Duration) -> mpsc::Receiver<Bytes> {
+        let (out, inbox) = mpsc::channel(SUBSCRIBER_BUFFER);
+        let _ = out.try_send(snapshot);
+        tokio::spawn(forward(self.events, out, heartbeat, self.slot));
+        inbox
+    }
+}
+
 /// An SSE frame; `data` is compact JSON, so it holds no newline.
 pub(crate) fn frame(event: &str, data: &Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
@@ -150,7 +166,22 @@ impl Hub {
         })
     }
 
+    /// Takes a place and joins the broadcast; events from here on wait for [`Joined::start`].
+    pub(crate) fn join(
+        self: &Arc<Self>,
+        peer: Option<IpAddr>,
+        token: &str,
+        limits: Limits,
+    ) -> Result<Joined, Refused> {
+        let slot = self.reserve(peer, token, limits)?;
+        Ok(Joined {
+            events: self.tx.subscribe(),
+            slot,
+        })
+    }
+
     /// Joins the broadcast, then queues `snapshot()` first, so no change between the two is lost.
+    #[cfg(test)]
     pub(crate) fn subscribe(
         self: &Arc<Self>,
         peer: Option<IpAddr>,
@@ -159,12 +190,7 @@ impl Hub {
         heartbeat: Duration,
         snapshot: impl FnOnce() -> Bytes,
     ) -> Result<mpsc::Receiver<Bytes>, Refused> {
-        let slot = self.reserve(peer, token, limits)?;
-        let events = self.tx.subscribe();
-        let (out, inbox) = mpsc::channel(SUBSCRIBER_BUFFER);
-        let _ = out.try_send(snapshot());
-        tokio::spawn(forward(events, out, heartbeat, slot));
-        Ok(inbox)
+        Ok(self.join(peer, token, limits)?.start(snapshot(), heartbeat))
     }
 
     pub(crate) fn publish(&self, frame: Bytes) {
@@ -255,8 +281,37 @@ impl Watcher {
         }
     }
 
-    /// What changed since the last call, or `None` to close every stream.
-    fn changes(&mut self, app: &App, now: Instant) -> Option<Vec<Event>> {
+    /// Records the current state without reporting it, before the first subscriber's snapshot.
+    fn prime(&mut self, app: &App, now: Instant) {
+        if let Some(seen) = self.observe(app) {
+            self.next_host = now + Duration::from_secs(seen.stream_interval_secs);
+        }
+    }
+
+    /// What changed since the last call, or `None` to close every stream. Host stats and a new
+    /// snapshot query the filesystems, so they are awaited off the runtime thread.
+    async fn changes(&mut self, app: &App, now: Instant) -> Option<Vec<Event>> {
+        let seen = self.observe(app)?;
+        let snapshot = app.snapshot();
+        let peers = snapshot.config.peers.as_ref()?;
+        let mut events = seen.events;
+        if seen.resnapshot {
+            let doc = super::health::document(app, peers).await;
+            events.push(Event::Frame(frame("snapshot", &doc)));
+        }
+        if peers.expose_host_stats && now >= self.next_host {
+            let host = super::host::stats(&super::health::disk_dirs(app, &snapshot.config)).await;
+            events.push(Event::Frame(frame(
+                "host",
+                &json!({"observed_at": seen.observed_at, "host": host}),
+            )));
+            self.next_host = now + Duration::from_secs(peers.stream_interval_secs);
+        }
+        Some(events)
+    }
+
+    /// The token, key and session changes since the last call, which need no filesystem.
+    fn observe(&mut self, app: &App) -> Option<Observed> {
         let snapshot = app.snapshot();
         let peers = snapshot.config.peers.as_ref().filter(|p| p.publishing())?;
         let tokens: Vec<(String, String)> = peers
@@ -299,9 +354,8 @@ impl Watcher {
         let mut frames = Vec::new();
         let same_names = current.len() == self.upstreams.len()
             && current.iter().zip(&self.upstreams).all(|(a, b)| a.0 == b.0);
-        if !same_names && !self.upstreams.is_empty() {
-            frames.push(frame("snapshot", &super::health::document(app, peers)));
-        } else if same_names {
+        let resnapshot = !same_names && !self.upstreams.is_empty();
+        if same_names {
             for (entry, ((_, now_print), (_, then_print))) in
                 upstreams.iter().zip(current.iter().zip(&self.upstreams))
             {
@@ -325,20 +379,26 @@ impl Watcher {
                 }
                 self.sessions = Some(sessions);
             }
-            if now >= self.next_host {
-                let host = super::host::stats(&super::health::disk_dirs(app, &snapshot.config));
-                frames.push(frame(
-                    "host",
-                    &json!({"observed_at": observed_at, "host": host}),
-                ));
-                self.next_host = now + Duration::from_secs(peers.stream_interval_secs);
-            }
         } else {
             self.sessions = None;
         }
         events.extend(frames.into_iter().map(Event::Frame));
-        Some(events)
+        Some(Observed {
+            events,
+            resnapshot,
+            observed_at,
+            stream_interval_secs: peers.stream_interval_secs,
+        })
     }
+}
+
+/// What [`Watcher::observe`] found.
+struct Observed {
+    events: Vec<Event>,
+    /// The set of upstreams changed, so subscribers need a whole new snapshot.
+    resnapshot: bool,
+    observed_at: String,
+    stream_interval_secs: u64,
 }
 
 /// Starts the change ticker unless it runs, priming it with the current state. Called before a
@@ -353,7 +413,7 @@ pub(crate) fn ensure_ticker(app: &Arc<App>, hub: &Arc<Hub>) {
         slots.ticking = true;
     }
     let mut watcher = Watcher::new();
-    let _ = watcher.changes(app, Instant::now());
+    watcher.prime(app, Instant::now());
     let handle = tokio::spawn(tick(Arc::downgrade(app), Arc::clone(hub), watcher));
     *hub.ticker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
 }
@@ -400,7 +460,7 @@ async fn tick(app: Weak<App>, hub: Arc<Hub>, mut watcher: Watcher) {
             hub.stop_ticking();
             return;
         };
-        match watcher.changes(&app, Instant::now()) {
+        match watcher.changes(&app, Instant::now()).await {
             Some(events) => events.into_iter().for_each(|event| match event {
                 Event::Frame(frame) => hub.publish(frame),
                 Event::Close(Some(tokens)) => hub.close_tokens(tokens.to_vec()),

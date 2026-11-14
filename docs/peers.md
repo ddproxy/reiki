@@ -8,6 +8,8 @@ Everything here is off by default. Without a `[peers]` table, or with `enabled =
 
 Peer support is the `peers` cargo feature, which is in the default feature set like the bundled plugins. It does nothing until the config enables it. A binary built with `--no-default-features` (or without `peers`) refuses a config that has a `[peers]` table, so a table cannot silently do nothing.
 
+The release binaries are built with the default features, so they include peer support. It stays inert without a `[peers]` table or with `enabled = false`: the release workflow runs each binary that its runner can execute through `reiki check` with both configs and requires `peers: disabled`.
+
 ## Configure
 
 ```toml

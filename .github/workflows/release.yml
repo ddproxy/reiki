@@ -52,6 +52,35 @@ jobs:
         run: |
           sudo apt-get install -y qemu-user
           qemu-x86_64 -cpu Nehalem "target/${{ matrix.target }}/release/reiki" ca-init --dir "$RUNNER_TEMP/ca" --host example.com --days 1
+      - name: Check peers are inert without config
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/reiki"
+          case "$(uname -m)" in
+            x86_64) host=x86_64 ;;
+            arm64|aarch64) host=aarch64 ;;
+            *) host=unknown ;;
+          esac
+          case "${{ matrix.target }}" in
+            "$host"-*) ;;
+            *) echo "skipping: ${{ matrix.target }} cannot run on $host"; exit 0 ;;
+          esac
+          dir="$RUNNER_TEMP/peers-smoke"
+          mkdir -p "$dir"
+          printf 'k\n' > "$dir/key"
+          chmod 600 "$dir/key"
+          base="[upstream.zen]
+          base_url = \"https://example.com/v1\"
+          [keys.a]
+          upstream = \"zen\"
+          file = \"$dir/key\""
+          printf '%s\n' "$base" | sed 's/^ *//' > "$dir/none.toml"
+          { printf '%s\n' "$base" | sed 's/^ *//'; printf '[peers]\nenabled = false\n'; } > "$dir/off.toml"
+          for config in none off; do
+            out="$("$bin" --config "$dir/$config.toml" check)"
+            echo "$out"
+            printf '%s\n' "$out" | grep -qx 'peers: disabled'
+          done
       - name: Package
         run: |
           name="reiki-${GITHUB_REF_NAME}-${{ matrix.target }}"

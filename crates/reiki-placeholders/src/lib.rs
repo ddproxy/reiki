@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
+use http::header::CONTENT_TYPE;
 use http::StatusCode;
 use reiki_plugin::{ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
@@ -96,7 +96,7 @@ impl Plugin for Placeholders {
             return Ok(());
         };
         // An encoded or non-text body cannot be masked, so refuse it rather than send it raw.
-        let encoded = ctx.headers.contains_key(CONTENT_ENCODING);
+        let encoded = reiki_detect::body_is_encoded(ctx.headers);
         let Some(text) = std::str::from_utf8(ctx.body).ok().filter(|_| !encoded) else {
             return Err(PluginError::Reject(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -126,7 +126,7 @@ impl Plugin for Placeholders {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let encoded = ctx.headers.contains_key(CONTENT_ENCODING);
+        let encoded = reiki_detect::body_is_encoded(ctx.headers);
         state.restorer.start(content_type.as_deref(), encoded);
         state.restoring = true;
     }
@@ -167,7 +167,16 @@ mod tests {
 
     /// The masked body the upstream would get.
     fn send(plugin: &dyn Plugin, state: &mut Box<dyn Any + Send>, body: &str) -> String {
-        let mut headers = HeaderMap::new();
+        send_with_headers(plugin, state, &mut HeaderMap::new(), body)
+    }
+
+    /// The masked body the upstream would get for a request with `headers`.
+    fn send_with_headers(
+        plugin: &dyn Plugin,
+        state: &mut Box<dyn Any + Send>,
+        headers: &mut HeaderMap,
+        body: &str,
+    ) -> String {
         let mut payload = Bytes::from(body.to_owned());
         plugin
             .on_request(&mut RequestCtx::new(
@@ -175,7 +184,7 @@ mod tests {
                 "zen",
                 &Method::POST,
                 "/zen/chat/completions",
-                &mut headers,
+                headers,
                 &mut payload,
                 state.as_mut(),
             ))
@@ -192,11 +201,21 @@ mod tests {
     ) -> String {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_str(content_type).unwrap());
+        receive_with_headers(plugin, state, &mut headers, parts)
+    }
+
+    /// What the client would get for an upstream body under `headers`.
+    fn receive_with_headers(
+        plugin: &dyn Plugin,
+        state: &mut Box<dyn Any + Send>,
+        headers: &mut HeaderMap,
+        parts: &[&str],
+    ) -> String {
         let mut status = StatusCode::OK;
         plugin.on_response_head(&mut ResponseHeadCtx::new(
             "k",
             &mut status,
-            &mut headers,
+            headers,
             state.as_mut(),
         ));
         let mut out = String::new();
@@ -355,6 +374,89 @@ mod tests {
             state.as_mut(),
         ));
         assert!(matches!(refused, Err(PluginError::Reject(..))));
+    }
+
+    #[test]
+    fn identity_content_encoding_is_masked_and_restored() {
+        let p = plugin("terms = [\"Falcon\"]\nbuiltin = false");
+        for value in ["identity", "Identity", " identity ", "identity, identity"] {
+            let mut state = p.new_state();
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_str(value).unwrap());
+            let sent =
+                send_with_headers(p.as_ref(), &mut state, &mut headers, "{\"q\":\"Falcon\"}");
+            assert!(!sent.to_lowercase().contains("falcon"), "{value}: {sent}");
+            let placeholder = first_placeholder(&sent);
+
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert("content-type", HeaderValue::from_static("application/json"));
+            response_headers.insert("content-encoding", HeaderValue::from_str(value).unwrap());
+            let reply = format!("{{\"a\":\"{placeholder} is on track\"}}");
+            let got =
+                receive_with_headers(p.as_ref(), &mut state, &mut response_headers, &[&reply]);
+            assert_eq!(got, "{\"a\":\"Falcon is on track\"}", "{value}");
+        }
+    }
+
+    #[test]
+    fn real_and_unknown_content_encodings_are_refused() {
+        let p = plugin("terms = [\"Falcon\"]\nbuiltin = false");
+        for value in ["gzip", "identity, gzip", "br", "GZIP", "identity,", ""] {
+            let mut state = p.new_state();
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_str(value).unwrap());
+            let mut payload = Bytes::from_static(b"{\"q\":\"Falcon\"}");
+            let refused = p.on_request(&mut RequestCtx::new(
+                "ct",
+                "zen",
+                &Method::POST,
+                "/zen/x",
+                &mut headers,
+                &mut payload,
+                state.as_mut(),
+            ));
+            assert!(
+                matches!(
+                    refused,
+                    Err(PluginError::Reject(StatusCode::UNSUPPORTED_MEDIA_TYPE, _))
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_identity_response_encoding_is_still_not_restored() {
+        let p = plugin("terms = [\"Falcon\"]\nbuiltin = false");
+        let mut state = p.new_state();
+        let sent = send(p.as_ref(), &mut state, "{\"q\":\"Falcon\"}");
+        let placeholder = first_placeholder(&sent);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        let got = receive_with_headers(p.as_ref(), &mut state, &mut headers, &[&placeholder]);
+        assert_eq!(got, placeholder);
+    }
+
+    #[test]
+    fn a_non_utf8_byte_in_a_text_body_is_refused() {
+        let p = plugin("terms = [\"Falcon\"]\nbuiltin = false");
+        let mut state = p.new_state();
+        let mut headers = HeaderMap::new();
+        let mut payload = Bytes::from_static(b"{\"q\":\"Falcon \xff\"}");
+        let refused = p.on_request(&mut RequestCtx::new(
+            "ct",
+            "zen",
+            &Method::POST,
+            "/zen/x",
+            &mut headers,
+            &mut payload,
+            state.as_mut(),
+        ));
+        let Err(PluginError::Reject(StatusCode::UNSUPPORTED_MEDIA_TYPE, message)) = refused else {
+            panic!("{refused:?}")
+        };
+        assert!(message.contains("not UTF-8"), "{message}");
     }
 
     #[test]

@@ -4,7 +4,26 @@
 //! more than one plugin needs: word boundaries, keyword proximity, digit runs, a Luhn checksum and
 //! the hit type. The `guard` module is the plugin shell the detection plugins share.
 
+use http::header::CONTENT_ENCODING;
+use http::HeaderMap;
+
 pub mod guard;
+
+/// True when the headers describe a body that is more than the clear bytes on the wire.
+///
+/// `Content-Encoding: identity` is a legal no-op, so a header whose every listed coding is
+/// `identity` (case-insensitive, trimmed, comma separated, and repeatable) counts as absent. Any
+/// other coding, an empty coding, or a value that is not visible ASCII keeps the body opaque.
+pub fn body_is_encoded(headers: &HeaderMap) -> bool {
+    headers.get_all(CONTENT_ENCODING).iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        value
+            .split(',')
+            .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+    })
+}
 
 /// A byte range of the scanned text that looks like an identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,15 +113,22 @@ impl Covered {
 }
 
 /// Adds the hits in `extra` that overlap nothing already in `hits`; exact duplicates count once.
+///
+/// An accepted extra also covers its bytes, so two extras over the same span, even of different
+/// kinds, are not both kept. The extras are sorted by start, so one running end is enough to test
+/// them against each other without a second pass over every accepted hit.
 pub fn merge_hits<K: Copy>(hits: &mut Vec<Hit<K>>, mut extra: Vec<Hit<K>>) {
     let covered = Covered::new(hits);
     extra.sort_unstable_by_key(|h| (h.start, h.end));
     extra.dedup_by(|a, b| a.start == b.start && a.end == b.end);
-    hits.extend(
-        extra
-            .into_iter()
-            .filter(|h| !covered.overlaps(h.start, h.end)),
-    );
+    let mut accepted_end = None;
+    hits.extend(extra.into_iter().filter(|h| {
+        if covered.overlaps(h.start, h.end) || accepted_end.is_some_and(|end| h.start < end) {
+            return false;
+        }
+        accepted_end = Some(h.end);
+        true
+    }));
 }
 
 #[cfg(test)]
@@ -115,6 +141,10 @@ mod tests {
             start,
             end,
         }
+    }
+
+    fn hit_kind(kind: u8, start: usize, end: usize) -> Hit<u8> {
+        Hit { kind, start, end }
     }
 
     #[test]
@@ -140,5 +170,26 @@ mod tests {
         );
         let spans: Vec<(usize, usize)> = hits.iter().map(|h| (h.start, h.end)).collect();
         assert_eq!(spans, [(0, 5), (20, 25), (10, 15), (30, 31)]);
+    }
+
+    #[test]
+    fn an_accepted_extra_covers_its_bytes_for_later_extras() {
+        let mut hits = Vec::new();
+        merge_hits(
+            &mut hits,
+            vec![hit_kind(b'a', 10, 20), hit_kind(b'b', 15, 25)],
+        );
+        assert_eq!(hits, [hit_kind(b'a', 10, 20)], "the same span counts once");
+
+        let mut hits = vec![hit(0, 5)];
+        merge_hits(
+            &mut hits,
+            vec![hit_kind(b'a', 10, 20), hit_kind(b'b', 20, 30)],
+        );
+        assert_eq!(
+            hits,
+            [hit(0, 5), hit_kind(b'a', 10, 20), hit_kind(b'b', 20, 30)],
+            "adjacent extras do not overlap"
+        );
     }
 }

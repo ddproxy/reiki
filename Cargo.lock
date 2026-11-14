@@ -1224,6 +1224,7 @@ dependencies = [
 name = "reiki-detect"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "http",
  "reiki-plugin",
  "toml",
@@ -1273,6 +1274,7 @@ dependencies = [
  "aho-corasick",
  "bytes",
  "http",
+ "reiki-detect",
  "reiki-plugin",
  "reiki-redact",
  "serde_json",

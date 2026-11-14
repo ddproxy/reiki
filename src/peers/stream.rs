@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub(crate) struct Limits {
 #[derive(Default)]
 struct Slots {
     total: usize,
+    /// A change ticker is running; it stops with the last subscriber or with publishing.
+    ticking: bool,
     per_peer: HashMap<IpAddr, usize>,
     per_token: HashMap<String, usize>,
 }
@@ -62,7 +64,7 @@ enum Event {
 pub(crate) struct Hub {
     tx: broadcast::Sender<Event>,
     slots: Mutex<Slots>,
-    ticker: OnceLock<()>,
+    ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Holds one subscriber's place until its forwarding task ends.
@@ -108,7 +110,7 @@ impl Hub {
         Arc::new(Self {
             tx,
             slots: Mutex::new(Slots::default()),
-            ticker: OnceLock::new(),
+            ticker: Mutex::new(None),
         })
     }
 
@@ -339,23 +341,63 @@ impl Watcher {
     }
 }
 
-/// Starts the change ticker once, on the first subscriber, and primes it with the current state.
+/// Starts the change ticker unless it runs, priming it with the current state. Called before a
+/// subscriber joins, so the first tick reports only real changes, and again after, in case a
+/// ticker that just saw no subscriber stopped in between.
 pub(crate) fn ensure_ticker(app: &Arc<App>, hub: &Arc<Hub>) {
-    hub.ticker.get_or_init(|| {
-        let mut watcher = Watcher::new();
-        // Primed before the first snapshot is built, so the first tick reports only real changes.
-        let _ = watcher.changes(app, Instant::now());
-        let (app, hub) = (Arc::downgrade(app), Arc::clone(hub));
-        tokio::spawn(tick(app, hub, watcher));
-    });
+    {
+        let mut slots = hub.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if slots.ticking {
+            return;
+        }
+        slots.ticking = true;
+    }
+    let mut watcher = Watcher::new();
+    let _ = watcher.changes(app, Instant::now());
+    let handle = tokio::spawn(tick(Arc::downgrade(app), Arc::clone(hub), watcher));
+    *hub.ticker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
 }
 
+impl Hub {
+    /// Stops the ticker when nobody is subscribed, under the lock a new subscriber takes, so a
+    /// subscriber either keeps it running or starts a new one.
+    fn idle(&self) -> bool {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        if slots.total == 0 {
+            slots.ticking = false;
+        }
+        !slots.ticking
+    }
+
+    fn stop_ticking(&self) {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ticking = false;
+    }
+
+    #[cfg(test)]
+    fn ticker_finished(&self) -> bool {
+        self.ticker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+}
+
+/// Looks for changes once a second while anyone is subscribed and publishing is on; it ends,
+/// reading nothing more, as soon as either stops.
 async fn tick(app: Weak<App>, hub: Arc<Hub>, mut watcher: Watcher) {
-    let mut ticker = tokio::time::interval(TICK);
+    let mut ticker = tokio::time::interval_at(Instant::now() + TICK, TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        if hub.idle() {
+            return;
+        }
         let Some(app) = app.upgrade() else {
+            hub.stop_ticking();
             return;
         };
         match watcher.changes(&app, Instant::now()) {
@@ -366,8 +408,8 @@ async fn tick(app: Weak<App>, hub: Arc<Hub>, mut watcher: Watcher) {
             }),
             None => {
                 hub.close_all();
-                watcher = Watcher::new();
-                let _ = watcher.changes(&app, Instant::now());
+                hub.stop_ticking();
+                return;
             }
         }
     }
@@ -558,6 +600,94 @@ mod tests {
             Bytes::from("event: key\ndata: {\"n\":1}\n\n")
         );
         settle(&hub, 1).await;
+    }
+
+    fn app_text(publish: bool) -> String {
+        format!(
+            "[upstream.zen]\nbase_url = \"https://example.com/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+             [peers]\nenabled = true\npublish = {publish}\nlisten = \"127.0.0.1:4099\"\n\
+             peer_token_sha256 = \"{}\"\nexpose_host_stats = true\n",
+            crate::auth::sha256_hex("ticker-test-token")
+        )
+    }
+
+    fn keys() -> HashMap<String, crate::proxy::Secret> {
+        [("a".to_owned(), crate::proxy::Secret::new("k"))].into()
+    }
+
+    fn publishing_app() -> Arc<App> {
+        App::new(
+            crate::config::Config::parse(&app_text(true)).unwrap(),
+            keys(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        )
+    }
+
+    fn join(app: &Arc<App>, hub: &Arc<Hub>) -> mpsc::Receiver<Bytes> {
+        ensure_ticker(app, hub);
+        let inbox = hub
+            .subscribe(ip(1), "default", limits(4, 4), HEARTBEAT, snapshot)
+            .unwrap();
+        ensure_ticker(app, hub);
+        inbox
+    }
+
+    async fn ticker_ends(hub: &Hub) {
+        for _ in 0..50 {
+            if hub.ticker_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the ticker is still running");
+    }
+
+    #[tokio::test]
+    async fn the_ticker_ends_with_the_last_subscriber_and_restarts_for_the_next() {
+        let app = publishing_app();
+        let hub = Hub::new();
+        assert!(hub.ticker_finished(), "nothing runs before a subscriber");
+        let inbox = join(&app, &hub);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!hub.ticker_finished());
+        drop(inbox);
+        ticker_ends(&hub).await;
+        let _inbox = join(&app, &hub);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!hub.ticker_finished(), "a new subscriber starts it again");
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_stops_publishing_ends_the_ticker_and_its_streams() {
+        let app = publishing_app();
+        let hub = Hub::new();
+        let mut inbox = join(&app, &hub);
+        assert_eq!(next(&mut inbox).await.unwrap(), snapshot());
+        app.reload(
+            crate::config::Config::parse(&app_text(false)).unwrap(),
+            keys(),
+        );
+        ticker_ends(&hub).await;
+        let mut ended = false;
+        for _ in 0..10 {
+            if next(&mut inbox).await.is_none() {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "the stream was closed");
+        settle(&hub, 0).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(hub.ticker_finished(), "and nothing restarted it");
+        app.reload(
+            crate::config::Config::parse(&app_text(true)).unwrap(),
+            keys(),
+        );
+        let _inbox = join(&app, &hub);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!hub.ticker_finished(), "publishing again restarts it");
     }
 
     #[test]

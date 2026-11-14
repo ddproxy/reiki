@@ -235,6 +235,9 @@ fn subscribe(app: &Arc<App>, peers: &PeersConfig, peer: Option<IpAddr>, token: &
     let subscribed = hub.subscribe(distinct_source(peer), token, limits, HEARTBEAT, || {
         super::stream::frame("snapshot", &super::health::document(app, peers))
     });
+    if subscribed.is_ok() {
+        ensure_ticker(app, &hub);
+    }
     match subscribed {
         Ok(inbox) => {
             let mut response = Response::new(axum::body::Body::from_stream(Frames(inbox)));

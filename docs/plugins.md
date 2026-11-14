@@ -78,8 +78,9 @@ REIKI_PLUGINS=placeholders,requestlog cargo build --release --no-default-feature
   --features plugin-placeholders,plugin-requestlog
 ```
 
-- Unset, every plugin whose feature is enabled is registered in the order of the catalog in `Cargo.toml` (`[[package.metadata.reiki.plugin]]`).
+- Unset, every plugin whose feature is enabled is registered in the order of the catalog in `Cargo.toml` (`[[package.metadata.reiki.plugin]]`). The catalog must be a non-empty array of tables with unique names and crates; `crate` must be a plain Rust identifier.
 - A name that is not in the catalog, a repeated name, or a plugin whose feature is off fails the build with a message saying what to change.
+- Putting `requestlog` before `placeholders` fails the build. The build also warns when `requestlog` has no masking plugin before it, or when `phi`, `finance` or `controlled` follows `placeholders`, because either order weakens what the later plugin can see or mask.
 - A plugin left out of the list is not registered, so naming it in `[plugins.*]` is a startup error.
 
 ## What a plugin can see and do
@@ -90,13 +91,13 @@ A plugin is trusted code that runs inside the Reiki process.
 - It sees the client's own headers, including the client token, and the whole request body. It never receives an upstream key: the key is attached after the hooks have run, and on a keyed upstream any `authorization` header a plugin sets is dropped (on a `passthrough` upstream the client's credentials, including one a plugin sets, are forwarded).
 - The request path is passed to plugins, the query string is not.
 - `on_attempt` runs after each upstream attempt, including the ones that fail over to the next key. It receives the key's name from the config, the upstream status (`None` when no response arrived) and, for an error response, the start of its body. It never receives a key's secret.
-- `on_response_head` receives the name of the key that produced the response, the upstream status and the headers. `on_response_chunk` receives each body chunk and may rewrite it.
+- `on_response_head` receives the name of the key that produced the response, the upstream that served it (the fallback upstream after a failover), the upstream status and the headers. `on_response_chunk` receives each body chunk and may rewrite it. `RequestCtx::id` is a 32-hex-digit request id, the same value in Reiki's logs and the request log.
 - Hooks are synchronous and run on the request's task. A hook that blocks is not interrupted, and there is no timeout. Do slow work, such as file writes, on a thread of your own.
 - A panic in a hook is caught and logged with the plugin and hook name, and the request carries on. The hook's earlier changes are kept, and the plugin's own state may be half-updated.
 - A panic in `on_request` counts as the plugin skipping the request, so `on_error` decides whether the request goes on or gets a 503. Rust's panic handler also prints the message to stderr, outside the log settings, so do not `unwrap` or `expect` on request data.
 - `on_event` receives facts about the relay rather than one request: a finished request (stream, upstream, final status), a failover from one key to the next, a key going on cooldown, a stream rate-limit rejection, and a request a plugin rejected (`Event::PluginRejected`, which the `metrics` plugin counts). It is not tied to a request's state and carries key names, never secrets.
-- `admin_paths` and `on_admin` let a plugin answer a GET on the admin listener, after the caller has been authenticated. Two plugins claiming one path, or a plugin claiming `/status`, is a startup error. The hook receives the current count of available, cooling and out-of-rotation keys.
-- A plugin that never touches bodies returns `false` from `uses_bodies`, so configuring it does not change how responses are streamed.
+- `admin_paths` and `on_admin` let a plugin answer a GET on the admin listener, after the caller has been authenticated. A plugin path must start with `/`, have no trailing slash, and contain no `.`/`..` segment or percent-encoding. Two plugins claiming one path after that normalisation, or a plugin claiming any path Reiki serves itself (`/status`, `/reload`, `/keys/enable`, their `/v1/...` forms and `/v1/openapi.json`), is a startup error. The hook receives the current count of available, cooling and out-of-rotation keys.
+- A plugin that never changes bodies returns `false` from `uses_bodies`, so configuring it does not change how responses are streamed. A plugin that only observes bodies still returns `false` there and `true` from `needs_response_hooks`, so it gets `on_response_head` and `on_response_chunk` without losing `content-length`.
 - While a plugin that uses bodies is configured, Reiki streams responses without a `content-length`, so a plugin may change a body's length. HEAD, 204 and 304 keep theirs because they have no body.
 - When a body ends normally, a final `on_response_chunk` call with `is_last` set follows the last chunk. It does not happen after an upstream read error or a client disconnect, so treat the per-request state being dropped as the end-of-response signal.
 - The request body is limited to 8 MiB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
@@ -141,4 +142,4 @@ To compile it in:
 
 Per-request data goes in the value returned by `Plugin::new_state`, which every hook for that request receives. One plugin instance serves many requests at once, so keep shared data behind its own synchronisation.
 
-Reject a request with `PluginError::Reject(status, message)`; the client receives a JSON error with that status and message. Return `PluginError::Skip(message)` when the plugin does not apply and let `on_error` decide what follows.
+Reject a request with `PluginError::Reject(status, message)`; the client receives a JSON error with that status and message. The message is public: it is sent to the client and written to Reiki's log, so never include request text or a secret. Return `PluginError::Skip(message)` when the plugin does not apply and let `on_error` decide what follows.

@@ -19,16 +19,21 @@ use http::{HeaderMap, Method, StatusCode};
 /// Keys every plugin table accepts. The host reads them, so a plugin must not reject them as unknown.
 pub const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run", "streams"];
 
-/// A fresh 16-hex-digit request id, unique enough to follow one request through logs.
+/// A fresh 32-hex-digit request id: a per-process nonce followed by a counter.
 pub fn new_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    hasher.write_u128(nanos);
-    format!("{:016x}", hasher.finish())
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let nonce = *NONCE.get_or_init(|| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        hasher.write_u128(nanos);
+        hasher.finish()
+    });
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nonce:016x}{counter:016x}")
 }
 
 /// Hooks into the request and response path. `Send + Sync` so a single
@@ -79,7 +84,15 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// False for a plugin that never touches bodies, so its presence keeps `content-length` on responses.
+    /// True when the plugin needs the response head and body chunks, even if it does not change them.
+    /// Defaults to [`Plugin::uses_bodies`] so existing plugins keep their behaviour.
+    fn needs_response_hooks(&self) -> bool {
+        self.uses_bodies()
+    }
+
+    /// False for a plugin that never changes a body, so its presence keeps `content-length` on responses.
+    /// A plugin that only observes bodies returns `false` here and `true` from
+    /// [`Plugin::needs_response_hooks`].
     fn uses_bodies(&self) -> bool {
         true
     }
@@ -192,7 +205,8 @@ pub struct AdminReply {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PluginError {
-    /// Return the status and message to the client without calling upstream.
+    /// Return the status and message to the client without calling upstream. The message is public:
+    /// it is sent to the client and written to Reiki's log, so never put request text or a secret in it.
     Reject(StatusCode, String),
     /// Report that the plugin did not apply. Non-fatal; the relay either logs
     /// and continues or rejects, depending on the plugin's `on_error` setting.
@@ -214,7 +228,7 @@ impl std::error::Error for PluginError {}
 /// [`Plugin::new_state`], downcast it with `Any::downcast_mut`.
 #[non_exhaustive]
 pub struct RequestCtx<'a> {
-    /// The id Reiki gives this request in its own logs; empty when the host set none.
+    /// The id Reiki gives this request in its own logs, 32 hex digits; empty when the host set none.
     pub id: &'a str,
     pub stream: &'a str,
     pub upstream: &'a str,
@@ -259,6 +273,8 @@ pub struct AttemptCtx<'a> {
 pub struct ResponseHeadCtx<'a> {
     /// The name of the key in the config that produced this response.
     pub key: &'a str,
+    /// The upstream that served this response, which may differ from the request's after a fallback.
+    pub upstream: &'a str,
     pub status: &'a mut StatusCode,
     pub headers: &'a mut HeaderMap,
     pub state: &'a mut (dyn Any + Send),
@@ -315,7 +331,7 @@ impl<'a> RequestCtx<'a> {
     pub fn report_detail(&mut self, kind: &'static str, detail: &str, count: usize, blocked: bool) {
         self.reported.push(Reported {
             kind,
-            detail: Some(detail.to_owned()),
+            detail: detail_label(detail),
             count,
             blocked,
         });
@@ -354,10 +370,18 @@ impl<'a> ResponseHeadCtx<'a> {
     ) -> Self {
         Self {
             key,
+            upstream: "",
             status,
             headers,
             state,
         }
+    }
+
+    /// Names the upstream that served this response.
+    #[must_use]
+    pub fn with_upstream(mut self, upstream: &'a str) -> Self {
+        self.upstream = upstream;
+        self
     }
 }
 
@@ -368,5 +392,60 @@ impl<'a> ChunkCtx<'a> {
             is_last,
             state,
         }
+    }
+}
+
+/// Longest detail label kept, in bytes.
+const DETAIL_MAX_BYTES: usize = 64;
+
+/// Keeps only the documented label characters and cuts the result at a character boundary.
+fn detail_label(raw: &str) -> Option<String> {
+    let mut kept = String::new();
+    for c in raw.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '*' | '/' | '-')) {
+            continue;
+        }
+        if kept.len() + c.len_utf8() > DETAIL_MAX_BYTES {
+            break;
+        }
+        kept.push(c);
+    }
+    (!kept.is_empty()).then_some(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_ids_are_32_hex_digits_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = new_request_id();
+            assert_eq!(id.len(), 32);
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+            assert!(seen.insert(id), "request id repeated");
+        }
+    }
+
+    #[test]
+    fn report_detail_bounds_and_filters_before_storing() {
+        let method = Method::POST;
+        let mut headers = HeaderMap::new();
+        let mut body = Bytes::new();
+        let mut state = ();
+        let mut ctx = RequestCtx::new("s", "u", &method, "/x", &mut headers, &mut body, &mut state);
+
+        let long = "a".repeat(1024 * 1024);
+        ctx.report_detail("tool", &long, 1, false);
+        assert_eq!(
+            ctx.reported[0].detail.as_ref().map(String::len),
+            Some(DETAIL_MAX_BYTES)
+        );
+
+        ctx.report_detail("tool", "bad \n name / ok", 1, false);
+        assert_eq!(ctx.reported[1].detail.as_deref(), Some("badname/ok"));
+        ctx.report_detail("tool", " \n ", 1, false);
+        assert_eq!(ctx.reported[2].detail, None);
     }
 }

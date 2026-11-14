@@ -92,6 +92,29 @@ async fn the_clients_own_credentials_and_headers_reach_the_upstream_untouched() 
 }
 
 #[tokio::test]
+async fn the_clients_key_query_parameter_reaches_the_upstream_untouched() {
+    let relay = relay().await;
+
+    let body = reqwest::Client::new()
+        .post(format!(
+            "{relay}/direct/chat/completions?key=client-secret&x=1"
+        ))
+        .header("authorization", "Bearer the-clients-own-key")
+        .body("{}")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.ends_with("/zen/v1/chat/completions?key=client-secret&x=1"),
+        "the client's query key was changed: {body}"
+    );
+}
+
+#[tokio::test]
 async fn no_reiki_token_is_needed_and_none_of_reikis_keys_are_used() {
     let relay = relay().await;
 

@@ -32,6 +32,16 @@ const ROUTES: &[(&str, &str, &str)] = &[
     ("/keys/enable", "post", "Re-enable a disabled key"),
 ];
 
+/// True when the admin listener serves this path itself, bare or under [`V1`].
+pub(crate) fn is_reserved_path(path: &str) -> bool {
+    if path == format!("{V1}/openapi.json") {
+        return true;
+    }
+    ROUTES.iter().any(|(route, _, _)| {
+        path == *route || path.strip_prefix(V1).is_some_and(|rest| rest == *route)
+    })
+}
+
 fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
     match (path, method) {
         ("/reload", "post") => post(reload),

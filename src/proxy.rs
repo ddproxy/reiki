@@ -167,7 +167,11 @@ impl Snapshot {
     /// Counts a request against the stream's rate limit, if it has one. Returns
     /// the wait until the window resets when the stream is over the limit.
     fn rate_limit_retry_after(&self, stream: &str, now: Instant) -> Option<Duration> {
-        let mut limiter = self.limiters.get(stream)?.lock().ok()?;
+        let mut limiter = self
+            .limiters
+            .get(stream)?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         limiter.check(now).err()
     }
 
@@ -1175,6 +1179,7 @@ async fn dispatch_inner(
         plugin_states,
         faithful,
     };
+    let mut serving_upstream = upstream_name;
     let mut result = if upstream.passthrough {
         forward_passthrough(app, first, rewritten).await
     } else {
@@ -1203,6 +1208,7 @@ async fn dispatch_inner(
             let body = rewrite_body(body, &fallback.model_aliases, &[]);
             let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
             let used = fallback.upstream.as_str();
+            serving_upstream = used;
             request_done.set_upstream(used);
             result = forward(
                 app,
@@ -1226,7 +1232,7 @@ async fn dispatch_inner(
         Err(spent) => match spent.refusal {
             Some((key, status, headers, body)) => {
                 let mut session = spent.plugin_states;
-                finish_buffered(&mut session, &key, status, &headers, body)
+                finish_buffered(&mut session, &key, serving_upstream, status, &headers, body)
             }
             None => exhausted(snapshot, &app.health, stream),
         },
@@ -1281,7 +1287,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         faithful,
     } = fwd;
 
-    let url = target_url(upstream, rest, parts);
+    let url = target_url(upstream, rest, parts, true);
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
     let max_attempts = snapshot
@@ -1420,6 +1426,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             return Ok(stream_response(
                 plugin_states,
                 &key_name,
+                upstream_name,
                 response,
                 parts.method == Method::HEAD,
                 &secrets,
@@ -1433,10 +1440,24 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             .map(str::to_owned);
         let response_headers = response.headers.clone();
         let secrets = [secret.0.as_str(), auth_value.as_str()];
-        let snippet = scrub(read_limited(response).await, &secrets);
+        let (snippet, read_error) = read_limited(response).await;
+        if let Some(error) = &read_error {
+            tracing::warn!(
+                stream = %stream,
+                key = %key_name,
+                status = status.as_u16(),
+                %error,
+                "could not read the whole upstream error body; classifying by status"
+            );
+        }
+        let snippet = scrub(snippet, &secrets);
         let response_headers = scrub_headers(response_headers, &secrets);
         plugin_states.on_attempt(&key_name, Some(status.as_u16()), &snippet);
-        let text = String::from_utf8_lossy(&snippet);
+        let text = if read_error.is_some() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&snippet).into_owned()
+        };
 
         let outcome = if upstream.pass_errors {
             Outcome::PassThrough
@@ -1451,6 +1472,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 return Ok(finish_buffered(
                     &mut plugin_states,
                     &key_name,
+                    upstream_name,
                     status,
                     &response_headers,
                     snippet,
@@ -1504,6 +1526,12 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     class,
                     Some(status.as_u16()),
                 );
+                // A first transient failure does not cool the key yet, so without this
+                // the walk would spend its budget on the same key and never reach the rest.
+                if matches!(class, FailureClass::Transient) {
+                    skip.push(key_name.clone());
+                    last_refusal = Some((key_name.clone(), status, response_headers, snippet));
+                }
                 pending_failover = Some((key_name, FailureKind::from(class)));
             }
         }
@@ -1523,6 +1551,7 @@ async fn forward_passthrough(
     body: Bytes,
 ) -> Result<Response, Box<Spent>> {
     let Forward {
+        upstream_name,
         upstream,
         parts,
         rest,
@@ -1530,7 +1559,7 @@ async fn forward_passthrough(
         faithful,
         ..
     } = fwd;
-    let url = target_url(upstream, rest, parts);
+    let url = target_url(upstream, rest, parts, false);
     // For a forward upstream this bounds the whole exchange, not only response headers.
     let sent = tokio::time::timeout(app.header_timeout, async {
         app.transport(faithful, upstream)
@@ -1556,6 +1585,7 @@ async fn forward_passthrough(
             Ok(stream_response(
                 plugin_states,
                 PASSTHROUGH_KEY,
+                upstream_name,
                 response,
                 parts.method == Method::HEAD,
                 &[],
@@ -1599,9 +1629,21 @@ async fn forward_passthrough(
     }
 }
 
-fn target_url(upstream: &crate::config::Upstream, rest: &str, parts: &Parts) -> String {
+fn target_url(
+    upstream: &crate::config::Upstream,
+    rest: &str,
+    parts: &Parts,
+    strip_key: bool,
+) -> String {
     let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
-    if let Some(query) = parts.uri.query().and_then(strip_query_key) {
+    let query = parts.uri.query().and_then(|query| {
+        if strip_key {
+            strip_query_key(query)
+        } else {
+            Some(query.to_owned())
+        }
+    });
+    if let Some(query) = query {
         url.push('?');
         url.push_str(&query);
     }
@@ -1737,16 +1779,21 @@ fn is_pre_send(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
-async fn read_limited(mut response: UpstreamResponse) -> Bytes {
+async fn read_limited(mut response: UpstreamResponse) -> (Bytes, Option<std::io::Error>) {
     let mut collected = Vec::new();
-    while let Some(Ok(chunk)) = response.chunk().await {
-        let room = MAX_ERROR_BODY.saturating_sub(collected.len());
-        collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if collected.len() >= MAX_ERROR_BODY {
-            break;
+    while let Some(chunk) = response.chunk().await {
+        match chunk {
+            Ok(chunk) => {
+                let room = MAX_ERROR_BODY.saturating_sub(collected.len());
+                collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if collected.len() >= MAX_ERROR_BODY {
+                    break;
+                }
+            }
+            Err(error) => return (Bytes::from(collected), Some(error)),
         }
     }
-    Bytes::from(collected)
+    (Bytes::from(collected), None)
 }
 
 /// True for a response the client consumes incrementally, so it must not be held back.
@@ -1847,6 +1894,7 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
 fn stream_response(
     plugin_states: PluginSession,
     key: &str,
+    upstream: &str,
     response: UpstreamResponse,
     is_head: bool,
     secrets: &[&str],
@@ -1879,18 +1927,18 @@ fn stream_response(
             None => response.into_stream(),
         }
     };
-    let body = if plugin_states.is_empty() {
+    let body = if !plugin_states.needs_response_hooks() {
         Body::from_stream(stream(response))
     } else {
         let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
-        session.on_response_head(key, &mut status, &mut headers);
+        session.on_response_head(key, upstream, &mut status, &mut headers);
         // A plugin may change the body length, and a known length would also stop
         // the final `is_last` call from being made. These responses carry no body, so
         // their length is only metadata.
         let bodyless =
             is_head || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
-        if !bodyless {
+        if !bodyless && !session.is_empty() {
             headers.remove(header::CONTENT_LENGTH);
         }
         Body::from_stream(PluginBody {
@@ -1909,16 +1957,17 @@ fn stream_response(
 fn finish_buffered(
     session: &mut PluginSession,
     key: &str,
+    upstream: &str,
     status: StatusCode,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    if session.is_empty() {
+    if !session.needs_response_hooks() {
         return buffered_response(status, headers, body);
     }
     let mut status = status;
     let mut headers = headers.clone();
-    session.on_response_head(key, &mut status, &mut headers);
+    session.on_response_head(key, upstream, &mut status, &mut headers);
     let mut body = body;
     session.on_response_chunk(&mut body, true);
     buffered_response(status, &headers, body)
@@ -2199,6 +2248,31 @@ mod tests {
     }
 
     #[test]
+    fn a_poisoned_rate_limiter_lock_still_enforces_the_limit() {
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\nrate_limit_per_minute = 1\n",
+            crate::auth::sha256_hex("tok")
+        );
+        let snapshot = Arc::new(Snapshot::new(Config::parse(&text).unwrap(), HashMap::new()));
+        let poisoner = Arc::clone(&snapshot);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.limiters.get("s").unwrap().lock().unwrap();
+            panic!("poison the limiter lock");
+        })
+        .join();
+        assert!(snapshot.limiters.get("s").unwrap().is_poisoned());
+
+        let now = Instant::now();
+        assert!(snapshot.rate_limit_retry_after("s", now).is_none());
+        assert!(
+            snapshot.rate_limit_retry_after("s", now).is_some(),
+            "a poisoned lock must not fail open"
+        );
+    }
+
+    #[test]
     fn dot_segments_and_encoded_separators_are_path_tricks() {
         for path in [
             "/up/../admin",
@@ -2372,5 +2446,25 @@ mod tests {
             &[(Vec::new(), true)],
             "the disconnect must balance with exactly one final call"
         );
+    }
+
+    #[tokio::test]
+    async fn a_body_read_error_is_reported_with_the_bytes_read_so_far() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"quota")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "body stalled",
+            )),
+        ];
+        let response = UpstreamResponse::from_stream(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            axum::http::Version::HTTP_11,
+            futures_util::stream::iter(chunks),
+        );
+        let (body, error) = read_limited(response).await;
+        assert_eq!(&body[..], b"quota");
+        assert!(error.is_some(), "a read error must not look like EOF");
     }
 }

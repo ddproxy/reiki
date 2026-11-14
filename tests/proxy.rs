@@ -789,19 +789,39 @@ async fn a_bad_request_is_passed_through_without_failover() {
 }
 
 #[tokio::test]
-async fn a_transient_error_is_retried_once_on_the_same_key() {
+async fn a_transient_upstream_error_is_not_replayed_on_the_same_key() {
     let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
     h.mock
         .script("up-a", vec![Reply::Status(502, "bad gateway", None)]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 502);
+    assert_eq!(res.text().await.unwrap(), "bad gateway");
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn every_key_in_the_chain_is_tried_once_before_the_last_refusal_is_returned() {
+    let streams: Vec<(&str, &str, &[&str])> = vec![("ct", "tok-a", &["a", "b", "c", "d"][..])];
+    let h = harness(&streams, Policy::default()).await;
+    for (key, text) in [
+        ("up-a", "a broke"),
+        ("up-b", "b broke"),
+        ("up-c", "c broke"),
+        ("up-d", "d broke"),
+    ] {
+        h.mock.script(
+            key,
+            (0..4).map(|_| Reply::Status(500, text, None)).collect(),
+        );
+    }
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
     assert_eq!(
-        h.post("tok-a", "/zen/x", "1")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
+        h.mock.keys_called(),
+        ["up-a", "up-b", "up-c", "up-d"],
+        "each key must get one attempt"
     );
-    assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+    assert_eq!(res.status(), 500);
+    assert_eq!(res.text().await.unwrap(), "d broke");
 }
 
 #[tokio::test]
@@ -1762,8 +1782,48 @@ async fn pass_errors_relays_a_403_without_taking_the_key_out_of_rotation() {
     assert_eq!(
         h.mock.keys_called()[..2],
         ["up-a", "up-b"],
-        "without the option a 403 still disables the key"
+        "without the option a 403 still fails over to the next key"
     );
+}
+
+#[tokio::test]
+async fn a_generic_403_does_not_permanently_disable_a_key() {
+    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            403,
+            r#"{"error":{"message":"request blocked by security policy"}}"#,
+            None,
+        )],
+    );
+    let denied = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(
+        denied.status(),
+        403,
+        "the upstream's own answer still reaches the client"
+    );
+    let again = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(again.status(), 200, "the key was not permanently disabled");
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+#[tokio::test]
+async fn a_403_naming_an_invalid_key_still_disables_it() {
+    let h = harness(&[("ct", "tok-a", &["a"][..])], Policy::default()).await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            403,
+            r#"{"error":{"message":"API key is invalid"}}"#,
+            None,
+        )],
+    );
+    let denied = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(denied.status(), 503, "no key can serve the request");
+    let exhausted = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(exhausted.status(), 503, "the key stays disabled");
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
 }
 
 #[tokio::test]

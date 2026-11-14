@@ -250,7 +250,8 @@ impl Authority {
         })
     }
 
-    /// Refuses a CA that cannot serve `hosts` safely; it runs only on a CA that replaces the running one.
+    /// Refuses a CA that cannot serve `hosts` safely. It runs at startup, from `reiki check`
+    /// and whenever a reload would replace the running CA.
     fn validate(&self, hosts: &[String]) -> Result<(), String> {
         if !self.key_matches {
             return Err("the CA key does not match the CA certificate".to_owned());
@@ -270,11 +271,18 @@ impl Authority {
         Ok(())
     }
 
+    /// The leaf lifetime, kept inside the CA's own remaining validity.
+    fn leaf_ttl(&self, ttl: Duration) -> Duration {
+        let remaining = u64::try_from(self.not_after.saturating_sub(now_unix())).unwrap_or(0);
+        ttl.min(Duration::from_secs(remaining))
+    }
+
     fn server_config(
         &self,
         host: &str,
         ttl: Duration,
-    ) -> Result<Arc<rustls::ServerConfig>, String> {
+    ) -> Result<(Arc<rustls::ServerConfig>, Duration), String> {
+        let ttl = self.leaf_ttl(ttl);
         let key = KeyPair::generate().map_err(err)?;
         let mut params = CertificateParams::new(vec![host.to_owned()]).map_err(err)?;
         let mut name = DistinguishedName::new();
@@ -299,8 +307,12 @@ impl Authority {
         .map_err(err)?;
         // The upstream leg negotiates HTTP/2 on its own, so the client leg stays HTTP/1.1.
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Arc::new(config))
+        Ok((Arc::new(config), ttl))
     }
+}
+
+fn configured_hosts(config: &InterceptConfig) -> Vec<String> {
+    config.hosts.iter().map(|h| h.host.clone()).collect()
 }
 
 /// Days left on a CA that expires at `not_after` (Unix seconds); negative once expired.
@@ -310,7 +322,9 @@ pub fn days_left(not_after: i64) -> i64 {
 
 /// Loads the CA without starting anything, for `reiki check`; returns the days it has left.
 pub fn check_ca(config: &InterceptConfig) -> Result<i64, String> {
-    Authority::load(config).map(|a| days_left(a.not_after))
+    let authority = Authority::load(config)?;
+    authority.validate(&configured_hosts(config))?;
+    Ok(days_left(authority.not_after))
 }
 
 /// Days of validity at or below which startup warns.
@@ -326,7 +340,18 @@ pub struct Interceptor {
 
 struct Minting {
     authority: Arc<Authority>,
-    leaves: HashMap<String, (Instant, Arc<rustls::ServerConfig>)>,
+    leaves: HashMap<String, Leaf>,
+}
+
+struct Leaf {
+    made: Instant,
+    not_after: Instant,
+    config: Arc<rustls::ServerConfig>,
+}
+
+/// A cached leaf is reusable only while it is inside half the current TTL and still valid.
+fn leaf_is_fresh(made: Instant, not_after: Instant, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(made) < ttl / 2 && now < not_after
 }
 
 /// What a reload can replace while tunnels are open.
@@ -361,6 +386,7 @@ pub struct InterceptPlan {
 impl Interceptor {
     pub fn new(app: Arc<App>, config: &InterceptConfig) -> Result<Self, String> {
         let authority = Authority::load(config)?;
+        authority.validate(&configured_hosts(config))?;
         let left = days_left(authority.not_after);
         app.set_ca_not_after(authority.not_after);
         if left < 0 {
@@ -454,6 +480,7 @@ impl Interceptor {
 
     /// Swaps in a plan from [`Interceptor::plan_reload`], dropping the certificates the old CA minted.
     pub fn apply_reload(&self, plan: InterceptPlan) {
+        let ttl_changed = self.settings().ttl != plan.settings.ttl;
         if !plan.settings.require_auth {
             tracing::warn!(
                 "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
@@ -467,6 +494,14 @@ impl Interceptor {
             let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
             minting.authority = authority;
             minting.leaves.clear();
+        } else if ttl_changed {
+            // A cached leaf was minted under the old lifetime; keep the new setting from
+            // making an already-expired certificate look reusable.
+            self.minting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .leaves
+                .clear();
         }
         *self
             .settings
@@ -494,18 +529,26 @@ impl Interceptor {
         self.app.snapshot().authenticate(&token) == Some(stream)
     }
 
-    /// Reuses a certificate until half its life is gone.
+    /// Reuses a certificate until half its life is gone or the certificate expires.
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
         let ttl = self.settings().ttl;
         let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
         let Minting { authority, leaves } = &mut *minting;
-        if let Some((made, config)) = leaves.get(host) {
-            if made.elapsed() < ttl / 2 {
-                return Ok(Arc::clone(config));
+        let now = Instant::now();
+        if let Some(leaf) = leaves.get(host) {
+            if leaf_is_fresh(leaf.made, leaf.not_after, now, ttl) {
+                return Ok(Arc::clone(&leaf.config));
             }
         }
-        let config = authority.server_config(host, ttl)?;
-        leaves.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
+        let (config, ttl) = authority.server_config(host, ttl)?;
+        leaves.insert(
+            host.to_owned(),
+            Leaf {
+                made: now,
+                not_after: now + ttl,
+                config: Arc::clone(&config),
+            },
+        );
         Ok(config)
     }
 
@@ -704,5 +747,120 @@ mod tests {
         let mut out = String::new();
         stream.read_to_string(&mut out).await.unwrap();
         assert_eq!(out, "headtail");
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "reiki-intercept-unit-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn intercept_config(dir: &Path, hosts: &[&str]) -> InterceptConfig {
+        InterceptConfig {
+            ca_cert: dir.join("ca.pem").display().to_string(),
+            ca_key: dir.join("ca.key").display().to_string(),
+            leaf_ttl_hours: 24,
+            require_auth: true,
+            ca_key_permissions: CaKeyPermissions::Warn,
+            hosts: hosts
+                .iter()
+                .map(|host| InterceptHost {
+                    host: (*host).to_owned(),
+                    upstream: "up".to_owned(),
+                    stream: None,
+                    paths: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn write_ca(dir: &Path, params: CertificateParams) {
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        write_private(&dir.join("ca.pem"), cert.pem().as_bytes()).unwrap();
+        write_private(&dir.join("ca.key"), key.serialize_pem().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_cached_leaf_cannot_outlive_its_own_validity_after_the_ttl_is_raised() {
+        let made = Instant::now();
+        let not_after = made + Duration::from_secs(3600);
+        let raised = Duration::from_secs(720 * 3600);
+        assert!(leaf_is_fresh(made, not_after, made, raised));
+        assert!(
+            !leaf_is_fresh(made, not_after, made + Duration::from_secs(3601), raised),
+            "raising the TTL must not revive an expired leaf"
+        );
+        let ttl = Duration::from_secs(3600);
+        assert!(leaf_is_fresh(
+            made,
+            not_after,
+            made + Duration::from_secs(1799),
+            ttl
+        ));
+        assert!(!leaf_is_fresh(
+            made,
+            not_after,
+            made + Duration::from_secs(1801),
+            ttl
+        ));
+    }
+
+    #[test]
+    fn a_ca_with_a_key_from_another_ca_is_refused_by_check() {
+        let dir = scratch("mismatch");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        init_ca(&a, &["api.example.com".to_owned()], 30, false).unwrap();
+        init_ca(&b, &["api.example.com".to_owned()], 30, false).unwrap();
+        let mixed = dir.join("mixed");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::copy(a.join("ca.pem"), mixed.join("ca.pem")).unwrap();
+        std::fs::copy(b.join("ca.key"), mixed.join("ca.key")).unwrap();
+
+        let error = check_ca(&intercept_config(&mixed, &["api.example.com"])).unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn a_ca_without_a_name_constraint_is_refused_by_check() {
+        let dir = scratch("unconstrained");
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.not_before = at(BACKDATE, false);
+        params.not_after = at(Duration::from_secs(30 * 86_400), true);
+        write_ca(&dir, params);
+
+        let error = check_ca(&intercept_config(&dir, &["api.example.com"])).unwrap_err();
+        assert!(error.contains("name constraint"), "{error}");
+    }
+
+    #[test]
+    fn an_expired_ca_is_refused_by_check() {
+        let dir = scratch("expired");
+        let mut params = CertificateParams::new(vec!["api.example.com".to_owned()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName("api.example.com".to_owned())],
+            excluded_subtrees: Vec::new(),
+        });
+        params.not_before = at(Duration::from_secs(10 * 86_400), false);
+        params.not_after = at(Duration::from_secs(86_400), false);
+        write_ca(&dir, params);
+
+        let error = check_ca(&intercept_config(&dir, &["api.example.com"])).unwrap_err();
+        assert!(error.contains("expired"), "{error}");
+    }
+
+    #[test]
+    fn ca_init_refuses_a_lifetime_of_zero_days() {
+        let dir = scratch("zero-days");
+        let error =
+            init_ca(&dir.join("ca"), &["api.example.com".to_owned()], 0, false).unwrap_err();
+        assert!(error.contains("days"), "{error}");
     }
 }

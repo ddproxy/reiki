@@ -40,6 +40,20 @@ struct KeyHealth {
     status_seq: u64,
 }
 
+impl KeyHealth {
+    /// Extends a cooldown but never shortens an existing one. Returns true only when the
+    /// deadline moves later, so a shorter failure does not emit a second Cooldown event.
+    fn cool_until(&mut self, until: Instant) -> bool {
+        match self.cooling_until {
+            Some(existing) if existing >= until => false,
+            _ => {
+                self.cooling_until = Some(until);
+                true
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct KeyState {
     health: HashMap<String, KeyHealth>,
@@ -190,23 +204,19 @@ impl KeyState {
                 true
             }
             FailureClass::RateLimited(retry_after) => {
-                h.cooling_until = Some(now + retry_after.unwrap_or(policy.rate_limited_default));
-                true
+                let until = now + retry_after.unwrap_or(policy.rate_limited_default);
+                h.cool_until(until)
             }
             FailureClass::QuotaExhausted => {
-                h.cooling_until = Some(now + quota_cooldown.unwrap_or(policy.quota_exhausted));
-                true
+                let until = now + quota_cooldown.unwrap_or(policy.quota_exhausted);
+                h.cool_until(until)
             }
-            FailureClass::AccessDisabled => {
-                h.cooling_until = Some(now + policy.access_disabled);
-                true
-            }
+            FailureClass::AccessDisabled => h.cool_until(now + policy.access_disabled),
             FailureClass::Transient => {
                 h.transient_failures += 1;
                 if h.transient_failures >= policy.transient_threshold {
-                    h.cooling_until = Some(now + policy.transient);
                     h.transient_failures = 0;
-                    true
+                    h.cool_until(now + policy.transient)
                 } else {
                     false
                 }
@@ -344,6 +354,48 @@ mod tests {
         assert!(!state.is_available("a", now + secs(9)));
         assert_eq!(state.cooling_remaining("a", now + secs(4)), Some(secs(6)));
         assert!(state.is_available("a", now + secs(10)));
+    }
+
+    #[test]
+    fn a_later_shorter_failure_does_not_shorten_a_quota_cooldown() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        assert!(state.record_failure("a", FailureClass::QuotaExhausted, &policy, now));
+        assert!(
+            !state.record_failure(
+                "a",
+                FailureClass::RateLimited(Some(secs(30))),
+                &policy,
+                now + secs(1)
+            ),
+            "the deadline did not move later"
+        );
+        assert_eq!(
+            state.cooling_remaining("a", now + secs(1)),
+            Some(policy.quota_exhausted - secs(1))
+        );
+        assert!(
+            !state.is_available("a", now + secs(31)),
+            "the 30 s rate limit must not replace the 5 h quota window"
+        );
+        assert!(state.is_available("a", now + policy.quota_exhausted));
+    }
+
+    #[test]
+    fn a_later_longer_failure_extends_a_rate_limit_cooldown() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        assert!(state.record_failure("a", FailureClass::RateLimited(Some(secs(30))), &policy, now));
+        assert!(
+            state.record_failure("a", FailureClass::QuotaExhausted, &policy, now + secs(1)),
+            "the quota deadline is later"
+        );
+        assert_eq!(
+            state.cooling_remaining("a", now + secs(1)),
+            Some(policy.quota_exhausted)
+        );
     }
 
     #[test]

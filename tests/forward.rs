@@ -1639,6 +1639,98 @@ async fn forward_socket_without_streaming_waits_for_the_whole_reply() {
     let _ = std::fs::remove_file(&sock);
 }
 
+/// A forwarder that writes `head` and then stops answering.
+async fn stalling_socket(head: &'static [u8]) -> PathBuf {
+    let sock = unique_sock_path();
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = AsyncWriteExt::write_all(&mut stream, head).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+        }
+    });
+    sock
+}
+
+async fn timeout_app(sock: &std::path::Path, streaming: bool, idle: u64) -> String {
+    let text = format!(
+        "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+         response_idle_timeout_secs = {idle}\n\
+         [upstream.zen.forward]\nsocket = \"{}\"\nstreaming = {streaming}\n\
+         [keys.k]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+         [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+        sock.display(),
+        reiki::auth::sha256_hex("tok")
+    );
+    let app = App::new(
+        Config::parse(&text).unwrap(),
+        HashMap::from([("k".to_string(), Secret::new("key123"))]),
+        Policy::default(),
+        PluginChain::default(),
+    );
+    serve_app(app).await
+}
+
+#[tokio::test]
+async fn a_buffered_forward_body_that_stalls_times_out() {
+    let sock =
+        stalling_socket(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc")
+            .await;
+    let base = timeout_app(&sock, false, 1).await;
+    let started = Instant::now();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        reqwest::Client::new()
+            .post(format!("{base}/zen/chat"))
+            .bearer_auth("tok")
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("the buffered response must not wait for the forwarder")
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the idle timeout ended the exchange"
+    );
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[tokio::test]
+async fn a_streamed_forward_body_that_stalls_times_out() {
+    let sock = stalling_socket(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nfirst \r\n",
+    )
+    .await;
+    let base = timeout_app(&sock, true, 1).await;
+    let mut resp = reqwest::Client::new()
+        .post(format!("{base}/zen/chat"))
+        .bearer_auth("tok")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let first = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+        .await
+        .expect("the first chunk arrives")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&first[..], b"first ");
+    let ended = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+        .await
+        .expect("the idle timeout ends the body");
+    assert!(
+        ended.is_err(),
+        "a stalled stream must end with an error, got {ended:?}"
+    );
+    let _ = std::fs::remove_file(&sock);
+}
+
 #[tokio::test]
 async fn forward_command_streaming_relays_before_exit_and_reaps_the_child() {
     if !python_available() {

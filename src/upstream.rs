@@ -375,7 +375,9 @@ pub struct Standard {
 }
 
 impl Standard {
-    pub fn new() -> Self {
+    /// Builds all three clients. A failure is returned instead of falling back to a
+    /// differently configured client.
+    pub fn try_new() -> Result<Self, reqwest::Error> {
         let build = |http1_only: bool, title_case: bool| {
             // Reiki decodes compressed bodies itself, so the configured cap applies to the
             // expanded bytes and error bodies stay readable. Letting reqwest decode would hide
@@ -397,13 +399,19 @@ impl Standard {
             } else {
                 builder
             };
-            builder.build().unwrap_or_else(|_| reqwest::Client::new())
+            builder.build()
         };
-        Self {
-            http1: build(true, false),
-            http2: build(false, false),
-            title_case: build(true, true),
-        }
+        Ok(Self {
+            http1: build(true, false)?,
+            http2: build(false, false)?,
+            title_case: build(true, true)?,
+        })
+    }
+
+    /// Panics rather than substituting a different redirect or decoding policy.
+    pub fn new() -> Self {
+        Self::try_new()
+            .unwrap_or_else(|error| panic!("cannot build the upstream HTTP client: {error}"))
     }
 
     fn client_for(&self, upstream: &Upstream) -> &reqwest::Client {
@@ -643,7 +651,7 @@ pub(crate) struct ErrMap<S> {
 impl<S, E> Stream for ErrMap<S>
 where
     S: Stream<Item = Result<Bytes, E>>,
-    E: std::error::Error + Send + Sync + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
 {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -659,6 +667,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_clients_are_built_or_fail_without_a_policy_swap() {
+        assert!(Standard::try_new().is_ok());
+    }
 
     #[tokio::test]
     async fn from_bytes_yields_the_body_once() {

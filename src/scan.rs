@@ -46,18 +46,31 @@ pub fn plugins() -> Vec<&'static str> {
 }
 
 /// The kinds of `selection` that one plugin knows; `None` when it knows none of the named ones.
+/// When `required`, a selected plugin that knows none of the names is an error rather than a skip.
 fn pick<K: Copy>(
     selection: &Kinds,
     default: &[K],
     all: &[K],
     parse: fn(&str) -> Option<K>,
-) -> Option<Vec<K>> {
+    plugin: &str,
+    required: bool,
+) -> Result<Option<Vec<K>>, String> {
     match selection {
-        Kinds::Default => Some(default.to_vec()),
-        Kinds::All => Some(all.to_vec()),
+        Kinds::Default => Ok(Some(default.to_vec())),
+        Kinds::All => Ok(Some(all.to_vec())),
         Kinds::Named(labels) => {
             let kinds: Vec<K> = labels.iter().filter_map(|l| parse(l)).collect();
-            (!kinds.is_empty()).then_some(kinds)
+            if kinds.is_empty() {
+                if required {
+                    return Err(format!(
+                        "plugin `{plugin}` knows none of the named kinds: {}",
+                        labels.join(", ")
+                    ));
+                }
+                Ok(None)
+            } else {
+                Ok(Some(kinds))
+            }
         }
     }
 }
@@ -106,6 +119,7 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
             ));
         }
     }
+    let required = !only.is_empty();
     let wanted = |name: &str| only.is_empty() || only.iter().any(|p| p == name);
     let mut findings: Vec<Finding> = Vec::new();
     #[cfg(feature = "plugin-phi")]
@@ -115,7 +129,9 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
             &reiki_phi::Kind::DEFAULT,
             &reiki_phi::Kind::ALL,
             reiki_phi::Kind::parse,
-        ) {
+            "phi",
+            required,
+        )? {
             findings.extend(reiki_phi::scan(text, &kinds).into_iter().map(|h| Finding {
                 plugin: "phi",
                 kind: h.kind.label(),
@@ -131,7 +147,9 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
             &reiki_finance::Kind::DEFAULT,
             &reiki_finance::Kind::ALL,
             reiki_finance::Kind::parse,
-        ) {
+            "finance",
+            required,
+        )? {
             findings.extend(
                 reiki_finance::scan(text, &kinds)
                     .into_iter()
@@ -151,7 +169,9 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
             &reiki_controlled::Kind::DEFAULT,
             &reiki_controlled::Kind::ALL,
             reiki_controlled::Kind::parse,
-        ) {
+            "controlled",
+            required,
+        )? {
             findings.extend(
                 reiki_controlled::scan(text, &kinds)
                     .into_iter()
@@ -174,17 +194,42 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
     Ok(findings)
 }
 
+/// An incremental byte-offset to line/column cursor. Offsets must not move backwards.
+struct LineCursor<'a> {
+    bytes: &'a [u8],
+    scanned: usize,
+    line: usize,
+    col: usize,
+}
+
+impl<'a> LineCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            scanned: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    fn position(&mut self, offset: usize) -> (usize, usize) {
+        let target = offset.min(self.bytes.len());
+        while self.scanned < target {
+            if self.bytes[self.scanned] == b'\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+            self.scanned += 1;
+        }
+        (self.line, self.col)
+    }
+}
+
 /// Line and column (both 1-based, in bytes) of a byte offset.
 pub fn position(text: &str, offset: usize) -> (usize, usize) {
-    let before = &text.as_bytes()[..offset.min(text.len())];
-    let line = before.iter().filter(|b| **b == b'\n').count() + 1;
-    let col = before.len()
-        - before
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |p| p + 1)
-        + 1;
-    (line, col)
+    LineCursor::new(text).position(offset)
 }
 
 /// Counts per plugin and kind, in a stable order.
@@ -216,6 +261,48 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// Scans one input and writes its findings. Returns the number of findings.
+fn scan_one(
+    name: &str,
+    bytes: &[u8],
+    plugins: &[String],
+    selection: &Kinds,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    counts: &mut std::collections::BTreeMap<(&'static str, &'static str), usize>,
+) -> Result<usize, i32> {
+    let text = String::from_utf8_lossy(bytes);
+    let findings = match scan(&text, plugins, selection) {
+        Ok(findings) => findings,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return Err(2);
+        }
+    };
+    let mut cursor = LineCursor::new(&text);
+    for f in &findings {
+        let (line, col) = cursor.position(f.start);
+        let written = if json {
+            writeln!(
+                out,
+                "{{\"file\":{},\"line\":{line},\"col\":{col},\"plugin\":\"{}\",\"kind\":\"{}\"}}",
+                json_string(name),
+                f.plugin,
+                f.kind
+            )
+        } else {
+            writeln!(out, "{name}:{line}:{col} {} {}", f.plugin, f.kind)
+        };
+        if written.is_err() {
+            return Err(2);
+        }
+    }
+    for f in &findings {
+        *counts.entry((f.plugin, f.kind)).or_default() += 1;
+    }
+    Ok(findings.len())
+}
+
 /// The `reiki scan` command. Findings go to stdout, one per line, and a summary goes to stderr.
 /// Returns the exit code: 0 for none, 1 for findings, 2 for a usage or read error.
 pub fn run(
@@ -225,7 +312,7 @@ pub fn run(
     json: bool,
     files: &[std::path::PathBuf],
 ) -> i32 {
-    use std::io::{Read, Write};
+    use std::io::Read;
     let selection = if all {
         Kinds::All
     } else if kinds.is_empty() {
@@ -233,69 +320,67 @@ pub fn run(
     } else {
         Kinds::Named(kinds.to_vec())
     };
-    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut out = std::io::stdout().lock();
+    let mut counts: std::collections::BTreeMap<(&'static str, &'static str), usize> =
+        std::collections::BTreeMap::new();
+    let mut inputs = 0usize;
+    let mut findings = 0usize;
+
     if files.is_empty() || files.iter().any(|f| f.as_os_str() == "-") {
         let mut bytes = Vec::new();
         if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
             eprintln!("reiki: cannot read stdin: {e}");
             return 2;
         }
-        inputs.push(("-".to_owned(), bytes));
+        match scan_one(
+            "-",
+            &bytes,
+            plugins,
+            &selection,
+            json,
+            &mut out,
+            &mut counts,
+        ) {
+            Ok(n) => findings += n,
+            Err(code) => return code,
+        }
+        inputs += 1;
     }
     for file in files.iter().filter(|f| f.as_os_str() != "-") {
-        match std::fs::read(file) {
-            Ok(bytes) => inputs.push((file.display().to_string(), bytes)),
+        let name = file.display().to_string();
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("reiki: cannot read {}: {e}", file.display());
-                return 2;
-            }
-        }
-    }
-    let mut out = std::io::stdout().lock();
-    let mut all_findings = Vec::new();
-    for (name, bytes) in &inputs {
-        let text = String::from_utf8_lossy(bytes);
-        let findings = match scan(&text, plugins, &selection) {
-            Ok(findings) => findings,
-            Err(e) => {
-                eprintln!("reiki: {e}");
+                eprintln!("reiki: cannot read {name}: {e}");
                 return 2;
             }
         };
-        for f in &findings {
-            let (line, col) = position(&text, f.start);
-            let written = if json {
-                writeln!(
-                    out,
-                    "{{\"file\":{},\"line\":{line},\"col\":{col},\"plugin\":\"{}\",\"kind\":\"{}\"}}",
-                    json_string(name),
-                    f.plugin,
-                    f.kind
-                )
-            } else {
-                writeln!(out, "{name}:{line}:{col} {} {}", f.plugin, f.kind)
-            };
-            if written.is_err() {
-                return 2;
-            }
+        match scan_one(
+            &name,
+            &bytes,
+            plugins,
+            &selection,
+            json,
+            &mut out,
+            &mut counts,
+        ) {
+            Ok(n) => findings += n,
+            Err(code) => return code,
         }
-        all_findings.extend(findings);
+        inputs += 1;
     }
     drop(out);
-    let counts = summary(&all_findings)
-        .iter()
-        .map(|(p, k, n)| format!("{p} {k} x{n}"))
+
+    let counts = counts
+        .into_iter()
+        .map(|((p, k), n)| format!("{p} {k} x{n}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if all_findings.is_empty() {
-        eprintln!("scanned {} input(s): no findings", inputs.len());
+    if findings == 0 {
+        eprintln!("scanned {inputs} input(s): no findings");
         0
     } else {
-        eprintln!(
-            "scanned {} input(s): {} finding(s): {counts}",
-            inputs.len(),
-            all_findings.len()
-        );
+        eprintln!("scanned {inputs} input(s): {findings} finding(s): {counts}");
         1
     }
 }
@@ -360,6 +445,16 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_plugin_must_know_a_named_kind() {
+        let only = vec!["finance".to_owned()];
+        let err = scan("x", &only, &Kinds::Named(vec!["ssn".into()])).unwrap_err();
+        assert!(err.contains("finance") && err.contains("ssn"), "{err}");
+        assert!(scan("x", &only, &Kinds::Named(vec!["cusip".into()])).is_ok());
+        // Without an explicit plugin filter, each label applies to whichever plugin knows it.
+        assert!(scan("x", &[], &Kinds::Named(vec!["ssn".into()])).is_ok());
+    }
+
+    #[test]
     fn positions_are_one_based_lines_and_columns() {
         let text = "a\nbc\n\ndef";
         assert_eq!(position(text, 0), (1, 1));
@@ -370,6 +465,15 @@ mod tests {
             (4, 4),
             "past the end clamps to the end"
         );
+    }
+
+    #[test]
+    fn the_cursor_matches_position_for_sorted_offsets() {
+        let text = "a\nbc\n\ndef";
+        let mut cursor = LineCursor::new(text);
+        for offset in [0, 1, 2, 3, 3, 8, 10] {
+            assert_eq!(cursor.position(offset), position(text, offset), "{offset}");
+        }
     }
 
     #[test]

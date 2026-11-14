@@ -34,14 +34,16 @@ enum Host {
 }
 
 impl Rule {
-    /// `host`, `host:port`, `*.host` or `*`; the port defaults to 443.
+    /// `host`, `host:port`, `[ipv6]:port`, `*.host` or `*`; the port defaults to 443.
     fn parse(text: &str) -> Option<Self> {
-        let text = text.trim().to_ascii_lowercase();
-        let (host, port) = match text.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (text.as_str(), 443),
-        };
-        let host = match host {
+        // Whitespace and a trailing dot are almost always typos, and can never match a CONNECT
+        // target as written.
+        if text.is_empty() || text.chars().any(char::is_whitespace) || text.ends_with('.') {
+            return None;
+        }
+        let text = text.to_ascii_lowercase();
+        let (host, port) = split_host_port(&text, Some(443))?;
+        let host = match host.as_str() {
             "" => return None,
             "*" => Host::Any,
             h if h.starts_with("*.") && h.len() > 2 => Host::Suffix(h[1..].to_owned()),
@@ -208,21 +210,12 @@ impl Tunnel {
             IpAddr::V4(v4) => local_v4(v4),
             IpAddr::V6(v6) => {
                 let seg = v6.segments();
-                let embedded = if seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff) {
-                    // IPv4-compatible (::a.b.c.d) and IPv4-mapped (::ffff:a.b.c.d)
-                    Some(embedded_v4(&seg))
-                } else if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4] {
-                    // NAT64 well-known prefix
-                    Some(embedded_v4(&seg))
-                } else {
-                    None
-                };
                 v6.is_loopback()
                     || v6.is_unspecified()
                     || v6.is_multicast()
                     || (seg[0] & 0xffc0) == 0xfe80
                     || seg == [0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254]
-                    || embedded.is_some_and(local_v4)
+                    || embedded_v4s(&seg).into_iter().flatten().any(local_v4)
             }
         };
         !local
@@ -238,37 +231,18 @@ fn private_v4(v4: std::net::Ipv4Addr) -> bool {
         || (a == 192 && b == 0 && c == 0)
 }
 
-/// RFC 1918, shared address space and IPv6 unique-local, including IPv4 forms embedded in IPv6.
+/// RFC 1918, shared address space, local addresses and IPv6 unique-local, including IPv4 forms
+/// embedded in IPv6.
 fn private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => private_v4(v4),
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            let embedded = (seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff))
-                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4]);
-            // 6to4 carries the IPv4 address in the next 32 bits; Teredo carries the server in the
-            // same place and the client inverted in the last 32 bits.
-            let six_to_four = seg[0] == 0x2002 && {
-                let [a, b] = seg[1].to_be_bytes();
-                let [c, d] = seg[2].to_be_bytes();
-                let v4 = std::net::Ipv4Addr::new(a, b, c, d);
-                private_v4(v4) || local_v4(v4)
-            };
-            let teredo = seg[0] == 0x2001 && seg[1] == 0 && {
-                let [a, b] = seg[2].to_be_bytes();
-                let [c, d] = seg[3].to_be_bytes();
-                let server = std::net::Ipv4Addr::new(a, b, c, d);
-                let [e, f] = (!seg[6]).to_be_bytes();
-                let [g, h] = (!seg[7]).to_be_bytes();
-                let client = std::net::Ipv4Addr::new(e, f, g, h);
-                [server, client]
-                    .into_iter()
-                    .any(|v4| private_v4(v4) || local_v4(v4))
-            };
             (seg[0] & 0xfe00) == 0xfc00
-                || (embedded && private_v4(embedded_v4(&seg)))
-                || six_to_four
-                || teredo
+                || embedded_v4s(&seg)
+                    .into_iter()
+                    .flatten()
+                    .any(|v4| private_v4(v4) || local_v4(v4))
         }
     }
 }
@@ -287,10 +261,34 @@ fn local_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.octets()[0] == 0
 }
 
-fn embedded_v4(seg: &[u16; 8]) -> std::net::Ipv4Addr {
-    let [a, b] = seg[6].to_be_bytes();
-    let [c, d] = seg[7].to_be_bytes();
+fn v4_from_segments(high: u16, low: u16) -> std::net::Ipv4Addr {
+    let [a, b] = high.to_be_bytes();
+    let [c, d] = low.to_be_bytes();
     std::net::Ipv4Addr::new(a, b, c, d)
+}
+
+fn embedded_v4(seg: &[u16; 8]) -> std::net::Ipv4Addr {
+    v4_from_segments(seg[6], seg[7])
+}
+
+/// The IPv4 addresses carried by the compatibility and transition forms this proxy recognises.
+/// IPv4-mapped/compatible and NAT64 carry one; 6to4 one; Teredo carries the server and the client
+/// (the client is inverted in the last 32 bits).
+fn embedded_v4s(seg: &[u16; 8]) -> [Option<std::net::Ipv4Addr>; 2] {
+    if (seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff))
+        || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4])
+    {
+        [Some(embedded_v4(seg)), None]
+    } else if seg[0] == 0x2002 {
+        [Some(v4_from_segments(seg[1], seg[2])), None]
+    } else if seg[0] == 0x2001 && seg[1] == 0 {
+        [
+            Some(v4_from_segments(seg[2], seg[3])),
+            Some(v4_from_segments(!seg[6], !seg[7])),
+        ]
+    } else {
+        [None, None]
+    }
 }
 
 /// Most tunnels open at once; further connections are dropped until one closes.
@@ -533,14 +531,42 @@ async fn read_connect(client: &mut TcpStream) -> std::io::Result<Option<ConnectH
     }
 }
 
-/// `host:port` with an optional bracketed IPv6 host, lowercased.
+/// `host:port` with an optional bracketed IPv6 host, lowercased and canonicalized.
 fn split_target(target: &str) -> Option<(String, u16)> {
-    let (host, port) = target.rsplit_once(':')?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.is_empty() {
-        return None;
+    split_host_port(target, None)
+}
+
+/// Splits `host`, `host:port`, `[ipv6]:port` or a bare IPv6 literal. A bare IPv6 literal with no
+/// brackets keeps `default_port`, because an unbracketed trailing `:port` is ambiguous.
+fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(String, u16)> {
+    use std::net::Ipv6Addr;
+    let text = text.to_ascii_lowercase();
+    if let Some(rest) = text.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let host = host.parse::<Ipv6Addr>().ok()?.to_string();
+        let port = match tail {
+            "" => default_port?,
+            tail => tail.strip_prefix(':')?.parse().ok()?,
+        };
+        return Some((host, port));
     }
-    Some((host.to_ascii_lowercase(), port.parse().ok()?))
+    if let Some((host, port)) = text.rsplit_once(':') {
+        if let Ok(port) = port.parse::<u16>() {
+            if let Ok(host) = host.parse::<Ipv6Addr>() {
+                return Some((host.to_string(), port));
+            }
+            if !host.is_empty() && !host.contains(':') {
+                return Some((host.to_owned(), port));
+            }
+        }
+    }
+    if let Some(port) = default_port {
+        if !text.is_empty() && !text.contains(':') {
+            return Some((text, port));
+        }
+    }
+    let host = text.parse::<Ipv6Addr>().ok()?.to_string();
+    Some((host, default_port?))
 }
 
 #[cfg(test)]
@@ -580,10 +606,35 @@ mod tests {
 
     #[test]
     fn bad_rules_are_rejected() {
-        for bad in ["", "*.", "a*b.com", "host:notaport", ":443"] {
+        for bad in [
+            "",
+            "*.",
+            "a*b.com",
+            "host:notaport",
+            ":443",
+            " host",
+            "host ",
+            "exa mple.com",
+            "example.com.",
+        ] {
             assert!(!valid_rule(bad), "{bad}");
         }
         assert!(valid_rule("Opencode.AI") && valid_rule("*.x.io:8443") && valid_rule("*"));
+        assert!(valid_rule("[::1]:443") && valid_rule("::1"));
+    }
+
+    #[test]
+    fn bracketed_and_bare_ipv6_rules_match_the_connect_target() {
+        let t = tunnel(&["[::1]:443", "[2001:db8::1]:8443", "2001:db8::2"]);
+        assert!(t.allows("::1", 443));
+        assert!(t.allows("2001:db8::1", 8443));
+        assert!(t.allows("2001:db8::2", 443));
+        assert_eq!(split_target("[::1]:443"), Some(("::1".into(), 443)));
+        assert_eq!(split_target("::1:443"), Some(("::1".into(), 443)));
+        assert_eq!(
+            split_target("[2001:DB8::1]:8443"),
+            Some(("2001:db8::1".into(), 8443))
+        );
     }
 
     #[test]
@@ -594,6 +645,7 @@ mod tests {
         );
         assert_eq!(split_target("[::1]:443"), Some(("::1".into(), 443)));
         assert_eq!(split_target("nohost"), None);
+        assert_eq!(split_target("[::1]"), None);
         assert_eq!(split_target(":443"), None);
         assert_eq!(split_target("host:99999"), None);
     }
@@ -611,6 +663,9 @@ mod tests {
             "0.1.2.3:1",
             "[::127.0.0.1]:1",
             "[64:ff9b::7f00:1]:1",
+            "[2002:7f00:1::]:443",
+            "[2001:0:4136:e378:8000:63bf:80ff:fffe]:443",
+            "[2002:a9fe:a9fe::]:443",
         ] {
             assert!(!t.reachable(&addr.parse().unwrap()), "{addr}");
         }
@@ -619,6 +674,7 @@ mod tests {
             "10.0.0.5:443",
             "[2606:4700::1]:443",
             "[64:ff9b::5db8:d822]:443",
+            "[2002:5db8:d822::]:443",
         ] {
             assert!(t.reachable(&addr.parse().unwrap()), "{addr}");
         }

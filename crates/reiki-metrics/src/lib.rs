@@ -31,7 +31,15 @@ impl Plugin for MetricsPlugin {
         NAME
     }
 
+    fn needs_response_hooks(&self) -> bool {
+        true
+    }
+
     fn uses_bodies(&self) -> bool {
+        false
+    }
+
+    fn live_reload(&self) -> bool {
         false
     }
 
@@ -82,14 +90,15 @@ impl Plugin for MetricsPlugin {
         let Some(state) = ctx.state.downcast_mut::<RequestState>() else {
             return;
         };
-        state.key = Some(ctx.key.to_owned());
-        state.status = Some(ctx.status.as_u16());
+        if !ctx.upstream.is_empty() {
+            state.upstream = Some(ctx.upstream.to_owned());
+        }
         let content_type = ctx
             .headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        state.is_sse = content_type.contains("text/event-stream");
+        state.is_sse = is_event_stream(content_type);
     }
 
     fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
@@ -161,11 +170,13 @@ struct RequestState {
     metrics: Arc<Metrics>,
     stream: Option<String>,
     upstream: Option<String>,
-    key: Option<String>,
-    status: Option<u16>,
     is_sse: bool,
     /// A JSON body, or the unfinished line of an event stream.
     buffer: Vec<u8>,
+    /// Bytes already searched for a newline, so a feed only scans what it appended.
+    scan: usize,
+    /// Dropping the rest of an over-long event line up to its newline.
+    discarding: bool,
     exceeded: bool,
     input: Option<u64>,
     output: Option<u64>,
@@ -178,10 +189,10 @@ impl RequestState {
             metrics,
             stream: None,
             upstream: None,
-            key: None,
-            status: None,
             is_sse: false,
             buffer: Vec::new(),
+            scan: 0,
+            discarding: false,
             exceeded: false,
             input: None,
             output: None,
@@ -191,14 +202,7 @@ impl RequestState {
 
     fn feed(&mut self, chunk: &[u8]) {
         if self.is_sse {
-            self.buffer.extend_from_slice(chunk);
-            while let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = self.buffer.drain(..=end).collect();
-                self.read_event_line(&line);
-            }
-            if self.buffer.len() > MAX_SSE_LINE {
-                self.buffer.clear();
-            }
+            self.feed_sse(chunk);
         } else if !self.exceeded {
             if self.buffer.len() + chunk.len() > MAX_JSON_BODY {
                 self.exceeded = true;
@@ -206,6 +210,48 @@ impl RequestState {
             } else {
                 self.buffer.extend_from_slice(chunk);
             }
+        }
+    }
+
+    fn feed_sse(&mut self, mut chunk: &[u8]) {
+        if self.discarding {
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(end) => {
+                    self.discarding = false;
+                    chunk = &chunk[end + 1..];
+                }
+                None => return,
+            }
+        }
+        if chunk.is_empty() {
+            return;
+        }
+        self.buffer.extend_from_slice(chunk);
+        let Some(rel) = self.buffer[self.scan..].iter().rposition(|&b| b == b'\n') else {
+            self.scan = self.buffer.len();
+            if self.buffer.len() > MAX_SSE_LINE {
+                self.buffer.clear();
+                self.scan = 0;
+                self.discarding = true;
+            }
+            return;
+        };
+        let end = self.scan + rel;
+        let complete: Vec<u8> = self.buffer.drain(..=end).collect();
+        self.scan = 0;
+        let mut start = 0;
+        for (i, byte) in complete.iter().enumerate() {
+            if *byte == b'\n' {
+                let line = &complete[start..i];
+                if line.len() <= MAX_SSE_LINE {
+                    self.read_event_line(line);
+                }
+                start = i + 1;
+            }
+        }
+        if self.buffer.len() > MAX_SSE_LINE {
+            self.buffer.clear();
+            self.discarding = true;
         }
     }
 
@@ -235,7 +281,9 @@ impl RequestState {
         }
         if self.is_sse {
             let rest = std::mem::take(&mut self.buffer);
-            self.read_event_line(&rest);
+            if !self.discarding && rest.len() <= MAX_SSE_LINE {
+                self.read_event_line(&rest);
+            }
         } else if !self.exceeded {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buffer) {
                 self.take(usage_in(&value));
@@ -258,6 +306,16 @@ impl Drop for RequestState {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// True for the event-stream media type, ignoring case and any parameters.
+fn is_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
 }
 
 /// Input and output tokens from a response or an event, in OpenAI
@@ -348,7 +406,7 @@ impl Metrics {
     ) {
         let action = if blocked { "blocked" } else { "reported" };
         self.with(|inner| {
-            *inner
+            let total = inner
                 .findings
                 .entry((
                     stream.to_owned(),
@@ -356,7 +414,8 @@ impl Metrics {
                     kind.to_owned(),
                     action,
                 ))
-                .or_insert(0) += count;
+                .or_insert(0);
+            *total = total.saturating_add(count);
         });
     }
 
@@ -382,10 +441,11 @@ impl Metrics {
 
     pub fn record_tokens(&self, stream: &str, upstream: &str, direction: &'static str, count: u64) {
         self.with(|inner| {
-            *inner
+            let total = inner
                 .tokens
                 .entry((stream.to_owned(), upstream.to_owned(), direction))
-                .or_insert(0) += count;
+                .or_insert(0);
+            *total = total.saturating_add(count);
         });
     }
 
@@ -570,6 +630,21 @@ mod tests {
     }
 
     #[test]
+    fn event_stream_detection_ignores_case_and_parameters() {
+        for value in [
+            "text/event-stream",
+            "Text/Event-Stream",
+            "TEXT/EVENT-STREAM; charset=UTF-8",
+            " text/event-stream ;charset=utf-8",
+        ] {
+            assert!(is_event_stream(value), "{value}");
+        }
+        for value in ["application/json", "text/event-stream-x", ""] {
+            assert!(!is_event_stream(value), "{value}");
+        }
+    }
+
+    #[test]
     fn label_escaping_covers_backslash_quote_and_newline() {
         assert_eq!(escape_label("a\"b"), "a\\\"b");
         assert_eq!(escape_label("a\\b"), "a\\\\b");
@@ -621,6 +696,25 @@ mod tests {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }
         assert!(text.contains("reiki_keys{state=\"available\"} 0"));
+    }
+
+    #[test]
+    fn upstream_controlled_counts_saturate_instead_of_wrapping() {
+        let metrics = Metrics::new();
+        for _ in 0..2 {
+            metrics.record_tokens("s", "u", "input", u64::MAX);
+            metrics.record_finding("s", "phi", "ssn", u64::MAX, false);
+        }
+        let usage: serde_json::Value = serde_json::from_str(&metrics.render_usage()).unwrap();
+        assert_eq!(usage["s"]["u"]["input"], u64::MAX);
+        let text = metrics.render(KeyCounts::default());
+        assert!(
+            text.contains(&format!(
+                "reiki_findings_total{{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"}} {}",
+                u64::MAX
+            )),
+            "{text}"
+        );
     }
 
     #[test]
@@ -714,6 +808,7 @@ mod tests {
         assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
         assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
         assert!(!plugin.uses_bodies());
+        assert!(plugin.needs_response_hooks());
     }
 
     #[test]
@@ -768,6 +863,53 @@ mod tests {
             ),
             (Some(7), Some(9))
         );
+    }
+
+    #[test]
+    fn an_event_line_over_the_cap_is_dropped_without_parsing() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, true);
+        let mut line =
+            b"data: {\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}".to_vec();
+        line.resize(MAX_SSE_LINE + 1, b' ');
+        line.push(b'\n');
+        s.feed(&line);
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":8}}\n\n");
+        s.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(usage["s"]["zen"]["input"], 7);
+        assert_eq!(usage["s"]["zen"]["output"], 8);
+    }
+
+    #[test]
+    fn an_unterminated_event_line_stays_bounded_and_is_dropped() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, true);
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}");
+        for _ in 0..(MAX_SSE_LINE * 2) {
+            s.feed(b"x");
+            assert!(s.buffer.len() <= MAX_SSE_LINE);
+        }
+        s.feed(b"\n");
+        s.feed(b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5}}\n\n");
+        s.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(usage["s"]["zen"]["input"], 4);
+        assert_eq!(usage["s"]["zen"]["output"], 5);
+    }
+
+    #[test]
+    fn an_event_stream_fed_one_byte_at_a_time_is_counted() {
+        let metrics = Arc::new(Metrics::default());
+        let mut s = state(&metrics, true);
+        let stream = b"data: {\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":7}}\n\n";
+        for byte in stream {
+            s.feed(&[*byte]);
+        }
+        s.finish();
+        let usage = usage_of(&metrics);
+        assert_eq!(usage["s"]["zen"]["input"], 6);
+        assert_eq!(usage["s"]["zen"]["output"], 7);
     }
 
     #[test]

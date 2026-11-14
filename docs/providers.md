@@ -146,7 +146,7 @@ Any failure of the link to the forwarder answers the client with 502. That cover
 
 - `args`, `pass_env` and `max_concurrent` are valid only with `command`. `expect_uid` is valid only with `socket`.
 - A forward upstream cannot be combined with `http2` or `title_case_headers`. Startup rejects these. It can serve an intercepted tunnel host: Reiki still terminates the client's TLS and swaps the key, then hands the request to the forwarder.
-- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head.
+- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head. Either way `response_idle_timeout_secs` and `response_timeout_secs` bound the forwarder's body as they do for an upstream, and a timeout releases the command's concurrency slot.
 - A buffered request does not necessarily stop when the client disconnects; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
@@ -218,7 +218,7 @@ A 401 takes the key out of rotation at once, and one request disables at most on
 
 ## Relaying errors as they are
 
-Reiki reads a 401, a 403 or a quota phrase as a key failure: it cools or disables the key and tries the next one. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
+Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 only skips the key for that request. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
 
 ## Falling back to another upstream
 
@@ -251,7 +251,7 @@ http2 = true
 forward_accept_encoding = true
 ```
 
-A request to `/zen-direct/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions` with the client's headers, `Authorization` and `x-api-key` included, and the `key=` query parameter removed. Plugins may rewrite the body. Whatever comes back is returned as it is, errors too.
+A request to `/zen-direct/chat/completions` goes to `https://opencode.ai/zen/v1/chat/completions` with the client's headers, `Authorization` and `x-api-key` included, and its query string unchanged, including any `key=` parameter. Plugins may rewrite the body. Whatever comes back is returned as it is, errors too.
 
 - No Reiki token is checked, so a client needs none. Anything that can reach the listener can use the upstream with its own credentials, so keep the listener on loopback or behind your own access control.
 - No key from the chain is used and there is no failover. Keys and streams cannot refer to a passthrough upstream, and it cannot have a `fallback`.

@@ -92,6 +92,17 @@ fn bad_options_and_missing_files_exit_two() {
 }
 
 #[test]
+fn a_selected_plugin_that_knows_none_of_the_kinds_is_an_error() {
+    let run = reiki(
+        &["--plugin", "finance", "--kinds", "ssn"],
+        "ssn 123-45-6789\n",
+    );
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("finance") && run.stderr.contains("ssn"));
+    assert!(run.stdout.is_empty());
+}
+
+#[test]
 fn files_are_scanned_and_named_in_the_output() {
     let dir = std::env::temp_dir().join(format!("reiki-scan-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

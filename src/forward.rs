@@ -77,13 +77,16 @@ impl Transport for Forwarder {
                 .as_ref()
                 .ok_or_else(|| fail("forward transport used without [upstream.forward]"))?;
             let request = build_request(&call).map_err(fail)?;
+            let idle = Duration::from_secs(call.upstream.response_idle_timeout_secs);
+            let total = call.upstream.response_timeout_secs.map(Duration::from_secs);
             match (&spec.socket, &spec.command) {
                 (Some(path), _) => {
-                    exchange_socket(path, spec.expect_uid, request, spec.streaming).await
+                    exchange_socket(path, spec.expect_uid, request, spec.streaming, idle, total)
+                        .await
                 }
                 (None, Some(_)) => {
                     let permit = self.permit(spec)?;
-                    exchange_command(spec, request, permit).await
+                    exchange_command(spec, request, permit, idle, total).await
                 }
                 (None, None) => Err(fail("[upstream.forward] has neither socket nor command")),
             }
@@ -159,6 +162,8 @@ async fn exchange_socket(
     expect_uid: Option<u32>,
     request: Request<Full<Bytes>>,
     streaming: bool,
+    idle: Duration,
+    total: Option<Duration>,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let stream = tokio::net::UnixStream::connect(path)
         .await
@@ -175,7 +180,7 @@ async fn exchange_socket(
             )));
         }
     }
-    exchange(stream, request, streaming, None).await
+    exchange(stream, request, streaming, None, idle, total).await
 }
 
 #[cfg(not(unix))]
@@ -184,6 +189,8 @@ async fn exchange_socket(
     _expect_uid: Option<u32>,
     _request: Request<Full<Bytes>>,
     _streaming: bool,
+    _idle: Duration,
+    _total: Option<Duration>,
 ) -> Result<UpstreamResponse, std::io::Error> {
     Err(fail("socket forwarding needs a Unix platform"))
 }
@@ -192,6 +199,8 @@ async fn exchange_command(
     spec: &Forward,
     request: Request<Full<Bytes>>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    idle: Duration,
+    total: Option<Duration>,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let command = spec.command.as_deref().unwrap_or_default();
     let mut cmd = tokio::process::Command::new(command);
@@ -225,6 +234,8 @@ async fn exchange_command(
         request,
         spec.streaming,
         Some(guard),
+        idle,
+        total,
     )
     .await
 }
@@ -292,12 +303,14 @@ async fn exchange<T>(
     request: Request<Full<Bytes>>,
     streaming: bool,
     mut guard: Option<ChildGuard>,
+    idle: Duration,
+    total: Option<Duration>,
 ) -> Result<UpstreamResponse, std::io::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let is_head = request.method() == Method::HEAD;
-    let result = exchange_inner(io, request, streaming, is_head).await;
+    let result = exchange_inner(io, request, streaming, is_head, idle, total).await;
     match result {
         Ok((Relayed::Buffered(response), _)) => Ok(response),
         Ok((Relayed::Streaming(parts, body), connection)) => {
@@ -313,12 +326,10 @@ where
                 },
                 _guard: guard.take(),
             };
-            Ok(UpstreamResponse::from_stream(
-                parts.status,
-                headers,
-                Version::HTTP_11,
-                stream,
-            ))
+            Ok(
+                UpstreamResponse::from_stream(parts.status, headers, Version::HTTP_11, stream)
+                    .with_deadlines(idle, total),
+            )
         }
         Err(error) => {
             if let Some(guard) = guard.as_mut() {
@@ -342,6 +353,8 @@ async fn exchange_inner<T>(
     request: Request<Full<Bytes>>,
     streaming: bool,
     is_head: bool,
+    idle: Duration,
+    total: Option<Duration>,
 ) -> Result<(Relayed, Connection<T>), std::io::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -374,12 +387,21 @@ where
         if streaming {
             return Ok(Relayed::Streaming(parts, body));
         }
-        let body = Limited::new(body, MAX_RESPONSE_BYTES)
-            .collect()
-            .await
-            .map_err(|e| fail(format!("response body failed: {e}")))?
-            .to_bytes();
-        let mut headers = parts.headers;
+        // The body cap and the response timeouts apply to the forwarder's answer just
+        // like to an upstream's, whether it is buffered or streamed.
+        let body = ErrMap {
+            inner: Box::pin(Limited::new(body, MAX_RESPONSE_BYTES).into_data_stream()),
+        };
+        let mut response =
+            UpstreamResponse::from_stream(status, parts.headers, Version::HTTP_11, body)
+                .with_deadlines(idle, total);
+        let mut collected = Vec::new();
+        while let Some(chunk) = response.chunk().await {
+            collected
+                .extend_from_slice(&chunk.map_err(|e| fail(format!("response body failed: {e}")))?);
+        }
+        let body = Bytes::from(collected);
+        let mut headers = response.headers;
         let original_length = headers.get(header::CONTENT_LENGTH).cloned();
         strip_hop_by_hop(&mut headers, false);
         headers.remove(header::CONTENT_LENGTH);
@@ -471,10 +493,15 @@ mod tests {
     use std::os::unix::fs as unixfs;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::http::{Method, Request};
 
     use crate::config::Config;
+    use crate::upstream::{Call, Transport};
 
-    use super::socket_warnings;
+    use super::{socket_warnings, Forwarder};
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -599,5 +626,54 @@ file = "/etc/reiki/keys/zen-a"
         assert!(warnings.iter().any(|w| w.contains("others can write to")));
         assert!(warnings.iter().any(|w| w.contains("does not exist yet")));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_releases_its_concurrency_slot() {
+        let script = "printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 10\\r\\nConnection: close\\r\\n\\r\\nabc'; sleep 30";
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+             response_idle_timeout_secs = 1\n\
+             [upstream.zen.forward]\ncommand = \"sh\"\nargs = [\"-c\", {script:?}]\nmax_concurrent = 1\n\
+             [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        let upstream = &config.upstream["zen"];
+        let parts = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let forwarder = Forwarder::default();
+        let call = || Call {
+            parts: &parts,
+            url: "https://example.test/v1/chat",
+            credential: Some(("authorization", "Bearer key")),
+            body: Bytes::from_static(b"{}"),
+            upstream,
+        };
+        let first = match tokio::time::timeout(Duration::from_secs(5), forwarder.send(call()))
+            .await
+            .expect("the command's stalled body times out")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the stalled body is an error"),
+        };
+        assert!(first.to_string().contains("timeout"), "{first}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let second = match tokio::time::timeout(Duration::from_secs(5), forwarder.send(call()))
+            .await
+            .expect("the second call does not hang")
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the second command stalls too"),
+        };
+        assert!(
+            !second.to_string().contains("too many copies"),
+            "the timed-out command still holds its slot: {second}"
+        );
     }
 }

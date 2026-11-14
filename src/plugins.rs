@@ -22,7 +22,20 @@ use reiki_plugin::{
 
 use crate::config::ConfigError;
 
-const RESERVED_ADMIN_PATHS: [&str; 1] = ["/status"];
+/// A plugin admin path in the form the admin router matches: absolute, already normalised.
+fn admin_path(path: &str) -> Option<&str> {
+    if !path.starts_with('/') || path == "/" || path.ends_with('/') || path.contains('%') {
+        return None;
+    }
+    if path
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some(path)
+}
 
 /// What to do when a plugin declines a request with [`PluginError::Skip`].
 /// [`PluginError::Reject`] always rejects regardless of this setting.
@@ -363,19 +376,28 @@ impl PluginChain {
     }
 
     fn check_admin_paths(entries: &[Entry]) -> Result<(), ConfigError> {
-        let mut claimed: Vec<(&'static str, &str)> = Vec::new();
+        let mut claimed: Vec<(&str, &str)> = Vec::new();
         for entry in entries {
             for path in entry.plugin.admin_paths() {
+                let Some(path) = admin_path(path) else {
+                    return Err(ConfigError::PluginConfig {
+                        name: entry.plugin.name().to_owned(),
+                        message: format!(
+                            "admin path {path:?} must start with '/', have no trailing slash, \
+                             no '.' or '..' segment and no percent-encoding"
+                        ),
+                    });
+                };
+                if crate::admin::is_reserved_path(path) {
+                    return Err(ConfigError::PluginConfig {
+                        name: entry.plugin.name().to_owned(),
+                        message: format!("admin path {path} is served by reiki itself"),
+                    });
+                }
                 if let Some((_, other)) = claimed.iter().find(|(p, _)| *p == path) {
                     return Err(ConfigError::PluginConfig {
                         name: entry.plugin.name().to_owned(),
                         message: format!("admin path {path} is already served by {other}"),
-                    });
-                }
-                if RESERVED_ADMIN_PATHS.contains(&path) {
-                    return Err(ConfigError::PluginConfig {
-                        name: entry.plugin.name().to_owned(),
-                        message: format!("admin path {path} is served by reiki itself"),
                     });
                 }
                 claimed.push((path, entry.plugin.name()));
@@ -384,9 +406,14 @@ impl PluginChain {
         Ok(())
     }
 
-    /// True when no plugin touches bodies, so the body path skips the per-request work.
+    /// True when no plugin changes a response body, so `content-length` can stay.
     pub fn is_empty(&self) -> bool {
         !self.entries.iter().any(|e| e.plugin.uses_bodies())
+    }
+
+    /// True when no plugin needs the response head or chunks.
+    pub fn needs_response_hooks(&self) -> bool {
+        self.entries.iter().any(|e| e.plugin.needs_response_hooks())
     }
 
     /// Delivers a relay-level event to every plugin; a panicking hook is logged and skipped.
@@ -556,11 +583,13 @@ impl PluginChain {
     /// Runs `on_response_head` on every plugin, in reverse order, so the plugin that
     /// touched the request first sees the response last. A panicking hook is logged
     /// and skipped.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_response_head(
         &self,
         states: &mut [Box<dyn Any + Send>],
         scope: &[bool],
         key: &str,
+        upstream: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
     ) {
@@ -574,7 +603,8 @@ impl PluginChain {
             if !runs {
                 continue;
             }
-            let mut ctx = ResponseHeadCtx::new(key, &mut *status, &mut *headers, &mut **state);
+            let mut ctx = ResponseHeadCtx::new(key, &mut *status, &mut *headers, &mut **state)
+                .with_upstream(upstream);
             let _ = guard(entry.plugin.name(), "on_response_head", || {
                 entry.plugin.on_response_head(&mut ctx);
             });
@@ -628,9 +658,14 @@ impl Default for PluginSession {
 }
 
 impl PluginSession {
-    /// True when no plugin in this session touches bodies.
+    /// True when no plugin in this session changes a response body.
     pub fn is_empty(&self) -> bool {
         self.chain.is_empty()
+    }
+
+    /// True when no plugin in this session needs the response hooks.
+    pub fn needs_response_hooks(&self) -> bool {
+        self.chain.needs_response_hooks()
     }
 
     /// The chain this session runs.
@@ -656,11 +691,18 @@ impl PluginSession {
     pub fn on_response_head(
         &mut self,
         key: &str,
+        upstream: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
     ) {
-        self.chain
-            .on_response_head(&mut self.states, &self.scope, key, status, headers);
+        self.chain.on_response_head(
+            &mut self.states,
+            &self.scope,
+            key,
+            upstream,
+            status,
+            headers,
+        );
     }
 
     pub fn on_response_chunk(&mut self, chunk: &mut Bytes, is_last: bool) {
@@ -1014,6 +1056,35 @@ mod tests {
             same_instance(&first, &next.chain, "sticky"),
             "the running instance stays"
         );
+    }
+
+    #[cfg(feature = "plugin-metrics")]
+    #[test]
+    fn a_changed_metrics_table_keeps_its_counters_and_asks_for_a_restart() {
+        let registry = vec![Registration {
+            name: reiki_metrics::NAME,
+            build: reiki_metrics::build,
+        }];
+        let first = PluginChain::build(&configured("[metrics]\n"), &registry).unwrap();
+        first.on_event(&Event::RequestDone {
+            stream: "s",
+            upstream: "u",
+            status: 503,
+        });
+        let next = first
+            .rebuild(&configured("[metrics]\non_error = \"reject\"\n"), &registry)
+            .unwrap();
+        assert_eq!(next.restart_needed, ["metrics"]);
+        assert!(next.changed.is_empty());
+        assert!(same_instance(&first, &next.chain, "metrics"));
+        let text = next
+            .chain
+            .on_admin("/metrics", KeyCounts::default())
+            .unwrap()
+            .body;
+        assert!(text.contains(
+            "reiki_requests_total{stream=\"s\",upstream=\"u\",status=\"server_error\"} 1"
+        ));
     }
 
     #[test]
@@ -1446,7 +1517,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, "31".parse().unwrap());
         let scope = chain.scope(None);
-        chain.on_response_head(&mut states, &scope, "key-a", &mut status, &mut headers);
+        chain.on_response_head(&mut states, &scope, "key-a", "u", &mut status, &mut headers);
         assert!(headers.get(CONTENT_LENGTH).is_none());
 
         let payload = b"echo <PLACEHOLDER> end";
@@ -1461,6 +1532,79 @@ mod tests {
             release.extend_from_slice(&chunk);
             assert_eq!(release, b"echo s3cr3t end", "split at {split}");
         }
+    }
+
+    #[cfg(feature = "plugin-metrics")]
+    #[test]
+    fn metrics_alone_still_gets_response_hooks_and_keeps_content_length() {
+        let registry = vec![Registration {
+            name: reiki_metrics::NAME,
+            build: reiki_metrics::build,
+        }];
+        let chain = Arc::new(PluginChain::build(&configured("[metrics]"), &registry).unwrap());
+        assert!(chain.is_empty(), "metrics does not rewrite bodies");
+        assert!(chain.needs_response_hooks());
+
+        let mut session = chain.session();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream: "s",
+            upstream: "u",
+            method: &method,
+            path: "/x",
+        };
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap();
+        let mut status = StatusCode::OK;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "42".parse().unwrap());
+        session.on_response_head("key-a", "u", &mut status, &mut headers);
+        assert!(headers.get(CONTENT_LENGTH).is_some());
+        let mut body =
+            Bytes::from_static(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
+        session.on_response_chunk(&mut body, true);
+
+        let reply = chain.on_admin("/usage", KeyCounts::default()).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(usage["s"]["u"]["input"], 2);
+        assert_eq!(usage["s"]["u"]["output"], 3);
+        assert_eq!(usage["s"]["u"]["requests"], 1);
+    }
+
+    #[cfg(feature = "plugin-metrics")]
+    #[test]
+    fn metrics_attribute_tokens_to_the_upstream_that_served_the_response() {
+        let registry = vec![Registration {
+            name: reiki_metrics::NAME,
+            build: reiki_metrics::build,
+        }];
+        let chain = Arc::new(PluginChain::build(&configured("[metrics]"), &registry).unwrap());
+        let mut session = chain.session();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "",
+            stream: "s",
+            upstream: "first",
+            method: &method,
+            path: "/x",
+        };
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap();
+        let mut status = StatusCode::OK;
+        let mut headers = HeaderMap::new();
+        session.on_response_head("fallback-key", "fallback", &mut status, &mut headers);
+        let mut body =
+            Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":6}}"#);
+        session.on_response_chunk(&mut body, true);
+
+        let reply = chain.on_admin("/usage", KeyCounts::default()).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(usage["s"]["fallback"]["input"], 5);
+        assert_eq!(usage["s"]["fallback"]["output"], 6);
+        assert!(usage["s"].get("first").is_none(), "{usage}");
     }
 
     #[test]
@@ -1548,8 +1692,41 @@ mod tests {
     fn two_plugins_cannot_claim_one_admin_path_or_reiki_s_own() {
         let clash = admin_chain(vec![admin("a", vec!["/m"]), admin("b", vec!["/m"])]);
         assert!(matches!(clash, Err(ConfigError::PluginConfig { name, .. }) if name == "b"));
-        let reserved = admin_chain(vec![admin("a", vec!["/status"])]);
-        assert!(matches!(reserved, Err(ConfigError::PluginConfig { .. })));
+        for path in [
+            "/status",
+            "/reload",
+            "/keys/enable",
+            "/v1/status",
+            "/v1/reload",
+            "/v1/keys/enable",
+            "/v1/openapi.json",
+        ] {
+            let reserved = admin_chain(vec![admin("a", vec![path])]);
+            assert!(
+                matches!(reserved, Err(ConfigError::PluginConfig { .. })),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_admin_paths_must_be_normalised() {
+        for path in [
+            "metrics",
+            "/metrics/",
+            "/",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/metrics%2Fv1",
+        ] {
+            let result = admin_chain(vec![admin("a", vec![path])]);
+            assert!(
+                matches!(result, Err(ConfigError::PluginConfig { .. })),
+                "{path}"
+            );
+        }
+        assert!(admin_chain(vec![admin("a", vec!["/metrics/v1"])]).is_ok());
     }
 
     #[test]

@@ -99,7 +99,7 @@ Served by the `metrics` plugin, so it exists only when the binary includes the p
 [plugins.metrics]
 ```
 
-Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts.
+Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts. A changed `[plugins.metrics]` table keeps the running counters and is reported in `restart_needed`. Series for a renamed stream, upstream or key are kept until Reiki restarts.
 
 | Metric | Type | Labels |
 | --- | --- | --- |
@@ -109,6 +109,7 @@ Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape t
 | `reiki_rate_limit_rejections_total` | counter | `stream` |
 | `reiki_plugin_rejections_total` | counter | `plugin`, `stream` |
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
+| `reiki_tokens_total` | counter | `stream`, `upstream`, `direction` |
 | `reiki_keys` | gauge | `state` |
 
 `reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value. The `detail` label that a plugin can attach to a finding is not a label here: `reiki_findings_total` ignores it so that the number of series does not grow with the names a plugin reports. Use the request log for per-name counts.
@@ -123,7 +124,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
 
 ## GET /usage
 
-Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
+Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. `requests` counts responses that carried a `usage` object, not every proxied request. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. A response with a `content-encoding` is passed through compressed and is not read, so its usage is not counted. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
 
 ```json
 {"stream":{"upstream":{"input":10,"output":20,"requests":1}}}

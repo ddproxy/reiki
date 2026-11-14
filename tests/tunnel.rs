@@ -134,6 +134,14 @@ fn the_tunnel_section_is_validated() {
             "not a valid allow entry",
         ),
         (
+            "[tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\"example.com.\"]\n",
+            "not a valid allow entry",
+        ),
+        (
+            "[tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\" example.com\"]\n",
+            "not a valid allow entry",
+        ),
+        (
             "[tunnel]\nlisten = \"127.0.0.1:4097\"\nallow = [\"*\"]\n",
             "must differ",
         ),
@@ -144,7 +152,7 @@ fn the_tunnel_section_is_validated() {
         assert!(error.contains(wanted), "{error}");
     }
     assert!(Config::parse(&format!(
-        "{base}[tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\"opencode.ai\"]\n"
+        "{base}[tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\"opencode.ai\", \"[::1]:443\"]\n"
     ))
     .is_ok());
 }

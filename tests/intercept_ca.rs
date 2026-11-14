@@ -159,6 +159,29 @@ fn read(path: &Path) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn startup_and_check_reject_a_ca_whose_key_does_not_match() {
+    let rig = Rig::new("startup-mismatch", "").await;
+    let other = scratch("startup-other");
+    init_ca(&other, &[HOST.to_owned()], 30, false).unwrap();
+    std::fs::copy(other.join("ca.key"), rig.ca_dir.join("ca.key")).unwrap();
+    let text = std::fs::read_to_string(&rig.config).unwrap();
+
+    let config = Config::parse(&text).unwrap();
+    let intercept = config.tunnel.as_ref().unwrap().intercept.as_ref().unwrap();
+    let error = reiki::intercept::check_ca(intercept).unwrap_err();
+    assert!(error.contains("does not match"), "{error}");
+
+    let keys = load_keys(&config).unwrap();
+    let app = App::new(config, keys, Policy::default(), PluginChain::default());
+    let config = Config::parse(&text).unwrap();
+    let intercept = config.tunnel.unwrap().intercept.unwrap();
+    let error = Interceptor::new(app, &intercept)
+        .err()
+        .expect("a mismatched CA is refused");
+    assert!(error.contains("does not match"), "{error}");
+}
+
+#[tokio::test]
 async fn a_reload_swaps_the_ca_for_new_connections() {
     let rig = Rig::new("swap", "").await;
     let old_pem = read(&rig.ca_dir.join("ca.pem"));

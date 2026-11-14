@@ -179,6 +179,44 @@ fn is_edge_block_page(body: &str) -> bool {
     contains_any(body, &["error code: 10"])
 }
 
+/// 403 bodies that establish a bad credential rather than a request-scoped refusal.
+fn names_invalid_credential(body: &str) -> bool {
+    contains_any(
+        body,
+        &[
+            "invalid api key",
+            "api key is invalid",
+            "api key not valid",
+            "api key is not valid",
+            "api key is expired",
+            "api key has expired",
+            "api key is revoked",
+            "api key has been revoked",
+            "api key revoked",
+            "api key is disabled",
+            "api key has been disabled",
+            "incorrect api key",
+            "api key is incorrect",
+            "api_key_invalid",
+            "invalid_api_key",
+            "invalid x-api-key",
+            "invalid credential",
+            "credential is invalid",
+            "credentials are invalid",
+            "credential is revoked",
+            "credential has been revoked",
+            "credential is expired",
+            "credential has expired",
+            "invalid token",
+            "token is invalid",
+            "token is revoked",
+            "token has been revoked",
+            "token is expired",
+            "token has expired",
+        ],
+    )
+}
+
 pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> Outcome {
     classify_at(status, retry_after, body_snippet, SystemTime::now())
 }
@@ -227,8 +265,12 @@ pub fn classify_at(
                 Outcome::PassThrough
             } else if contains_any(&body, &["access is disabled", "free tier", "not enabled"]) {
                 Outcome::KeyFailure(FailureClass::AccessDisabled)
-            } else {
+            } else if names_invalid_credential(&body) {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
+            } else {
+                // A bare 403 usually means a WAF, geo-block or plan/model restriction. Do not
+                // take the key out of rotation for a refusal that may only apply to this request.
+                Outcome::KeyFailure(FailureClass::AccessDisabled)
             }
         }
         500..=599 => {
@@ -387,10 +429,34 @@ mod tests {
             classify(401, None, "invalid api key"),
             Outcome::KeyFailure(FailureClass::Unauthorized)
         );
-        assert_eq!(
-            classify(403, None, "forbidden"),
-            Outcome::KeyFailure(FailureClass::Unauthorized)
-        );
+        for body in [
+            "invalid api key",
+            r#"{"error":{"message":"API key is not valid"}}"#,
+            r#"{"error":{"type":"invalid_api_key"}}"#,
+            "the credential has been revoked",
+            "token has expired",
+        ] {
+            assert_eq!(
+                classify(403, None, body),
+                Outcome::KeyFailure(FailureClass::Unauthorized),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_403_is_a_request_scoped_refusal() {
+        for body in [
+            "forbidden",
+            r#"{"error":{"message":"request blocked by security policy"}}"#,
+            r#"{"error":{"message":"this model is not available on your plan"}}"#,
+        ] {
+            assert_eq!(
+                classify(403, None, body),
+                Outcome::KeyFailure(FailureClass::AccessDisabled),
+                "{body}"
+            );
+        }
     }
 
     #[test]

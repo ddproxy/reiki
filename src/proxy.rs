@@ -1109,14 +1109,50 @@ async fn dispatch_inner(
     upstream_name: &str,
     upstream: &crate::config::Upstream,
     rest: String,
-    mut parts: Parts,
+    parts: Parts,
     body: Body,
     id: &str,
     faithful: bool,
     plugin_session: PluginSession,
 ) -> Response {
-    let rest = rest.as_str();
+    // One event per request, with the status the client got and the upstream that served
+    // it; dropping the future before a response exists reports 499 instead.
     let mut request_done = RequestDone::new(plugin_session.chain().clone(), stream, upstream_name);
+    let response = dispatch_body(
+        app,
+        snapshot,
+        stream,
+        upstream_name,
+        upstream,
+        rest,
+        parts,
+        body,
+        id,
+        faithful,
+        plugin_session,
+        &mut request_done,
+    )
+    .await;
+    request_done.finish(response.status().as_u16());
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_body(
+    app: &App,
+    snapshot: &Snapshot,
+    stream: &str,
+    upstream_name: &str,
+    upstream: &crate::config::Upstream,
+    rest: String,
+    mut parts: Parts,
+    body: Body,
+    id: &str,
+    faithful: bool,
+    plugin_session: PluginSession,
+    request_done: &mut RequestDone<'_>,
+) -> Response {
+    let rest = rest.as_str();
     if has_path_trick(parts.uri.path()) {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1196,15 +1232,6 @@ async fn dispatch_inner(
             .filter(|_| !spent.link_failed)
         {
             tracing::warn!(stream = %stream, from = upstream_name, to = %fallback.upstream, "falling back");
-            let failed = spent
-                .refusal
-                .as_ref()
-                .map_or(StatusCode::SERVICE_UNAVAILABLE, |r| r.1);
-            app.plugins().on_event(&Event::RequestDone {
-                stream,
-                upstream: upstream_name,
-                status: failed.as_u16(),
-            });
             let body = rewrite_body(body, &fallback.model_aliases, &[]);
             let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
             let used = fallback.upstream.as_str();
@@ -1227,7 +1254,7 @@ async fn dispatch_inner(
             .await;
         }
     }
-    let response = match result {
+    match result {
         Ok(response) => response,
         Err(spent) => match spent.refusal {
             Some((key, status, headers, body)) => {
@@ -1236,9 +1263,7 @@ async fn dispatch_inner(
             }
             None => exhausted(snapshot, &app.health, stream),
         },
-    };
-    request_done.finish(response.status().as_u16());
-    response
+    }
 }
 
 /// A request whose chain ran dry; the plugin state lets a fallback continue it.
@@ -2025,6 +2050,8 @@ impl Stream for PluginBody {
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.done = true;
+                    let mut tail = Bytes::new();
+                    this.session.on_response_chunk(&mut tail, true);
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
@@ -2446,6 +2473,54 @@ mod tests {
             &[(Vec::new(), true)],
             "the disconnect must balance with exactly one final call"
         );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_errors_midway_still_gets_one_final_chunk_call() {
+        use futures_util::StreamExt;
+        static CHUNKS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+        struct LastRecorder;
+        impl Plugin for LastRecorder {
+            fn name(&self) -> &str {
+                "last-recorder"
+            }
+            fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+                CHUNKS.lock().unwrap().push(ctx.is_last);
+            }
+        }
+        let registry = vec![Registration {
+            name: "last-recorder",
+            build: |_| Ok(Box::new(LastRecorder) as Box<dyn Plugin>),
+        }];
+        let chain = Arc::new(
+            PluginChain::build(&toml::from_str("[last-recorder]\n").unwrap(), &registry).unwrap(),
+        );
+        let mut session = chain.session();
+        let method = Method::GET;
+        let meta = RequestMeta {
+            id: "",
+            stream: "ct",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/x",
+        };
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"part")),
+            Err(std::io::Error::other("reset")),
+        ];
+        let mut body = PluginBody {
+            session,
+            inner: Box::pin(futures_util::stream::iter(chunks)),
+            done: false,
+        };
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(body.next().await.unwrap().is_err());
+        drop(body);
+        assert_eq!(*CHUNKS.lock().unwrap(), [false, true]);
     }
 
     #[tokio::test]

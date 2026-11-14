@@ -138,7 +138,7 @@ impl FailureKind {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum Event<'a> {
-    /// A request finished with the status the client received.
+    /// A request finished: sent once per request, with the status the client received and the upstream that served it (the fallback after a fallback).
     RequestDone {
         stream: &'a str,
         upstream: &'a str,

@@ -96,10 +96,13 @@ pub fn render_table(keys: &[KeyHealth]) -> String {
             ]
         })
         .collect();
-    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
+            widths[index] = widths[index].max(cell.chars().count());
         }
     }
     let mut out = String::new();
@@ -162,26 +165,35 @@ pub fn check_files(config: &Config) -> Vec<KeyCheck> {
         .map(|(name, key)| {
             let file = PathBuf::from(&key.file);
             let mut issues = Vec::new();
-            match std::fs::metadata(&file) {
+            // Metadata and contents come from one handle, so the file cannot change between
+            // the permission check and the read.
+            match std::fs::File::open(&file) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     issues.push(CheckIssue::Missing);
                 }
                 Err(error) => issues.push(CheckIssue::Unreadable(error.to_string())),
-                Ok(metadata) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = metadata.permissions().mode() & 0o777;
-                        if mode & 0o044 != 0 {
-                            issues.push(CheckIssue::GroupOrWorldReadable(mode));
+                Ok(mut handle) => match handle.metadata() {
+                    Err(error) => issues.push(CheckIssue::Unreadable(error.to_string())),
+                    Ok(metadata) if !metadata.is_file() => {
+                        issues.push(CheckIssue::Unreadable("not a regular file".to_owned()));
+                    }
+                    Ok(metadata) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = metadata.permissions().mode() & 0o777;
+                            if mode & 0o044 != 0 {
+                                issues.push(CheckIssue::GroupOrWorldReadable(mode));
+                            }
+                        }
+                        let mut text = String::new();
+                        match std::io::Read::read_to_string(&mut handle, &mut text) {
+                            Err(error) => issues.push(CheckIssue::Unreadable(error.to_string())),
+                            Ok(_) if text.trim().is_empty() => issues.push(CheckIssue::Empty),
+                            Ok(_) => {}
                         }
                     }
-                    match std::fs::read_to_string(&file) {
-                        Err(error) => issues.push(CheckIssue::Unreadable(error.to_string())),
-                        Ok(text) if text.trim().is_empty() => issues.push(CheckIssue::Empty),
-                        Ok(_) => {}
-                    }
-                }
+                },
             }
             KeyCheck {
                 name: name.clone(),
@@ -230,4 +242,113 @@ pub fn render_check(checks: &[KeyCheck]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn health(name: &str, streams: &[&str]) -> KeyHealth {
+        KeyHealth {
+            name: name.to_owned(),
+            upstream: "zen".to_owned(),
+            state: "ok".to_owned(),
+            cooldown_seconds: None,
+            last_status_code: None,
+            streams: streams.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn parse_status_keeps_key_order_and_lists_streams_in_status_order() {
+        let body = r#"{"keys":[
+            {"name":"b","upstream":"zen","state":"cooling","retry_after_seconds":7,"last_status_code":429},
+            {"name":"a","upstream":"zen","state":"out_of_rotation"},
+            {"name":"c","upstream":"zen","state":"available"}],
+          "streams":[{"name":"s2","chain":["a","b"]},{"name":"s1","chain":["b"]}]}"#;
+        let keys = parse_status(body).unwrap();
+        let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, ["b", "a", "c"]);
+        assert_eq!(keys[0].state, "cooling");
+        assert_eq!(keys[0].cooldown_seconds, Some(7));
+        assert_eq!(keys[0].streams, ["s2", "s1"]);
+        assert_eq!(keys[1].state, "disabled");
+        assert!(keys[2].streams.is_empty());
+        assert!(parse_status(
+            r#"{"keys":[{"name":"a","upstream":"u","state":"weird"}],"streams":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn table_columns_align_by_characters_not_bytes() {
+        let table = render_table(&[health("clé-日本", &["s"]), health("abcdefg", &["s"])]);
+        let columns: Vec<usize> = table
+            .lines()
+            .skip(1)
+            .map(|line| line.chars().take_while(|c| *c != 'z').count())
+            .collect();
+        assert_eq!(columns, [9, 9]);
+        assert!(table.contains("clé-日本   zen"), "{table}");
+        assert_eq!(render_table(&[]), "no keys\n");
+    }
+
+    fn config_for(files: &[(&str, &std::path::Path)]) -> Config {
+        let mut text = String::from("[upstream.zen]\nbase_url = \"http://127.0.0.1:1\"\n");
+        for (name, file) in files {
+            text.push_str(&format!(
+                "[keys.{name}]\nupstream = \"zen\"\nfile = \"{}\"\n",
+                file.display()
+            ));
+        }
+        Config::parse(&text).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_files_flags_modes_directories_empty_and_missing_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reiki-keys-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str, mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let good = write("good", "secret\n", 0o600);
+        let loose = write("loose", "secret\n", 0o644);
+        let empty = write("empty", " \n", 0o600);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let missing = dir.join("missing");
+        let weird = write("clé-日本", "secret", 0o600);
+        let config = config_for(&[
+            ("good", &good),
+            ("loose", &loose),
+            ("empty", &empty),
+            ("dir", &sub),
+            ("missing", &missing),
+            ("weird", &weird),
+        ]);
+        let checks = check_files(&config);
+        let by = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert!(by("good").issues.is_empty());
+        assert_eq!(
+            by("loose").issues,
+            [CheckIssue::GroupOrWorldReadable(0o644)]
+        );
+        assert_eq!(by("empty").issues, [CheckIssue::Empty]);
+        assert_eq!(by("missing").issues, [CheckIssue::Missing]);
+        assert!(matches!(
+            by("dir").issues.as_slice(),
+            [CheckIssue::Unreadable(_)]
+        ));
+        assert!(by("weird").issues.is_empty());
+        assert!(check_has_problems(&checks));
+        let text = render_check(&checks);
+        assert!(text.contains("good: ok"), "{text}");
+        assert!(!text.contains("secret"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

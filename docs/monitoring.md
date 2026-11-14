@@ -99,7 +99,7 @@ Served by the `metrics` plugin, so it exists only when the binary includes the p
 [plugins.metrics]
 ```
 
-Prometheus text exposition, format version 0.0.4. Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts. A changed `[plugins.metrics]` table keeps the running counters and is reported in `restart_needed`. Series for a renamed stream, upstream or key are kept until Reiki restarts.
+Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts each client request once, with the status the client received and the upstream that served it: after a fallback that is the fallback upstream, so the first upstream's refusal is not counted. A client that disconnects before the response is counted as `client_error` (499). Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts. A changed `[plugins.metrics]` table keeps the running counters and is reported in `restart_needed`. Series for a renamed stream, upstream or key are kept until Reiki restarts.
 
 | Metric | Type | Labels |
 | --- | --- | --- |

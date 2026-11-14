@@ -362,7 +362,7 @@ impl Watcher {
                 if now_print != then_print {
                     frames.push(frame(
                         "key",
-                        &json!({"observed_at": observed_at, "upstream": entry}),
+                        &json!({"observed_at": observed_at, "age_seconds": 0, "upstream": entry}),
                     ));
                 }
             }

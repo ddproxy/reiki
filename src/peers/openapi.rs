@@ -37,6 +37,8 @@ fn health_schema() -> Value {
         "properties": {
             "instance": {"type": "string"},
             "observed_at": {"type": "string", "format": "date-time"},
+            "age_seconds": {"type": "integer", "minimum": 0,
+                "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},
             "upstreams": {"type": "array", "items": upstream_schema()},
             "host": {
                 "description": "Only with expose_host_stats",

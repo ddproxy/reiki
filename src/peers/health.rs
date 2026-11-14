@@ -129,6 +129,8 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
     let mut doc = json!({
         "instance": instance_name(peers),
         "observed_at": crate::reload::rfc3339(app.wall_now()),
+        // Every figure is read as the answer is built; a reader adds its own time since receipt.
+        "age_seconds": 0,
         "upstreams": upstreams,
     });
     if peers.expose_host_stats {

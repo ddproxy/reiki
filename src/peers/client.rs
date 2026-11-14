@@ -46,6 +46,9 @@ impl UpstreamHealth {
 pub(crate) struct HealthDoc {
     pub(crate) instance: String,
     pub(crate) observed_at: String,
+    /// How old the figures were when the peer sent them; absent from older publishers.
+    #[serde(default)]
+    pub(crate) age_seconds: Option<u64>,
     pub(crate) upstreams: Vec<UpstreamHealth>,
 }
 
@@ -57,7 +60,8 @@ pub struct PeerReport {
     pub state: &'static str,
     pub error: Option<String>,
     pub instance: Option<String>,
-    /// Seconds between the peer's `observed_at` and this host's clock.
+    /// How old the data is: the age the peer reported plus the time since this host received
+    /// it, or, from a peer that reports no age, `observed_at` against this host's clock.
     pub age_seconds: Option<u64>,
     /// Empty unless `state` is `fresh`, so old data never reads as healthy.
     pub upstreams: Vec<UpstreamHealth>,
@@ -80,34 +84,16 @@ impl PeerReport {
     }
 }
 
-/// Seconds since the Unix epoch of an RFC 3339 UTC time such as `2026-11-13T09:30:00Z`.
+/// Whole seconds since the Unix epoch of an RFC 3339 time: fractional seconds, a lowercase
+/// `t` or `z` and a numeric offset are all accepted.
 pub(crate) fn parse_rfc3339(text: &str) -> Option<i64> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    // The parser also takes a space between date and time; Reiki never sends one, so refuse it.
+    if !matches!(text.as_bytes().get(10), Some(b'T' | b't')) {
         return None;
     }
-    if bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'Z' {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        let part = text.get(range)?;
-        part.bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| part.parse().ok())
-            .flatten()
-    };
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let days = crate::classify::days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(time::OffsetDateTime::unix_timestamp)
 }
 
 fn unix_now(now: SystemTime) -> i64 {
@@ -115,14 +101,21 @@ fn unix_now(now: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// Judges a fetched document against this host's clock: data more than three poll intervals
-/// old, or that far in the future, is unknown.
+/// Judges a document received just now: data more than three poll intervals old is unknown.
+/// The age is the one the peer reports, which needs no agreement between the two clocks; only a
+/// peer that reports none is judged by `observed_at` against this host's clock, and then data
+/// that far in the future is unknown too.
 pub(crate) fn assess(name: &str, doc: HealthDoc, poll: Duration, now: SystemTime) -> PeerReport {
-    let Some(observed) = parse_rfc3339(&doc.observed_at) else {
-        return PeerReport::unknown(name, "observed_at is not an RFC 3339 UTC time".to_owned());
-    };
     let limit = i64::try_from(poll.as_secs().saturating_mul(3)).unwrap_or(i64::MAX);
-    let age = unix_now(now) - observed;
+    let age = match doc.age_seconds {
+        Some(age) => i64::try_from(age).unwrap_or(i64::MAX),
+        None => match parse_rfc3339(&doc.observed_at) {
+            Some(observed) => unix_now(now) - observed,
+            None => {
+                return PeerReport::unknown(name, "observed_at is not an RFC 3339 time".to_owned());
+            }
+        },
+    };
     if age > limit {
         return PeerReport::unknown(name, format!("stale data, {age}s old"));
     }
@@ -503,6 +496,8 @@ impl SseParser {
 #[derive(Deserialize)]
 struct KeyEvent {
     observed_at: String,
+    #[serde(default)]
+    age_seconds: Option<u64>,
     upstream: UpstreamHealth,
 }
 
@@ -575,6 +570,7 @@ async fn follow_stream(
                     "key" => match (serde_json::from_str::<KeyEvent>(&data), doc.as_mut()) {
                         (Ok(key), Some(doc)) => {
                             doc.observed_at = key.observed_at;
+                            doc.age_seconds = key.age_seconds;
                             match doc
                                 .upstreams
                                 .iter_mut()
@@ -674,7 +670,8 @@ pub async fn watch(
             },
             _ = expiry.tick() => {
                 for (report, seen) in reports.iter_mut().zip(&mut received) {
-                    if seen.is_some_and(|at| at.elapsed() > limit) {
+                    let reported = Duration::from_secs(report.age_seconds.unwrap_or(0));
+                    if seen.is_some_and(|at| reported + at.elapsed() > limit) {
                         *report = PeerReport::unknown(&report.name, format!("no data for over {}s", limit.as_secs()));
                         *seen = None;
                         changed = true;
@@ -688,7 +685,8 @@ pub async fn watch(
         let mut shown = reports.clone();
         for (report, seen) in shown.iter_mut().zip(&received) {
             if let Some(at) = seen {
-                report.age_seconds = Some(at.elapsed().as_secs());
+                let reported = report.age_seconds.unwrap_or(0);
+                report.age_seconds = Some(reported.saturating_add(at.elapsed().as_secs()));
             }
         }
         let text = if json {
@@ -749,6 +747,7 @@ mod tests {
         HealthDoc {
             instance: "ct-4".to_owned(),
             observed_at: observed_at.to_owned(),
+            age_seconds: None,
             upstreams: vec![UpstreamHealth {
                 name: "zen".to_owned(),
                 healthy_keys: 0,
@@ -782,11 +781,52 @@ mod tests {
             "2026-11-13T09:30:00",
             "2026-13-13T09:30:00Z",
             "2026-11-13T24:30:00Z",
-            "2026-11-13T09:30:00+01:00",
             "+026-11-13T09:30:00Z",
+            "2026-11-13T09:30:00+0100",
+            "2026-11-13T09:30:00.Z",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn rfc3339_accepts_fractions_lowercase_and_offsets() {
+        let base = parse_rfc3339("2026-11-13T09:30:00Z").unwrap();
+        for (text, expected) in [
+            ("2026-11-13T09:30:00.5Z", base),
+            ("2026-11-13T09:30:00.123456789Z", base),
+            ("2026-11-13t09:30:00z", base),
+            ("2026-11-13T10:30:00+01:00", base),
+            ("2026-11-13T04:00:00-05:30", base),
+            ("2026-11-13T09:30:00+00:00", base),
+            ("2026-11-13T09:30:00-00:00", base),
+            ("2026-11-13T10:30:00.25+01:00", base),
+        ] {
+            assert_eq!(parse_rfc3339(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_reported_age_decides_freshness_whatever_the_clocks_say() {
+        let poll = Duration::from_secs(30);
+        let now = at("2026-11-13T10:00:00Z");
+        let aged = |observed_at: &str, age: u64| HealthDoc {
+            age_seconds: Some(age),
+            ..doc(observed_at)
+        };
+        for skewed in ["2026-11-13T07:00:00Z", "2026-11-13T13:00:00Z"] {
+            let report = assess("ct-4", aged(skewed, 0), poll, now);
+            assert!(report.is_fresh(), "a peer clock off by hours: {report:?}");
+            assert_eq!(report.age_seconds, Some(0));
+        }
+        let report = assess("ct-4", aged("2026-11-13T10:00:00Z", 90), poll, now);
+        assert!(report.is_fresh());
+        assert_eq!(report.age_seconds, Some(90));
+        let report = assess("ct-4", aged("2026-11-13T10:00:00Z", 91), poll, now);
+        assert_eq!(report.state, "unknown", "too old by its own account");
+        assert!(report.error.unwrap().contains("stale"));
+        let report = assess("ct-4", aged("not a time", 0), poll, now);
+        assert!(report.is_fresh(), "observed_at is not needed with an age");
     }
 
     #[test]

@@ -21,7 +21,7 @@ listen = "127.0.0.1:4099"          # required to publish; its own socket; loopba
 # tls_key = "/etc/reiki/peers/listener.key"    # its PEM key, mode 0600
 # tls_key_permissions = "error"    # or "warn" to load a key group or others can access
 peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; this or [[peers.tokens]] to publish
-# instance = "ct-1"                # published name; the host name by default
+# instance = "ct-1"                # published name; "reiki" by default
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
 expose_host_stats = false          # publish load, memory, disk use and active sessions
@@ -52,7 +52,7 @@ Validation, at startup, on reload and in `reiki check`:
 - Without them the peer listener serves plain HTTP, so `listen` must be a loopback address; any other address is refused. Reach it from another host through a tunnel you control (WireGuard, `ssh -L`) or a TLS-terminating proxy, or turn TLS on.
 - A peer `url` uses https, or plain http only on a loopback address, and carries no credentials, query or fragment. An https peer needs `ca_file`.
 
-`instance` (optional) sets the name published as `instance`, with the same character rules as a peer name; without it the host name is used. A change to `listen`, or turning publishing on or off, needs a restart and shows in a reload's `restart_needed` as `peers.listen`. The tokens and the other settings apply on reload, and a reload that turns publishing off makes the listener answer 404 at once.
+`instance` (optional) sets the name published as `instance`, with the same character rules as a peer name; without it the instance is published as `reiki`. The host name is never used, so a host, container or node name does not leave the host unless you set it here. A change to `listen`, or turning publishing on or off, needs a restart and shows in a reload's `restart_needed` as `peers.listen`. The tokens and the other settings apply on reload, and a reload that turns publishing off makes the listener answer 404 at once.
 
 ## TLS on the peer listener
 

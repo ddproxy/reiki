@@ -230,7 +230,7 @@ pub struct PeersConfig {
     pub peer_token_sha256: Option<String>,
     /// Every peer token, the shorthand first; publishing needs at least one.
     pub tokens: Vec<PeerToken>,
-    /// Name published as `instance`; the host name when unset.
+    /// Name published as `instance`; `reiki` when unset.
     pub instance: Option<String>,
     /// Reader poll period; data older than three of them counts as unknown.
     pub poll_interval_secs: u64,

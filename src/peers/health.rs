@@ -89,26 +89,16 @@ pub(crate) fn upstreams(
     out
 }
 
-/// The name this instance publishes: the configured one, or the host name.
+/// The name this instance publishes: the configured one, or a fixed `reiki`, so a host,
+/// container or node name never leaves the host unless the operator sets it.
 pub(crate) fn instance_name(peers: &PeersConfig) -> String {
-    if let Some(name) = &peers.instance {
-        return name.clone();
-    }
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|path| {
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|text| text.trim().to_owned())
-                .filter(|name| !name.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|name| !name.is_empty())
-        })
-        .unwrap_or_else(|| "reiki".to_owned())
+    peers
+        .instance
+        .clone()
+        .unwrap_or_else(|| DEFAULT_INSTANCE.to_owned())
 }
+
+const DEFAULT_INSTANCE: &str = "reiki";
 
 /// The whole `/v1/health` answer for the current snapshot and key health.
 pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
@@ -300,6 +290,16 @@ mod tests {
         let exact = &upstreams(&config, &health, now, true, 0)[1];
         assert_eq!(exact["soonest_cooldown_seconds"], 10);
         assert_eq!(exact["keys"][1]["cooldown_seconds"], 301);
+    }
+
+    #[test]
+    fn the_instance_defaults_to_a_fixed_name_not_the_host_name() {
+        let parse = |text: &str| Config::parse(text).unwrap().peers.expect("a [peers] table");
+        assert_eq!(instance_name(&parse("[peers]\n")), "reiki");
+        assert_eq!(
+            instance_name(&parse("[peers]\ninstance = \"ct-4\"\n")),
+            "ct-4"
+        );
     }
 
     #[test]

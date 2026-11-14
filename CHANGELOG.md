@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.1
 
 ### Added
 
@@ -13,6 +13,10 @@
 
 ### Fixed
 
+- A placeholder fragment held back when a stream ends is flushed instead of lost, and a placeholder split right after its first `[` is rejoined.
+- Placeholder ids are 64-bit, and an id is never shared by two different values in a request.
+- PHI and finance table scanning continues past a ragged row instead of stopping at it; a blank line still ends the table.
+- The request log masks credential values in form-encoded and other `k=v&k=v` bodies, in requests and responses.
 - The PHI, finance and controlled detectors find an identifier or banner right after a JSON-escaped `\n`, `\t` or `\r`; a multi-line prompt used to hide an SSN or card number from them.
 - A detector in block mode fails closed if it panics, instead of forwarding the unscanned body.
 - Overlapping masked terms, or a term overlapping a credential, are masked as one span, so no tail reaches the upstream.

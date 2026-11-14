@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- The built-in credential masks cover more vendor formats: Slack `xoxc-`, `xoxd-` (cookie, including its percent-encoded and base64 characters), `xoxe-`, `xoxr-` and `xapp-`; Anthropic `sk-ant-`; Google `GOCSPX-`; the other GitLab token kinds; Grafana, Sentry, Square, Shopify, DigitalOcean, Notion, Postman, PlanetScale, Netlify, HashiCorp, Pulumi, Linear OAuth, LangSmith, PostHog, Sourcegraph, Cloudflare, RubyGems, Bitbucket, Databricks and Fireworks keys; and age secret keys.
+
 ## 0.9.0
 
 ### Added

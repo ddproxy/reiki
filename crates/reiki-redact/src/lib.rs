@@ -22,6 +22,11 @@ const PREFIXES: &[(&str, usize)] = &[
     ("xoxp-", 20),
     ("xoxa-", 20),
     ("xoxs-", 20),
+    ("xoxc-", 20),
+    ("xoxd-", 20),
+    ("xoxe-", 20),
+    ("xoxr-", 20),
+    ("xapp-", 20),
     ("eyJ", 40),
     ("sk_live_", 16),
     ("sk_test_", 16),
@@ -48,7 +53,50 @@ const PREFIXES: &[(&str, usize)] = &[
     ("hvs.", 20),
     ("pypi-", 50),
     ("ATATT3", 30),
+    ("ATBB", 30),
+    ("sk-ant-", 20),
+    ("GOCSPX-", 20),
+    ("gldt-", 16),
+    ("glrt-", 16),
+    ("glcbt-", 16),
+    ("glimt-", 16),
+    ("glft-", 16),
+    ("glsoat-", 16),
+    ("glc_", 30),
+    ("glsa_", 30),
+    ("rk_test_", 16),
+    ("sq0atp-", 20),
+    ("sq0csp-", 30),
+    ("shpca_", 30),
+    ("shpss_", 30),
+    ("shppa_", 30),
+    ("doo_v1_", 40),
+    ("dor_v1_", 40),
+    ("sntrys_", 30),
+    ("sntryu_", 30),
+    ("ntn_", 30),
+    ("PMAK-", 30),
+    ("pscale_tkn_", 20),
+    ("pscale_pw_", 20),
+    ("pscale_oauth_", 20),
+    ("nfp_", 30),
+    ("hvb.", 20),
+    ("pul-", 30),
+    ("lin_oauth_", 30),
+    ("lsv2_pt_", 30),
+    ("lsv2_sk_", 30),
+    ("phc_", 30),
+    ("phx_", 30),
+    ("sgp_", 30),
+    ("cfut_", 30),
+    ("rubygems_", 30),
+    ("AGE-SECRET-KEY-", 30),
+    ("dapi", 32),
+    ("fw_", 20),
 ];
+
+/// Prefixes whose tokens carry URL-encoded or base64 characters, so the token runs on through them.
+const WIDE: &[&str] = &["xoxd-"];
 
 const BEARER: &[u8] = b"bearer ";
 const BEARER_MIN: usize = 16;
@@ -72,6 +120,13 @@ fn is_token(byte: u8) -> bool {
 
 fn token_len(bytes: &[u8]) -> usize {
     bytes.iter().take_while(|b| is_token(**b)).count()
+}
+
+fn wide_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|b| is_token(**b) || matches!(**b, b'%' | b'+' | b'/' | b'='))
+        .count()
 }
 
 /// Every credential-shaped range in `text`, in order and never overlapping.
@@ -119,7 +174,11 @@ pub fn scan(text: &str) -> Vec<Span> {
         for (prefix, min) in PREFIXES {
             if bytes[i..].starts_with(prefix.as_bytes()) {
                 let after = i + prefix.len();
-                let len = token_len(&bytes[after..]);
+                let len = if WIDE.contains(prefix) {
+                    wide_len(&bytes[after..])
+                } else {
+                    token_len(&bytes[after..])
+                };
                 if len >= *min {
                     spans.push(Span {
                         start: i,
@@ -257,6 +316,38 @@ mod tests {
         assert_eq!(partial_tail("ask-0123"), None);
         assert_eq!(partial_tail("a Bearer of news"), None);
         assert_eq!(partial_tail(""), None);
+    }
+
+    #[test]
+    fn slack_cookie_and_app_tokens_are_found() {
+        let d = fake("xoxd-", "abc%2Bdef%2Fghi%3D%3Dklmnopqrstuv");
+        let c = fake("xoxc-", "1234567890-1234567890-abcdefghij");
+        let a = fake("xapp-", "1-A0123456789-0123456789-abcdef");
+        let text = format!("cookie {d} header {c} app {a};");
+        assert_eq!(found(&text), vec![d.as_str(), c.as_str(), a.as_str()]);
+    }
+
+    #[test]
+    fn newer_vendor_prefixes_are_found() {
+        let cases = [
+            fake("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz"),
+            fake("GOCSPX-", "abcdefghijklmnopqrstuvwx"),
+            fake("glsa_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            fake("sntrys_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            fake("AGE-SECRET-KEY-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+            fake("cfut_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        ];
+        for key in cases {
+            let text = format!("x {key} y");
+            assert_eq!(found(&text), vec![key.as_str()]);
+        }
+    }
+
+    #[test]
+    fn short_vendor_lookalikes_are_left_alone() {
+        for word in ["dapi_client", "fw_config", "phc_id", "pul-down", "ntn_key"] {
+            assert!(scan(word).is_empty(), "{word}");
+        }
     }
 
     #[test]

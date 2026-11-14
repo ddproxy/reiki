@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::mask::{HEAD, TAIL};
 
@@ -57,14 +57,47 @@ fn restore(text: &str, reverse: &HashMap<String, String>, secrets: bool) -> Stri
 
 /// Where a placeholder that has only partly arrived begins, or the text length when none does.
 pub fn incomplete_start(text: &str) -> usize {
-    let Some(at) = text.rfind("[[") else {
-        return text.len();
-    };
-    let tail = &text[at..];
-    if tail.len() > MAX_PLACEHOLDER || tail.contains(TAIL) || !looks_partial(tail) {
-        return text.len();
-    }
-    at
+    // A placeholder is at most MAX_PLACEHOLDER bytes, so only the last window can hold an unfinished one.
+    let from = text.len().saturating_sub(MAX_PLACEHOLDER);
+    (from..text.len())
+        .find(|&at| {
+            text.as_bytes()[at] == b'[' && {
+                let tail = &text[at..];
+                !tail.contains(TAIL) && looks_partial(tail)
+            }
+        })
+        .unwrap_or(text.len())
+}
+
+/// True when `text` could end, or contain, the start of a placeholder: a `[[` pair, or a lone `[`
+/// that closes a JSON string (`["`), a raw line or the text. Other events keep their exact bytes.
+fn may_hold(text: &str) -> bool {
+    text.contains("[[")
+        || text.match_indices('[').any(|(at, _)| {
+            matches!(
+                text.as_bytes().get(at + 1),
+                None | Some(b'"' | b'\n' | b'\r')
+            )
+        })
+}
+
+/// The smallest JSON value that carries `text` at `at`, shaped like the stream's own events.
+fn field_event(at: &[Seg], text: &str) -> Value {
+    at.iter()
+        .rev()
+        .fold(Value::String(text.to_owned()), |inner, seg| match seg {
+            Seg::Key(key) => {
+                let mut map = Map::new();
+                map.insert(key.clone(), inner);
+                Value::Object(map)
+            }
+            Seg::Index(index) => {
+                let mut items = vec![Value::Null; *index];
+                items.push(inner);
+                Value::Array(items)
+            }
+            Seg::Raw => inner,
+        })
 }
 
 fn looks_partial(tail: &str) -> bool {
@@ -79,6 +112,14 @@ fn looks_partial(tail: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Where a held tail belongs: a JSON key or array index, or the text of a payload that is not JSON.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Seg {
+    Key(String),
+    Index(usize),
+    Raw,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Idle,
@@ -90,8 +131,8 @@ enum Mode {
 pub struct Restorer {
     mode: Mode,
     buf: Vec<u8>,
-    /// Partial placeholders held back per JSON field until the next event completes them.
-    held: HashMap<String, String>,
+    /// Partial placeholders held back per field until the next event completes them.
+    held: HashMap<Vec<Seg>, String>,
     cap: usize,
     given_up: bool,
     /// Whether credentials are restored inside tool-call arguments too.
@@ -240,17 +281,21 @@ impl Restorer {
         if self.buf.len() > self.cap {
             // No event boundary within the cap: stop buffering and pass the rest through.
             self.given_up = true;
+            out.extend(self.flush().into_bytes());
             out.extend(std::mem::take(&mut self.buf));
         }
         if is_last && !self.buf.is_empty() {
             let rest = std::mem::take(&mut self.buf);
             out.extend(self.event(&rest, reverse));
         }
-        if is_last && !self.held.is_empty() {
-            tracing::debug!(
-                fields = self.held.len(),
-                "placeholders: stream ended mid-placeholder"
-            );
+        if is_last {
+            if !self.held.is_empty() {
+                tracing::debug!(
+                    fields = self.held.len(),
+                    "placeholders: stream ended mid-placeholder"
+                );
+            }
+            out.extend(self.flush().into_bytes());
         }
         *chunk = Bytes::from(out);
     }
@@ -259,8 +304,7 @@ impl Restorer {
         let Ok(text) = std::str::from_utf8(event) else {
             return event.to_vec();
         };
-        // Skipping events with no `[[` keeps most events byte-exact.
-        if self.held.is_empty() && !text.contains("[[") {
+        if self.held.is_empty() && !may_hold(text) {
             return event.to_vec();
         }
         let mut out = String::with_capacity(text.len());
@@ -270,6 +314,9 @@ impl Restorer {
             match body.strip_prefix("data:") {
                 Some(rest) => {
                     let payload = rest.strip_prefix(' ').unwrap_or(rest);
+                    if payload.trim() == "[DONE]" {
+                        out.push_str(&self.flush());
+                    }
                     out.push_str("data: ");
                     out.push_str(&self.payload(payload, reverse));
                     out.push_str(eol);
@@ -286,29 +333,37 @@ impl Restorer {
         }
         match serde_json::from_str::<Value>(payload) {
             Ok(mut value) => {
-                self.walk("", &mut value, reverse);
+                self.walk(&mut Vec::new(), false, &mut value, reverse);
                 value.to_string()
             }
-            Err(_) => self.text_at("data", payload, reverse),
+            Err(_) => self.text_at(&[Seg::Raw], false, payload, reverse),
         }
     }
 
-    fn walk(&mut self, path: &str, value: &mut Value, reverse: &HashMap<String, String>) {
+    /// Restores every string in `value`; `at` is where it sits and `in_call` whether that is inside a
+    /// tool call.
+    fn walk(
+        &mut self,
+        at: &mut Vec<Seg>,
+        in_call: bool,
+        value: &mut Value,
+        reverse: &HashMap<String, String>,
+    ) {
         match value {
-            Value::String(text) => *text = self.text_at(path, text, reverse),
+            Value::String(text) => *text = self.text_at(at, in_call, text, reverse),
             Value::Array(items) => {
                 for (i, item) in items.iter_mut().enumerate() {
-                    self.walk(&format!("{path}[{i}]"), item, reverse);
+                    at.push(Seg::Index(i));
+                    self.walk(at, in_call, item, reverse);
+                    at.pop();
                 }
             }
             Value::Object(map) => {
-                let base = if declares_tool_call(map) {
-                    format!("{path}.tool_use")
-                } else {
-                    path.to_owned()
-                };
+                let in_call = in_call || declares_tool_call(map);
                 for (key, item) in map.iter_mut() {
-                    self.walk(&format!("{base}.{key}"), item, reverse);
+                    at.push(Seg::Key(key.clone()));
+                    self.walk(at, in_call || in_tool_call(key), item, reverse);
+                    at.pop();
                 }
             }
             _ => {}
@@ -316,17 +371,34 @@ impl Restorer {
     }
 
     /// Restores `text` after any tail held for this field, holding back a new partial placeholder.
-    fn text_at(&mut self, path: &str, text: &str, reverse: &HashMap<String, String>) -> String {
-        let mut combined = self.held.remove(path).unwrap_or_default();
+    fn text_at(
+        &mut self,
+        at: &[Seg],
+        in_call: bool,
+        text: &str,
+        reverse: &HashMap<String, String>,
+    ) -> String {
+        let mut combined = self.held.remove(at).unwrap_or_default();
         combined.push_str(text);
-        let restored = restore(&combined, reverse, self.tool_args || !in_tool_call(path));
+        let restored = restore(&combined, reverse, self.tool_args || !in_call);
         let keep = incomplete_start(&restored);
         if keep == restored.len() {
             return restored;
         }
-        self.held
-            .insert(path.to_owned(), restored[keep..].to_owned());
+        self.held.insert(at.to_vec(), restored[keep..].to_owned());
         restored[..keep].to_owned()
+    }
+
+    /// Every held tail as its own event, so a stream that ends mid-placeholder still delivers its text.
+    fn flush(&mut self) -> String {
+        let mut held: Vec<(Vec<Seg>, String)> = self.held.drain().collect();
+        held.sort();
+        held.iter()
+            .map(|(at, text)| match at.as_slice() {
+                [Seg::Raw] => format!("data: {text}\n\n"),
+                _ => format!("data: {}\n\n", field_event(at, text)),
+            })
+            .collect()
     }
 }
 
@@ -428,7 +500,7 @@ fn event_len(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    const FALCON: &str = "[[REIKI_TERM_aaaaaaaa]]";
+    const FALCON: &str = "[[REIKI_TERM_aaaaaaaaaaaaaaaa]]";
 
     fn reverse() -> HashMap<String, String> {
         HashMap::from([(FALCON.to_owned(), "Falcon".to_owned())])
@@ -468,10 +540,10 @@ mod tests {
 
     #[test]
     fn complete_placeholders_are_restored_and_unknown_ones_left_alone() {
-        let text = format!("a {FALCON} b [[REIKI_TERM_bbbbbbbb]] c [[REIKI_ d");
+        let text = format!("a {FALCON} b [[REIKI_TERM_bbbbbbbbbbbbbbbb]] c [[REIKI_ d");
         assert_eq!(
             restore_text(&text, &reverse()),
-            "a Falcon b [[REIKI_TERM_bbbbbbbb]] c [[REIKI_ d"
+            "a Falcon b [[REIKI_TERM_bbbbbbbbbbbbbbbb]] c [[REIKI_ d"
         );
         assert_eq!(
             restore_text(&format!("{FALCON}{FALCON}"), &reverse()),
@@ -485,10 +557,12 @@ mod tests {
         assert_eq!(incomplete_start("see [["), 4);
         assert_eq!(incomplete_start("see [[REI"), 4);
         assert_eq!(incomplete_start("see [[REIKI_TERM_aa"), 4);
-        assert_eq!(incomplete_start("see [[REIKI_TERM_aaaaaaaa]"), 4);
+        assert_eq!(incomplete_start("see [[REIKI_TERM_aaaaaaaaaaaaaaaa]"), 4);
         // Finished, unrelated or too long: nothing to hold.
-        assert_eq!(incomplete_start("see [[REIKI_TERM_aaaaaaaa]]"), 27);
-        assert_eq!(incomplete_start("list [1] and ["), 14);
+        assert_eq!(incomplete_start("see [[REIKI_TERM_aaaaaaaaaaaaaaaa]]"), 35);
+        // A lone bracket may start a placeholder, so it is held; a closed one is not.
+        assert_eq!(incomplete_start("list [1] and ["), 13);
+        assert_eq!(incomplete_start("list [1] and"), 12);
         assert_eq!(incomplete_start("json [[1, 2"), 11);
         let long = format!("x [[REIKI_{}", "A".repeat(60));
         assert_eq!(incomplete_start(&long), long.len());
@@ -497,7 +571,7 @@ mod tests {
     #[test]
     fn a_placeholder_split_across_events_is_restored_whole() {
         let e1 = event("The [[REI");
-        let e2 = event("KI_TERM_aaaaaaaa]] plan");
+        let e2 = event("KI_TERM_aaaaaaaaaaaaaaaa]] plan");
         let done = "data: [DONE]\n\n";
         let out = run_stream(&[e1.as_bytes(), e2.as_bytes(), done.as_bytes()]);
         assert_eq!(contents(&out), "The Falcon plan");
@@ -508,7 +582,7 @@ mod tests {
     fn the_result_does_not_depend_on_where_the_network_splits_the_stream() {
         let whole = [
             event("go [[REIKI_TERM_"),
-            event("aaaaaaaa]] now"),
+            event("aaaaaaaaaaaaaaaa]] now"),
             "data: [DONE]\n\n".to_owned(),
         ]
         .concat();
@@ -595,7 +669,7 @@ mod tests {
         assert_eq!(&chunk[..], FALCON.as_bytes());
     }
 
-    const SECRET: &str = "[[REIKI_SECRET_cccccccc]]";
+    const SECRET: &str = "[[REIKI_SECRET_cccccccccccccccc]]";
 
     fn secret_reverse() -> HashMap<String, String> {
         HashMap::from([
@@ -694,6 +768,73 @@ mod tests {
             .replace(&format!("hi {FALCON}"), "hi Falcon")
             .replace(&format!("\\\" {SECRET}\"}}"), "\\\" tok-123\"}");
         assert_eq!(String::from_utf8(chunk.to_vec()).unwrap(), want);
+    }
+
+    #[test]
+    fn a_lone_open_bracket_at_the_end_of_an_event_is_held_and_rejoined() {
+        let e1 = event("Array [");
+        let e2 = event("[REIKI_TERM_aaaaaaaaaaaaaaaa]] end");
+        let out = run_stream(&[e1.as_bytes(), e2.as_bytes(), b"data: [DONE]\n\n"]);
+        assert_eq!(contents(&out), "Array Falcon end");
+        assert!(!String::from_utf8_lossy(&out).contains("REIKI"));
+    }
+
+    #[test]
+    fn a_held_tail_at_the_end_of_the_stream_is_flushed_on_done() {
+        for tail in ["Array [", "Array [[", "Array [[REIKI_TERM_aa"] {
+            let e = event(tail);
+            let out = run_stream(&[e.as_bytes(), b"data: [DONE]\n\n"]);
+            assert_eq!(contents(&out), tail, "held tail lost");
+            assert!(String::from_utf8_lossy(&out).ends_with("data: [DONE]\n\n"));
+        }
+    }
+
+    #[test]
+    fn a_held_tail_is_flushed_when_the_last_chunk_has_no_done_event() {
+        let e1 = event("see [[");
+        let e2 = event("done [");
+        let out = run_stream(&[e1.as_bytes(), e2.as_bytes()]);
+        assert_eq!(contents(&out), "see [[done [");
+    }
+
+    #[test]
+    fn a_held_tail_flushed_at_the_end_is_not_restored_into_a_partial_placeholder() {
+        let e = event("left [[REIKI_TERM_aaaa");
+        let out = run_stream(&[e.as_bytes(), b"data: [DONE]\n\n"]);
+        assert_eq!(contents(&out), "left [[REIKI_TERM_aaaa");
+    }
+
+    #[test]
+    fn a_split_secret_placeholder_after_its_first_bracket_is_restored() {
+        let e1 = event("token [");
+        let e2 = event("[REIKI_SECRET_cccccccccccccccc]] ok");
+        let mut restorer = Restorer::new(1024, false);
+        restorer.start(Some("text/event-stream"), false);
+        let mut out = Vec::new();
+        for part in [e1.as_bytes(), e2.as_bytes(), b"data: [DONE]\n\n"] {
+            let mut chunk = Bytes::copy_from_slice(part);
+            restorer.feed(&mut chunk, false, &secret_reverse());
+            out.extend_from_slice(&chunk);
+        }
+        assert_eq!(contents(&out), "token tok-123 ok");
+    }
+
+    #[test]
+    fn a_held_tail_is_flushed_before_the_done_event_and_only_once() {
+        let e = event("x [");
+        let done = "data: [DONE]\n\n";
+        let out = String::from_utf8(run_stream(&[e.as_bytes(), done.as_bytes()])).unwrap();
+        assert_eq!(out.matches("[DONE]").count(), 1);
+        assert_eq!(contents(out.as_bytes()), "x [");
+        let mut restorer = Restorer::new(1024, true);
+        restorer.start(Some("text/event-stream"), false);
+        let mut first = Bytes::from(event("x ["));
+        restorer.feed(&mut first, false, &reverse());
+        let mut second = Bytes::from(done);
+        restorer.feed(&mut second, false, &reverse());
+        let mut third = Bytes::new();
+        restorer.feed(&mut third, true, &reverse());
+        assert!(third.is_empty(), "nothing left to flush twice");
     }
 
     #[test]

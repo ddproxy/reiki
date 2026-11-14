@@ -30,11 +30,11 @@ A [reload](troubleshooting.md#reload) re-reads `terms_file` when the file change
 
 ## What it does
 
-A masked value becomes `[[REIKI_TERM_9b2e41ff]]` (a term) or `[[REIKI_SECRET_3f9a1c07]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id.
+A masked value becomes `[[REIKI_TERM_9b2e41f0c3a7d652]]` (a term) or `[[REIKI_SECRET_3f9a1c07e5b08d41]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id.
 
 Responses are restored as they stream. JSON and other bodies are held until they end, then restored. A JSON body that carries tool calls is walked as JSON so credential placeholders can stay masked in them (see `restore_tool_args`); only the string values that change are rewritten, so key order, spacing and number formatting survive byte for byte.
 
-For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41ff]]`, is held back from the first event and completed with the second. Events without `[[` keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
+For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41f0c3a7d652]]`, is held back from the first event and completed with the second, and a lone `[` at the end of a field is held the same way. A held fragment that is still unfinished when the stream ends, at `[DONE]` or at the last chunk, is sent as plain text. Events with no placeholder start keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
 
 Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plugins-at-build-time)); the default build registers `placeholders` before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response and the originals are restored only afterwards.
 
@@ -44,5 +44,5 @@ Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plu
 - Only the request body is masked, as raw text: header values, the path and the query string are not, and JSON object keys are masked like any other text.
 - A model can paraphrase or transform a value instead of repeating the placeholder. Whatever it writes back that is not a placeholder is delivered as it is.
 - A request body with a `Content-Encoding` other than `identity`, or that is not valid UTF-8 text, cannot be masked and is refused with 415 rather than sent raw. `Content-Encoding: identity` is a no-op and does not prevent masking.
-- A response with a `Content-Encoding` other than `identity` is not restored, and a stream that ends in the middle of a placeholder loses that fragment.
+- A response with a `Content-Encoding` other than `identity` is not restored, and a stream that ends in the middle of a placeholder sends that unfinished fragment as plain text, unrestored.
 - Matching is by substring, so a term inside a longer word is masked too. Choose terms accordingly.

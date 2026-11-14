@@ -306,9 +306,12 @@ mod tests {
             p.as_ref(),
             &mut state,
             "application/json",
-            &["[[REIKI_TERM_aaaaaaaa]]"],
+            &["[[REIKI_TERM_aaaaaaaaaaaaaaaa]]"],
         );
-        assert_eq!(got, "[[REIKI_TERM_aaaaaaaa]]", "not ours, so not touched");
+        assert_eq!(
+            got, "[[REIKI_TERM_aaaaaaaaaaaaaaaa]]",
+            "not ours, so not touched"
+        );
     }
 
     #[test]

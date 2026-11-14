@@ -136,17 +136,35 @@ impl Masker {
             Kind::Secret => ("SECRET", original.to_owned()),
             Kind::Term => ("TERM", fold(original).into_iter().collect()),
         };
-        let mut hasher = Sha256::new();
-        hasher.update(self.salt);
-        hasher.update(label.as_bytes());
-        hasher.update(basis.as_bytes());
-        let digest = hasher.finalize();
-        let id: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
-        let placeholder = format!("{HEAD}{label}_{id}{TAIL}");
-        reverse
-            .entry(placeholder.clone())
-            .or_insert_with(|| original.to_owned());
-        placeholder
+        // Two values can share a truncated digest; a taken id is re-derived with the next counter so
+        // no id ever stands for two originals.
+        let mut counter: u32 = 0;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(self.salt);
+            hasher.update(label.as_bytes());
+            hasher.update(counter.to_le_bytes());
+            hasher.update(basis.as_bytes());
+            let digest = hasher.finalize();
+            let id: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let placeholder = format!("{HEAD}{label}_{id}{TAIL}");
+            match reverse.get(&placeholder) {
+                Some(existing) if !same_value(kind, existing, original) => counter += 1,
+                Some(_) => return placeholder,
+                None => {
+                    reverse.insert(placeholder.clone(), original.to_owned());
+                    return placeholder;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `existing` is the original of the same value, which for a term is any casing of it.
+fn same_value(kind: Kind, existing: &str, original: &str) -> bool {
+    match kind {
+        Kind::Term => fold(existing) == fold(original),
+        _ => existing == original,
     }
 }
 
@@ -467,6 +485,46 @@ mod tests {
         assert_eq!(got, want);
         assert_eq!(got_reverse, want_reverse);
         assert!(got_reverse.len() > 100, "many terms should be exercised");
+    }
+
+    #[test]
+    fn a_placeholder_id_is_sixty_four_bits() {
+        let m = masker(&[], true);
+        let mut reverse = HashMap::new();
+        let p = m.placeholder(Kind::Secret, "tok-123", &mut reverse);
+        let id = p
+            .strip_prefix("[[REIKI_SECRET_")
+            .and_then(|rest| rest.strip_suffix("]]"))
+            .unwrap();
+        assert_eq!(id.len(), 16, "{p}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{p}");
+    }
+
+    #[test]
+    fn an_id_taken_by_another_value_is_never_reused() {
+        let m = masker(&[], true);
+        let taken = m.placeholder(Kind::Secret, "value-b", &mut HashMap::new());
+        let mut reverse = HashMap::from([(taken.clone(), "value-a".to_owned())]);
+
+        let got = m.placeholder(Kind::Secret, "value-b", &mut reverse);
+        assert_ne!(got, taken, "a second value must not reuse the id");
+        assert_eq!(reverse[&got], "value-b");
+        assert_eq!(reverse[&taken], "value-a", "the first original is kept");
+
+        let again = m.placeholder(Kind::Secret, "value-b", &mut reverse);
+        assert_eq!(again, got, "the same value keeps its placeholder");
+    }
+
+    #[test]
+    fn case_variants_of_a_term_still_share_one_placeholder_after_a_collision() {
+        let m = masker(&["Falcon"], false);
+        let taken = m.placeholder(Kind::Term, "falcon", &mut HashMap::new());
+        let mut reverse = HashMap::from([(taken.clone(), "other".to_owned())]);
+        let a = m.placeholder(Kind::Term, "Falcon", &mut reverse);
+        let b = m.placeholder(Kind::Term, "FALCON", &mut reverse);
+        assert_eq!(a, b);
+        assert_ne!(a, taken);
+        assert_eq!(reverse.len(), 2);
     }
 
     #[test]

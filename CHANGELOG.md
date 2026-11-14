@@ -9,7 +9,7 @@
 ### Changed
 
 - `reiki_requests_total` counts a fallback request once, under the upstream that served it, instead of also counting the primary's refusal.
-- The state file records the byte length of each key file, so a rotated key is detected even when the file keeps its mtime.
+- The state file records a SHA-256 of each key, so a rotated key is detected even when the file keeps its modified time. Older state without it still uses the modified time.
 - A 403 whose body does not name an invalid, expired or revoked credential no longer disables the key permanently; the key is treated as access-denied for that request, so a WAF or model-plan refusal cannot take a key out of rotation. A 401, or a 403 naming a bad credential, still disables it.
 - The `metrics` docs now state that series for a renamed stream, upstream or key are kept until Reiki restarts; they are not pruned on reload.
 

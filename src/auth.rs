@@ -50,11 +50,15 @@ impl From<&crate::config::AuthConfig> for ThrottleSettings {
 pub const MIN_TOKEN_LEN: usize = 16;
 
 /// The key a failure is counted under: an IPv4 address as is, an IPv6 address by its /64 so a
-/// host that rotates through its prefix shares one count.
+/// host that rotates through its prefix shares one count. A mapped IPv4 address (a dual-stack
+/// listener's IPv4 peer) is counted as the IPv4 address it carries.
 fn throttle_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
             let mut octets = v6.octets();
             octets[8..].fill(0);
             IpAddr::V6(octets.into())
@@ -361,6 +365,24 @@ mod tests {
         assert!(
             !throttle.seen.lock().unwrap().contains_key(&first),
             "the oldest entry was evicted"
+        );
+    }
+
+    #[test]
+    fn mapped_ipv4_peers_are_counted_apart() {
+        let throttle = LoginThrottle::default();
+        let t0 = Instant::now();
+        let bad: IpAddr = "::ffff:203.0.113.5".parse().unwrap();
+        let other: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            throttle.fail(bad, t0);
+        }
+        assert!(throttle.blocked(bad, t0).is_some());
+        assert!(throttle.blocked(other, t0).is_none());
+        let plain: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(
+            throttle.blocked(plain, t0).is_some(),
+            "mapped and plain share a count"
         );
     }
 

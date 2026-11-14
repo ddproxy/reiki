@@ -155,7 +155,9 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
         } else {
             parent
         };
-        std::fs::File::open(parent)?.sync_all()?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }

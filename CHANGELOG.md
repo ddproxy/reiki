@@ -9,7 +9,7 @@
 ### Changed
 
 - `reiki_requests_total` counts a fallback request once, under the upstream that served it, instead of also counting the primary's refusal.
-- A 403 whose body does not name an invalid, expired or revoked credential cools the key (5 h) instead of disabling it permanently. A 401, or a 403 naming a bad credential, still disables it.
+- A 403 whose body does not name an invalid, expired or revoked credential skips the key for that request instead of disabling it permanently. A 401, or a 403 naming a bad credential, still disables it.
 
 ### Fixed
 
@@ -26,11 +26,11 @@
 - `auth_header` and `auth_format` are checked when the config loads instead of turning into 401s that disable every key.
 - Config syntax errors report line and column without the offending source line, in `/reload`, `/status` and the logs.
 - `POST /reload` rejects a bare, empty or repeated `dry_run` with 400.
-- A full login-throttle table never releases a locked-out address, and an IPv4 peer of a dual-stack listener is counted as its IPv4 address.
+- A full login-throttle table evicts the weakest entry instead of ignoring new addresses, and an IPv4 peer of a dual-stack listener is counted as its IPv4 address.
 - Admin and client auth accept the same spacing, and the percent decoder takes hex digits only.
 - The log file is set to 0640, refuses a symlink, and counts failed writes.
 - Startup config warnings reach the log, and SIGHUP reload and key re-enable no longer block the async runtime.
-- The connection-limit warning is rate-limited, the file watcher detects a same-size swap, and listener collision checks resolve host names.
+- The connection-limit warning is rate-limited, the file watcher detects a same-size swap, and listener collision checks compare literal addresses without a DNS lookup.
 - `metrics` sees responses when it is the only plugin, and keeps `content-length`.
 - `metrics` recognises `text/event-stream` regardless of case or parameters, parses event-stream usage in linear time with a bounded line buffer, saturates totals instead of overflowing, and attributes usage to the upstream that served the response.
 - A changed `[plugins.metrics]` table keeps the running counters and reports a restart is needed.

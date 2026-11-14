@@ -123,7 +123,7 @@ fn token_len(bytes: &[u8]) -> usize {
 fn wide_len(bytes: &[u8]) -> usize {
     bytes
         .iter()
-        .take_while(|b| is_token(**b) || matches!(**b, b'%' | b'+' | b'/' | b'='))
+        .take_while(|b| is_token(**b) || **b == b'%')
         .count()
 }
 

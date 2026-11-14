@@ -1514,28 +1514,13 @@ impl Config {
 /// `bind` would; when it cannot be, only its port is compared, so an unknown host is not assumed
 /// to be elsewhere.
 fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
-    use std::net::ToSocketAddrs;
-    if addr.port() == 0 {
-        return false;
-    }
-    let collides = |other: std::net::SocketAddr| {
-        other.port() == addr.port()
+    other.parse::<std::net::SocketAddr>().is_ok_and(|other| {
+        addr.port() != 0
+            && other.port() == addr.port()
             && (other.ip() == addr.ip()
                 || other.ip().is_unspecified()
                 || addr.ip().is_unspecified())
-    };
-    if let Ok(literal) = other.parse::<std::net::SocketAddr>() {
-        return collides(literal);
-    }
-    match other.to_socket_addrs() {
-        Ok(mut resolved) => resolved.any(collides),
-        Err(_) => {
-            other
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                == Some(addr.port())
-        }
-    }
+    })
 }
 
 fn valid_peer_token_name(name: &str) -> bool {
@@ -2632,24 +2617,14 @@ socket = "/run/forwarder.sock"
     }
 
     #[test]
-    fn a_host_name_listener_is_compared_by_what_it_resolves_to() {
+    fn listener_collisions_compare_literal_addresses_only() {
         let peer: std::net::SocketAddr = "127.0.0.1:4097".parse().unwrap();
         assert!(same_listener("127.0.0.1:4097", peer));
         assert!(same_listener("0.0.0.0:4097", peer));
         assert!(!same_listener("127.0.0.1:4098", peer));
-        assert!(
-            same_listener("localhost:4097", peer),
-            "localhost is loopback"
-        );
-        let elsewhere: std::net::SocketAddr = "192.0.2.1:4097".parse().unwrap();
-        assert!(!same_listener("localhost:4097", elsewhere));
-        assert!(
-            same_listener("no-such-host.invalid:4097", elsewhere),
-            "an unresolvable host is compared by port alone"
-        );
-        assert!(!same_listener("no-such-host.invalid:4098", elsewhere));
+        assert!(!same_listener("host.example:4097", peer), "never resolved");
         assert!(!same_listener(
-            "localhost:4097",
+            "127.0.0.1:0",
             "127.0.0.1:0".parse().unwrap()
         ));
     }

@@ -6,7 +6,7 @@ Each provider is an `[upstream.<name>]` table in `reiki.toml`. A client reaches 
 
 - Set `base_url` to the root the provider's own SDK uses by default.
 - Set the client's base URL to `http://127.0.0.1:4097/<name>`. The SDK then appends its usual paths, and Reiki forwards them to `base_url`.
-- Set `auth_header` and `auth_format` to the way the provider expects the key. The defaults are `authorization` and `Bearer {key}`. `auth_header` must be a valid header name, and `auth_format` must contain `{key}` exactly once and make a valid header value; anything else is refused when the config loads.
+- Set `auth_header` and `auth_format` to the way the provider expects the key. The defaults are `authorization` and `Bearer {key}`. A bad pair is refused when the config loads.
 - Clients send their stream token in `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, whichever their SDK uses for the key. The headers win; the query parameter is the last resort.
 
 One stream can chain keys from several providers. A request only uses keys from the provider named in its path.
@@ -38,7 +38,7 @@ By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed re
 - `response_timeout_secs` bounds the whole response body, starting when its head arrives. It is unset by default, so only the idle limit applies; when set it must be at least 1. The separate 120-second request timeout still bounds the wait for the head.
 
 - `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
-- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection. A forward upstream always carries `Connection: close`, so the config refuses `send_keep_alive = true` there.
+- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection. A forward upstream always closes, so `send_keep_alive = true` is refused there.
 
 ```toml
 [upstream.zen]
@@ -146,7 +146,7 @@ Any failure of the link to the forwarder answers the client with 502. That cover
 
 - `args`, `pass_env` and `max_concurrent` are valid only with `command`. `expect_uid` is valid only with `socket`.
 - A forward upstream cannot be combined with `http2` or `title_case_headers`. Startup rejects these. It can serve an intercepted tunnel host: Reiki still terminates the client's TLS and swaps the key, then hands the request to the forwarder.
-- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head. Either way `response_idle_timeout_secs` and `response_timeout_secs` bound the forwarder's body as they do for an upstream, and a timeout releases the command's concurrency slot.
+- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head. `response_idle_timeout_secs` and `response_timeout_secs` also bound the body.
 - A buffered request does not necessarily stop when the client disconnects; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
@@ -218,7 +218,7 @@ A 401 takes the key out of rotation at once, and one request disables at most on
 
 ## Relaying errors as they are
 
-Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 only skips the key for that request. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
+Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 cools the key for `access_disabled` (5 h). That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
 
 ## Falling back to another upstream
 

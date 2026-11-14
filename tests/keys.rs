@@ -16,19 +16,13 @@ use reiki::config::Config;
 use reiki::plugins::PluginChain;
 use reiki::proxy::{load_keys, router, App};
 
+mod common;
+use common::serve;
+
 const ADMIN_TOKEN: &str = "admin-token";
 const STREAM_TOKEN: &str = "stream-token";
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
 
 struct Rig {
     dir: PathBuf,

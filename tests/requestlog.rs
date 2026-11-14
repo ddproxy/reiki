@@ -16,6 +16,9 @@ use reiki::plugins::{builtin, PluginChain};
 use reiki::proxy::{router, App, Secret};
 use serde_json::Value;
 
+mod common;
+use common::serve;
+
 const CLIENT_TOKEN: &str = "client-token-do-not-log";
 const KEY_A: &str = "upstream-key-a-do-not-log";
 const KEY_B: &str = "upstream-key-b-do-not-log";
@@ -54,15 +57,6 @@ async fn upstream(req: Request) -> Response {
             .unwrap();
     }
     Response::new(Body::from("{\"ok\":true}"))
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 struct Rig {

@@ -13,6 +13,9 @@ use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::proxy::{load_keys, router, App};
 
+mod common;
+use common::serve;
+
 const STREAM_TOKEN: &str = "stream-token";
 const ADMIN_TOKEN: &str = "admin-token";
 const SSN_BODY: &str = "{\"q\":\"ssn 123-45-6789\"}";
@@ -27,15 +30,6 @@ struct Rig {
     relay: String,
     admin: String,
     client: reqwest::Client,
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 impl Rig {

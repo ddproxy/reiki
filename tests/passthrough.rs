@@ -9,6 +9,9 @@ use reiki::config::Config;
 use reiki::plugins::PluginChain;
 use reiki::proxy::{router, App};
 
+mod common;
+use common::serve;
+
 /// Echoes the headers it was sent, or refuses with a 429 on `/limited`.
 async fn mock(req: Request) -> Response {
     if req.uri().path().ends_with("/limited") {
@@ -34,15 +37,6 @@ async fn mock(req: Request) -> Response {
         req.uri()
     );
     Response::builder().body(Body::from(echo)).unwrap()
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 async fn relay() -> String {

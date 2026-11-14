@@ -12,6 +12,9 @@ use reiki::proxy::{router, App, Secret};
 use reiki_plugin::{Event, Plugin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod common;
+use common::serve;
+
 const TOKEN: &str = "client-token";
 
 type Done = Arc<Mutex<Vec<(String, u16)>>>;
@@ -33,15 +36,6 @@ impl Plugin for Recorder {
             }
         }
     }
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 async fn refuse(_: Request) -> Response {

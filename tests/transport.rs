@@ -14,6 +14,9 @@ use reiki::plugins::PluginChain;
 use reiki::proxy::{router, App, Secret};
 use tokio::io::AsyncWriteExt;
 
+mod common;
+use common::serve;
+
 const CLIENT_TOKEN: &str = "client-token";
 const CLIENT_ENCODING: &str = "gzip, deflate, br, zstd";
 
@@ -113,15 +116,6 @@ async fn mock(State(seen): State<Arc<Seen>>, req: Request) -> Response {
         );
     }
     reply(StatusCode::OK, "{\"ok\":true}")
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 /// A relay in front of the mock. `options` goes in the upstream table.

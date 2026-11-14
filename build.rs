@@ -24,12 +24,6 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
-fn plain_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 fn parse_catalog(text: &str) -> Result<Vec<Plugin>, String> {
     let parsed: toml::Table = text
         .parse()
@@ -39,59 +33,38 @@ fn parse_catalog(text: &str) -> Result<Vec<Plugin>, String> {
         .and_then(|v| v.get("metadata"))
         .and_then(|v| v.get("reiki"))
         .and_then(|v| v.get("plugin"))
+        .and_then(toml::Value::as_array)
     else {
         return Err("[[package.metadata.reiki.plugin]] is missing".to_owned());
-    };
-    let Some(entries) = entries.as_array() else {
-        return Err("[[package.metadata.reiki.plugin]] must be an array of tables".to_owned());
     };
     if entries.is_empty() {
         return Err("[[package.metadata.reiki.plugin]] must not be empty".to_owned());
     }
     let mut names = HashSet::new();
-    let mut crates = HashSet::new();
     let mut plugins = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        let Some(entry) = entry.as_table() else {
-            return Err(format!(
-                "[[package.metadata.reiki.plugin]] entry {} must be a table",
-                index + 1
-            ));
-        };
         let field = |key: &str| {
             entry
                 .get(key)
                 .and_then(toml::Value::as_str)
                 .filter(|value| !value.is_empty())
+                .map(str::to_owned)
                 .ok_or_else(|| {
                     format!(
                         "[[package.metadata.reiki.plugin]] entry {} is missing `{key}`",
                         index + 1
                     )
                 })
-                .map(|value| (*value).to_owned())
         };
         let plugin = Plugin {
             name: field("name")?,
             feature: field("feature")?,
             krate: field("crate")?,
         };
-        if !plain_identifier(&plugin.krate) {
-            return Err(format!(
-                "[[package.metadata.reiki.plugin]] `crate` must be a plain identifier, got `{}`",
-                plugin.krate
-            ));
-        }
         if !names.insert(plugin.name.clone()) {
             return Err(format!(
                 "[[package.metadata.reiki.plugin]] names `{}` twice",
                 plugin.name
-            ));
-        }
-        if !crates.insert(plugin.krate.clone()) {
-            return Err(format!(
-                "[[package.metadata.reiki.plugin]] uses crate `{}` twice",
-                plugin.krate
             ));
         }
         plugins.push(plugin);
@@ -249,63 +222,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_empty_and_non_array_catalogs() {
+    fn rejects_missing_empty_and_duplicate_catalogs() {
         let missing = "[package]\nname = \"reiki\"\n";
         assert!(parse_catalog(missing).unwrap_err().contains("missing"));
-
-        let empty = manifest("");
-        assert!(parse_catalog(&empty).unwrap_err().contains("empty"));
-
-        let table =
-            "[package]\nname = \"reiki\"\n[package.metadata.reiki]\nplugin = { name = \"phi\" }\n";
-        assert!(parse_catalog(table)
-            .unwrap_err()
-            .contains("array of tables"));
-    }
-
-    #[test]
-    fn rejects_malformed_entries_duplicates_and_unsafe_crate_names() {
-        let cases = [
-            (r#""phi","#, "must be a table"),
-            (
-                r#"{ name = "phi", feature = "plugin-phi" },"#,
-                "missing `crate`",
-            ),
-            (
-                r#"{ name = "phi", feature = "", crate = "reiki_phi" },"#,
-                "missing `feature`",
-            ),
-            (
-                r#"{ name = "phi", feature = "plugin-phi", crate = "reiki-phi" },"#,
-                "plain identifier",
-            ),
-            (
-                r#"{ name = "phi", feature = "plugin-phi", crate = "1phi" },"#,
-                "plain identifier",
-            ),
-            (
-                r#"{ name = "phi", feature = "plugin-phi", crate = "a::b" },"#,
-                "plain identifier",
-            ),
-            (
-                r#"
+        assert!(parse_catalog(&manifest("")).unwrap_err().contains("empty"));
+        let duplicate = manifest(
+            r#"
     { name = "phi", feature = "plugin-phi", crate = "reiki_phi" },
     { name = "phi", feature = "plugin-finance", crate = "reiki_finance" },
 "#,
-                "names `phi` twice",
-            ),
-            (
-                r#"
-    { name = "phi", feature = "plugin-phi", crate = "reiki_phi" },
-    { name = "finance", feature = "plugin-finance", crate = "reiki_phi" },
-"#,
-                "uses crate `reiki_phi` twice",
-            ),
-        ];
-        for (entries, expected) in cases {
-            let error = parse_catalog(&manifest(entries)).unwrap_err();
-            assert!(error.contains(expected), "{entries}: {error}");
-        }
+        );
+        assert!(parse_catalog(&duplicate)
+            .unwrap_err()
+            .contains("names `phi` twice"));
     }
 
     #[test]

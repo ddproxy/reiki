@@ -4,55 +4,47 @@
 
 ### Added
 
-- The built-in credential masks cover more vendor formats: Slack `xoxc-`, `xoxd-` (cookie, including its percent-encoded and base64 characters), `xoxe-`, `xoxr-` and `xapp-`; Anthropic `sk-ant-`; Google `GOCSPX-`; the other GitLab token kinds; Grafana, Sentry, Square, Shopify, DigitalOcean, Notion, Postman, PlanetScale, Netlify, HashiCorp, Pulumi, Linear OAuth, LangSmith, PostHog, Sourcegraph, Cloudflare, RubyGems, Bitbucket, Databricks and Fireworks keys; and age secret keys.
+- Credential masks cover about 40 more vendor formats (Slack cookie and app tokens, Anthropic, Google, GitLab, Grafana, Sentry, Cloudflare and others; age keys). The list is `PREFIXES` in `reiki-redact`.
 
 ### Changed
 
 - `reiki_requests_total` counts a fallback request once, under the upstream that served it, instead of also counting the primary's refusal.
-- The state file records a SHA-256 of each key, so a rotated key is detected even when the file keeps its modified time. Older state without it still uses the modified time.
-- A 403 whose body does not name an invalid, expired or revoked credential no longer disables the key permanently; the key is treated as access-denied for that request, so a WAF or model-plan refusal cannot take a key out of rotation. A 401, or a 403 naming a bad credential, still disables it.
-- The `metrics` docs now state that series for a renamed stream, upstream or key are kept until Reiki restarts; they are not pruned on reload.
+- A 403 whose body does not name an invalid, expired or revoked credential cools the key (5 h) instead of disabling it permanently. A 401, or a 403 naming a bad credential, still disables it.
 
 ### Fixed
 
 - Each proxied request reports one `RequestDone` event with the status the client received. This ends the double count on a fallback and the false 499 on 400, 408, 413 and plugin-block responses.
+- State records a SHA-256 of each key, so rotation is detected without relying on mtime; state is written through a unique temp file and a directory sync. Older state without a digest still uses the modified time.
+- A first transient 5xx no longer spends two attempts on one key, and the last upstream refusal is returned when no key serves the request.
+- A later failure no longer shortens a longer cooldown on the same key.
 - A response plugin gets its final chunk call when the upstream body errors midway.
 - `reiki keys --check` reads each key file through one handle, and the key table aligns columns with non-ASCII names.
 - A forward upstream with `send_keep_alive = true` is refused when the config loads, because its connection always closes.
-- A reload applies the `[log]` level and lists `[log]` changes that need a restart.
-- A reload with no change no longer reports a spurious `tunnel.listen` restart, and the interception CA files are watched.
+- Forward upstreams apply `response_idle_timeout_secs` and `response_timeout_secs` to buffered and streamed bodies; a timed-out command releases its concurrency slot.
+- A passthrough upstream receives the client's `key=` query parameter instead of having it stripped.
+- A reload applies the `[log]` level and lists `[log]` changes that need a restart. A reload with no change no longer reports a spurious `tunnel.listen` restart, and the interception CA files are watched.
 - `auth_header` and `auth_format` are checked when the config loads instead of turning into 401s that disable every key.
 - Config syntax errors report line and column without the offending source line, in `/reload`, `/status` and the logs.
 - `POST /reload` rejects a bare, empty or repeated `dry_run` with 400.
-- A full login-throttle table never releases a locked-out address.
-- Admin bearer parsing accepts the same spacing as client auth, and the percent decoder takes hex digits only.
-- Saved key state is dropped when the key file is unreadable or its size changed, and the state file is written through a unique temp file followed by a directory sync.
+- A full login-throttle table never releases a locked-out address, and an IPv4 peer of a dual-stack listener is counted as its IPv4 address.
+- Admin and client auth accept the same spacing, and the percent decoder takes hex digits only.
 - The log file is set to 0640, refuses a symlink, and counts failed writes.
 - Startup config warnings reach the log, and SIGHUP reload and key re-enable no longer block the async runtime.
 - The connection-limit warning is rate-limited, the file watcher detects a same-size swap, and listener collision checks resolve host names.
-- The `metrics` plugin now receives response bodies when it is the only plugin configured, so `/usage` and `reiki_tokens_total` work with just `[plugins.metrics]`. It no longer forces chunked responses because it only observes them.
-- The `metrics` plugin parses event-stream usage linearly and bounds an unfinished or oversized event line, so a long stream cannot cause quadratic work or unbounded buffering.
-- Changing a `[plugins.metrics]` setting now keeps the running counters and reports that a restart is needed instead of silently resetting them.
-- Token and finding totals saturate instead of overflowing when an upstream or plugin reports an extreme count.
-- `RequestCtx::report_detail` filters and cuts a finding detail before allocating it, so an oversized label no longer copies the whole string.
-- Documented that `PluginError::Reject`'s message is public, because it is returned to the client and logged.
-- Request ids are now 128 bits (32 hex digits) instead of 64, so logs and the request log are far less likely to merge two requests.
-- Plugin admin paths are validated and the reserved set comes from the real admin routes, including `/reload`, `/keys/enable` and every `/v1/...` form, so a plugin can no longer shadow them.
-- The `metrics` plugin recognises `text/event-stream` regardless of case or parameters, so usage in such a response is counted. The monitoring docs now list `reiki_tokens_total` and explain `/usage`'s `requests` count and compressed responses.
-- Token usage is attributed to the upstream that actually served the response, not the one that failed before a fallback.
-- The build script rejects a malformed, empty or duplicate plugin catalog and a non-identifier `crate`, and warns about orders that put `requestlog` before any masking plugin or detectors after `placeholders`.
-- A key that fails one request is no longer tried twice before the next key: a first transient 5xx used to spend two attempts on the same key, so a four-key chain never reached its last key and answered a synthetic 503. The last upstream refusal is now returned when no key serves the request.
-- Forward upstreams apply `response_idle_timeout_secs` and `response_timeout_secs` to buffered and streamed bodies instead of reading without a body deadline; a timed-out command also releases its concurrency slot.
-- A passthrough upstream now receives the client's `key=` query parameter instead of having it stripped as if it were a Reiki token.
-- Upstream HTTP clients are built fallibly. A build failure now stops startup with a clear error instead of silently using a client that follows redirects and decompresses responses.
+- `metrics` sees responses when it is the only plugin, and keeps `content-length`.
+- `metrics` recognises `text/event-stream` regardless of case or parameters, parses event-stream usage in linear time with a bounded line buffer, saturates totals instead of overflowing, and attributes usage to the upstream that served the response.
+- A changed `[plugins.metrics]` table keeps the running counters and reports a restart is needed.
+- `RequestCtx::report_detail` filters and cuts a finding detail before allocating it.
+- `PluginError::Reject`'s message is documented as public, because it is returned to the client and logged.
+- Request ids are 32 hex digits.
+- Plugin admin paths are validated and the reserved set comes from the real admin routes, so a plugin cannot shadow `/reload`, `/keys/enable` or a `/v1/...` form.
+- The build script rejects a missing, empty or duplicate plugin catalog, and warns about orders that put `requestlog` before any masking plugin or detectors after `placeholders`.
+- Upstream HTTP clients are built fallibly; a failure stops startup instead of silently using a client that follows redirects and decompresses responses.
 - An error body that fails mid-read no longer looks like a clean end: the key is classified from the status and `Retry-After` only, and the incomplete read is logged at warn without the body.
-- A poisoned rate limiter lock no longer disables a stream's limit: the limiter state is recovered and the limit is still enforced.
-- A configured intercept CA is validated at startup and by `reiki check`: the key must match the certificate, the CA must not be expired, carry a DNS name constraint and cover every intercepted host, and leaf certificates are clamped to the CA's own validity.
-- A cached interception certificate is reused only while it is still inside its own validity; raising `leaf_ttl_hours` on a reload no longer keeps an expired leaf in use.
-- A later failure no longer shortens a longer cooldown on the same key: a 5 hour quota cooldown survives a concurrent 30 second rate limit.
-- `reiki scan -p <plugin> -k <kind>` refuses a kind the selected plugin does not know instead of reporting a clean scan, and reads inputs one at a time with a running line and column cursor.
-- `allow_loopback = false` also refuses 6to4 and Teredo addresses that embed a loopback, link-local or metadata address, and bracketed IPv6 tunnel allow rules (`[::1]:443`) now match.
-- Throttle counting now treats an IPv4 peer of a dual-stack listener as its IPv4 address instead of one shared key for every IPv4 client.
+- A poisoned rate limiter lock no longer disables a stream's limit.
+- A configured intercept CA is validated at startup and by `reiki check`: the key must match, the CA must not be expired, carry a DNS name constraint and cover every intercepted host, and leaf certificates are clamped to the CA's validity. A cached leaf is reused only inside its own validity, so raising `leaf_ttl_hours` on a reload cannot revive an expired one.
+- `reiki scan -p <plugin> -k <kind>` refuses a kind the selected plugin does not know instead of reporting a clean scan.
+- `allow_loopback = false` also refuses 6to4 and Teredo addresses that embed a loopback, link-local or metadata address, and bracketed IPv6 tunnel allow rules (`[::1]:443`) match.
 
 ## 0.9.0
 

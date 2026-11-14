@@ -48,7 +48,7 @@ reiki scan --all --json notes.txt           # every kind, one JSON object per fi
 - Each finding prints as `file:line:col plugin kind`. The matched text is never printed, so the output is safe to paste into a ticket. A summary goes to stderr.
 - The exit code is 0 for no findings, 1 for findings and 2 for a usage or read error, so the command also works as a pre-commit or CI check.
 - `--kinds` takes labels from any plugin. `--all` adds the kinds that are off by default.
-- It reads bytes as UTF-8 text with lossy conversion, the same way the plugins read a request body.
+- It reads bytes as UTF-8 text with lossy conversion. The proxy plugins refuse a request body that is not valid UTF-8 instead.
 
 ## Report findings with a detail
 

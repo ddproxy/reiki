@@ -45,7 +45,7 @@ Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data 
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `iban x1, crypto x2`, and never a value.
-- A blocked request gets `422`. A body with a `Content-Encoding` cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked.
+- A blocked request gets `422`. A body with a `Content-Encoding` other than `identity`, or a body that is not valid UTF-8, cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked. `Content-Encoding: identity` is a no-op and is checked as if the header were absent.
 - The plugin runs after `phi` and before `placeholders` in the default build, so it sees the original request.
 - Only the request body is checked. Headers, the query string and responses are not.
 

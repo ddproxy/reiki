@@ -27,9 +27,9 @@ Start in `report`, read the log for false positives, then switch to `block`.
 
 | Kind | Default | Matches |
 | --- | --- | --- |
-| `cui` | on | A stand-alone upper-case `CUI` banner, or a `CUI//SP-` marker with a 2- to 8-character category code such as `CUI//SP-CTI`. |
+| `cui` | on | An upper-case `CUI` banner: the whole line, ignoring surrounding whitespace and Markdown punctuation such as `*` or `-`; a line that starts with `CUI//` and a caveat marker such as `CUI//SP-CTI`; or a portion marking such as `(CUI)` at the start of a paragraph. A mention in prose, in quotes or in a JSON string is not a banner. |
 | `classification` | on | `TOP SECRET`, `SECRET` or `CONFIDENTIAL` followed immediately by a `//` caveat chain, such as `TOP SECRET//SI//NOFORN` or `SECRET//REL TO USA, GBR`. A bare level is not reported. |
-| `dissemination` | on | A stand-alone upper-case `NOFORN` or `ORCON` token. |
+| `dissemination` | on | `NOFORN` or `ORCON` in the same banner shape as `cui`: alone on a line, as a `//` segment of a banner such as `SECRET//NOFORN` or `TOP SECRET//SI//ORCON/NOFORN`, or in a portion marking at the start of a paragraph. A mention in prose, in quotes or in a JSON string is not a banner. |
 | `ein` | off | Two digits, a hyphen and seven digits after `ein` or `employer identification number`. No checksum; the label is the only gate. |
 | `itin` | off | `9XX-XX-XXXX` after `itin` or `individual taxpayer identification number`, with the historical group range 70-88, 90-92 or 94-99. |
 | `cage` | off | Five characters from the CAGE alphabet (no `I`, `O`, `Q` or `S`) after `cage` or `cage code`. |
@@ -44,13 +44,14 @@ Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data 
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `cui x1, dissemination x1`, and never a value.
-- A blocked request gets `422`. A body with a `Content-Encoding` cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked.
+- A blocked request gets `422`. A body with a `Content-Encoding` other than `identity`, or a body that is not valid UTF-8, cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked. `Content-Encoding: identity` is a no-op and is checked as if the header were absent.
 - The plugin runs after `phi` and `finance` and before `placeholders` in the default build, so it sees the original request.
 - Only the request body is checked. Headers, the query string and responses are not.
 
 ## What it does not cover
 
 - **Bare classification and control words.** `SECRET`, `CONFIDENTIAL`, `EAR`, `ITAR`, `FCI`, `CTI`, `CMMC` and `FOUO` are not detected on their own, because they are ordinary prose and code. A classification level is reported only with a `//` caveat chain.
+- **Markings inside prose or strings.** `CUI`, `NOFORN` and `ORCON` are reported only in banner or portion-marking shape. A mention in a sentence, in quotes or as a JSON string value is not reported, even when upper-case.
 - **Passports and driver licences.** Formats vary by issuer and have no reliable public checksum, so they are not detected.
 - **Identifiers without their label.** `ein`, `itin`, `cage`, `uei`, `edipi` and `eccn` are reported only next to their own label. A bare number or code is not reported, and a label that appears after the value is not enough.
 - **Contract numbers.** FAR and DFARS numbers vary too widely to detect without a false-positive rate that would make `block` mode unusable.

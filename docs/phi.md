@@ -48,6 +48,8 @@ A header names a column, so the plugin checks every cell under it as that kind o
 - SQL `INSERT INTO t (a, b) VALUES (...), (...)` with a column list
 - SQL `COPY t (a, b) FROM stdin` blocks
 
+A header is read only on the first line of its table: the first line after a blank line or a line without that delimiter. When a header maps to the `column` kind, which accepts almost any value, at least half of its non-empty cells must be a known column name. A row later in a table, such as `alice,address`, is therefore not read as a header, and its cells are not reported as columns.
+
 A table without a recognised header, or an `INSERT` without a column list, is checked only by the keyword and shape rules above. A cell that holds a type name, `null` or a placeholder is not reported.
 
 Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data to see what this plugin flags before you choose a mode.
@@ -55,7 +57,7 @@ Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data 
 ## Behavior
 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `ssn x1, card x2`, and never a value.
-- A blocked request gets `422`. A body with a `Content-Encoding` cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked.
+- A blocked request gets `422`. A body with a `Content-Encoding` other than `identity`, or a body that is not valid UTF-8, cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked. `Content-Encoding: identity` is a no-op and is checked as if the header were absent.
 - The plugin runs before `placeholders` in the default build, so it sees the original request.
 - The [request log](requestlog.md#findings-from-detection-plugins) records a `finding` for each hit, but its default `body = "full"` keeps the request body, identifiers included, when the plugin only reports. Set `body = "summary"` where a detector runs in `report` mode.
 - Only the request body is checked. Headers, the query string and responses are not.

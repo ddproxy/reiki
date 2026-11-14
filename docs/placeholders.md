@@ -43,6 +43,6 @@ Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plu
 - This is pattern and list matching, not a data-loss guarantee. Credential detection is heuristic, and a term only matches the exact characters you list.
 - Only the request body is masked, as raw text: header values, the path and the query string are not, and JSON object keys are masked like any other text.
 - A model can paraphrase or transform a value instead of repeating the placeholder. Whatever it writes back that is not a placeholder is delivered as it is.
-- A request body that is encoded (`Content-Encoding`) or not UTF-8 text cannot be masked and is refused with 415 rather than sent raw.
-- A response with a `Content-Encoding` is not restored, and a stream that ends in the middle of a placeholder loses that fragment.
+- A request body with a `Content-Encoding` other than `identity`, or that is not valid UTF-8 text, cannot be masked and is refused with 415 rather than sent raw. `Content-Encoding: identity` is a no-op and does not prevent masking.
+- A response with a `Content-Encoding` other than `identity` is not restored, and a stream that ends in the middle of a placeholder loses that fragment.
 - Matching is by substring, so a term inside a longer word is masked too. Choose terms accordingly.

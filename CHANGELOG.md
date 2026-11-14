@@ -1,15 +1,10 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- The `placeholders` plugin masks configured terms in one Aho-Corasick pass over the folded text instead of one scan per term, so the cost no longer grows with the number of terms. Matching, case folding, overlap rules and placeholders are unchanged.
-
 ## 0.9.0
 
 ### Added
 
+- `requestlog` option `queue_max_bytes` (default 67108864, 1 MiB to 4096 MiB) caps the total bytes of records queued for the writer thread. Before, the default queue could hold about 1 GiB of request bodies. A record that would pass the cap is dropped like a full queue: it is counted, the first drop logs one warning, and the request is never delayed.
 - An optional `[peers]` table for health sharing between instances, behind a new `peers` cargo feature that is in the default set. It is off unless `enabled = true`: without the table, or with it disabled, no listener is opened, no peer is contacted, and `/status` and `/v1/openapi.json` are unchanged (golden and socket-table tests check this). A binary built without the feature refuses a `[peers]` table. See [peers](docs/peers.md).
 - `[peers]` validation: unknown keys are refused, publishing needs its own `listen` (loopback unless TLS is on) and a `peer_token_sha256` that differs from the admin token and every stream token, and a peer `url` must be https with a `ca_file`, or http on loopback.
 - `reiki check` prints a `peers:` line with the effective settings, or `peers: disabled`.
@@ -29,6 +24,23 @@
 - `[peers] cooldown_bucket_secs` (default 300, 0 for exact) rounds `soonest_cooldown_seconds` and the labelled `cooldown_seconds` up to a multiple of it, in `/v1/health` and in stream events.
 - `[peers] tls_cert` and `tls_key` serve the peer listener over HTTPS with rustls, from a certificate any CA issued. Both or neither; the key must not be accessible to group or others (`tls_key_permissions = "warn"` loads it with a warning, as for the interception CA key). Without them a non-loopback `listen` is refused. `reiki check` validates the files and prints the certificate's days left, and a reload swaps a renewed certificate and key without a restart (`peers.tls` in `changed`); switching TLS on or off is `peers.tls` in `restart_needed`.
 - `[[peers.tokens]] (`name`, `token_sha256`) adds named peer tokens beside `peer_token_sha256`, which is the token `default`. Any of them opens the peer listener; all are compared on every request. Names are `[a-z0-9-]`, at most 32 bytes, unique, and hashes must differ from each other, the admin token and every stream token. `max_subscribers_per_token` (default 8) caps streams per token. A reload applies token changes at once and ends the streams of a removed or changed token.
+
+### Changed
+
+- The `placeholders` plugin masks configured terms in one Aho-Corasick pass over the folded text instead of one scan per term, so the cost no longer grows with the number of terms. Matching, case folding, overlap rules and placeholders are unchanged.
+
+### Fixed
+
+- The detection plugins and `placeholders` no longer treat `Content-Encoding: identity` as an encoded body. `identity` is a legal no-op, so it is now ignored (case-insensitive, trimmed, comma separated and repeatable) while any real or unknown coding still fails closed. Before, a request with `identity` was rejected with 415 in block mode and skipped in report mode, and `placeholders` refused it or did not restore the response.
+- The detection plugins now fail closed on a request body that is not valid UTF-8 instead of scanning a lossy replacement-character copy, which could hide an identifier by breaking a digit run. `block` mode rejects it with 415 and a message saying so; `report` mode logs that it was not checked. `placeholders` already refused such a body.
+- Detection results no longer count two overlapping extra hits twice. An accepted extra now covers its bytes for later extras, including when the hits have different kinds.
+- The `phi` table detector reads a header only on the first line of a table and, when the header maps to the `column` kind, only when at least half of its non-empty cells are known column names. A CSV data row such as `alice,address` is no longer read as a header, so block mode no longer rejects ordinary tabular data.
+- The `controlled` plugin reports `CUI`, `NOFORN` and `ORCON` only in banner or portion-marking shape: alone on a line, at the start of a `//` caveat chain, or inside a portion marking at the start of a paragraph. A mention in prose, in quotes or in a JSON string is no longer reported, so block mode no longer rejects ordinary requests. `docs/controlled.md` states exactly what matches.
+
+### Security
+
+- `requestlog` masks more credential query parameters in the logged path. The name is percent-decoded and normalised (lowercase, non-alphanumerics dropped) before matching, so `api-key`, `access-token`, `auth_token`, `api_secret`, `client_secret`, `signature`, `passwd` and `bearer` are masked, including repeated parameters and percent-encoded names such as `api%2Dkey`. Ordinary names such as `monkey`, `keyboard` and `page_token_count` are not.
+- `requestlog` finds a credential anywhere in a base64-decoded value, not only at its start, so a base64 `user:sk-…`, a base64 JSON object carrying a token, or a key after a text prefix is masked whole.
 
 ## 0.8.3
 

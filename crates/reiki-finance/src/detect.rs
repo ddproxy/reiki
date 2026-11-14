@@ -67,6 +67,7 @@ pub type Hit = reiki_detect::Hit<Kind>;
 
 /// Every hit for the wanted `kinds`, in order of position within each kind.
 pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
+    let text = &*reiki_detect::blank_json_escapes(text);
     let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
     let lower = lower.as_bytes();
@@ -1090,6 +1091,11 @@ mod tests {
             "account is off by default but can be asked for"
         );
         assert!(scan("id,account\n1,000123456789\n", &Kind::DEFAULT).is_empty());
+    }
+
+    #[test]
+    fn a_card_after_a_json_escape_is_found() {
+        assert_eq!(kinds("cvc: 1234\\n4111 1111 1111 1111"), [Kind::PanSad]);
     }
 
     #[test]

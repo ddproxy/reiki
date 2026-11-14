@@ -289,7 +289,8 @@ pub fn stream_deltas(events: &mut [Value], cut: bool) {
     }
 }
 
-/// Headers whose whole value is a credential, whatever shape it takes.
+/// Headers whose whole value is a credential, whatever shape it takes. A header named like a
+/// credential field (`api-key`, `x-auth-token`, `private-token`) is masked too.
 const SECRET_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -326,7 +327,7 @@ fn secret_param(name: &str) -> bool {
 
 /// A header value, masked whole when the header carries credentials.
 pub fn header<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
-    if SECRET_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+    if SECRET_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) || secret_field(name) {
         return Cow::Borrowed(MASK);
     }
     secrets(value)
@@ -494,6 +495,10 @@ mod tests {
         assert_eq!(header("Authorization", "Basic dXNlcjpwYXNz"), MASK);
         assert_eq!(header("cookie", "sid=abc"), MASK);
         assert_eq!(header("user-agent", "curl/8"), "curl/8");
+        for name in ["api-key", "X-Auth-Token", "private-token", "x-access-token"] {
+            assert_eq!(header(name, "0123456789abcdef"), MASK, "{name}");
+        }
+        assert_eq!(header("x-ratelimit-remaining-tokens", "41"), "41");
     }
 
     #[test]

@@ -202,7 +202,7 @@ impl Tunnel {
         if policy.deny_private && private_ip(addr.ip()) {
             return false;
         }
-        if policy.allow_loopback {
+        if policy.allow_loopback && addr.ip().is_loopback() {
             return true;
         }
         let local = match addr.ip() {
@@ -402,7 +402,11 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         tracing::info!(%host, "tunnel intercepting");
-        interceptor.serve(&host, Prefixed::new(rest, client)).await;
+        let _ = tokio::time::timeout(
+            MAX_TUNNEL_LIFETIME,
+            interceptor.serve(&host, Prefixed::new(rest, client)),
+        )
+        .await;
         return Ok(());
     }
 
@@ -645,6 +649,30 @@ mod tests {
         assert_eq!(split_target("[::1]"), None);
         assert_eq!(split_target(":443"), None);
         assert_eq!(split_target("host:99999"), None);
+    }
+
+    #[test]
+    fn allowing_loopback_does_not_open_metadata_or_link_local_addresses() {
+        let t = Tunnel {
+            policy: RwLock::new(Arc::new(Policy {
+                rules: vec![Rule::parse("*").unwrap()],
+                allow: vec!["*".to_owned()],
+                connect_timeout: Duration::from_secs(5),
+                allow_loopback: true,
+                deny_private: false,
+            })),
+            interceptor: None,
+        };
+        assert!(t.reachable(&"127.0.0.1:1".parse().unwrap()));
+        assert!(t.reachable(&"[::1]:1".parse().unwrap()));
+        for addr in [
+            "169.254.169.254:80",
+            "168.63.129.16:80",
+            "0.0.0.0:1",
+            "[fe80::1]:1",
+        ] {
+            assert!(!t.reachable(&addr.parse().unwrap()), "{addr}");
+        }
     }
 
     #[test]

@@ -19,6 +19,8 @@ struct FileState {
     keep: u32,
     file: Option<File>,
     size: u64,
+    /// After a failed rotation, the size at which to try again.
+    rotate_after: u64,
 }
 
 impl FileState {
@@ -76,14 +78,23 @@ impl FileState {
         if self.file.is_none() {
             self.open()?;
         }
-        if self.max_bytes > 0 && self.size > 0 && self.size + data.len() as u64 > self.max_bytes {
-            self.rotate()?;
+        let due = self.max_bytes > 0
+            && self.size > 0
+            && self.size >= self.rotate_after
+            && self.size + data.len() as u64 > self.max_bytes;
+        // A rotation that fails must not stop logging: keep writing to the live file.
+        let rotated = if due { self.rotate() } else { Ok(()) };
+        if rotated.is_err() && self.file.is_none() {
+            self.open()?;
         }
         if let Some(file) = self.file.as_mut() {
             file.write_all(data)?;
             self.size += data.len() as u64;
         }
-        Ok(())
+        if rotated.is_err() {
+            self.rotate_after = self.size + self.max_bytes;
+        }
+        rotated
     }
 }
 
@@ -108,6 +119,7 @@ impl LogFile {
             keep: config.file_keep,
             file: None,
             size: 0,
+            rotate_after: 0,
         };
         state.open()?;
         Ok(Arc::new(Self {
@@ -285,7 +297,28 @@ mod tests {
             keep,
             file: None,
             size: 0,
+            rotate_after: 0,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_rotation_keeps_the_log_writing() {
+        let dir = dir("wedge");
+        let path = dir.join("reiki.log");
+        std::fs::create_dir(dir.join("reiki.log.1")).unwrap();
+        let mut file = state(path.clone(), 10, 1);
+        assert!(file.write(b"first line\n").is_ok());
+        assert!(
+            file.write(b"second line\n").is_err(),
+            "the failure is reported"
+        );
+        assert!(file.write(b"third\n").is_ok(), "and later lines still land");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("second line") && text.contains("third"),
+            "{text}"
+        );
     }
 
     fn detached(started: LogConfig) -> (Logging, impl tracing::Subscriber + Send + Sync) {

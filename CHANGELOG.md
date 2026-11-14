@@ -13,6 +13,13 @@
 
 ### Fixed
 
+- The PHI, finance and controlled detectors find an identifier or banner right after a JSON-escaped `\n`, `\t` or `\r`; a multi-line prompt used to hide an SSN or card number from them.
+- A detector in block mode fails closed if it panics, instead of forwarding the unscanned body.
+- Overlapping masked terms, or a term overlapping a credential, are masked as one span, so no tail reaches the upstream.
+- A response object declared a tool call by `"type": "tool_use"` (Anthropic) keeps credentials masked in its arguments whatever the fields are named.
+- The log file keeps taking lines when a rotation fails; the failure is reported once.
+- An intercepted tunnel closes after an hour like a passthrough one, and `allow_loopback` opens loopback only, not link-local or cloud-metadata addresses.
+- The request log masks headers named like credentials (`api-key`, `x-auth-token`, `private-token`).
 - Each proxied request reports one `RequestDone` event with the status the client received. This ends the double count on a fallback and the false 499 on 400, 408, 413 and plugin-block responses.
 - State records a SHA-256 of each key, so rotation is detected without relying on mtime; state is written through a unique temp file and a directory sync. Older state without a digest still uses the modified time.
 - A first transient 5xx no longer spends two attempts on one key, and the last upstream refusal is returned when no key serves the request.

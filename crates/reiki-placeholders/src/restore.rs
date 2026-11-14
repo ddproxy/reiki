@@ -98,6 +98,36 @@ pub struct Restorer {
     tool_args: bool,
 }
 
+/// True for an object that declares itself a tool call by value (`"type": "tool_use"`), as
+/// Anthropic and OpenAI Responses do, so its fields are tool arguments whatever they are named.
+fn declares_tool_call(map: &serde_json::Map<String, Value>) -> bool {
+    map.get("type").and_then(Value::as_str).is_some_and(|t| {
+        ["tool_use", "tool_call", "function_call"]
+            .iter()
+            .any(|m| t.contains(m))
+    })
+}
+
+/// Paths of every object in `value` that declares itself a tool call.
+fn tool_call_paths(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                tool_call_paths(item, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            if declares_tool_call(map) {
+                out.push(path.to_owned());
+            }
+            for (key, item) in map {
+                tool_call_paths(item, &format!("{path}.{key}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// True when `path` (or, for a whole body, the text) sits inside a tool call.
 fn in_tool_call(path: &str) -> bool {
     TOOL_CALL_MARKERS.iter().any(|m| path.contains(m))
@@ -162,9 +192,18 @@ impl Restorer {
         if self.tool_args || !TOOL_CALL_MARKERS.iter().any(|m| text.contains(m)) {
             return restore_text(text, reverse);
         }
-        if serde_json::from_str::<Value>(text).is_err() {
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
             return restore(text, reverse, false);
-        }
+        };
+        let mut tool_paths = Vec::new();
+        tool_call_paths(&parsed, "", &mut tool_paths);
+        let in_call = |path: &str| {
+            in_tool_call(path)
+                || tool_paths.iter().any(|p| {
+                    path.strip_prefix(p.as_str())
+                        .is_some_and(|rest| rest.starts_with(['.', '[']))
+                })
+        };
         let mut spans = Vec::new();
         let mut at = 0;
         if collect_strings(text, &mut at, "", &mut spans, 0).is_none() {
@@ -177,7 +216,7 @@ impl Restorer {
             let Ok(decoded) = serde_json::from_str::<String>(&text[start..end]) else {
                 continue;
             };
-            let restored = restore(&decoded, reverse, !in_tool_call(&path));
+            let restored = restore(&decoded, reverse, !in_call(&path));
             if restored != decoded {
                 out.push_str(&text[last..start]);
                 out.push_str(&serde_json::to_string(&restored).unwrap_or_default());
@@ -263,8 +302,13 @@ impl Restorer {
                 }
             }
             Value::Object(map) => {
+                let base = if declares_tool_call(map) {
+                    format!("{path}.tool_use")
+                } else {
+                    path.to_owned()
+                };
                 for (key, item) in map.iter_mut() {
-                    self.walk(&format!("{path}.{key}"), item, reverse);
+                    self.walk(&format!("{base}.{key}"), item, reverse);
                 }
             }
             _ => {}
@@ -574,6 +618,25 @@ mod tests {
         let out = String::from_utf8(chunk.to_vec()).unwrap();
         assert!(out.contains(&format!("curl {SECRET} Falcon")), "{out}");
         assert!(out.contains("\"content\":\"tok-123\""), "{out}");
+    }
+
+    #[test]
+    fn a_tool_call_declared_by_type_keeps_credentials_masked() {
+        let body = serde_json::json!({"content": [
+            {"type": "text", "text": SECRET},
+            {"input": {"command": format!("curl {SECRET}")}, "type": "tool_use"}
+        ]})
+        .to_string();
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("application/json"), false);
+        let mut chunk = Bytes::from(body);
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        let out: Value = serde_json::from_slice(&chunk).unwrap();
+        assert_eq!(out["content"][0]["text"], "tok-123");
+        assert_eq!(
+            out["content"][1]["input"]["command"],
+            format!("curl {SECRET}")
+        );
     }
 
     #[test]

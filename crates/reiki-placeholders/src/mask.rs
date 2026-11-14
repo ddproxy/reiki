@@ -29,7 +29,7 @@ struct Found {
 /// A placeholder depends only on the value and a per-process salt, so resent history masks identically.
 pub struct Masker {
     salt: [u8; 16],
-    /// One leftmost-longest automaton over the folded terms, or `None` when there are no terms.
+    /// One automaton over the folded terms, scanned for overlapping matches, or `None` when there are no terms.
     matcher: Option<AhoCorasick>,
     builtin: bool,
 }
@@ -46,7 +46,7 @@ impl Masker {
         needles.dedup();
         let matcher = (!needles.is_empty()).then(|| {
             AhoCorasickBuilder::new()
-                .match_kind(MatchKind::LeftmostLongest)
+                .match_kind(MatchKind::Standard)
                 .build(needles)
                 .expect("aho-corasick builds from validated terms")
         });
@@ -75,7 +75,7 @@ impl Masker {
         }
         if let Some(matcher) = &self.matcher {
             let folded = FoldedText::new(text);
-            for hit in matcher.find_iter(folded.text.as_bytes()) {
+            for hit in matcher.find_overlapping_iter(folded.text.as_bytes()) {
                 found.push(Found {
                     start: folded.original_start(hit.start()),
                     end: folded.original_end(hit.end()),
@@ -97,14 +97,25 @@ impl Masker {
             return None;
         }
 
-        // Earliest first, longest on ties, overlapping matches dropped.
+        // Earliest first; overlapping matches merge into one span, so no part of either survives.
         found.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        let mut spans: Vec<Found> = Vec::new();
+        for item in found {
+            match spans.last_mut() {
+                Some(last) if item.start < last.end => {
+                    last.end = last.end.max(item.end);
+                    if item.kind == Kind::PrivateKey {
+                        last.kind = Kind::PrivateKey;
+                    } else if last.kind == Kind::Term && item.kind == Kind::Secret {
+                        last.kind = Kind::Secret;
+                    }
+                }
+                _ => spans.push(item),
+            }
+        }
         let mut out = String::with_capacity(text.len());
         let mut copied = 0;
-        for item in found {
-            if item.start < copied {
-                continue;
-            }
+        for item in spans {
             out.push_str(&text[copied..item.start]);
             let original = &text[item.start..item.end];
             out.push_str(&self.placeholder(item.kind, original, reverse));
@@ -235,6 +246,22 @@ mod tests {
         assert_eq!(out.matches("[[REIKI_TERM_").count(), 3);
         assert_eq!(reverse.len(), 1, "one placeholder for every casing");
         assert_eq!(reverse.values().next().unwrap(), "ACME corp");
+    }
+
+    #[test]
+    fn overlapping_terms_and_secrets_merge_so_no_tail_escapes() {
+        let m = masker(&["Project Falcon", "Falcon Heights"], false);
+        let mut reverse = HashMap::new();
+        let out = m
+            .mask("see Project Falcon Heights now", &mut reverse)
+            .unwrap();
+        assert!(!out.contains("Heights") && !out.contains("Falcon"), "{out}");
+
+        let m = masker(&["Acme-ghp"], true);
+        let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
+        let mut reverse = HashMap::new();
+        let out = m.mask(&format!("Acme-{key} x"), &mut reverse).unwrap();
+        assert!(!out.contains("0123456789abcdef"), "{out}");
     }
 
     #[test]
@@ -443,13 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_terms_use_the_earliest_then_longest_match() {
+    fn overlapping_terms_mask_their_union() {
         let m = masker(&["cdefg", "abcde"], false);
         let mut reverse = HashMap::new();
         let out = m.mask("abcdefg", &mut reverse).unwrap();
         assert_eq!(out.matches("[[REIKI_TERM_").count(), 1);
-        assert_eq!(reverse.values().next().unwrap(), "abcde");
-        assert!(out.starts_with("[[REIKI_TERM_") && out.ends_with("]]fg"));
+        assert_eq!(reverse.values().next().unwrap(), "abcdefg");
+        assert!(out.starts_with("[[REIKI_TERM_") && out.ends_with("]]"));
     }
 
     #[test]

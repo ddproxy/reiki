@@ -131,6 +131,10 @@ impl<K: Kind> Plugin for Guard<K> {
         self.spec.name
     }
 
+    fn fails_closed(&self) -> bool {
+        self.mode == Mode::Block
+    }
+
     fn uses_bodies(&self) -> bool {
         false
     }

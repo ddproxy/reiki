@@ -33,6 +33,37 @@ pub struct Hit<K> {
     pub end: usize,
 }
 
+/// `text` with each JSON escape for whitespace or a quote (`\n`, `\t`, `\r`, `\"`, `\/`) turned
+/// into a space plus the real character (or two spaces), so an identifier or banner right after
+/// one is not read as part of a word and line starts are real. Byte offsets are unchanged.
+pub fn blank_json_escapes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\\') {
+        return text.into();
+    }
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\\' {
+            let real = match bytes[i + 1] {
+                b'n' => Some(b'\n'),
+                b't' => Some(b'\t'),
+                b'r' => Some(b'\r'),
+                b'"' | b'/' => Some(b' '),
+                _ => None,
+            };
+            if let Some(real) = real {
+                out[i] = b' ';
+                out[i + 1] = real;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_or_else(|_| text.into(), Into::into)
+}
+
 /// True when the byte at `i - 1` is part of a word.
 pub fn word_before(bytes: &[u8], i: usize) -> bool {
     i > 0 && i <= bytes.len() && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')
@@ -133,6 +164,18 @@ pub fn merge_hits<K: Copy>(hits: &mut Vec<Hit<K>>, mut extra: Vec<Hit<K>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_whitespace_escapes_are_blanked_without_moving_offsets() {
+        let text = r#"a\n123-45-6789\t4\\n"#;
+        let blanked = super::blank_json_escapes(text);
+        assert_eq!(blanked.len(), text.len());
+        assert_eq!(blanked, "a \n123-45-6789 \t4\\\\n");
+        assert!(matches!(
+            super::blank_json_escapes("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
     use super::*;
 
     fn hit(start: usize, end: usize) -> Hit<u8> {

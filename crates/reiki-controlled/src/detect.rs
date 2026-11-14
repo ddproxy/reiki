@@ -93,6 +93,7 @@ const ECCN_WORDS: &[&str] = &[
 
 /// Every hit for the wanted `kinds`, in order of position within each kind.
 pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
+    let text = &*reiki_detect::blank_json_escapes(text);
     let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
     let lower = lower.as_bytes();
@@ -584,6 +585,11 @@ mod tests {
         let mut found: Vec<Kind> = scan(text, &all()).into_iter().map(|h| h.kind).collect();
         found.sort();
         found
+    }
+
+    #[test]
+    fn a_banner_after_a_json_escape_is_found() {
+        assert_eq!(kinds("{\"c\":\"intro\\nCUI//SP-CTI\\nbody\"}"), [Kind::Cui]);
     }
 
     #[test]

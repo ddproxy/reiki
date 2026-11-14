@@ -211,6 +211,7 @@ const NON_DATA: &[&str] = &[
 
 /// Every hit for the wanted `kinds`, in order of position within each kind.
 pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
+    let text = &*reiki_detect::blank_json_escapes(text);
     let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
     let lower = lower.as_bytes();
@@ -459,6 +460,7 @@ fn account_value(bytes: &[u8], at: usize) -> Option<usize> {
 pub(crate) fn id_value(bytes: &[u8], at: usize) -> Option<usize> {
     let token = bytes[at..]
         .iter()
+        .take(21)
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
         .count();
     let digits = bytes[at..at + token]
@@ -719,6 +721,12 @@ mod tests {
         let mut k = Kind::DEFAULT.to_vec();
         k.extend([Kind::Email, Kind::Phone]);
         k
+    }
+
+    #[test]
+    fn an_identifier_after_a_json_escape_is_found() {
+        assert_eq!(kinds("Notes:\\n123-45-6789", &all()), [Kind::Ssn]);
+        assert_eq!(kinds("x\\t4111 1111 1111 1111", &all()), [Kind::Card]);
     }
 
     #[test]

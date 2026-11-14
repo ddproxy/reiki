@@ -404,7 +404,8 @@ struct Shaped {
 fn full_body(config: &Config, body: &[u8], cut: bool) -> Shaped {
     let masked = |text: &str| {
         if config.redact {
-            redact::secrets_cut(text, cut).into_owned()
+            let keyed = redact::form(text, cut);
+            redact::secrets_cut(keyed.as_deref().unwrap_or(text), cut).into_owned()
         } else {
             text.to_owned()
         }
@@ -1042,5 +1043,45 @@ mod tests {
         assert_eq!(record["body_truncated"], true);
         assert!(!record.to_string().contains("sk-0123"), "{record}");
         assert_eq!(record["body_bytes"], full.len());
+    }
+
+    #[test]
+    fn a_form_body_has_its_credential_values_masked() {
+        let record = parsed(
+            &config(""),
+            request("password=hunter2&client_secret=abc&user=bob"),
+        );
+        assert_eq!(
+            record["body"],
+            "password=[REDACTED]&client_secret=[REDACTED]&user=bob"
+        );
+    }
+
+    #[test]
+    fn a_form_body_masks_percent_encoded_names_and_a_cut_pair() {
+        let record = parsed(&config(""), request("pass%77ord=x&a=1"));
+        assert_eq!(record["body"], "pass%77ord=[REDACTED]&a=1");
+        let mut event = request("password=hunter2&client_sec");
+        event.body_bytes = 64;
+        let record = parsed(&config(""), event);
+        assert_eq!(record["body"], "password=[REDACTED]&client_sec");
+        assert_eq!(record["body_truncated"], true);
+    }
+
+    #[test]
+    fn a_form_response_body_is_masked_too() {
+        let record: Value = serde_json::from_str(&render(
+            &config("response = \"body\""),
+            Event::Response(response_with(Some(b"token=abc123&user=bob"), false)),
+        ))
+        .unwrap();
+        assert_eq!(record["body"], "token=[REDACTED]&user=bob");
+    }
+
+    #[test]
+    fn prose_with_an_equals_sign_is_not_a_form() {
+        let text = "the ratio a=b is fine, and password=set later";
+        let record = parsed(&config(""), request(text));
+        assert_eq!(record["body"], text);
     }
 }

@@ -341,19 +341,55 @@ pub fn path(path: &str) -> String {
     };
     let mut out = secrets(base).into_owned();
     if let Some(query) = query {
-        let masked: Vec<String> = query
-            .split('&')
-            .map(|part| match part.split_once('=') {
-                Some((name, _)) if secret_param(name) => {
-                    format!("{name}={MASK}")
-                }
-                _ => secrets(part).into_owned(),
-            })
-            .collect();
         out.push('?');
-        out.push_str(&masked.join("&"));
+        out.push_str(&mask_query(query));
     }
     out
+}
+
+fn mask_query(query: &str) -> String {
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((name, _)) if secret_param(name) => {
+                format!("{name}={MASK}")
+            }
+            _ => secrets(part).into_owned(),
+        })
+        .collect();
+    masked.join("&")
+}
+
+/// Form-shaped text is not JSON, so the key-based rule is applied to it by hand.
+pub fn form(text: &str, cut: bool) -> Option<String> {
+    let last = text.split('&').count() - 1;
+    let mut paired = false;
+    for (i, part) in text.split('&').enumerate() {
+        match part.split_once('=') {
+            Some((name, value)) => {
+                let value_ok = value.chars().all(|c| !c.is_whitespace() && !c.is_control());
+                if !plausible_form_name(name) || !value_ok {
+                    return None;
+                }
+                paired = true;
+            }
+            None => {
+                let incomplete = cut && i == last;
+                if !incomplete || !part.bytes().all(is_form_name_byte) {
+                    return None;
+                }
+            }
+        }
+    }
+    paired.then(|| mask_query(text))
+}
+
+fn plausible_form_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_form_name_byte)
+}
+
+fn is_form_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'%' | b'+' | b'~' | b'[' | b']')
 }
 
 /// Masks every string value and object key in place, and the string under a field named like a
@@ -788,5 +824,24 @@ mod tests {
         let mut events = vec![delta("see "), delta(&fake("sk-", "0123"))];
         stream_deltas(&mut events, false);
         assert_eq!(events[1]["choices"][0]["delta"]["content"], "sk-0123");
+    }
+
+    #[test]
+    fn form_bodies_are_recognised_strictly() {
+        assert_eq!(
+            form("password=hunter2&client_secret=abc&user=bob", false).as_deref(),
+            Some("password=[REDACTED]&client_secret=[REDACTED]&user=bob")
+        );
+        assert_eq!(form("a=b&", false), None);
+        assert_eq!(form("a=b&c", false), None);
+        assert_eq!(form("a=b&c", true).as_deref(), Some("a=b&c"));
+        assert_eq!(form(r#"{"password":"a=b"}"#, false), None);
+        assert_eq!(form("name with spaces=x", false), None);
+        assert_eq!(form("token=two words", false), None);
+        assert_eq!(form("no pairs here", false), None);
+        assert_eq!(
+            form("token=abc&note=sk-0123456789abcdef0123456789", false).as_deref(),
+            Some("token=[REDACTED]&note=[REDACTED]")
+        );
     }
 }

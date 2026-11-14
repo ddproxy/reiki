@@ -126,18 +126,22 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
         };
         let mut j = i + 1;
         while j < all.len() {
-            let cells = split_cells(all[j].text, delim, all[j].start);
-            if cells.len() != width {
+            if all[j].text.trim().is_empty() {
                 break;
             }
-            for (idx, (s, e)) in cells.iter().enumerate() {
-                if let Some(kind) = map[idx] {
-                    if cell_ok(kind, &text[*s..*e]) {
-                        hits.push(Hit {
-                            kind,
-                            start: *s,
-                            end: *e,
-                        });
+            // A row of another width is skipped, not treated as the end: a quoted cell that spans
+            // lines leaves a short line behind.
+            let cells = split_cells(all[j].text, delim, all[j].start);
+            if cells.len() == width {
+                for (idx, (s, e)) in cells.iter().enumerate() {
+                    if let Some(kind) = map[idx] {
+                        if cell_ok(kind, &text[*s..*e]) {
+                            hits.push(Hit {
+                                kind,
+                                start: *s,
+                                end: *e,
+                            });
+                        }
                     }
                 }
             }
@@ -399,6 +403,45 @@ mod tests {
         assert!(found("id,price,qty\n1,9.99,3\n").is_empty());
         assert!(found("iban,isin\nN/A,N/A\n").is_empty());
         assert!(found("INSERT INTO t (a, b) VALUES (1, 2);").is_empty());
+    }
+
+    fn table_values(text: &str) -> Vec<&str> {
+        super::scan_tables(text, &Kind::DEFAULT)
+            .into_iter()
+            .map(|h| &text[h.start..h.end])
+            .collect()
+    }
+
+    #[test]
+    fn a_ragged_row_does_not_end_the_table() {
+        let iban = "GB82WEST12345698765432";
+        assert_eq!(
+            table_values(&format!("iban,note\n{iban},x\nfoo,bar,baz\n{iban},y\n")),
+            [iban, iban]
+        );
+        assert_eq!(
+            table_values(&format!("iban,note\n{iban},\"a\nb\"\n{iban},y\n")),
+            [iban, iban],
+            "a quoted cell spanning lines leaves a short line behind"
+        );
+    }
+
+    #[test]
+    fn a_normal_table_is_read_in_full() {
+        let iban = "GB82WEST12345698765432";
+        assert_eq!(
+            table_values(&format!("iban,note\n{iban},x\n{iban},y\n")),
+            [iban, iban]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_still_ends_the_table() {
+        let iban = "GB82WEST12345698765432";
+        assert_eq!(
+            table_values(&format!("iban,note\n{iban},x\n\n{iban},y\n")),
+            [iban]
+        );
     }
 
     #[test]

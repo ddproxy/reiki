@@ -208,18 +208,22 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
         };
         let mut j = i + 1;
         while j < all.len() {
-            let cells = split_cells(all[j].text, delim, all[j].start);
-            if cells.len() != width {
+            if all[j].text.trim().is_empty() {
                 break;
             }
-            for (idx, (s, e)) in cells.iter().enumerate() {
-                if let Some(kind) = map[idx] {
-                    if cell_ok(kind, &text[*s..*e]) {
-                        hits.push(Hit {
-                            kind,
-                            start: *s,
-                            end: *e,
-                        });
+            // A row of another width is skipped, not treated as the end: a quoted cell that spans
+            // lines leaves a short line behind.
+            let cells = split_cells(all[j].text, delim, all[j].start);
+            if cells.len() == width {
+                for (idx, (s, e)) in cells.iter().enumerate() {
+                    if let Some(kind) = map[idx] {
+                        if cell_ok(kind, &text[*s..*e]) {
+                            hits.push(Hit {
+                                kind,
+                                start: *s,
+                                end: *e,
+                            });
+                        }
                     }
                 }
             }
@@ -576,6 +580,42 @@ mod tests {
     fn a_cell_is_reported_once_when_text_and_column_scans_both_see_it() {
         let hits = scan("ssn,x\n123-45-6789,y\n", &all());
         assert_eq!(hits.len(), 1);
+    }
+
+    fn table_values(text: &str) -> Vec<&str> {
+        super::scan_tables(text, &all())
+            .into_iter()
+            .map(|h| &text[h.start..h.end])
+            .collect()
+    }
+
+    #[test]
+    fn a_ragged_row_does_not_end_the_table() {
+        assert_eq!(
+            table_values("ssn,last_name\n123456789,Doe\nx,y,z\n234567890,Roe\n"),
+            ["123456789", "Doe", "234567890", "Roe"]
+        );
+        assert_eq!(
+            table_values("ssn,last_name\n123456789,\"Doe\nJane\"\n234567890,Roe\n"),
+            ["123456789", "Doe", "234567890", "Roe"],
+            "a quoted cell spanning lines leaves a short line behind"
+        );
+    }
+
+    #[test]
+    fn a_normal_table_is_read_in_full() {
+        assert_eq!(
+            table_values("ssn,last_name\n123456789,Doe\n234567890,Roe\n"),
+            ["123456789", "Doe", "234567890", "Roe"]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_still_ends_the_table() {
+        assert_eq!(
+            table_values("ssn,last_name\n123456789,Doe\n\n234567890,Roe\n"),
+            ["123456789", "Doe"]
+        );
     }
 
     #[test]

@@ -142,7 +142,7 @@ fn is_base64_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_')
 }
 
-/// `Some(private_key)` when the base64 text starts with a credential.
+/// `Some(private_key)` when the base64 text decodes to a credential anywhere in the decoded text.
 fn decoded_credential(text: &[u8]) -> Option<bool> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     for group in text.as_chunks::<4>().0 {
@@ -158,7 +158,6 @@ fn decoded_credential(text: &[u8]) -> Option<bool> {
     };
     reiki_redact::scan(decoded)
         .first()
-        .filter(|span| span.start == 0)
         .map(|span| span.private_key)
 }
 
@@ -219,12 +218,16 @@ const SECRET_FIELD_ENDINGS: &[&str] = &[
     "accesskey",
 ];
 
-fn secret_field(name: &str) -> bool {
-    let name: String = name
-        .chars()
+/// The comparison form of a field or query parameter name: lowercase ASCII alphanumerics only.
+fn normalize(name: &str) -> String {
+    name.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
-        .collect();
+        .collect()
+}
+
+fn secret_field(name: &str) -> bool {
+    let name = normalize(name);
     SECRET_FIELDS.contains(&name.as_str()) || SECRET_FIELD_ENDINGS.iter().any(|e| name.ends_with(e))
 }
 
@@ -296,17 +299,30 @@ const SECRET_HEADERS: &[&str] = &[
     "x-goog-api-key",
 ];
 
-/// Query parameters whose value is a credential.
+/// Query parameters whose whole value is a credential, after the name is percent-decoded and
+/// normalised the way `secret_field` normalises a JSON field name.
 const SECRET_PARAMS: &[&str] = &[
     "key",
-    "api_key",
     "apikey",
     "token",
-    "access_token",
+    "accesstoken",
+    "authtoken",
     "auth",
     "password",
+    "passwd",
     "secret",
+    "bearer",
+    "signature",
 ];
+
+/// Whether a query parameter carries a credential. The raw name is percent-decoded first, so
+/// `api%2Dkey` and `api+key` match `api-key`, then normalised and matched whole or by one of the
+/// known `secret_field` endings. Ordinary names such as `monkey` or `keyboard` are left alone.
+fn secret_param(name: &str) -> bool {
+    let decoded = percent_decode(name.as_bytes());
+    let name = normalize(&String::from_utf8_lossy(&decoded));
+    SECRET_PARAMS.contains(&name.as_str()) || SECRET_FIELD_ENDINGS.iter().any(|e| name.ends_with(e))
+}
 
 /// A header value, masked whole when the header carries credentials.
 pub fn header<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
@@ -327,7 +343,7 @@ pub fn path(path: &str) -> String {
         let masked: Vec<String> = query
             .split('&')
             .map(|part| match part.split_once('=') {
-                Some((name, _)) if SECRET_PARAMS.contains(&name.to_ascii_lowercase().as_str()) => {
+                Some((name, _)) if secret_param(name) => {
                     format!("{name}={MASK}")
                 }
                 _ => secrets(part).into_owned(),
@@ -492,6 +508,78 @@ mod tests {
     }
 
     #[test]
+    fn normalised_query_names_are_masked() {
+        for name in [
+            "key",
+            "api_key",
+            "api-key",
+            "apikey",
+            "ApiKey",
+            "token",
+            "access_token",
+            "access-token",
+            "accesstoken",
+            "auth_token",
+            "authtoken",
+            "api_secret",
+            "apisecret",
+            "client_secret",
+            "clientsecret",
+            "password",
+            "passwd",
+            "secret",
+            "bearer",
+            "signature",
+            "Auth",
+        ] {
+            assert_eq!(
+                path(&format!("/x?{name}=value&keep=1")),
+                format!("/x?{name}=[REDACTED]&keep=1"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_query_names_are_left_alone() {
+        for name in [
+            "monkey",
+            "keyboard",
+            "page_token_count",
+            "tokens",
+            "keys",
+            "note",
+        ] {
+            assert_eq!(
+                path(&format!("/x?{name}=value")),
+                format!("/x?{name}=value"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_encoded_query_names_are_masked() {
+        assert_eq!(path("/x?api%2Dkey=value"), "/x?api%2Dkey=[REDACTED]");
+        assert_eq!(
+            path("/x?access%5Ftoken=value"),
+            "/x?access%5Ftoken=[REDACTED]"
+        );
+        assert_eq!(path("/x?api+key=value"), "/x?api+key=[REDACTED]");
+        assert_eq!(path("/x?monkey=value"), "/x?monkey=value");
+    }
+
+    #[test]
+    fn repeated_and_valueless_query_parameters() {
+        assert_eq!(
+            path("/x?key=a&key=b&note=c"),
+            "/x?key=[REDACTED]&key=[REDACTED]&note=c"
+        );
+        assert_eq!(path("/x?token="), "/x?token=[REDACTED]");
+        assert_eq!(path("/x?token"), "/x?token");
+    }
+
+    #[test]
     fn json_keys_are_masked_too() {
         let key = fake("sk-", "0123456789abcdef0123456789");
         let mut value: Value = serde_json::from_str(&format!("{{\"{key}\":1}}")).unwrap();
@@ -559,6 +647,43 @@ mod tests {
             run(&format!("k={}", b64(&pem, false))),
             "k=[REDACTED PRIVATE KEY]"
         );
+    }
+
+    #[test]
+    fn a_base64_value_with_a_credential_anywhere_is_masked_whole() {
+        let key = fake("sk-", "0123456789abcdef0123456789");
+        let cases = [
+            format!("user:{key}"),
+            format!(r#"{{"token":"{key}"}}"#),
+            format!("prefix {key} tail"),
+        ];
+        for plain in cases {
+            for url in [false, true] {
+                let encoded = b64(&plain, url);
+                assert_eq!(
+                    run(&format!("v={encoded}")),
+                    "v=[REDACTED]",
+                    "{plain} -> {encoded}"
+                );
+            }
+        }
+        // A private key anywhere in the decoded text is still masked as a private key.
+        let pem = format!(
+            "prefix\n{}\nMIIabc\n",
+            fake("-----BEGIN ", "PRIVATE KEY-----")
+        );
+        assert_eq!(
+            run(&format!("k={}", b64(&pem, false))),
+            "k=[REDACTED PRIVATE KEY]"
+        );
+        // A whole-value base64 key keeps being masked.
+        assert_eq!(run(&format!("v={}", b64(&key, false))), "v=[REDACTED]");
+        // A base64 value with no credential stays untouched.
+        let plain = b64(
+            "the quick brown fox jumps over the lazy dog, twice over",
+            false,
+        );
+        assert!(matches!(secrets(&plain), Cow::Borrowed(_)), "{plain}");
     }
 
     #[test]

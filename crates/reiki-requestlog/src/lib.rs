@@ -14,7 +14,7 @@ mod timefmt;
 mod writer;
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -45,6 +45,10 @@ pub struct RequestLog {
     config: Arc<Config>,
     tx: Option<SyncSender<Event>>,
     dropped: Arc<AtomicU64>,
+    /// Bytes of queued events, bounded by `config.queue_max_bytes`.
+    queued_bytes: Arc<AtomicU64>,
+    /// Set once when the first record is dropped, so the warning is not repeated.
+    warned: Arc<AtomicBool>,
     writer: Option<JoinHandle<()>>,
 }
 
@@ -65,6 +69,9 @@ struct RequestState {
     body_truncated: bool,
     tx: SyncSender<Event>,
     dropped: Arc<AtomicU64>,
+    queued_bytes: Arc<AtomicU64>,
+    queue_max_bytes: u64,
+    warned: Arc<AtomicBool>,
 }
 
 impl Drop for RequestState {
@@ -84,8 +91,67 @@ impl Drop for RequestState {
             body: (self.response == ResponseMode::Body).then(|| std::mem::take(&mut self.body)),
             body_truncated: self.body_truncated,
         });
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        enqueue(
+            &self.tx,
+            &self.queued_bytes,
+            self.queue_max_bytes,
+            &self.dropped,
+            &self.warned,
+            event,
+        );
+    }
+}
+
+/// Reserves `size` bytes of the queue budget; `false` when that would pass `max`.
+fn reserve(queued: &AtomicU64, max: u64, size: u64) -> bool {
+    let mut current = queued.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(size) else {
+            return false;
+        };
+        if next > max {
+            return false;
+        }
+        match queued.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Counts one dropped record and warns once, so a burst does not flood the log.
+fn drop_record(dropped: &AtomicU64, warned: &AtomicBool) {
+    dropped.fetch_add(1, Ordering::Relaxed);
+    if !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "requestlog: dropping records; the writer queue is full or over its byte limit"
+        );
+    }
+}
+
+/// Queues an event without blocking. It is dropped and counted when the queue is full or the
+/// queued bytes would pass `queue_max_bytes`; a full queue releases the bytes it reserved.
+fn enqueue(
+    tx: &SyncSender<Event>,
+    queued: &AtomicU64,
+    max: u64,
+    dropped: &AtomicU64,
+    warned: &AtomicBool,
+    event: Event,
+) {
+    let size = event.queued_bytes();
+    if !reserve(queued, max, size) {
+        drop_record(dropped, warned);
+        return;
+    }
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            queued.fetch_sub(size, Ordering::Relaxed);
+            drop_record(dropped, warned);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            queued.fetch_sub(size, Ordering::Relaxed);
         }
     }
 }
@@ -97,6 +163,8 @@ impl RequestLog {
                 config: Arc::new(config),
                 tx: None,
                 dropped: Arc::new(AtomicU64::new(0)),
+                queued_bytes: Arc::new(AtomicU64::new(0)),
+                warned: Arc::new(AtomicBool::new(false)),
                 writer: None,
             });
         }
@@ -136,18 +204,28 @@ impl RequestLog {
         let config = Arc::new(config);
         let (tx, rx) = sync_channel(config.queue);
         let dropped = Arc::new(AtomicU64::new(0));
+        let queued_bytes = Arc::new(AtomicU64::new(0));
+        let warned = Arc::new(AtomicBool::new(false));
         let sinks = Sinks {
             file,
             #[cfg(unix)]
             socket,
             syslog,
         };
-        let writer = writer::spawn(Arc::clone(&config), sinks, rx, Arc::clone(&dropped))
-            .map_err(|e| format!("{NAME}: cannot start the writer thread: {e}"))?;
+        let writer = writer::spawn(
+            Arc::clone(&config),
+            sinks,
+            rx,
+            Arc::clone(&dropped),
+            Arc::clone(&queued_bytes),
+        )
+        .map_err(|e| format!("{NAME}: cannot start the writer thread: {e}"))?;
         Ok(Self {
             config,
             tx: Some(tx),
             dropped,
+            queued_bytes,
+            warned,
             writer: Some(writer),
         })
     }
@@ -156,13 +234,14 @@ impl RequestLog {
         let Some(tx) = &self.tx else {
             return;
         };
-        match tx.try_send(event) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {}
-        }
+        enqueue(
+            tx,
+            &self.queued_bytes,
+            self.config.queue_max_bytes,
+            &self.dropped,
+            &self.warned,
+            event,
+        );
     }
 }
 
@@ -232,6 +311,9 @@ impl Plugin for RequestLog {
             body_truncated: false,
             tx,
             dropped: Arc::clone(&self.dropped),
+            queued_bytes: Arc::clone(&self.queued_bytes),
+            queue_max_bytes: self.config.queue_max_bytes,
+            warned: Arc::clone(&self.warned),
         })
     }
 
@@ -494,6 +576,8 @@ mod tests {
             config: Arc::new(config),
             tx: Some(tx),
             dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicU64::new(0)),
+            warned: Arc::new(AtomicBool::new(false)),
             writer: None,
         };
         let started = Instant::now();
@@ -502,6 +586,164 @@ mod tests {
         }
         assert!(started.elapsed().as_secs() < 2, "hooks blocked");
         assert!(log.dropped.load(Ordering::Relaxed) > 0);
+    }
+
+    fn finding(id: &str) -> Event {
+        Event::Finding(FindingEvent {
+            id: id.to_owned(),
+            at: SystemTime::now(),
+            stream: String::new(),
+            plugin: String::new(),
+            kind: String::new(),
+            detail: None,
+            count: 1,
+            blocked: false,
+        })
+    }
+
+    #[test]
+    fn the_queue_byte_budget_is_reserved_and_refused_at_the_cap() {
+        let queued = AtomicU64::new(0);
+        assert!(reserve(&queued, 10, 6));
+        assert_eq!(queued.load(Ordering::Relaxed), 6);
+        assert!(reserve(&queued, 10, 4));
+        assert_eq!(queued.load(Ordering::Relaxed), 10);
+        // A reservation that would pass the cap is refused and changes nothing.
+        assert!(!reserve(&queued, 10, 1));
+        assert_eq!(queued.load(Ordering::Relaxed), 10);
+        // Released bytes can be reserved again.
+        queued.fetch_sub(6, Ordering::Relaxed);
+        assert!(reserve(&queued, 10, 6));
+        assert_eq!(queued.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn an_event_over_the_byte_cap_is_dropped_and_its_bytes_are_not_kept() {
+        let (tx, _rx) = sync_channel::<Event>(16);
+        let queued = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+        let warned = AtomicBool::new(false);
+        // A finding's queued size is the sum of its strings: 50 bytes here.
+        enqueue(
+            &tx,
+            &queued,
+            50,
+            &dropped,
+            &warned,
+            finding(&"i".repeat(50)),
+        );
+        assert_eq!(queued.load(Ordering::Relaxed), 50);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        enqueue(
+            &tx,
+            &queued,
+            50,
+            &dropped,
+            &warned,
+            finding(&"i".repeat(50)),
+        );
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            50,
+            "a dropped event must not keep its bytes"
+        );
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(warned.load(Ordering::Relaxed), "a drop warns once");
+    }
+
+    #[test]
+    fn a_full_queue_releases_the_bytes_of_the_event_it_refuses() {
+        let (tx, _rx) = sync_channel::<Event>(1);
+        let queued = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+        let warned = AtomicBool::new(false);
+        enqueue(&tx, &queued, 1000, &dropped, &warned, finding("a"));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        // The channel holds one event, so the second send fails: its bytes are released.
+        enqueue(&tx, &queued, 1000, &dropped, &warned, finding("b"));
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_writer_releases_queued_bytes_as_it_takes_an_event() {
+        let dir = dir("release");
+        let path = dir.join("req.jsonl");
+        let config = Arc::new(
+            Config::parse(&format!("file = \"{}\"", path.display()).parse().unwrap()).unwrap(),
+        );
+        let sinks = Sinks {
+            file: Some(FileSink::open(&path, 0, 0).unwrap()),
+            #[cfg(unix)]
+            socket: None,
+            syslog: None,
+        };
+        let (tx, rx) = sync_channel::<Event>(16);
+        let queued = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let warned = Arc::new(AtomicBool::new(false));
+        // Queue the event before the writer starts, so the reservation is observable.
+        enqueue(
+            &tx,
+            &queued,
+            config.queue_max_bytes,
+            &dropped,
+            &warned,
+            finding("queued"),
+        );
+        assert!(queued.load(Ordering::Relaxed) > 0);
+        let handle = writer::spawn(
+            Arc::clone(&config),
+            sinks,
+            rx,
+            Arc::clone(&dropped),
+            Arc::clone(&queued),
+        )
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&path).map_or(true, |text| text.is_empty()) {
+            assert!(
+                Instant::now() < deadline,
+                "the writer did not take the event"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        tx.send(Event::Shutdown).unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_byte_cap_drops_records_instead_of_blocking_and_releases_them() {
+        let config = Config::parse(
+            &"file = \"/unused\"\nqueue_max_bytes = 1048576"
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let (tx, _rx) = sync_channel::<Event>(config.queue);
+        let queued = Arc::new(AtomicU64::new(0));
+        let log = RequestLog {
+            config: Arc::new(config),
+            tx: Some(tx),
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::clone(&queued),
+            warned: Arc::new(AtomicBool::new(false)),
+            writer: None,
+        };
+        let body = format!(r#"{{"content":"{}"}}"#, "y".repeat(300_000));
+        let started = Instant::now();
+        for _ in 0..40 {
+            drive(&log, &[], &body, 200);
+        }
+        assert!(started.elapsed().as_secs() < 2, "hooks blocked");
+        assert!(log.dropped.load(Ordering::Relaxed) > 0, "no drop counted");
+        assert!(
+            queued.load(Ordering::Relaxed) <= 1_048_576,
+            "the queued bytes passed the cap: {}",
+            queued.load(Ordering::Relaxed)
+        );
     }
 
     #[cfg(unix)]

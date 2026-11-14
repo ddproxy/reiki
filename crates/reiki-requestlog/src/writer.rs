@@ -25,6 +25,52 @@ pub enum Event {
     Shutdown,
 }
 
+impl Event {
+    /// Bytes this event holds, the amount reserved on the queue's byte budget while it waits.
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        let strings = |parts: &[&str]| -> usize { parts.iter().map(|p| p.len()).sum() };
+        match self {
+            Event::Request(request) => {
+                let body = request.body.as_ref().map_or(0, |b| b.len());
+                let headers: usize = request
+                    .headers
+                    .iter()
+                    .map(|(name, value)| name.len() + value.len())
+                    .sum();
+                (body
+                    + headers
+                    + strings(&[
+                        &request.id,
+                        &request.stream,
+                        &request.upstream,
+                        &request.method,
+                        &request.path,
+                    ])) as u64
+            }
+            Event::Response(response) => {
+                let body = response.body.as_ref().map_or(0, Vec::len);
+                let attempts: usize = response
+                    .attempts
+                    .iter()
+                    .map(|a| a.key.len() + a.body.as_ref().map_or(0, Vec::len))
+                    .sum();
+                (body + attempts + strings(&[&response.id, response.key.as_deref().unwrap_or("")]))
+                    as u64
+            }
+            Event::Finding(finding) => {
+                (strings(&[
+                    &finding.id,
+                    &finding.stream,
+                    &finding.plugin,
+                    &finding.kind,
+                    finding.detail.as_deref().unwrap_or(""),
+                ])) as u64
+            }
+            Event::Shutdown => 0,
+        }
+    }
+}
+
 /// A detection plugin found identifiers in a request. It names a kind and a count, never the text.
 pub struct FindingEvent {
     pub id: String,
@@ -110,6 +156,7 @@ pub fn spawn(
     mut sinks: Sinks,
     rx: Receiver<Event>,
     dropped: Arc<AtomicU64>,
+    queued_bytes: Arc<AtomicU64>,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("requestlog-writer".to_owned())
@@ -118,6 +165,7 @@ pub fn spawn(
             // Records only syslog missed. The file and socket have them, so only syslog hears of it.
             let mut syslog_lost: u64 = 0;
             for event in rx {
+                queued_bytes.fetch_sub(event.queued_bytes(), Ordering::Relaxed);
                 if matches!(event, Event::Shutdown) {
                     break;
                 }
@@ -583,10 +631,14 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         let dropped = Arc::new(AtomicU64::new(3));
-        let handle = spawn(config, sinks, rx, Arc::clone(&dropped)).unwrap();
-        tx.send(Event::Request(request("{}"))).unwrap();
+        let event = Event::Request(request("{}"));
+        // The writer releases the bytes each queued event reserved, so seed the budget with it.
+        let queued = Arc::new(AtomicU64::new(event.queued_bytes()));
+        let handle = spawn(config, sinks, rx, Arc::clone(&dropped), Arc::clone(&queued)).unwrap();
+        tx.send(event).unwrap();
         tx.send(Event::Shutdown).unwrap();
         handle.join().unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
 
         let lines: Vec<Value> = std::fs::read_to_string(&path)
             .unwrap()

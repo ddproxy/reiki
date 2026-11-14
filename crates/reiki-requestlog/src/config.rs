@@ -23,6 +23,9 @@ const MAX_BODY_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const MAX_CAPTURE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_QUEUE: usize = 1024;
+const DEFAULT_QUEUE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_QUEUE_MAX_BYTES: u64 = 1024 * 1024;
+const MAX_QUEUE_MAX_BYTES: u64 = 4096 * 1024 * 1024;
 /// Below the 104-byte limit of the smallest platform (macOS), leaving room for the terminator.
 const MAX_SOCKET_PATH: usize = 100;
 const DEFAULT_SYSLOG_FACILITY: u8 = 16;
@@ -97,6 +100,8 @@ pub struct Config {
     pub response: ResponseMode,
     pub redact: bool,
     pub queue: usize,
+    /// Most bytes of queued records held for the writer thread.
+    pub queue_max_bytes: u64,
     pub dry_run: bool,
     /// Top-level keys or JSON pointers dropped from logged JSON bodies.
     pub exclude: Vec<String>,
@@ -125,6 +130,7 @@ impl Config {
             "response",
             "redact",
             "queue",
+            "queue_max_bytes",
             "exclude",
             "summarize",
             "max_string_bytes",
@@ -217,6 +223,13 @@ impl Config {
             MAX_CAPTURE_BYTES_LIMIT as u64,
         )? as usize;
         let queue = integer(table, "queue", DEFAULT_QUEUE as u64, 16, 65_536)? as usize;
+        let queue_max_bytes = integer(
+            table,
+            "queue_max_bytes",
+            DEFAULT_QUEUE_MAX_BYTES,
+            MIN_QUEUE_MAX_BYTES,
+            MAX_QUEUE_MAX_BYTES,
+        )?;
 
         let headers = headers(table)?;
         let exclude = paths(table, "exclude")?;
@@ -278,6 +291,7 @@ impl Config {
             response,
             redact,
             queue,
+            queue_max_bytes,
             dry_run,
             exclude,
             summarize,
@@ -436,6 +450,7 @@ mod tests {
         assert_eq!(config.file_keep, 5);
         assert_eq!(config.max_body_bytes, 65_536);
         assert_eq!(config.max_capture_bytes, 1_048_576);
+        assert_eq!(config.queue_max_bytes, 67_108_864);
         assert!(config.headers.is_empty() && config.socket.is_none());
     }
 
@@ -610,6 +625,20 @@ mod tests {
             4096
         );
         assert!(parse("file = \"/x\"\nqueue = 4").is_err());
+        assert!(parse("file = \"/x\"\nqueue_max_bytes = 1048575").is_err());
+        assert!(parse("file = \"/x\"\nqueue_max_bytes = 4294967297").is_err());
+        assert_eq!(
+            parse("file = \"/x\"\nqueue_max_bytes = 1048576")
+                .unwrap()
+                .queue_max_bytes,
+            1_048_576
+        );
+        assert_eq!(
+            parse("file = \"/x\"\nqueue_max_bytes = 4294967296")
+                .unwrap()
+                .queue_max_bytes,
+            4_294_967_296
+        );
         assert!(parse("file = \"/x\"\nfile_keep = 500").is_err());
         assert!(parse("file = \"/x\"\nredact = \"yes\"").is_err());
         assert!(parse("file = \"/x\"\nfile_max_bytes = -1").is_err());

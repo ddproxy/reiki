@@ -268,8 +268,8 @@ pub fn classify_at(
             } else if names_invalid_credential(&body) {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
             } else {
-                // A bare 403 usually means a WAF, geo-block or plan/model restriction. Do not
-                // take the key out of rotation for a refusal that may only apply to this request.
+                // A bare 403 is usually a WAF, geo-block or plan/model restriction that may only
+                // apply to this request: the key is skipped for it, not cooled.
                 Outcome::KeyFailure(FailureClass::AccessDisabled)
             }
         }

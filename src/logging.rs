@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing_subscriber::fmt::MakeWriter;
@@ -96,8 +96,8 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
 /// The log file, shared by the subscriber and the SIGHUP handler.
 pub struct LogFile {
     state: Mutex<FileState>,
-    /// Lines that could not be written; the first is also reported on stderr.
-    failed: AtomicU64,
+    /// Set by the first failed write, which is also reported on stderr.
+    warned: AtomicBool,
 }
 
 impl LogFile {
@@ -112,13 +112,8 @@ impl LogFile {
         state.open()?;
         Ok(Arc::new(Self {
             state: Mutex::new(state),
-            failed: AtomicU64::new(0),
+            warned: AtomicBool::new(false),
         }))
-    }
-
-    /// How many lines could not be written to the file since start.
-    fn failures(&self) -> u64 {
-        self.failed.load(Ordering::Relaxed)
     }
 
     /// Closes and reopens the file, so a log rotation tool can move it away.
@@ -137,12 +132,12 @@ impl Write for FileWriter {
             let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.write(data)
         };
-        // A log line must never take the service down, so a failed write is dropped, but counted.
+        // A log line must never take the service down, so a failed write is dropped.
         // Reported on stderr: a tracing event would come straight back to this writer.
         if let Err(error) = result {
-            if self.0.failed.fetch_add(1, Ordering::Relaxed) == 0 {
+            if !self.0.warned.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "reiki: cannot write to the log file: {error}; later failures are only counted"
+                    "reiki: cannot write to the log file: {error}; later failures are dropped silently"
                 );
             }
         }
@@ -170,7 +165,6 @@ pub struct Logging {
     filter: reload::Handle<EnvFilter, Registry>,
     file: Option<Arc<LogFile>>,
     from_env: bool,
-    /// What the subscriber was built from; the settings a reload cannot change are compared to it.
     started: LogConfig,
 }
 
@@ -229,32 +223,23 @@ pub fn init(config: &LogConfig, with_file: bool) -> Result<Logging, String> {
 }
 
 impl Logging {
-    /// How many lines the log file failed to take since start.
-    pub fn file_write_failures(&self) -> u64 {
-        self.file.as_ref().map_or(0, |file| file.failures())
-    }
-
-    /// The `[log]` settings in `new` that differ from the running ones and only apply after a
-    /// restart, such as `log.format`.
+    /// `[log]` settings that changed but need a restart.
     pub fn restart_needed(&self, new: &LogConfig) -> Vec<String> {
         let old = &self.started;
-        let mut out = Vec::new();
-        if old.file != new.file {
-            out.push("log.file".to_owned());
-        }
-        if old.format != new.format {
-            out.push("log.format".to_owned());
-        }
-        if old.stderr != new.stderr {
-            out.push("log.stderr".to_owned());
-        }
-        if old.file_max_bytes != new.file_max_bytes {
-            out.push("log.file_max_bytes".to_owned());
-        }
-        if old.file_keep != new.file_keep {
-            out.push("log.file_keep".to_owned());
-        }
-        out
+        [
+            ("log.file", old.file != new.file),
+            ("log.format", old.format != new.format),
+            ("log.stderr", old.stderr != new.stderr),
+            (
+                "log.file_max_bytes",
+                old.file_max_bytes != new.file_max_bytes,
+            ),
+            ("log.file_keep", old.file_keep != new.file_keep),
+        ]
+        .into_iter()
+        .filter(|(_, differs)| *differs)
+        .map(|(name, _)| name.to_owned())
+        .collect()
     }
 
     /// Reopens the log file, so a rotation tool can move it away, without touching the level.
@@ -388,16 +373,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_file_writes_are_counted_and_never_fail_the_caller() {
+    fn failed_file_writes_never_fail_the_caller() {
         let dir = dir("failing");
         let log = Arc::new(LogFile {
             state: Mutex::new(state(dir.join("no-such-dir").join("reiki.log"), 0, 2)),
-            failed: AtomicU64::new(0),
+            warned: AtomicBool::new(false),
         });
         let mut writer = FileWriter(Arc::clone(&log));
         assert_eq!(writer.write(b"one\n").unwrap(), 4);
         assert_eq!(writer.write(b"two\n").unwrap(), 4);
-        assert_eq!(log.failures(), 2);
+        assert!(log.warned.load(Ordering::Relaxed));
     }
 
     #[test]

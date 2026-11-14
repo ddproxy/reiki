@@ -8,7 +8,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -21,6 +21,7 @@ use reiki_plugin::{
 };
 
 use crate::config::ConfigError;
+use crate::reload::{file_stamp, stamps, Stamps};
 
 /// A plugin admin path in the form the admin router matches: absolute, already normalised.
 fn admin_path(path: &str) -> Option<&str> {
@@ -69,34 +70,21 @@ struct Entry {
     /// The `[plugins.<name>]` table the instance was built from, to tell on a reload whether it changed.
     table: toml::Table,
     /// The files the plugin reads, as they were when it was built.
-    stamps: Vec<(PathBuf, Option<FileStamp>)>,
+    stamps: Stamps,
     /// Streams the plugin runs on; `None` runs it on every stream.
     streams: Option<Vec<String>>,
 }
 
-/// Enough of a file's identity to notice an edit: its modification time and size.
-pub(crate) type FileStamp = (std::time::SystemTime, u64);
-
-pub(crate) fn stamp(path: &Path) -> Option<FileStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
-}
-
-fn stamps_of(plugin: &dyn Plugin) -> Vec<(PathBuf, Option<FileStamp>)> {
-    plugin
-        .watched_files()
-        .into_iter()
-        .map(|path| {
-            let seen = stamp(&path);
-            (path, seen)
-        })
-        .collect()
+fn stamps_of(plugin: &dyn Plugin) -> Stamps {
+    stamps(&plugin.watched_files())
 }
 
 impl Entry {
     /// True when a file the plugin reads differs from what it saw at build time.
     fn files_changed(&self) -> bool {
-        self.stamps.iter().any(|(path, seen)| stamp(path) != *seen)
+        self.stamps
+            .iter()
+            .any(|(path, seen)| file_stamp(path) != *seen)
     }
 
     /// Whether the plugin runs for a request on `stream`; a stream-less event reaches only unscoped plugins.
@@ -411,7 +399,7 @@ impl PluginChain {
         !self.entries.iter().any(|e| e.plugin.uses_bodies())
     }
 
-    /// True when no plugin needs the response head or chunks.
+    /// True when any plugin needs the response head or chunks.
     pub fn needs_response_hooks(&self) -> bool {
         self.entries.iter().any(|e| e.plugin.needs_response_hooks())
     }
@@ -663,7 +651,7 @@ impl PluginSession {
         self.chain.is_empty()
     }
 
-    /// True when no plugin in this session needs the response hooks.
+    /// True when any plugin in this session needs the response hooks.
     pub fn needs_response_hooks(&self) -> bool {
         self.chain.needs_response_hooks()
     }

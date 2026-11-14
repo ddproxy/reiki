@@ -9,8 +9,10 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
 
-use crate::admin::{bearer_token, text_response, throttled, unauthorized};
-use crate::auth::{constant_time_eq, sha256_hex, LoginThrottle, Peer, ThrottleSettings};
+use crate::admin::{text_response, throttled, unauthorized};
+use crate::auth::{
+    bearer_token, constant_time_eq, sha256_hex, LoginThrottle, Peer, ThrottleSettings,
+};
 use crate::config::{PeerToken, PeersConfig};
 use crate::proxy::App;
 

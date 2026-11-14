@@ -9,7 +9,7 @@ use axum::response::Response;
 use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 
-use crate::auth::{constant_time_eq, sha256_hex, Peer};
+use crate::auth::{bearer_token, constant_time_eq, sha256_hex, Peer};
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::StrategyConfig;
 use crate::proxy::{App, Snapshot};
@@ -450,16 +450,6 @@ fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
     }
 }
 
-/// The credential of an `Authorization: Bearer <token>` value. The scheme name is
-/// case-insensitive, and the same surrounding whitespace is accepted as on the client listener.
-pub(crate) fn bearer_token(value: &str) -> Option<&str> {
-    let (scheme, rest) = value
-        .trim_ascii()
-        .split_once(|c: char| c.is_ascii_whitespace())?;
-    let token = rest.trim_ascii();
-    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
-}
-
 pub(crate) fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
@@ -584,21 +574,6 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bearer_scheme_is_case_insensitive_but_the_token_is_exact() {
-        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
-        assert_eq!(bearer_token("bearer abc"), Some("abc"));
-        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
-        assert_eq!(bearer_token("Bearer Abc"), Some("Abc"));
-        assert_eq!(bearer_token("Bearer"), None);
-        assert_eq!(bearer_token("Basic abc"), None);
-        assert_eq!(bearer_token("Bearerabc"), None);
-        assert_eq!(bearer_token("  Bearer   abc  "), Some("abc"));
-        assert_eq!(bearer_token("Bearer\tabc"), Some("abc"));
-        assert_eq!(bearer_token("Bearer "), None);
-        assert_eq!(bearer_token("Bearer   "), None);
-    }
 
     #[test]
     fn percent_decoding_takes_hex_digits_only() {

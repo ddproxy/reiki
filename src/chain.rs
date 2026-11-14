@@ -7,7 +7,6 @@ use crate::classify::FailureClass;
 pub struct Policy {
     pub rate_limited_default: Duration,
     pub quota_exhausted: Duration,
-    pub access_disabled: Duration,
     pub transient: Duration,
     pub transient_threshold: u32,
 }
@@ -17,7 +16,6 @@ impl Default for Policy {
         Self {
             rate_limited_default: Duration::from_secs(60),
             quota_exhausted: Duration::from_secs(5 * 3600),
-            access_disabled: Duration::from_secs(5 * 3600),
             transient: Duration::from_secs(30),
             transient_threshold: 2,
         }
@@ -211,7 +209,8 @@ impl KeyState {
                 let until = now + quota_cooldown.unwrap_or(policy.quota_exhausted);
                 h.cool_until(until)
             }
-            FailureClass::AccessDisabled => h.cool_until(now + policy.access_disabled),
+            // Request-scoped: the proxy skips the key for this request and never records it.
+            FailureClass::AccessDisabled => false,
             FailureClass::Transient => {
                 h.transient_failures += 1;
                 if h.transient_failures >= policy.transient_threshold {
@@ -428,21 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn a_quota_cooldown_does_not_change_other_classes() {
+    fn access_disabled_never_cools_a_key() {
         let mut state = KeyState::default();
         let now = Instant::now();
-        let policy = Policy::default();
-        state.record_failure_with(
-            "a",
-            FailureClass::AccessDisabled,
-            &policy,
-            now,
-            Some(secs(5)),
-        );
-        assert_eq!(
-            state.cooling_remaining("a", now),
-            Some(policy.access_disabled)
-        );
+        assert!(!state.record_failure("a", FailureClass::AccessDisabled, &Policy::default(), now));
+        assert!(state.is_available("a", now));
     }
 
     #[test]
@@ -456,14 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn quota_and_access_failures_use_long_cooldowns() {
+    fn quota_failures_use_a_long_cooldown() {
         let mut state = KeyState::default();
         let now = Instant::now();
         let policy = Policy::default();
         state.record_failure("q", FailureClass::QuotaExhausted, &policy, now);
-        state.record_failure("d", FailureClass::AccessDisabled, &policy, now);
         assert!(!state.is_available("q", now + secs(3600)));
-        assert!(!state.is_available("d", now + secs(3600)));
         assert!(state.is_available("q", now + policy.quota_exhausted));
     }
 

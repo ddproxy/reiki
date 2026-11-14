@@ -124,27 +124,15 @@ impl LoginThrottle {
         }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
-            // One pass frees one slot: an expired entry if there is one, else the least-failed,
-            // then oldest, entry that is not blocked.
-            let mut expired = None;
-            let mut weakest: Option<(IpAddr, (u32, Instant))> = None;
-            for (key, (count, since)) in seen.iter() {
-                if now.saturating_duration_since(*since) >= settings.window {
-                    expired = Some(*key);
-                    break;
-                }
-                if *count < settings.max_failures
-                    && weakest.is_none_or(|(_, rank)| (*count, *since) < rank)
-                {
-                    weakest = Some((*key, (*count, *since)));
-                }
-            }
-            match expired.or(weakest.map(|(key, _)| key)) {
-                Some(victim) => {
-                    seen.remove(&victim);
-                }
-                // Every tracked address is blocked; releasing one would let it guess again.
-                None => return 1,
+            // Free one slot: an expired entry, else the least-failed oldest unblocked one, else
+            // the oldest blocked one, so a flood of blocked addresses cannot leave new ones untracked.
+            let victim = seen.iter().min_by_key(|(_, (count, since))| {
+                let expired = now.saturating_duration_since(*since) >= settings.window;
+                (!expired, *count >= settings.max_failures, *count, *since)
+            });
+            if let Some((victim, _)) = victim {
+                let victim = *victim;
+                seen.remove(&victim);
             }
         }
         let entry = seen.entry(ip).or_insert((0, now));
@@ -190,21 +178,30 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// The credential of an `Authorization: Bearer <token>` value. The scheme name is
+/// case-insensitive, and the same surrounding whitespace is accepted as on the client listener.
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, rest) = value
+        .trim_ascii()
+        .split_once(|c: char| c.is_ascii_whitespace())?;
+    let token = rest.trim_ascii();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
 /// The token in a `Proxy-Authorization` value: a bearer token, or the password of a basic
 /// credential (the user name when the password is empty), as `HTTPS_PROXY=http://user:token@host` sends it.
 pub fn proxy_token(value: &str) -> Option<String> {
+    if let Some(token) = bearer_token(value) {
+        return Some(token.to_owned());
+    }
     let (scheme, rest) = value.trim().split_once(' ')?;
-    let rest = rest.trim();
-    let token = if scheme.eq_ignore_ascii_case("bearer") {
-        rest.to_owned()
-    } else if scheme.eq_ignore_ascii_case("basic") {
-        let decoded = String::from_utf8(base64_decode(rest)?).ok()?;
-        let (user, pass) = decoded.split_once(':').unwrap_or((decoded.as_str(), ""));
-        if pass.is_empty() { user } else { pass }.to_owned()
-    } else {
+    if !scheme.eq_ignore_ascii_case("basic") {
         return None;
-    };
-    (!token.is_empty()).then_some(token)
+    }
+    let decoded = String::from_utf8(base64_decode(rest.trim())?).ok()?;
+    let (user, pass) = decoded.split_once(':').unwrap_or((decoded.as_str(), ""));
+    let token = if pass.is_empty() { user } else { pass };
+    (!token.is_empty()).then(|| token.to_owned())
 }
 
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
@@ -237,11 +234,12 @@ pub fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String>
 }
 
 fn token_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        let value = value.trim();
-        if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") {
-            return Some(value[7..].trim().to_owned());
-        }
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_token);
+    if let Some(token) = bearer {
+        return Some(token.to_owned());
     }
     CREDENTIAL_HEADERS.iter().find_map(|name| {
         headers
@@ -379,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_table_of_blocked_addresses_never_releases_one() {
+    fn a_full_table_of_blocked_addresses_evicts_the_oldest_to_track_a_newcomer() {
         let throttle = LoginThrottle::default();
         let t0 = Instant::now();
         for n in 0..MAX_TRACKED as u32 {
@@ -394,11 +392,17 @@ mod tests {
             throttle.fail(newcomer, now);
         }
         assert_eq!(throttle.seen.lock().unwrap().len(), MAX_TRACKED);
-        assert!(throttle.blocked(newcomer, now).is_none(), "not tracked");
-        for n in 0..MAX_TRACKED as u32 {
-            let ip = IpAddr::from(std::net::Ipv4Addr::from(n + 1));
-            assert!(throttle.blocked(ip, now).is_some(), "{ip} stays blocked");
-        }
+        assert!(
+            throttle.blocked(newcomer, now).is_some(),
+            "tracked and blocked"
+        );
+        let oldest = IpAddr::from(std::net::Ipv4Addr::from(1u32));
+        assert!(
+            throttle.blocked(oldest, now).is_none(),
+            "the oldest was evicted"
+        );
+        let next = IpAddr::from(std::net::Ipv4Addr::from(2u32));
+        assert!(throttle.blocked(next, now).is_some());
     }
 
     #[test]
@@ -482,6 +486,21 @@ mod tests {
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "ab"));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_but_the_token_is_exact() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Bearer Abc"), Some("Abc"));
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+        assert_eq!(bearer_token("  Bearer   abc  "), Some("abc"));
+        assert_eq!(bearer_token("Bearer\tabc"), Some("abc"));
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer   "), None);
     }
 
     #[test]

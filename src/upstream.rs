@@ -408,12 +408,6 @@ impl Standard {
         })
     }
 
-    /// Panics rather than substituting a different redirect or decoding policy.
-    pub fn new() -> Self {
-        Self::try_new()
-            .unwrap_or_else(|error| panic!("cannot build the upstream HTTP client: {error}"))
-    }
-
     fn client_for(&self, upstream: &Upstream) -> &reqwest::Client {
         if upstream.http2 {
             &self.http2
@@ -422,12 +416,6 @@ impl Standard {
         } else {
             &self.http1
         }
-    }
-}
-
-impl Default for Standard {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

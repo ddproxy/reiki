@@ -79,6 +79,10 @@ impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -290,7 +294,7 @@ impl App {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             policy,
-            standard: Standard::new(),
+            standard: Standard::try_new().expect("cannot build the upstream HTTP client"),
             faithful: Faithful::new(),
             forwarder: Forwarder::default(),
             header_timeout,
@@ -435,11 +439,12 @@ impl App {
             .persist_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let snapshot = match self.health.lock() {
-            Ok(health) => health.snapshot(Instant::now()),
-            Err(_) => return,
-        };
-        crate::state::save(path, &snapshot, &self.snapshot().config);
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot(Instant::now());
+        crate::state::save(path, &health, &self.snapshot().keys);
     }
 
     /// Re-enables a key that was taken out of rotation and persists the change. Returns false
@@ -680,12 +685,8 @@ impl App {
         if tunnel_listen(&current.config) != tunnel_listen(&config) {
             restart_needed.push("tunnel.listen".to_owned());
         }
-        match self.logging.get() {
-            Some(logging) => restart_needed.extend(logging.restart_needed(&config.log)),
-            None if current.config.log.file != config.log.file => {
-                restart_needed.push("log.file".to_owned());
-            }
-            None => {}
+        if let Some(logging) = self.logging.get() {
+            restart_needed.extend(logging.restart_needed(&config.log));
         }
         match (self.tunnel.get(), &config.tunnel) {
             (Some(_), None) => restart_needed.push("tunnel removed".to_owned()),
@@ -1136,8 +1137,7 @@ async fn dispatch_inner(
     faithful: bool,
     plugin_session: PluginSession,
 ) -> Response {
-    // One event per request, with the status the client got and the upstream that served
-    // it; dropping the future before a response exists reports 499 instead.
+    // Dropped before a response: reports 499.
     let mut request_done = RequestDone::new(plugin_session.chain().clone(), stream, upstream_name);
     let response = dispatch_body(
         app,
@@ -1333,7 +1333,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         faithful,
     } = fwd;
 
-    let url = target_url(upstream, rest, parts, true);
+    let url = target_url(upstream, rest, parts.uri.query().and_then(strip_query_key));
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
     let max_attempts = snapshot
@@ -1572,8 +1572,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     class,
                     Some(status.as_u16()),
                 );
-                // A first transient failure does not cool the key yet, so without this
-                // the walk would spend its budget on the same key and never reach the rest.
+                // A first transient 5xx does not cool the key; skip it so the walk moves on.
                 if matches!(class, FailureClass::Transient) {
                     skip.push(key_name.clone());
                     last_refusal = Some((key_name.clone(), status, response_headers, snippet));
@@ -1605,7 +1604,7 @@ async fn forward_passthrough(
         faithful,
         ..
     } = fwd;
-    let url = target_url(upstream, rest, parts, false);
+    let url = target_url(upstream, rest, parts.uri.query().map(str::to_owned));
     // For a forward upstream this bounds the whole exchange, not only response headers.
     let sent = tokio::time::timeout(app.header_timeout, async {
         app.transport(faithful, upstream)
@@ -1675,20 +1674,8 @@ async fn forward_passthrough(
     }
 }
 
-fn target_url(
-    upstream: &crate::config::Upstream,
-    rest: &str,
-    parts: &Parts,
-    strip_key: bool,
-) -> String {
+fn target_url(upstream: &crate::config::Upstream, rest: &str, query: Option<String>) -> String {
     let mut url = format!("{}{}", upstream.base_url.trim_end_matches('/'), rest);
-    let query = parts.uri.query().and_then(|query| {
-        if strip_key {
-            strip_query_key(query)
-        } else {
-            Some(query.to_owned())
-        }
-    });
     if let Some(query) = query {
         url.push('?');
         url.push_str(&query);

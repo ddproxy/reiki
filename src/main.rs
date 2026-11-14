@@ -477,7 +477,7 @@ async fn main() {
     let logging =
         Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
     for warning in &warnings {
-        warning.emit();
+        tracing::warn!("{warning}");
     }
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let plugin_tables = if checking {

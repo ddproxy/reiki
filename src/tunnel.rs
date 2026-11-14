@@ -41,8 +41,7 @@ impl Rule {
         if text.is_empty() || text.chars().any(char::is_whitespace) || text.ends_with('.') {
             return None;
         }
-        let text = text.to_ascii_lowercase();
-        let (host, port) = split_host_port(&text, Some(443))?;
+        let (host, port) = split_host_port(text, Some(443))?;
         let host = match host.as_str() {
             "" => return None,
             "*" => Host::Any,
@@ -267,10 +266,6 @@ fn v4_from_segments(high: u16, low: u16) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(a, b, c, d)
 }
 
-fn embedded_v4(seg: &[u16; 8]) -> std::net::Ipv4Addr {
-    v4_from_segments(seg[6], seg[7])
-}
-
 /// The IPv4 addresses carried by the compatibility and transition forms this proxy recognises.
 /// IPv4-mapped/compatible and NAT64 carry one; 6to4 one; Teredo carries the server and the client
 /// (the client is inverted in the last 32 bits).
@@ -278,7 +273,7 @@ fn embedded_v4s(seg: &[u16; 8]) -> [Option<std::net::Ipv4Addr>; 2] {
     if (seg[..5] == [0; 5] && (seg[5] == 0 || seg[5] == 0xffff))
         || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0; 4])
     {
-        [Some(embedded_v4(seg)), None]
+        [Some(v4_from_segments(seg[6], seg[7])), None]
     } else if seg[0] == 0x2002 {
         [Some(v4_from_segments(seg[1], seg[2])), None]
     } else if seg[0] == 0x2001 && seg[1] == 0 {
@@ -552,9 +547,6 @@ fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(String, u16
     }
     if let Some((host, port)) = text.rsplit_once(':') {
         if let Ok(port) = port.parse::<u16>() {
-            if let Ok(host) = host.parse::<Ipv6Addr>() {
-                return Some((host.to_string(), port));
-            }
             if !host.is_empty() && !host.contains(':') {
                 return Some((host.to_owned(), port));
             }
@@ -630,7 +622,12 @@ mod tests {
         assert!(t.allows("2001:db8::1", 8443));
         assert!(t.allows("2001:db8::2", 443));
         assert_eq!(split_target("[::1]:443"), Some(("::1".into(), 443)));
-        assert_eq!(split_target("::1:443"), Some(("::1".into(), 443)));
+        assert_eq!(
+            split_target("::1:443"),
+            None,
+            "an unbracketed IPv6 host has no port"
+        );
+        assert!(Rule::parse("::1").unwrap().allows("::1", 443));
         assert_eq!(
             split_target("[2001:DB8::1]:8443"),
             Some(("2001:db8::1".into(), 8443))

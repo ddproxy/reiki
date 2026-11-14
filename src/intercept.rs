@@ -250,8 +250,7 @@ impl Authority {
         })
     }
 
-    /// Refuses a CA that cannot serve `hosts` safely. It runs at startup, from `reiki check`
-    /// and whenever a reload would replace the running CA.
+    /// Refuses a CA that cannot serve `hosts` safely.
     fn validate(&self, hosts: &[String]) -> Result<(), String> {
         if !self.key_matches {
             return Err("the CA key does not match the CA certificate".to_owned());
@@ -344,14 +343,30 @@ struct Minting {
 }
 
 struct Leaf {
-    made: Instant,
-    not_after: Instant,
+    /// Half the certificate's life, after which a new one is minted.
+    refresh_at: Instant,
     config: Arc<rustls::ServerConfig>,
 }
 
-/// A cached leaf is reusable only while it is inside half the current TTL and still valid.
-fn leaf_is_fresh(made: Instant, not_after: Instant, now: Instant, ttl: Duration) -> bool {
-    now.saturating_duration_since(made) < ttl / 2 && now < not_after
+impl Minting {
+    /// Reuses a certificate until half its life is gone, which is always before it expires.
+    fn config_for(
+        &mut self,
+        host: &str,
+        ttl: Duration,
+        now: Instant,
+    ) -> Result<Arc<rustls::ServerConfig>, String> {
+        if let Some(leaf) = self.leaves.get(host).filter(|leaf| now < leaf.refresh_at) {
+            return Ok(Arc::clone(&leaf.config));
+        }
+        let (config, life) = self.authority.server_config(host, ttl)?;
+        let leaf = Leaf {
+            refresh_at: now + life / 2,
+            config: Arc::clone(&config),
+        };
+        self.leaves.insert(host.to_owned(), leaf);
+        Ok(config)
+    }
 }
 
 /// What a reload can replace while tunnels are open.
@@ -480,7 +495,6 @@ impl Interceptor {
 
     /// Swaps in a plan from [`Interceptor::plan_reload`], dropping the certificates the old CA minted.
     pub fn apply_reload(&self, plan: InterceptPlan) {
-        let ttl_changed = self.settings().ttl != plan.settings.ttl;
         if !plan.settings.require_auth {
             tracing::warn!(
                 "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
@@ -494,14 +508,6 @@ impl Interceptor {
             let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
             minting.authority = authority;
             minting.leaves.clear();
-        } else if ttl_changed {
-            // A cached leaf was minted under the old lifetime; keep the new setting from
-            // making an already-expired certificate look reusable.
-            self.minting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .leaves
-                .clear();
         }
         *self
             .settings
@@ -529,27 +535,10 @@ impl Interceptor {
         self.app.snapshot().authenticate(&token) == Some(stream)
     }
 
-    /// Reuses a certificate until half its life is gone or the certificate expires.
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
         let ttl = self.settings().ttl;
         let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
-        let Minting { authority, leaves } = &mut *minting;
-        let now = Instant::now();
-        if let Some(leaf) = leaves.get(host) {
-            if leaf_is_fresh(leaf.made, leaf.not_after, now, ttl) {
-                return Ok(Arc::clone(&leaf.config));
-            }
-        }
-        let (config, ttl) = authority.server_config(host, ttl)?;
-        leaves.insert(
-            host.to_owned(),
-            Leaf {
-                made: now,
-                not_after: now + ttl,
-                config: Arc::clone(&config),
-            },
-        );
-        Ok(config)
+        minting.config_for(host, ttl, Instant::now())
     }
 
     /// Runs the handshake on `io`, then relays requests until the client closes.
@@ -786,28 +775,27 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_leaf_cannot_outlive_its_own_validity_after_the_ttl_is_raised() {
-        let made = Instant::now();
-        let not_after = made + Duration::from_secs(3600);
-        let raised = Duration::from_secs(720 * 3600);
-        assert!(leaf_is_fresh(made, not_after, made, raised));
-        assert!(
-            !leaf_is_fresh(made, not_after, made + Duration::from_secs(3601), raised),
-            "raising the TTL must not revive an expired leaf"
-        );
+    fn a_leaf_is_reused_for_half_its_life_and_then_replaced() {
+        let dir = scratch("leaf-cache");
+        let ca = dir.join("ca");
+        init_ca(&ca, &["api.example.com".to_owned()], 30, false).unwrap();
+        let authority =
+            Arc::new(Authority::load(&intercept_config(&ca, &["api.example.com"])).unwrap());
+        let mut minting = Minting {
+            authority,
+            leaves: HashMap::new(),
+        };
         let ttl = Duration::from_secs(3600);
-        assert!(leaf_is_fresh(
-            made,
-            not_after,
-            made + Duration::from_secs(1799),
-            ttl
-        ));
-        assert!(!leaf_is_fresh(
-            made,
-            not_after,
-            made + Duration::from_secs(1801),
-            ttl
-        ));
+        let t0 = Instant::now();
+        let first = minting.config_for("api.example.com", ttl, t0).unwrap();
+        let reused = minting
+            .config_for("api.example.com", ttl, t0 + Duration::from_secs(1799))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        let renewed = minting
+            .config_for("api.example.com", ttl, t0 + Duration::from_secs(1801))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &renewed));
     }
 
     #[test]

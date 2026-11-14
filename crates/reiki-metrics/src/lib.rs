@@ -173,8 +173,6 @@ struct RequestState {
     is_sse: bool,
     /// A JSON body, or the unfinished line of an event stream.
     buffer: Vec<u8>,
-    /// Bytes already searched for a newline, so a feed only scans what it appended.
-    scan: usize,
     /// Dropping the rest of an over-long event line up to its newline.
     discarding: bool,
     exceeded: bool,
@@ -191,7 +189,6 @@ impl RequestState {
             upstream: None,
             is_sse: false,
             buffer: Vec::new(),
-            scan: 0,
             discarding: false,
             exceeded: false,
             input: None,
@@ -213,45 +210,25 @@ impl RequestState {
         }
     }
 
-    fn feed_sse(&mut self, mut chunk: &[u8]) {
-        if self.discarding {
-            match chunk.iter().position(|&b| b == b'\n') {
-                Some(end) => {
-                    self.discarding = false;
-                    chunk = &chunk[end + 1..];
+    fn feed_sse(&mut self, chunk: &[u8]) {
+        for part in chunk.split_inclusive(|b| *b == b'\n') {
+            let complete = part.ends_with(b"\n");
+            if !self.discarding {
+                if self.buffer.len() + part.len() > MAX_SSE_LINE + usize::from(complete) {
+                    self.buffer.clear();
+                    self.discarding = true;
+                } else {
+                    self.buffer.extend_from_slice(part);
                 }
-                None => return,
             }
-        }
-        if chunk.is_empty() {
-            return;
-        }
-        self.buffer.extend_from_slice(chunk);
-        let Some(rel) = self.buffer[self.scan..].iter().rposition(|&b| b == b'\n') else {
-            self.scan = self.buffer.len();
-            if self.buffer.len() > MAX_SSE_LINE {
+            if complete {
+                if !self.discarding {
+                    let line = std::mem::take(&mut self.buffer);
+                    self.read_event_line(&line);
+                }
                 self.buffer.clear();
-                self.scan = 0;
-                self.discarding = true;
+                self.discarding = false;
             }
-            return;
-        };
-        let end = self.scan + rel;
-        let complete: Vec<u8> = self.buffer.drain(..=end).collect();
-        self.scan = 0;
-        let mut start = 0;
-        for (i, byte) in complete.iter().enumerate() {
-            if *byte == b'\n' {
-                let line = &complete[start..i];
-                if line.len() <= MAX_SSE_LINE {
-                    self.read_event_line(line);
-                }
-                start = i + 1;
-            }
-        }
-        if self.buffer.len() > MAX_SSE_LINE {
-            self.buffer.clear();
-            self.discarding = true;
         }
     }
 
@@ -281,7 +258,7 @@ impl RequestState {
         }
         if self.is_sse {
             let rest = std::mem::take(&mut self.buffer);
-            if !self.discarding && rest.len() <= MAX_SSE_LINE {
+            if !self.discarding {
                 self.read_event_line(&rest);
             }
         } else if !self.exceeded {

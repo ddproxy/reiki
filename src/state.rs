@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::SavedHealth;
 use crate::config::Config;
+use crate::proxy::Secret;
 
 /// Longest cooldown a state file may restore. Quota resets can be monthly, so
 /// the cap is a year; it only guards against a hand-edited recovery time that
 /// would overflow `Instant`.
 const MAX_RESTORED_COOLDOWN: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
-/// The state file sits next to the config file. It records key health only:
-/// names, cooldowns, the disabled flag, consecutive failures and a SHA-256 of each
-/// key, which only tells a rotated secret from an unchanged one. It never holds a key value.
+/// Sits next to the config file. Records key health only (names, cooldowns, disabled flag,
+/// failures, key SHA-256); never a key value.
 pub fn path_for(config_path: &Path) -> PathBuf {
     let mut name: OsString = config_path.as_os_str().to_owned();
     name.push(".state");
@@ -67,9 +67,9 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
     out
 }
 
-pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, config: &Config) {
+pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, keys: &HashMap<String, Secret>) {
     let now = unix_millis(SystemTime::now());
-    let keys = snapshot
+    let entries = snapshot
         .iter()
         .map(|(name, health)| {
             let recovery = health
@@ -81,14 +81,16 @@ pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, config: &Confi
                     disabled: health.disabled,
                     recovery,
                     failures: health.transient_failures,
-                    key_sha256: config.keys.get(name).and_then(|key| key_digest(&key.file)),
+                    key_sha256: keys
+                        .get(name)
+                        .map(|key| crate::auth::sha256_hex(key.expose())),
                 },
             )
         })
         .collect();
     let file = File {
         saved_at: now,
-        keys,
+        keys: entries,
     };
     let text = match toml::to_string(&file) {
         Ok(text) => text,
@@ -102,17 +104,15 @@ pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, config: &Confi
     }
 }
 
-fn key_digest(file: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
-    Some(crate::auth::sha256_hex(text.trim()))
-}
-
 /// A key whose secret changed after the state was written starts healthy. The recorded digest
 /// decides when there is one; state without it falls back to the file's modified time. A file
 /// that cannot be read counts as changed: nothing proves it holds the recorded secret.
 fn secret_changed(file: &str, saved_at: SystemTime, saved_digest: Option<&str>) -> bool {
     if let Some(saved) = saved_digest {
-        return key_digest(file).as_deref() != Some(saved);
+        let digest = std::fs::read_to_string(file)
+            .ok()
+            .map(|text| crate::auth::sha256_hex(text.trim()));
+        return digest.as_deref() != Some(saved);
     }
     std::fs::metadata(file)
         .and_then(|meta| meta.modified())
@@ -254,7 +254,11 @@ mod tests {
         );
         state.record_failure("b", FailureClass::Unauthorized, &policy, now);
 
-        save(&path, &state.snapshot(now), &config);
+        save(
+            &path,
+            &state.snapshot(now),
+            &crate::proxy::load_keys(&config).unwrap(),
+        );
         let loaded = load(&path, &config);
 
         assert!(loaded["a"].cooling.unwrap() > Duration::from_secs(40));
@@ -323,7 +327,11 @@ mod tests {
             Instant::now(),
         );
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
-        save(&path, &state.snapshot(Instant::now()), &config);
+        save(
+            &path,
+            &state.snapshot(Instant::now()),
+            &crate::proxy::load_keys(&config).unwrap(),
+        );
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("sk-fake-secret"));
@@ -388,7 +396,11 @@ mod tests {
             &Policy::default(),
             Instant::now(),
         );
-        save(&path, &state.snapshot(Instant::now()), &config);
+        save(
+            &path,
+            &state.snapshot(Instant::now()),
+            &crate::proxy::load_keys(&config).unwrap(),
+        );
         assert!(load(&path, &config)["a"].disabled, "same file is restored");
 
         std::fs::write(&key_file, "a-longer-replacement-secret").unwrap();
@@ -412,9 +424,7 @@ mod tests {
         let planted = dir.join("planted");
         std::fs::write(&planted, "x").unwrap();
         #[cfg(unix)]
-        for n in TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
-            ..TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed) + 3
-        {
+        for n in 0..TEMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed) + 3 {
             let name = format!("reiki.toml.state.tmp.{}.{n}", std::process::id());
             std::os::unix::fs::symlink(&planted, dir.join(name)).unwrap();
         }

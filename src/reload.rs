@@ -147,13 +147,11 @@ impl Default for ReloadState {
     }
 }
 
-/// What identifies a file's content cheaply: size, modification time to the nanosecond and, on
-/// Unix, the inode and change time, so a file replaced by a same-size copy that kept its
-/// modification time (`cp -p`, `rsync -t`) still differs.
+/// Size, mtime and, on Unix, inode and ctime, so `cp -p`/`rsync -t` swaps are seen.
 type FileStamp = (u64, Option<SystemTime>, u64, i128);
-type Stamps = Vec<(PathBuf, Option<FileStamp>)>;
+pub(crate) type Stamps = Vec<(PathBuf, Option<FileStamp>)>;
 
-fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+pub(crate) fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
     let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     let (inode, changed) = {
@@ -168,7 +166,7 @@ fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
     Some((meta.len(), meta.modified().ok(), inode, changed))
 }
 
-fn stamps(paths: &[PathBuf]) -> Stamps {
+pub(crate) fn stamps(paths: &[PathBuf]) -> Stamps {
     paths.iter().map(|p| (p.clone(), file_stamp(p))).collect()
 }
 

@@ -693,8 +693,8 @@ fn default_response_idle_timeout_secs() -> u64 {
     300
 }
 
-/// Why an upstream's `auth_header` / `auth_format` pair could not produce a request header, or
-/// `None` when it can. A bad pair would otherwise send no credential and look like a revoked key.
+/// Why an `auth_header` / `auth_format` pair produces no header. A bad pair sends no credential
+/// and looks like a revoked key.
 fn credential_problem(header: &str, format: &str) -> Option<String> {
     if axum::http::HeaderName::from_bytes(header.as_bytes()).is_err() {
         return Some(format!("auth_header `{header}` is not a valid header name"));
@@ -839,26 +839,9 @@ impl From<StrategyConfig> for Strategy {
     }
 }
 
-/// Something in a valid config worth telling the operator about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigWarning {
-    /// A plugin table still uses the plugin's old name.
-    RenamedPlugin { old: String, new: String },
-}
-
-impl ConfigWarning {
-    pub fn emit(&self) {
-        match self {
-            Self::RenamedPlugin { old, new } => {
-                tracing::warn!(old, new, "plugin table uses an old name; rename it");
-            }
-        }
-    }
-}
-
-/// A TOML error as `line L, column C: message`. The error's own text quotes the offending source
-/// line, which can hold a secret, and it ends up in HTTP bodies, `/status` and logs; so the
-/// snippet is dropped and any value the message quotes ahead of "expected" is hidden.
+/// Line/column plus message; the source line and any quoted value are dropped because errors
+/// reach HTTP bodies, `/status` and logs. Relies on toml's message wording (`expected`, quote
+/// delimiters); the sentinel test guards it.
 fn describe_parse_error(text: &str, error: &toml::de::Error) -> String {
     let message = error.message();
     let message = if message.starts_with("missing field") {
@@ -908,14 +891,14 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let (config, warnings) = Self::parse_with_warnings(text)?;
         for warning in &warnings {
-            warning.emit();
+            tracing::warn!("{warning}");
         }
         Ok(config)
     }
 
     /// Like [`Config::parse`], but hands back the warnings instead of logging them, for a caller
     /// that starts logging only after it has read the config.
-    pub fn parse_with_warnings(text: &str) -> Result<(Self, Vec<ConfigWarning>), ConfigError> {
+    pub fn parse_with_warnings(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
         let mut config: Config =
             toml::from_str(text).map_err(|e| ConfigError::Parse(describe_parse_error(text, &e)))?;
         let mut warnings = Vec::new();
@@ -926,7 +909,7 @@ impl Config {
     }
 
     /// Plugin tables under a name the plugin used to have move to the current one.
-    fn rename_old_plugins(&mut self, warnings: &mut Vec<ConfigWarning>) -> Result<(), ConfigError> {
+    fn rename_old_plugins(&mut self, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
         for (old, new) in RENAMED_PLUGINS {
             let Some(table) = self.plugins.remove(*old) else {
                 continue;
@@ -939,10 +922,9 @@ impl Config {
                     ),
                 });
             }
-            warnings.push(ConfigWarning::RenamedPlugin {
-                old: (*old).to_owned(),
-                new: (*new).to_owned(),
-            });
+            warnings.push(format!(
+                "plugin table `{old}` uses an old name; rename it to `{new}`"
+            ));
             self.plugins.insert((*new).to_owned(), table);
         }
         Ok(())
@@ -2930,10 +2912,7 @@ socket = "/run/forwarder.sock"
         assert!(config.plugins.contains_key("controlled"));
         assert_eq!(
             warnings,
-            [ConfigWarning::RenamedPlugin {
-                old: "gov".to_owned(),
-                new: "controlled".to_owned()
-            }]
+            ["plugin table `gov` uses an old name; rename it to `controlled`"]
         );
         let (_, none) = Config::parse_with_warnings(&base("")).unwrap();
         assert!(none.is_empty());

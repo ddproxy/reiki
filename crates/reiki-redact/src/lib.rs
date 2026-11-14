@@ -91,8 +91,6 @@ const PREFIXES: &[(&str, usize)] = &[
     ("cfut_", 30),
     ("rubygems_", 30),
     ("AGE-SECRET-KEY-", 30),
-    ("dapi", 32),
-    ("fw_", 20),
 ];
 
 /// Prefixes whose tokens carry URL-encoded or base64 characters, so the token runs on through them.
@@ -345,7 +343,7 @@ mod tests {
 
     #[test]
     fn short_vendor_lookalikes_are_left_alone() {
-        for word in ["dapi_client", "fw_config", "phc_id", "pul-down", "ntn_key"] {
+        for word in ["phc_id", "pul-down", "ntn_key"] {
             assert!(scan(word).is_empty(), "{word}");
         }
     }

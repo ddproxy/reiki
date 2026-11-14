@@ -23,6 +23,7 @@ peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; th
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
 expose_host_stats = false          # publish load, memory, disk use and active sessions
+cooldown_bucket_secs = 300         # published cooldowns round up to a multiple of this; 0 is exact
 # stream_interval_secs = 5         # period of `host` events on /v1/health/stream
 # max_subscribers = 16             # open streams in total
 # max_subscribers_per_peer = 4     # open streams per client address
@@ -91,10 +92,10 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://10.
 ```
 
 - One entry per upstream that uses Reiki's keys; a `passthrough` upstream is left out.
-- `soonest_cooldown_seconds` is the shortest wait among the cooling keys, rounded up, or `null`. It is relative, so a reader does not depend on this host's clock.
+- `soonest_cooldown_seconds` is the shortest wait among the cooling keys, or `null`. It is rounded up to whole seconds and then up to a multiple of `cooldown_bucket_secs` (default 300, at most 86400), so a 42 s wait reads as 300 and a 301 s wait as 600; with `cooldown_bucket_secs = 0` it is the exact second count. Coarse values tell a reader roughly when a key returns without giving away the provider's exact rate-limit reset. It is relative, so a reader does not depend on this host's clock.
 - `last_status_class` is `2xx`, `4xx` or `5xx` for the latest attempt on any of the upstream's keys, or `null` before one or when the attempt got no response.
 - `observed_at` is this host's UTC clock when the answer was built.
-- With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`.
+- With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`, bucketed the same way.
 - The answer never holds key values, token hashes, key file paths, stream names or request counts, and is sent with `Cache-Control: no-store`.
 
 ### Host stats and sessions

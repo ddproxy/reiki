@@ -282,6 +282,7 @@ impl Watcher {
                 &health,
                 std::time::Instant::now(),
                 peers.expose_key_labels,
+                peers.cooldown_bucket_secs,
             )
         };
         let current: Vec<(String, Value)> = upstreams

@@ -253,7 +253,8 @@ async fn every_other_path_and_method_on_the_peer_listener_is_404() {
 
 #[tokio::test]
 async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
-    let rig = Rig::new("").await;
+    // Exact cooldowns here; the default bucketing has its own test.
+    let rig = Rig::new("cooldown_bucket_secs = 0\n").await;
     let doc = rig.health().await;
     assert_eq!(doc["instance"], "ct-test");
     let observed = doc["observed_at"].as_str().unwrap();
@@ -417,6 +418,34 @@ async fn a_peer_token_hash_shared_with_another_credential_is_refused() {
         let error = Config::parse(&text).unwrap_err().to_string();
         assert!(error.contains("peer_token_sha256 is the same"), "{error}");
     }
+}
+
+async fn cool_both(rig: &Rig) {
+    let res = rig
+        .client
+        .post(format!("{}/zen/chat/completions", rig.relay))
+        .bearer_auth(STREAM_TOKEN)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+}
+
+#[tokio::test]
+async fn cooldowns_are_rounded_up_to_the_bucket_by_default() {
+    let rig = Rig::new("expose_key_labels = true\n").await;
+    cool_both(&rig).await;
+    let doc = rig.health().await;
+    let zen = &doc["upstreams"][0];
+    assert_eq!(zen["soonest_cooldown_seconds"], 300, "{zen}");
+    for key in zen["keys"].as_array().unwrap() {
+        assert_eq!(key["cooldown_seconds"], 300, "{key}");
+    }
+    let rig = Rig::new("expose_key_labels = true\ncooldown_bucket_secs = 20\n").await;
+    cool_both(&rig).await;
+    let doc = rig.health().await;
+    assert_eq!(doc["upstreams"][0]["soonest_cooldown_seconds"], 40);
 }
 
 #[tokio::test]

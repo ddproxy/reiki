@@ -9,9 +9,15 @@ use crate::chain::{KeyState, KeyStatus};
 use crate::config::{Config, PeersConfig};
 use crate::proxy::App;
 
-/// Whole seconds, rounded up so a short wait never reads as zero.
-fn ceil_secs(wait: Duration) -> u64 {
-    (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1)
+/// Whole seconds, rounded up so a short wait never reads as zero, then up to a multiple of
+/// `bucket` (exact for 0), so a reader learns only coarsely when a key comes back.
+fn ceil_secs(wait: Duration, bucket: u64) -> u64 {
+    let secs = (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1);
+    if bucket == 0 {
+        secs
+    } else {
+        secs.div_ceil(bucket).saturating_mul(bucket)
+    }
 }
 
 fn status_class(status: Option<u16>) -> Value {
@@ -29,6 +35,7 @@ pub(crate) fn upstreams(
     health: &KeyState,
     now: Instant,
     labels: bool,
+    bucket: u64,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for (name, upstream) in &config.upstream {
@@ -53,7 +60,7 @@ pub(crate) fn upstreams(
                 KeyStatus::Cooling(wait) => {
                     cooling += 1;
                     soonest = Some(soonest.map_or(wait, |s| s.min(wait)));
-                    ("cooling", Some(ceil_secs(wait)))
+                    ("cooling", Some(ceil_secs(wait, bucket)))
                 }
                 KeyStatus::OutOfRotation => {
                     disabled += 1;
@@ -69,7 +76,7 @@ pub(crate) fn upstreams(
             "healthy_keys": healthy,
             "cooling_keys": cooling,
             "disabled_keys": disabled,
-            "soonest_cooldown_seconds": soonest.map(ceil_secs),
+            "soonest_cooldown_seconds": soonest.map(|wait| ceil_secs(wait, bucket)),
             "last_status_class": health
                 .latest_status(keys.iter().copied())
                 .map_or(Value::Null, status_class),
@@ -116,6 +123,7 @@ pub(crate) fn document(app: &App, peers: &PeersConfig) -> Value {
             &health,
             Instant::now(),
             peers.expose_key_labels,
+            peers.cooldown_bucket_secs,
         )
     };
     let mut doc = json!({
@@ -215,7 +223,7 @@ mod tests {
         );
         health.record_status("a", Some(429));
         health.disable("b");
-        let out = upstreams(&config, &health, now, false);
+        let out = upstreams(&config, &health, now, false, 0);
         assert_eq!(
             out.len(),
             2,
@@ -240,13 +248,56 @@ mod tests {
         let config = config();
         let mut health = KeyState::default();
         health.disable("c");
-        let out = upstreams(&config, &health, Instant::now(), true);
+        let out = upstreams(&config, &health, Instant::now(), true, 0);
         let keys = out[1]["keys"].as_array().unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(
             keys[2],
             json!({"name": "c", "state": "out_of_rotation", "cooldown_seconds": null})
         );
+    }
+
+    #[test]
+    fn cooldowns_round_up_to_the_bucket_and_stay_exact_for_zero() {
+        let secs = Duration::from_secs;
+        for (wait, bucket, expected) in [
+            (Duration::from_millis(1), 300, 300),
+            (secs(1), 300, 300),
+            (secs(299), 300, 300),
+            (secs(300), 300, 300),
+            (Duration::from_millis(300_001), 300, 600),
+            (secs(301), 300, 600),
+            (secs(601), 300, 900),
+            (secs(7), 1, 7),
+            (Duration::from_millis(9_200), 0, 10),
+            (secs(42), 0, 42),
+            (Duration::from_millis(1), 0, 1),
+        ] {
+            assert_eq!(ceil_secs(wait, bucket), expected, "{wait:?} in {bucket}s");
+        }
+    }
+
+    #[test]
+    fn bucketing_applies_to_the_soonest_and_every_labelled_cooldown() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        for (key, millis) in [("a", 9_200), ("b", 301_000)] {
+            health.record_failure(
+                key,
+                FailureClass::RateLimited(Some(Duration::from_millis(millis))),
+                &policy,
+                now,
+            );
+        }
+        let zen = &upstreams(&config, &health, now, true, 300)[1];
+        assert_eq!(zen["soonest_cooldown_seconds"], 300);
+        assert_eq!(zen["keys"][0]["cooldown_seconds"], 300);
+        assert_eq!(zen["keys"][1]["cooldown_seconds"], 600);
+        let exact = &upstreams(&config, &health, now, true, 0)[1];
+        assert_eq!(exact["soonest_cooldown_seconds"], 10);
+        assert_eq!(exact["keys"][1]["cooldown_seconds"], 301);
     }
 
     #[test]

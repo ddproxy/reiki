@@ -10,6 +10,9 @@ use reiki::config::Config;
 use reiki::plugins::PluginChain;
 use reiki::proxy::{router, App, Secret};
 
+mod common;
+use common::serve;
+
 const CLIENT_TOKEN: &str = "client-token";
 
 /// Status and body an upstream refuses everything with; `None` answers normally.
@@ -39,15 +42,6 @@ async fn mock(State((seen, refusal)): State<(Arc<Seen>, Refusal)>, req: Request)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 struct Rig {

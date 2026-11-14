@@ -11,17 +11,11 @@ use reiki::config::Config;
 use reiki::plugins::{builtin, PluginChain};
 use reiki::proxy::{load_keys, router, App};
 
+mod common;
+use common::serve;
+
 const TOKEN: &str = "stream-token";
 const SSN: &str = "123-45-6789";
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
 
 /// Runs one request that holds an SSN through phi and the request log, and returns the log lines.
 async fn logged(format: &str, mode: &str, tag: &str) -> (u16, Vec<serde_json::Value>) {

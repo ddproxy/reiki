@@ -194,7 +194,7 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
     Ok(findings)
 }
 
-/// An incremental byte-offset to line/column cursor. Offsets must not move backwards.
+/// Offsets must not move backwards.
 struct LineCursor<'a> {
     bytes: &'a [u8],
     scanned: usize,
@@ -227,21 +227,6 @@ impl<'a> LineCursor<'a> {
     }
 }
 
-/// Line and column (both 1-based, in bytes) of a byte offset.
-pub fn position(text: &str, offset: usize) -> (usize, usize) {
-    LineCursor::new(text).position(offset)
-}
-
-/// Counts per plugin and kind, in a stable order.
-pub fn summary(findings: &[Finding]) -> Vec<(&'static str, &'static str, usize)> {
-    let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
-        std::collections::BTreeMap::new();
-    for f in findings {
-        *counts.entry((f.plugin, f.kind)).or_default() += 1;
-    }
-    counts.into_iter().map(|((p, k), n)| (p, k, n)).collect()
-}
-
 /// Escapes `text` for a JSON string.
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -261,48 +246,6 @@ fn json_string(text: &str) -> String {
     out
 }
 
-/// Scans one input and writes its findings. Returns the number of findings.
-fn scan_one(
-    name: &str,
-    bytes: &[u8],
-    plugins: &[String],
-    selection: &Kinds,
-    json: bool,
-    out: &mut dyn std::io::Write,
-    counts: &mut std::collections::BTreeMap<(&'static str, &'static str), usize>,
-) -> Result<usize, i32> {
-    let text = String::from_utf8_lossy(bytes);
-    let findings = match scan(&text, plugins, selection) {
-        Ok(findings) => findings,
-        Err(e) => {
-            eprintln!("reiki: {e}");
-            return Err(2);
-        }
-    };
-    let mut cursor = LineCursor::new(&text);
-    for f in &findings {
-        let (line, col) = cursor.position(f.start);
-        let written = if json {
-            writeln!(
-                out,
-                "{{\"file\":{},\"line\":{line},\"col\":{col},\"plugin\":\"{}\",\"kind\":\"{}\"}}",
-                json_string(name),
-                f.plugin,
-                f.kind
-            )
-        } else {
-            writeln!(out, "{name}:{line}:{col} {} {}", f.plugin, f.kind)
-        };
-        if written.is_err() {
-            return Err(2);
-        }
-    }
-    for f in &findings {
-        *counts.entry((f.plugin, f.kind)).or_default() += 1;
-    }
-    Ok(findings.len())
-}
-
 /// The `reiki scan` command. Findings go to stdout, one per line, and a summary goes to stderr.
 /// Returns the exit code: 0 for none, 1 for findings, 2 for a usage or read error.
 pub fn run(
@@ -312,7 +255,7 @@ pub fn run(
     json: bool,
     files: &[std::path::PathBuf],
 ) -> i32 {
-    use std::io::Read;
+    use std::io::{Read, Write};
     let selection = if all {
         Kinds::All
     } else if kinds.is_empty() {
@@ -320,67 +263,72 @@ pub fn run(
     } else {
         Kinds::Named(kinds.to_vec())
     };
-    let mut out = std::io::stdout().lock();
-    let mut counts: std::collections::BTreeMap<(&'static str, &'static str), usize> =
-        std::collections::BTreeMap::new();
-    let mut inputs = 0usize;
-    let mut findings = 0usize;
-
+    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
     if files.is_empty() || files.iter().any(|f| f.as_os_str() == "-") {
         let mut bytes = Vec::new();
         if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
             eprintln!("reiki: cannot read stdin: {e}");
             return 2;
         }
-        match scan_one(
-            "-",
-            &bytes,
-            plugins,
-            &selection,
-            json,
-            &mut out,
-            &mut counts,
-        ) {
-            Ok(n) => findings += n,
-            Err(code) => return code,
-        }
-        inputs += 1;
+        inputs.push(("-".to_owned(), bytes));
     }
     for file in files.iter().filter(|f| f.as_os_str() != "-") {
-        let name = file.display().to_string();
-        let bytes = match std::fs::read(file) {
-            Ok(bytes) => bytes,
+        match std::fs::read(file) {
+            Ok(bytes) => inputs.push((file.display().to_string(), bytes)),
             Err(e) => {
-                eprintln!("reiki: cannot read {name}: {e}");
+                eprintln!("reiki: cannot read {}: {e}", file.display());
+                return 2;
+            }
+        }
+    }
+    let mut out = std::io::stdout().lock();
+    let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    for (name, bytes) in &inputs {
+        let text = String::from_utf8_lossy(bytes);
+        let findings = match scan(&text, plugins, &selection) {
+            Ok(findings) => findings,
+            Err(e) => {
+                eprintln!("reiki: {e}");
                 return 2;
             }
         };
-        match scan_one(
-            &name,
-            &bytes,
-            plugins,
-            &selection,
-            json,
-            &mut out,
-            &mut counts,
-        ) {
-            Ok(n) => findings += n,
-            Err(code) => return code,
+        let mut cursor = LineCursor::new(&text);
+        for f in &findings {
+            let (line, col) = cursor.position(f.start);
+            let written = if json {
+                writeln!(
+                    out,
+                    "{{\"file\":{},\"line\":{line},\"col\":{col},\"plugin\":\"{}\",\"kind\":\"{}\"}}",
+                    json_string(name),
+                    f.plugin,
+                    f.kind
+                )
+            } else {
+                writeln!(out, "{name}:{line}:{col} {} {}", f.plugin, f.kind)
+            };
+            if written.is_err() {
+                return 2;
+            }
+            *counts.entry((f.plugin, f.kind)).or_default() += 1;
         }
-        inputs += 1;
+        total += findings.len();
     }
     drop(out);
-
     let counts = counts
         .into_iter()
         .map(|((p, k), n)| format!("{p} {k} x{n}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if findings == 0 {
-        eprintln!("scanned {inputs} input(s): no findings");
+    if total == 0 {
+        eprintln!("scanned {} input(s): no findings", inputs.len());
         0
     } else {
-        eprintln!("scanned {inputs} input(s): {findings} finding(s): {counts}");
+        eprintln!(
+            "scanned {} input(s): {total} finding(s): {counts}",
+            inputs.len()
+        );
         1
     }
 }
@@ -456,29 +404,15 @@ mod tests {
 
     #[test]
     fn positions_are_one_based_lines_and_columns() {
-        let text = "a\nbc\n\ndef";
-        assert_eq!(position(text, 0), (1, 1));
-        assert_eq!(position(text, 3), (2, 2));
-        assert_eq!(position(text, 8), (4, 3));
+        let mut cursor = LineCursor::new("a\nbc\n\ndef");
+        assert_eq!(cursor.position(0), (1, 1));
+        assert_eq!(cursor.position(3), (2, 2));
+        assert_eq!(cursor.position(3), (2, 2), "the same offset again");
+        assert_eq!(cursor.position(8), (4, 3));
         assert_eq!(
-            position(text, 999),
+            cursor.position(999),
             (4, 4),
             "past the end clamps to the end"
         );
-    }
-
-    #[test]
-    fn the_cursor_matches_position_for_sorted_offsets() {
-        let text = "a\nbc\n\ndef";
-        let mut cursor = LineCursor::new(text);
-        for offset in [0, 1, 2, 3, 3, 8, 10] {
-            assert_eq!(cursor.position(offset), position(text, offset), "{offset}");
-        }
-    }
-
-    #[test]
-    fn the_summary_counts_by_plugin_and_kind() {
-        let found = scan("123-45-6789 234-56-7890", &[], &Kinds::Default).unwrap();
-        assert_eq!(summary(&found), [("phi", "ssn", 2)]);
     }
 }

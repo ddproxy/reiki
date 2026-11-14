@@ -89,7 +89,7 @@ Applies a changed config like `SIGHUP`, with the same bearer token as `/status`,
 {"ok":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart, such as `tunnel.listen` or the `[log]` `file`, `format`, `stderr`, `file_max_bytes` and `file_keep`. A reload applies the `[log]` `level` and reopens the log file, like `SIGHUP`. Add `?dry_run=true` to preview (a `dry_run` that is bare, empty, repeated or anything other than `true`, `1`, `false` or `0` answers `400` and applies nothing): the answer has `"dry_run":true` and says what a reload would change, and nothing is applied or recorded in `/status`. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
+`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart, such as `tunnel.listen` or the `[log]` `file`, `format`, `stderr`, `file_max_bytes` and `file_keep`. Add `?dry_run=true` to preview (a `dry_run` other than `true`, `1`, `false` or `0` answers `400` and applies nothing): the answer has `"dry_run":true` and says what a reload would change, and nothing is applied or recorded in `/status`. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
 
 ## GET /metrics
 
@@ -99,7 +99,7 @@ Served by the `metrics` plugin, so it exists only when the binary includes the p
 [plugins.metrics]
 ```
 
-Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts each client request once, with the status the client received and the upstream that served it: after a fallback that is the fallback upstream, so the first upstream's refusal is not counted. A client that disconnects before the response is counted as `client_error` (499). Gauges are sampled at scrape time; counters live in memory, survive a reload and reset when Reiki restarts. A changed `[plugins.metrics]` table keeps the running counters and is reported in `restart_needed`. Series for a renamed stream, upstream or key are kept until Reiki restarts.
+Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts each request once, by client-visible status and serving upstream (the fallback, after a failover); a client that disconnects first counts as 499 (`client_error`). Gauges are sampled at scrape time. Counters live in memory and survive a reload; a changed `[plugins.metrics]` table keeps them and needs a restart. Series for renamed streams, upstreams and keys stay until restart.
 
 | Metric | Type | Labels |
 | --- | --- | --- |
@@ -124,7 +124,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
 
 ## GET /usage
 
-Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. `requests` counts responses that carried a `usage` object, not every proxied request. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. A response with a `content-encoding` is passed through compressed and is not read, so its usage is not counted. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
+Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. `requests` counts only responses that carried `usage`. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. A compressed response is not read, so its usage is not counted. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
 
 ```json
 {"stream":{"upstream":{"input":10,"output":20,"requests":1}}}

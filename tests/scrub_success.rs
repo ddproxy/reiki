@@ -13,17 +13,11 @@ use reiki::config::Config;
 use reiki::plugins::{builtin, PluginChain};
 use reiki::proxy::{load_keys, router, App};
 
+mod common;
+use common::serve;
+
 const TOKEN: &str = "stream-token";
 const KEY: &str = "upstream-secret-key-1234";
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
-}
 
 async fn echo(headers: HeaderMap) -> impl IntoResponse {
     let sent = headers["authorization"].to_str().unwrap().to_owned();

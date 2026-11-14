@@ -15,6 +15,9 @@ use reiki::plugins::PluginChain;
 use reiki::proxy::{router, App, Secret};
 use tokio::io::AsyncWriteExt;
 
+mod common;
+use common::serve;
+
 const CLIENT_TOKEN: &str = "client-token";
 
 /// A valid gzip stream that expands to 64 KiB, so decoding is observable.
@@ -85,15 +88,6 @@ async fn mock(State(gzip): State<Arc<Vec<u8>>>, req: Request<Body>) -> Response 
             .body(paced(chunks, Duration::from_millis(400), None))
             .unwrap()
     }
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 struct Rig {

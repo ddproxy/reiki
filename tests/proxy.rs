@@ -11,6 +11,9 @@ use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::proxy::{router, App, Secret};
 
+mod common;
+use common::serve;
+
 #[derive(Clone, Debug)]
 struct Call {
     path_and_query: String,
@@ -133,15 +136,6 @@ async fn mock_handler(State(mock): State<Arc<Mock>>, req: Request) -> Response {
         }
         None => Response::new(Body::from("{\"ok\":true}")),
     }
-}
-
-async fn serve(router: Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    format!("http://{addr}")
 }
 
 struct Harness {

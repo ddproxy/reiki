@@ -867,35 +867,35 @@ mod tests {
 
     #[test]
     fn an_event_line_over_the_cap_is_dropped_without_parsing() {
-        let metrics = Arc::new(Metrics::default());
-        let mut s = state(&metrics, true);
-        let mut line =
-            b"data: {\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}".to_vec();
-        line.resize(MAX_SSE_LINE + 1, b' ');
-        line.push(b'\n');
-        s.feed(&line);
-        s.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":8}}\n\n");
-        s.finish();
-        let usage = usage_of(&metrics);
-        assert_eq!(usage["s"]["zen"]["input"], 7);
-        assert_eq!(usage["s"]["zen"]["output"], 8);
-    }
-
-    #[test]
-    fn an_unterminated_event_line_stays_bounded_and_is_dropped() {
-        let metrics = Arc::new(Metrics::default());
-        let mut s = state(&metrics, true);
-        s.feed(b"data: {\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}");
-        for _ in 0..(MAX_SSE_LINE * 2) {
-            s.feed(b"x");
-            assert!(s.buffer.len() <= MAX_SSE_LINE);
+        let usage_line = b"data: {\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}";
+        let mut padded = usage_line.to_vec();
+        padded.resize(MAX_SSE_LINE + 1, b' ');
+        padded.push(b'\n');
+        for unterminated in [false, true] {
+            let metrics = Arc::new(Metrics::default());
+            let mut s = state(&metrics, true);
+            if unterminated {
+                s.feed(usage_line);
+                for _ in 0..(MAX_SSE_LINE * 2) {
+                    s.feed(b"x");
+                    assert!(s.buffer.len() <= MAX_SSE_LINE, "the buffer stays bounded");
+                }
+                s.feed(b"\n");
+            } else {
+                s.feed(&padded);
+            }
+            s.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":8}}\n\n");
+            s.finish();
+            let usage = usage_of(&metrics);
+            assert_eq!(
+                usage["s"]["zen"]["input"], 7,
+                "unterminated: {unterminated}"
+            );
+            assert_eq!(
+                usage["s"]["zen"]["output"], 8,
+                "unterminated: {unterminated}"
+            );
         }
-        s.feed(b"\n");
-        s.feed(b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5}}\n\n");
-        s.finish();
-        let usage = usage_of(&metrics);
-        assert_eq!(usage["s"]["zen"]["input"], 4);
-        assert_eq!(usage["s"]["zen"]["output"], 5);
     }
 
     #[test]

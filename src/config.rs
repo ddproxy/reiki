@@ -1129,6 +1129,13 @@ impl Config {
             if let Some(forward) = &upstream.forward {
                 let has_command = forward.command.is_some();
                 let has_socket = forward.socket.is_some();
+                if upstream.send_keep_alive {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "send_keep_alive has no effect, a forward connection always closes"
+                            .to_owned(),
+                    });
+                }
                 if has_command == has_socket {
                     return Err(ConfigError::BadForward {
                         upstream: name.clone(),
@@ -2238,6 +2245,22 @@ chain = ["zen-a"]
         let fwd = config.upstream["zen"].forward.as_ref().unwrap();
         assert_eq!(fwd.command.as_deref(), Some("python3"));
         assert_eq!(fwd.args, ["tests/external_child.py"]);
+    }
+
+    #[test]
+    fn a_forward_upstream_refuses_send_keep_alive() {
+        let text = base(&format!(
+            "[upstream.zen.forward]\ncommand = \"python3\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ))
+        .replace(
+            "[upstream.zen]\n",
+            "[upstream.zen]\nsend_keep_alive = true\n",
+        );
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadForward { .. }
+        ));
     }
 
     #[test]

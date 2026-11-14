@@ -8,11 +8,28 @@
 
 ### Changed
 
+- `reiki_requests_total` counts a fallback request once, under the upstream that served it, instead of also counting the primary's refusal.
+- The state file records the byte length of each key file, so a rotated key is detected even when the file keeps its mtime.
 - A 403 whose body does not name an invalid, expired or revoked credential no longer disables the key permanently; the key is treated as access-denied for that request, so a WAF or model-plan refusal cannot take a key out of rotation. A 401, or a 403 naming a bad credential, still disables it.
 - The `metrics` docs now state that series for a renamed stream, upstream or key are kept until Reiki restarts; they are not pruned on reload.
 
 ### Fixed
 
+- Each proxied request reports one `RequestDone` event with the status the client received. This ends the double count on a fallback and the false 499 on 400, 408, 413 and plugin-block responses.
+- A response plugin gets its final chunk call when the upstream body errors midway.
+- `reiki keys --check` reads each key file through one handle, and the key table aligns columns with non-ASCII names.
+- A forward upstream with `send_keep_alive = true` is refused when the config loads, because its connection always closes.
+- A reload applies the `[log]` level and lists `[log]` changes that need a restart.
+- A reload with no change no longer reports a spurious `tunnel.listen` restart, and the interception CA files are watched.
+- `auth_header` and `auth_format` are checked when the config loads instead of turning into 401s that disable every key.
+- Config syntax errors report line and column without the offending source line, in `/reload`, `/status` and the logs.
+- `POST /reload` rejects a bare, empty or repeated `dry_run` with 400.
+- A full login-throttle table never releases a locked-out address.
+- Admin bearer parsing accepts the same spacing as client auth, and the percent decoder takes hex digits only.
+- Saved key state is dropped when the key file is unreadable or its size changed, and the state file is written through a unique temp file followed by a directory sync.
+- The log file is set to 0640, refuses a symlink, and counts failed writes.
+- Startup config warnings reach the log, and SIGHUP reload and key re-enable no longer block the async runtime.
+- The connection-limit warning is rate-limited, the file watcher detects a same-size swap, and listener collision checks resolve host names.
 - The `metrics` plugin now receives response bodies when it is the only plugin configured, so `/usage` and `reiki_tokens_total` work with just `[plugins.metrics]`. It no longer forces chunked responses because it only observes them.
 - The `metrics` plugin parses event-stream usage linearly and bounds an unfinished or oversized event line, so a long stream cannot cause quadratic work or unbounded buffering.
 - Changing a `[plugins.metrics]` setting now keeps the running counters and reports that a restart is needed instead of silently resetting them.

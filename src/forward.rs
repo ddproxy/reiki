@@ -535,12 +535,12 @@ file = "/etc/reiki/keys/zen-a"
     #[test]
     fn a_forward_request_always_closes_the_connection() {
         let text = minimal_base(&format!(
-            "send_keep_alive = true\n[upstream.zen.forward]\nsocket = \"/run/x.sock\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
-        ))
-        .replace("send_keep_alive = true\n", "")
-        .replace("[upstream.zen]\n", "[upstream.zen]\nsend_keep_alive = true\n");
+            "[upstream.zen.forward]\nsocket = \"/run/x.sock\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
         let config = Config::parse(&text).unwrap();
-        let upstream = &config.upstream["zen"];
+        let mut upstream = config.upstream["zen"].clone();
+        upstream.send_keep_alive = true;
+        let upstream = &upstream;
         let (parts, _) = Request::builder()
             .method(Method::POST)
             .uri("/x")

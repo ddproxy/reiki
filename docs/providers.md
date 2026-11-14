@@ -38,7 +38,7 @@ By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed re
 - `response_timeout_secs` bounds the whole response body, starting when its head arrives. It is unset by default, so only the idle limit applies; when set it must be at least 1. The separate 120-second request timeout still bounds the wait for the head.
 
 - `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
-- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection. A forward upstream ignores `send_keep_alive`: each request to it always carries `Connection: close`.
+- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection. A forward upstream always carries `Connection: close`, so the config refuses `send_keep_alive = true` there.
 
 ```toml
 [upstream.zen]

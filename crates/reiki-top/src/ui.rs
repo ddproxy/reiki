@@ -14,7 +14,7 @@ use ratatui::Frame;
 use crate::view::{self, Span, Style};
 
 /// The key hints on the footer's right side.
-const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer";
+const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all";
 
 /// The filter the caller applies before rendering; this layer only stores it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

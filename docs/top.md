@@ -27,6 +27,6 @@ reiki top --interval 2    # redraw every two seconds instead of every second
 ```
 
 - Live mode follows each peer's stream and polls once when a stream cannot be opened, ends or goes quiet. Both failing puts the reason on that peer's card as a dim line. Data older than three `poll_interval_secs` is stale and drawn dim, never as healthy; a peer with no answer shows `no data`.
-- Keys: `q` or `Esc` quits; `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll; `p` pauses redraws (updates keep arriving; the screen catches up on resume); `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
+- Keys: `q` or `Esc` quits; `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll; `p` freezes the screen as a snapshot and shows its age (updates keep arriving; resuming shows the live view); `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
 - Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
 - `--once` polls each peer once and prints the same view as plain text, 100 columns wide and without colour. It exits 0 when at least one peer answered, 1 when none did, and 2 on a config problem.

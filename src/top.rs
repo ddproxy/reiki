@@ -277,6 +277,9 @@ async fn live_loop(
     let all: Vec<String> = peers.peers.keys().cloned().collect();
     let mut fleet = Fleet::new(poll.saturating_mul(3));
     let mut state = ui::UiState::default();
+    // Pause freezes the picture, not just the redraws, so a peer that goes quiet cannot keep
+    // looking fresh on a screen that is minutes old.
+    let mut frozen: Option<(Fleet, Instant)> = None;
 
     #[cfg(unix)]
     let mut terminate =
@@ -301,7 +304,8 @@ async fn live_loop(
             },
             // Return so the guard puts the terminal back before the process ends.
             () = terminated(&mut terminate) => return 0,
-            _ = frame_tick.tick() => draw_now = !state.paused,
+            // Also while paused, so the age of the frozen picture keeps counting.
+            _ = frame_tick.tick() => draw_now = true,
             _ = key_tick.tick() => loop {
                 match crossterm::event::poll(Duration::ZERO) {
                     Ok(true) => {}
@@ -324,7 +328,11 @@ async fn live_loop(
                 let Some(action) = ui::map_key(key) else {
                     continue;
                 };
-                let (total, viewport) = match measure(terminal, &fleet, &all, &state) {
+                let (shown, shown_at) = match &frozen {
+                    Some((snapshot, at)) => (snapshot, *at),
+                    None => (&fleet, Instant::now()),
+                };
+                let (total, viewport) = match measure(terminal, shown, shown_at, &all, &state) {
                     Ok(pair) => pair,
                     Err(e) => {
                         eprintln!("reiki: cannot size the terminal: {e}");
@@ -334,11 +342,20 @@ async fn live_loop(
                 if !apply_action(&mut state, action, &all, total, viewport) {
                     return 0;
                 }
+                match (state.paused, frozen.is_some()) {
+                    (true, false) => frozen = Some((fleet.clone(), Instant::now())),
+                    (false, true) => frozen = None,
+                    _ => {}
+                }
                 draw_now = true;
             },
         }
         if draw_now {
-            if let Err(e) = render_screen(terminal, &fleet, &all, &state) {
+            let (shown, shown_at, paused_for) = match &frozen {
+                Some((snapshot, at)) => (snapshot, *at, Some(at.elapsed())),
+                None => (&fleet, Instant::now(), None),
+            };
+            if let Err(e) = render_screen(terminal, shown, shown_at, paused_for, &all, &state) {
                 eprintln!("reiki: cannot draw: {e}");
                 return 1;
             }
@@ -395,29 +412,42 @@ fn visible_cts(all: &[String], state: &ui::UiState) -> Vec<String> {
 fn measure(
     terminal: &Screen,
     fleet: &Fleet,
+    now: Instant,
     all: &[String],
     state: &ui::UiState,
 ) -> io::Result<(usize, usize)> {
     let size = terminal.size()?;
     let visible = visible_cts(all, state);
-    let lines = view::render(fleet, &visible, Instant::now(), usize::from(size.width));
+    let lines = view::render(fleet, &visible, now, usize::from(size.width));
     // One footer row and a two-row border.
     Ok((lines.len(), usize::from(size.height.saturating_sub(3))))
+}
+
+/// The footer status. A paused screen is a snapshot, so it says how old that snapshot is.
+fn status_line(fresh: usize, total: usize, paused_for: Option<Duration>) -> String {
+    match paused_for {
+        Some(age) => format!(
+            "{fresh} of {total} peers fresh when paused {}s ago",
+            age.as_secs()
+        ),
+        None => format!("{fresh} of {total} peers fresh"),
+    }
 }
 
 fn render_screen(
     terminal: &mut Screen,
     fleet: &Fleet,
+    now: Instant,
+    paused_for: Option<Duration>,
     all: &[String],
     state: &ui::UiState,
 ) -> io::Result<()> {
     let visible = visible_cts(all, state);
-    let now = Instant::now();
     let fresh = visible
         .iter()
         .filter(|name| fleet.peer(name, now).is_some_and(|peer| !peer.stale))
         .count();
-    let status = format!("{fresh} of {} peers fresh", visible.len());
+    let status = status_line(fresh, visible.len(), paused_for);
     terminal.draw(|frame| {
         let lines = view::render(fleet, &visible, now, usize::from(frame.area().width));
         ui::draw(frame, &lines, state, &status);
@@ -443,6 +473,32 @@ mod tests {
 
     fn upstream(fleet: &Fleet, now: Instant) -> &reiki_top::Upstream {
         &fleet.peer("peer-a", now).unwrap().health.upstreams[0]
+    }
+
+    #[test]
+    fn a_paused_status_line_reports_the_age_of_the_snapshot() {
+        assert_eq!(status_line(2, 3, None), "2 of 3 peers fresh");
+        assert_eq!(
+            status_line(2, 3, Some(Duration::from_millis(12_900))),
+            "2 of 3 peers fresh when paused 12s ago"
+        );
+    }
+
+    #[test]
+    fn a_frozen_fleet_does_not_follow_later_feeds() {
+        let now = Instant::now();
+        let mut live = fleet();
+        apply_feed(
+            &mut live,
+            "peer-a",
+            FeedEvent::Snapshot(DOC.to_owned()),
+            now,
+        );
+        let frozen = live.clone();
+        let later = now + Duration::from_secs(40);
+        apply_feed(&mut live, "peer-a", FeedEvent::Heartbeat, later);
+        assert!(frozen.stale("peer-a", later, Duration::from_secs(30)));
+        assert!(!live.stale("peer-a", later, Duration::from_secs(30)));
     }
 
     #[test]

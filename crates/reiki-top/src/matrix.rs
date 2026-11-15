@@ -112,7 +112,13 @@ pub struct Row {
 pub struct Matrix {
     pub columns: Vec<Column>,
     pub rows: Vec<Row>,
+    /// Providers left out because a peer published more than [`MAX_COLUMNS`] distinct names.
+    pub hidden_columns: usize,
 }
+
+/// The most provider columns kept. Peers choose their upstream names, so an unbounded set
+/// would let one peer widen every row.
+pub const MAX_COLUMNS: usize = 32;
 
 impl Matrix {
     pub fn build(fleet: &Fleet, peers: &[String], now: Instant) -> Matrix {
@@ -143,6 +149,8 @@ impl Matrix {
                 .cmp(&a.peers_with)
                 .then_with(|| a.upstream.cmp(&b.upstream))
         });
+        let hidden_columns = columns.len().saturating_sub(MAX_COLUMNS);
+        columns.truncate(MAX_COLUMNS);
 
         let mut rows = Vec::with_capacity(peers.len());
         for name in peers {
@@ -179,7 +187,11 @@ impl Matrix {
                 .filter(|r| r.cells.get(i) == Some(&Cell::Healthy))
                 .count();
         }
-        Matrix { columns, rows }
+        Matrix {
+            columns,
+            rows,
+            hidden_columns,
+        }
     }
 }
 
@@ -903,5 +915,20 @@ mod tests {
         let mut h = History::new(0);
         h.push("peer-a", Sample::default());
         assert!(h.series("peer-a", Metric::Load1).is_empty());
+    }
+
+    #[test]
+    fn columns_are_capped_and_the_hidden_count_is_reported() {
+        let mut f = fleet();
+        let t0 = Instant::now();
+        let many: Vec<String> = (0..40)
+            .map(|i| upstream(&format!("up-{i:02}"), 1, 0, 0))
+            .collect();
+        add(&mut f, "peer-a", &doc(&many.join(",")), t0);
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        assert_eq!(m.columns.len(), MAX_COLUMNS);
+        assert_eq!(m.hidden_columns, 40 - MAX_COLUMNS);
+        assert_eq!(m.rows[0].cells.len(), MAX_COLUMNS);
+        assert_eq!(m.rows[0].combos.len(), MAX_COLUMNS);
     }
 }

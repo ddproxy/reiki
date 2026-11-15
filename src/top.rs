@@ -459,8 +459,20 @@ fn apply_action(
         }
         return true;
     }
+    // The first press has to move off the row that is selected by default.
+    if state.mode == ui::Mode::Matrix
+        && state.selected.is_none()
+        && matches!(action, ui::Action::NextPeer | ui::Action::PrevPeer)
+    {
+        state.selected = Some(0);
+    }
     let previous = state.selected;
     let keep = state.apply(action, total, viewport);
+    // A detail choice and its scroll belong to the peer they were made on.
+    if state.mode == ui::Mode::Matrix && state.selected != previous {
+        state.detail = None;
+        state.scroll = 0;
+    }
     if action == ui::Action::ClearFilter {
         state.selected = None;
     }
@@ -509,6 +521,7 @@ fn build_parts(
     now: Instant,
     state: &ui::UiState,
     width: usize,
+    height: usize,
 ) -> Parts {
     match state.mode {
         ui::Mode::Full => Parts {
@@ -525,10 +538,21 @@ fn build_parts(
                     .detail_open(is_problem(row))
                     .then(|| view::peer_detail(fleet, &row.peer, now, width))
             });
-            Parts {
-                lines: view::render_matrix(&matrix, history, pos, width),
-                detail,
-            }
+            // Rows above the footer, minus the detail pane when it is open.
+            let body = height.saturating_sub(1);
+            let top = match detail {
+                Some(_) => body.saturating_sub(usize::from(ui::detail_height(
+                    u16::try_from(height).unwrap_or(u16::MAX),
+                ))),
+                None => body,
+            };
+            let lines = view::window_matrix(
+                view::render_matrix(&matrix, history, pos, width),
+                matrix.rows.len(),
+                pos,
+                top,
+            );
+            Parts { lines, detail }
         }
     }
 }
@@ -583,7 +607,15 @@ fn measure(
     state: &ui::UiState,
 ) -> io::Result<(usize, usize)> {
     let size = terminal.size()?;
-    let parts = build_parts(fleet, history, all, now, state, usize::from(size.width));
+    let parts = build_parts(
+        fleet,
+        history,
+        all,
+        now,
+        state,
+        usize::from(size.width),
+        usize::from(size.height),
+    );
     Ok(match (state.mode, parts.detail) {
         (ui::Mode::Full, _) => (
             parts.lines.len(),
@@ -642,6 +674,7 @@ fn render_screen(
             shown.now,
             state,
             usize::from(frame.area().width),
+            usize::from(frame.area().height),
         );
         match state.mode {
             ui::Mode::Full => ui::draw(frame, &parts.lines, state, &status),
@@ -827,8 +860,11 @@ mod tests {
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let mut state = ui::UiState::default();
         apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
-        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
-        assert_eq!(state.selected, Some(1));
+        assert_eq!(
+            state.selected,
+            Some(1),
+            "the first press leaves the default row"
+        );
         assert_eq!(state.filter.peer, None, "the matrix does not filter");
         state.toggle_mode();
         apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
@@ -845,7 +881,8 @@ mod tests {
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let mut state = ui::UiState::default();
         apply_action(&mut state, ui::Action::ScrollDown, &all, 10, 3, false);
-        assert_eq!((state.selected, state.scroll), (Some(0), 0));
+        assert_eq!((state.selected, state.scroll), (Some(1), 0));
+        apply_action(&mut state, ui::Action::ScrollUp, &all, 10, 3, false);
         apply_action(&mut state, ui::Action::ScrollUp, &all, 10, 3, false);
         assert_eq!(state.selected, Some(0), "never underflows");
         state.toggle_mode();
@@ -894,7 +931,7 @@ mod tests {
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let history = History::new(0);
         let state = ui::UiState::default();
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, 40);
         let card = parts
             .detail
             .expect("peer-b is a problem, so the pane opens");
@@ -905,12 +942,12 @@ mod tests {
 
         let mut closed = state.clone();
         closed.detail = Some(false);
-        assert!(build_parts(&fleet, &history, &all, now, &closed, 100)
+        assert!(build_parts(&fleet, &history, &all, now, &closed, 100, 40)
             .detail
             .is_none());
         let mut full = state.clone();
         full.toggle_mode();
-        assert!(build_parts(&fleet, &history, &all, now, &full, 100)
+        assert!(build_parts(&fleet, &history, &all, now, &full, 100, 40)
             .detail
             .is_none());
     }
@@ -1150,5 +1187,22 @@ mod tests {
         assert!(out.contains("Providers"), "{out}");
         assert!(out.contains("no data"), "{out}");
         assert!(err.contains("peer `peer-a`"), "{err}");
+    }
+
+    #[test]
+    fn moving_the_selection_drops_the_detail_choice_and_its_scroll() {
+        let all = vec![
+            "peer-a".to_owned(),
+            "peer-b".to_owned(),
+            "peer-c".to_owned(),
+        ];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
+        apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, false);
+        state.scroll = 4;
+        assert_eq!(state.detail, Some(true));
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
+        assert_eq!(state.detail, None, "the new peer decides for itself");
+        assert_eq!(state.scroll, 0);
     }
 }

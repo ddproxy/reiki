@@ -306,6 +306,20 @@ fn dash(value: Option<String>) -> String {
 
 /// The table `reiki peers` prints: one row per peer upstream, one `unknown` row per peer
 /// without fresh data.
+/// Control characters and the invisible format characters that reorder or hide text. A peer
+/// chooses its instance and upstream names, and they go to a terminal.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 pub fn render_table(reports: &[PeerReport]) -> String {
     let headers = [
         "PEER", "INSTANCE", "UPSTREAM", "STATE", "HEALTHY", "COOLING", "DISABLED", "WAIT", "AGE",
@@ -347,10 +361,10 @@ pub fn render_table(reports: &[PeerReport]) -> String {
     }
     // A peer chooses its instance and upstream names, and they go to a terminal.
     for cell in rows.iter_mut().flatten() {
-        if cell.chars().any(char::is_control) {
+        if cell.chars().any(unsafe_char) {
             *cell = cell
                 .chars()
-                .map(|c| if c.is_control() { '?' } else { c })
+                .map(|c| if unsafe_char(c) { '?' } else { c })
                 .collect();
         }
     }
@@ -931,5 +945,17 @@ mod tests {
             json["peers"][0]["upstreams"][0]["soonest_cooldown_seconds"],
             42
         );
+    }
+
+    #[test]
+    fn bidi_overrides_and_zero_width_marks_from_a_peer_are_shown_as_question_marks() {
+        let mut report = PeerReport::unknown("peer-a", "down".to_owned());
+        report.instance = Some("a\u{202E}b\u{200B}c".to_owned());
+        let table = render_table(&[report]);
+        assert!(
+            !table.contains('\u{202E}') && !table.contains('\u{200B}'),
+            "{table:?}"
+        );
+        assert!(table.contains("a?b?c"), "{table:?}");
     }
 }

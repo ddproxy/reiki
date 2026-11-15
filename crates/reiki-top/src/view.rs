@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::matrix::{order_peers, resolve, Cell, History, Matrix, Metric, Row};
 use crate::Fleet;
 
@@ -41,16 +43,31 @@ impl Line {
 
 /// Peer-supplied strings reach the terminal, so control characters (escape sequences
 /// included) are shown as `?`.
+/// Control characters, and the invisible format characters that reorder or hide text (bidi
+/// overrides and isolates, zero-width marks, the byte-order mark): a peer must not be able to
+/// spoof what another peer's name or a status line says.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 fn span(text: impl Into<String>, style: Style) -> Span {
     let text: String = text
         .into()
         .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if unsafe_char(c) { '?' } else { c })
         .collect();
     Span { text, style }
 }
 
-/// Truncates every line to `width` characters, never inside a multi-byte char.
+/// Truncates every line to `width` terminal columns, never inside a multi-byte char.
 fn line(spans: Vec<Span>, width: usize) -> Line {
     let mut out = Vec::new();
     let mut left = width;
@@ -58,16 +75,31 @@ fn line(spans: Vec<Span>, width: usize) -> Line {
         if left == 0 {
             break;
         }
-        if s.text.chars().count() <= left {
-            left -= s.text.chars().count();
+        let w = text_width(&s.text);
+        if w <= left {
+            left -= w;
             out.push(s);
         } else {
-            let text: String = s.text.chars().take(left).collect();
-            out.push(span(text, s.style));
+            out.push(span(clip(&s.text, left), s.style));
             break;
         }
     }
     Line { spans: out }
+}
+
+/// Terminal columns a string takes; wide characters count two, combining marks none.
+fn text_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+/// One character's columns. A character `span` will replace with `?` takes one, so widths
+/// measured before and after sanitising agree.
+fn char_width(c: char) -> usize {
+    if unsafe_char(c) {
+        1
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
 }
 
 /// `4h31m`, `12m05s` or `45s`, from whole seconds.
@@ -146,7 +178,7 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
     let rows = fleet.provider_summary(now);
     let name_w = rows
         .iter()
-        .map(|r| r.upstream.chars().count())
+        .map(|r| text_width(&r.upstream))
         .max()
         .unwrap_or(0);
     for r in &rows {
@@ -374,6 +406,13 @@ pub fn render_matrix(
         ));
     }
 
+    if matrix.hidden_columns > 0 {
+        title.push(span(
+            format!("   +{} more", matrix.hidden_columns),
+            Style::Dim,
+        ));
+    }
+
     if order.is_empty() {
         return vec![line(title, width)];
     }
@@ -399,6 +438,31 @@ pub fn render_matrix(
         }
     }
     chip_lines(matrix, &order, history, title, selected, width)
+}
+
+/// Keeps the pinned lines (fleet line, header) and the window of peer rows that holds the
+/// selected one, so a fleet taller than the screen scrolls with the selection instead of
+/// hiding it. `rows` is the peer count and `selected` a display position.
+pub fn window_matrix(
+    mut lines: Vec<Line>,
+    rows: usize,
+    selected: Option<usize>,
+    height: usize,
+) -> Vec<Line> {
+    let pinned = lines.len().saturating_sub(rows);
+    if height <= pinned {
+        lines.truncate(height);
+        return lines;
+    }
+    let visible = height - pinned;
+    if rows <= visible {
+        return lines;
+    }
+    let pos = selected.unwrap_or(0).min(rows - 1);
+    let start = (pos + 1).saturating_sub(visible);
+    let mut out: Vec<Line> = lines.drain(..pinned).collect();
+    out.extend(lines.into_iter().skip(start).take(visible));
+    out
 }
 
 /// One peer's chip line per row: its providers with their cell, then load and disk.
@@ -492,13 +556,13 @@ impl<'a> Grid<'a> {
                 cells
                     .iter()
                     .filter_map(|row| row.get(c))
-                    .map(|(text, _)| text.chars().count())
-                    .fold(labels[c].chars().count(), usize::max)
+                    .map(|(text, _)| text_width(text))
+                    .fold(text_width(&labels[c]), usize::max)
             })
             .collect();
         let name_w = order
             .iter()
-            .map(|&i| clip(&matrix.rows[i].peer, NAME_MAX).chars().count())
+            .map(|&i| text_width(&clip(&matrix.rows[i].peer, NAME_MAX)))
             .max()
             .unwrap_or(0);
         let host: Vec<HostArea> = order
@@ -509,7 +573,7 @@ impl<'a> Grid<'a> {
         for area in &host {
             if let HostArea::Figures(figures) = area {
                 for (w, (text, _)) in host_w.iter_mut().zip(figures) {
-                    *w = (*w).max(text.chars().count());
+                    *w = (*w).max(text_width(text));
                 }
             }
         }
@@ -702,12 +766,22 @@ fn name_style(selected: bool) -> Style {
 
 /// The first `n` characters, never splitting one.
 fn clip(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w > n {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
 }
 
 /// Pads with spaces to `width` characters; a longer text is returned as it is.
 fn pad(text: &str, width: usize) -> String {
-    let len = text.chars().count();
+    let len = text_width(text);
     let mut out = text.to_owned();
     out.extend(std::iter::repeat_n(' ', width.saturating_sub(len)));
     out
@@ -936,6 +1010,7 @@ mod tests {
             })
             .collect();
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![Column {
                 upstream: "zen".to_owned(),
                 peers_with: cells.len(),
@@ -965,6 +1040,7 @@ mod tests {
             age,
         };
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![Column {
                 upstream: "zen".to_owned(),
                 peers_with: 1,
@@ -1066,6 +1142,7 @@ mod tests {
             age: Some(Duration::ZERO),
         };
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![],
             rows: vec![disk(53.0), disk(80.0), disk(95.0), disk(100.0)],
         };
@@ -1145,6 +1222,7 @@ mod tests {
             age: Some(Duration::ZERO),
         };
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![],
             rows: vec![row(1e308, u64::MAX), row(f64::NAN, 3)],
         };
@@ -1216,6 +1294,7 @@ mod tests {
             age: Some(Duration::ZERO),
         };
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![
                 Column {
                     upstream: "zen".to_owned(),
@@ -1239,6 +1318,7 @@ mod tests {
     #[test]
     fn no_peers_draw_only_the_fleet_line() {
         let m = Matrix {
+            hidden_columns: 0,
             columns: vec![],
             rows: vec![],
         };
@@ -1487,10 +1567,11 @@ mod tests {
         let names = vec!["pr-é🦀x".to_owned()];
         let lines = render(&f, &names, t0, 5);
         for l in &lines {
-            assert!(l.plain_text().chars().count() <= 5);
+            assert!(text_width(&l.plain_text()) <= 5);
         }
-        // c, t, -, é, 🦀: exactly five chars, 🦀 is not split.
-        assert_eq!(find(&lines, "é").plain_text(), "pr-é🦀");
+        // The crab is two columns wide and only one is left after `pr-é`, so it is dropped,
+        // never split.
+        assert_eq!(find(&lines, "é").plain_text(), "pr-é");
     }
 
     #[test]
@@ -1517,6 +1598,85 @@ mod tests {
         assert!(
             !unlabelled.iter().any(|l| l.contains("available")),
             "no key rows without labels"
+        );
+    }
+
+    #[test]
+    fn bidi_and_zero_width_characters_in_names_are_replaced() {
+        let mut f = fleet();
+        let t0 = Instant::now();
+        let doc = r#"{"instance":"x","observed_at":"t","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        add(&mut f, "peer\u{202E}evil\u{200B}\u{2066}x\u{FEFF}", doc, t0);
+        let text = texts(&matrix_lines(
+            &f,
+            &names(&["peer\u{202E}evil\u{200B}\u{2066}x\u{FEFF}"]),
+            t0,
+            100,
+        ))
+        .join("\n");
+        for bad in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}'] {
+            assert!(!text.contains(bad), "{bad:?} leaked: {text:?}");
+        }
+        assert!(text.contains("peer?evil"));
+    }
+
+    #[test]
+    fn wide_names_clip_and_align_by_display_width() {
+        let mut f = fleet();
+        let t0 = Instant::now();
+        let doc = r#"{"instance":"x","observed_at":"t","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        let wide = "\u{5BB6}".repeat(12);
+        add(&mut f, &wide, doc, t0);
+        add(&mut f, "peer-b", doc, t0);
+        for width in [20, 40, 100] {
+            let lines = matrix_lines(&f, &names(&[&wide, "peer-b"]), t0, width);
+            for l in &lines {
+                assert!(
+                    text_width(&l.plain_text()) <= width,
+                    "width {width}: {:?}",
+                    l.plain_text()
+                );
+            }
+        }
+        let lines = texts(&matrix_lines(&f, &names(&[&wide, "peer-b"]), t0, 100));
+        let cell_col: Vec<usize> = lines
+            .iter()
+            .skip(2)
+            .filter_map(|l| l.find('\u{25A0}').map(|b| text_width(&l[..b])))
+            .collect();
+        assert_eq!(cell_col.len(), 2);
+        assert_eq!(cell_col[0], cell_col[1], "cells line up: {lines:?}");
+    }
+
+    #[test]
+    fn the_window_keeps_the_header_and_the_selected_row_in_view() {
+        let rows = 20;
+        let mk = |n: usize| -> Vec<Line> {
+            (0..n)
+                .map(|i| line(vec![span(format!("L{i}"), Style::Plain)], 20))
+                .collect()
+        };
+        let plain =
+            |lines: &[Line]| -> Vec<String> { lines.iter().map(Line::plain_text).collect() };
+        // two pinned lines then 20 rows: L0 L1 pinned, rows are L2..L21
+        let win = plain(&window_matrix(mk(rows + 2), rows, Some(15), 10));
+        assert_eq!(win.len(), 10);
+        assert_eq!(&win[..2], ["L0", "L1"], "header stays");
+        assert!(
+            win.contains(&"L17".to_owned()),
+            "row 15 is line 17: {win:?}"
+        );
+        let top = plain(&window_matrix(mk(rows + 2), rows, Some(0), 10));
+        assert_eq!(top[2], "L2");
+        let all = window_matrix(mk(5), 3, Some(2), 40);
+        assert_eq!(all.len(), 5, "everything fits");
+        assert_eq!(window_matrix(mk(rows + 2), rows, Some(3), 2).len(), 2);
+        assert!(window_matrix(mk(rows + 2), rows, Some(3), 0).is_empty());
+        let past = plain(&window_matrix(mk(rows + 2), rows, Some(999), 10));
+        assert_eq!(
+            past.last().unwrap(),
+            "L21",
+            "a stale selection clamps to the last row"
         );
     }
 }

@@ -52,7 +52,7 @@ Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
 
 In the matrix:
 
-- `j`/`k`, the arrows, `Tab`/`Shift-Tab`: move the selection to the next or previous peer.
+- `j`/`k`, the arrows, `Tab`/`Shift-Tab`: move the selection to the next or previous peer. With more peers than rows the list scrolls with the selection and the header stays in place.
 - `Enter` or `e`: open or close the detail pane. A problem peer's pane opens by itself; Enter flips it.
 - `PgUp`/`PgDn`, `g`/`Home`, `G`/`End`: scroll the detail pane.
 - `v` or `E`: switch to the full view.
@@ -66,6 +66,10 @@ In the full view (`v` or `--full`):
 - `p` freezes, `v` returns to the matrix, `q` or `Esc` quits.
 
 Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
+
+### Names and columns
+
+Peer and provider names come from the network. Control characters and invisible format characters (bidi overrides, zero-width marks) are shown as `?`, and widths are measured in terminal columns, so wide characters stay aligned. At most 32 provider columns are drawn; the fleet line adds `+N more` for the rest.
 
 ### Narrow terminals
 

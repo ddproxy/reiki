@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog"]
+members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog", "crates/reiki-top"]
 resolver = "2"
 
 [package]

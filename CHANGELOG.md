@@ -4,6 +4,7 @@
 
 ### Added
 
+- The `reiki-top` crate gains a pure view model that renders a fleet as styled plain lines (title, provider bars, per-peer cards with class-aware cooldown bars, host load, disk and sessions). It is the base of the planned `reiki top` terminal view.
 - An optional `[upstream.NAME.limits]` table (`preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs`) is parsed and validated. An explicit zero means unlimited, even over a preset value. Nothing applies it yet.
 - `/status` and the labelled `/v1/health` key view report `cooldown_class` (`rate_limited`, `quota_exhausted`, `transient` and so on) for a cooling key, and `reiki keys --json` includes it. A cooldown restored from the state file has no class.
 - Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod view;
+
 /// The whole `/v1/health` document. Unknown fields are ignored; missing optional fields are
 /// `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,16 @@ pub struct ProviderRow {
     pub healthy_keys: u32,
     pub total_keys: u32,
     pub peer_count: u32,
+}
+
+/// A borrowed view of one peer's health for the view layer: the data plus its age on this host's
+/// clock. `stale` matches the rule `provider_summary` uses: exactly `max_age` old is fresh.
+#[derive(Debug)]
+pub struct PeerView<'a> {
+    pub health: &'a Health,
+    /// How long ago this host received the health.
+    pub age: Duration,
+    pub stale: bool,
 }
 
 impl Fleet {
@@ -212,6 +224,18 @@ impl Fleet {
             upstream.keys = Some(merged);
         }
         Ok(())
+    }
+
+    /// The peer's health view, or `None` when this host has nothing for it.
+    pub fn peer(&self, name: &str, now: Instant) -> Option<PeerView<'_>> {
+        self.peers.get(name).map(|peer| {
+            let age = now.saturating_duration_since(peer.received_at);
+            PeerView {
+                health: &peer.health,
+                age,
+                stale: age > self.max_age,
+            }
+        })
     }
 
     /// One row per upstream name, summed over every fresh peer, in upstream-name order.

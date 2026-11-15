@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod matrix;
 #[cfg(feature = "tui")]
 pub mod ui;
 pub mod view;

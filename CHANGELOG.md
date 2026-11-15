@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `reiki top`: a peers-by-providers model for the coming matrix view (providers a peer does not use are their own state, not a failure).
+
 ## 0.10.0
 
 ### Added

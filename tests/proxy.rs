@@ -28,6 +28,7 @@ type PathScript = HashMap<(String, String), VecDeque<Reply>>;
 
 enum Reply {
     Status(u16, &'static str, Option<(&'static str, &'static str)>),
+    Headers(u16, &'static str, Vec<(&'static str, &'static str)>),
     Slow(Vec<&'static str>, Duration),
     Delay(Duration),
 }
@@ -106,6 +107,13 @@ async fn mock_handler(State(mock): State<Arc<Mock>>, req: Request) -> Response {
         Some(Reply::Status(code, text, extra)) => {
             let mut b = Response::builder().status(code);
             if let Some((k, v)) = extra {
+                b = b.header(k, v);
+            }
+            b.body(Body::from(text)).unwrap()
+        }
+        Some(Reply::Headers(code, text, headers)) => {
+            let mut b = Response::builder().status(code);
+            for (k, v) in headers {
                 b = b.header(k, v);
             }
             b.body(Body::from(text)).unwrap()
@@ -192,6 +200,41 @@ fn config_with_limits(
     (Config::parse(&text).unwrap(), map)
 }
 
+/// Builds the same config as [`config_for`] plus an `[upstream.zen.limits]` table,
+/// so the shaper shapes every key of the one upstream.
+fn config_with_shaper(
+    mock_url: &str,
+    keys: &[(&str, &str)],
+    streams: &[(&str, &str, &[&str])],
+    limits: &str,
+) -> (Config, HashMap<String, Secret>) {
+    let mut text = format!("[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{limits}\n");
+    let mut map = HashMap::new();
+    for (name, secret) in keys {
+        text.push_str(&format!(
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+        ));
+        map.insert((*name).to_owned(), Secret::new(*secret));
+    }
+    for (name, token, chain) in streams {
+        let chain = chain
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n",
+            sha(token)
+        ));
+    }
+    text.push_str("[plugins.metrics]\n");
+    text.push_str(&format!(
+        "[admin]\nlisten = \"127.0.0.1:0\"\ntoken_sha256 = \"{}\"\n",
+        sha("admin-secret")
+    ));
+    (Config::parse(&text).unwrap(), map)
+}
+
 fn config_with_quota_resets(
     mock_url: &str,
     keys: &[(&str, &str)],
@@ -275,6 +318,45 @@ async fn harness_with_limits(
         Duration::from_secs(120),
     )
     .await
+}
+
+/// A harness whose single upstream has an outbound `limits` table, with the wall
+/// clock pinned so a test can jump between requests.
+async fn harness_with_shaper(
+    streams: &[(&str, &str, &[&str])],
+    limits: &str,
+    wall: SystemTime,
+) -> Harness {
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+
+    let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
+    let (config, keys) = config_with_shaper(&mock_url, &keys, streams, limits);
+    let plugins =
+        reiki::plugins::PluginChain::build(&config.plugins, &reiki::plugins::builtin()).unwrap();
+    let app = App::with_plugins(
+        config,
+        keys,
+        Policy::default(),
+        Duration::from_secs(120),
+        plugins,
+    );
+    app.set_wall_clock(wall);
+    let relay = serve(router(Arc::clone(&app))).await;
+    let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
+    Harness {
+        mock,
+        mock_url,
+        relay,
+        client: reqwest::Client::new(),
+        app,
+        admin: Some(admin),
+    }
 }
 
 async fn harness_with_admin(
@@ -471,6 +553,16 @@ impl Harness {
 
     fn reload(&self, keys: &[(&str, &str)], streams: &[(&str, &str, &[&str])]) {
         let (config, keys) = config_for(&self.mock_url, keys, streams);
+        self.app.reload(config, keys);
+    }
+
+    fn reload_shaped(
+        &self,
+        keys: &[(&str, &str)],
+        streams: &[(&str, &str, &[&str])],
+        limits: &str,
+    ) {
+        let (config, keys) = config_with_shaper(&self.mock_url, keys, streams, limits);
         self.app.reload(config, keys);
     }
 }
@@ -921,6 +1013,309 @@ async fn a_failover_cannot_spend_more_attempts_than_the_limit_allows() {
     let body = res.text().await.unwrap();
     assert!(body.contains("rate_limited"), "body was {body}");
     assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn a_shaped_rpm_budget_waits_for_the_next_slot() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let h = harness_with_shaper(
+        &one_stream(),
+        "[upstream.zen.limits]\nrpm = 2\nmax_wait_secs = 5\n",
+        now,
+    )
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            h.post("tok-a", "/zen/x", "1")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+
+    // One second short of the first slot's expiry: the request must sleep for it.
+    h.app.set_wall_clock(now + Duration::from_secs(59));
+    let started = Instant::now();
+    let res = h.post("tok-a", "/zen/x", "3").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the third request did not wait: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(h.mock.keys_called().len(), 3);
+}
+
+#[tokio::test]
+async fn a_wait_beyond_max_wait_is_shed_without_touching_key_health() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\nrpm = 1\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-reiki-origin"], "local");
+    let retry: u64 = res.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry), "retry-after was {retry}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("reiki_shaped"), "body was {body}");
+    // The shed never reached an upstream and neither key was cooled or disabled.
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+    assert_eq!(admin_key_state(&h, "a").await, "available");
+    assert_eq!(admin_key_state(&h, "b").await, "available");
+
+    let admin = h.admin.as_ref().unwrap();
+    let metrics = h
+        .client
+        .get(format!("{admin}/metrics"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("reiki_rate_limit_rejections_total{stream=\"client-a\"} 1"),
+        "shed was not counted: {metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_daily_window_moves_to_the_next_key() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let h = harness_with_shaper(
+        &one_stream(),
+        "[upstream.zen.limits]\ndaily_requests = 1\nmax_wait_secs = 10\n",
+        now,
+    )
+    .await;
+    for body in ["1", "2"] {
+        assert_eq!(
+            h.post("tok-a", "/zen/x", body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+    assert_eq!(admin_key_state(&h, "a").await, "available");
+    assert_eq!(admin_key_state(&h, "b").await, "available");
+}
+
+#[tokio::test]
+async fn a_concurrent_slot_is_held_until_the_first_body_ends() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let h = harness_with_shaper(
+        &one_stream(),
+        "[upstream.zen.limits]\nconcurrent = 1\nmax_wait_secs = 10\n",
+        now,
+    )
+    .await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Slow(
+            vec!["data: one\n\n", "data: two\n\n"],
+            Duration::from_millis(500),
+        )],
+    );
+
+    let mut first = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(&first.chunk().await.unwrap().unwrap()[..], b"data: one\n\n");
+
+    let second = h.post("tok-a", "/zen/x", "2").send();
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut second)
+            .await
+            .is_err(),
+        "the second request ran while the first body held the only slot"
+    );
+    while first.chunk().await.unwrap().is_some() {}
+    drop(first);
+
+    let res = tokio::time::timeout(Duration::from_secs(5), &mut second)
+        .await
+        .expect("the slot was not released after the body ended")
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn a_provider_429_lowers_the_bucket_so_the_next_request_waits() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\nrpm = 10\nmax_wait_secs = 5\n",
+        now,
+    )
+    .await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "1")),
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+
+    // Let the key's health cooldown pass, then jump to just before the learned
+    // cap's next slot so the second request has to sleep for it.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    h.app.set_wall_clock(now + Duration::from_secs(59));
+    let started = Instant::now();
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the learned bucket did not delay the next request: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+#[tokio::test]
+async fn a_response_reporting_no_remaining_requests_closes_the_window() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\nrpm = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Headers(
+            200,
+            "{\"ok\":true}",
+            vec![
+                ("x-ratelimit-remaining-requests", "0"),
+                ("x-ratelimit-reset-requests", "60"),
+            ],
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert!(res.text().await.unwrap().contains("reiki_shaped"));
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn a_quota_402_closes_the_bucket_for_the_same_cooldown_as_the_key() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\nrpm = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Status(402, "quota", None)]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+
+    // Clearing the health cooldown must not reopen the learned outbound window.
+    let admin = h.admin.as_ref().unwrap();
+    assert_eq!(
+        h.client
+            .post(format!("{admin}/v1/keys/enable?key=a"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert!(res.text().await.unwrap().contains("reiki_shaped"));
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn reload_keeps_the_bucket_of_an_unchanged_key() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let limits = "[upstream.zen.limits]\nrpm = 1\nmax_wait_secs = 1\n";
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(&streams, limits, now).await;
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    h.reload_shaped(&[("a", "up-a")], &streams, limits);
+    let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 429, "the reload reset the bucket");
+    assert!(res.text().await.unwrap().contains("reiki_shaped"));
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
+async fn an_upstream_without_limits_is_not_shaped() {
+    let h = harness(&one_stream(), Policy::default()).await;
+    for body in ["1", "2", "3"] {
+        assert_eq!(
+            h.post("tok-a", "/zen/x", body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-a", "up-a"]);
 }
 
 #[tokio::test]

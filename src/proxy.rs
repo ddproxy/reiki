@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -23,6 +23,9 @@ use crate::config::{Config, PeersConfig};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
 use crate::rewrite::rewrite_body;
+use crate::shaper::bucket::{Bucket, Permit};
+use crate::shaper::headers::{observe, Observed};
+use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use reiki_plugin::{Event, FailureKind};
 
@@ -131,6 +134,32 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
     Ok(keys)
 }
 
+/// Every key whose upstream has a `limits` table, with the window it shapes.
+/// Config validation has already rejected unusable tables; a stray error here
+/// leaves that key unshaped rather than taking the proxy down.
+fn shaped_keys(config: &Config) -> BTreeMap<String, KeyLimits> {
+    config
+        .keys
+        .iter()
+        .filter_map(|(name, key)| {
+            let limits = config.upstream.get(&key.upstream)?.limits.as_ref()?;
+            match limits.to_window() {
+                Ok((window, max_wait)) => Some((
+                    name.clone(),
+                    KeyLimits {
+                        window,
+                        max_wait,
+                    },
+                )),
+                Err(error) => {
+                    tracing::error!(key = %name, upstream = %key.upstream, %error, "ignoring unusable limits");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 pub(crate) struct Snapshot {
     pub(crate) config: Config,
     pub(crate) keys: HashMap<String, Secret>,
@@ -229,6 +258,8 @@ const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
+    /// Per-key outbound buckets, kept across reloads for an unchanged window.
+    shaper: Shaper,
     policy: Policy,
     standard: Standard,
     faithful: Faithful,
@@ -238,7 +269,8 @@ pub struct App {
     /// Held across snapshot and write, so a stale snapshot cannot land after a newer one.
     persist_lock: Mutex<()>,
     /// Overrides the wall clock for tests; production reads the system clock.
-    wall_clock: OnceLock<SystemTime>,
+    /// The override advances with real time, and tests may set it again to jump.
+    wall_clock: RwLock<Option<(SystemTime, Instant)>>,
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: RwLock<Option<i64>>,
     logins: LoginThrottle,
@@ -290,9 +322,12 @@ impl App {
         plugins: PluginChain,
     ) -> Arc<Self> {
         let throttle = ThrottleSettings::from(&config.auth);
+        let shaper = Shaper::new();
+        shaper.sync(&shaped_keys(&config));
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
+            shaper,
             policy,
             standard: Standard::try_new().expect("cannot build the upstream HTTP client"),
             faithful: Faithful::new(),
@@ -300,7 +335,7 @@ impl App {
             header_timeout,
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
-            wall_clock: OnceLock::new(),
+            wall_clock: RwLock::new(None),
             ca_not_after: RwLock::new(None),
             logins: LoginThrottle::new(throttle),
             admin_logins: LoginThrottle::new(throttle),
@@ -399,14 +434,21 @@ impl App {
     }
 
     pub fn set_wall_clock(&self, now: SystemTime) {
-        let _ = self.wall_clock.set(now);
+        *self
+            .wall_clock
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some((now, Instant::now()));
     }
 
     pub(crate) fn wall_now(&self) -> SystemTime {
-        self.wall_clock
-            .get()
-            .copied()
-            .unwrap_or_else(SystemTime::now)
+        match *self
+            .wall_clock
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Some((base, started)) => base.checked_add(started.elapsed()).unwrap_or(base),
+            None => SystemTime::now(),
+        }
     }
 
     /// Apply persisted key health. Missing or corrupt state is ignored.
@@ -471,6 +513,7 @@ impl App {
     /// with. Plugins are built at startup and are not rebuilt here.
     pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
         let throttle = ThrottleSettings::from(&config.auth);
+        let wanted_shapes = shaped_keys(&config);
         let next = Arc::new(Snapshot::new(config, keys));
         // Health first, then the snapshot: `record` takes them in the same order, so a
         // failure from a request on the old snapshot cannot land after the re-enable.
@@ -486,6 +529,7 @@ impl App {
                 health.enable(name);
             }
         }
+        self.shaper.sync(&wanted_shapes);
         *current = next;
         self.logins.configure(throttle);
         self.admin_logins.configure(throttle);
@@ -1326,6 +1370,42 @@ struct Forward<'a> {
     faithful: bool,
 }
 
+fn remember_wait(smallest: &mut Option<Duration>, wait: Duration) {
+    *smallest = Some(smallest.map_or(wait, |current| current.min(wait)));
+}
+
+/// A bucket has no pause-only call, so a response that reports zero remaining
+/// closes the bucket until its reset.
+fn note_reported_remaining(bucket: &Bucket, observed: Observed, now: SystemTime) {
+    for (remaining, reset) in [
+        (observed.requests_remaining, observed.requests_reset),
+        (observed.tokens_remaining, observed.tokens_reset),
+    ] {
+        if remaining == Some(0) {
+            if let Some(until) = reset.and_then(|reset| now.checked_add(reset)) {
+                bucket.note_window_closed(now, until);
+            }
+        }
+    }
+}
+
+fn shaped_response(wait: Duration) -> Response {
+    let mut response = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "reiki_shaped",
+        "no key may be used within the configured wait",
+    );
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if let Ok(value) = HeaderValue::from_str(&secs.clamp(1, 3600).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response.headers_mut().insert(
+        HeaderName::from_static("x-reiki-origin"),
+        HeaderValue::from_static("local"),
+    );
+    response
+}
+
 async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, Box<Spent>> {
     let Forward {
         snapshot,
@@ -1353,6 +1433,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     // The first key to answer 401 under `hold_unauthorized`, disabled once a later key succeeds.
     let mut held: Option<(String, u16)> = None;
     let mut confirmed: Vec<String> = Vec::new();
+    // The shortest wait any shaped-out key reported, for the local 429.
+    let mut shaped_wait: Option<Duration> = None;
     for _ in 0..max_attempts {
         let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
             break;
@@ -1376,6 +1458,60 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             app.plugins().on_event(&Event::RateLimited { stream });
             return Ok(rate_limited_response(wait));
         }
+
+        // Outbound shaping for this key's own upstream. A wait within its budget is
+        // slept off; anything longer skips the key without touching its health.
+        let estimate = (body.len() / 4) as u64;
+        let mut permit: Option<Permit> = None;
+        let mut shaped_out = false;
+        let budget = app
+            .shaper
+            .get(&key_name)
+            .map_or(Duration::ZERO, |(_, wait)| wait);
+        let mut waited = Duration::ZERO;
+        let mut rounds = 0;
+        loop {
+            match app
+                .shaper
+                .acquire_within(&key_name, app.wall_now(), estimate)
+            {
+                Acquire::Unshaped => break,
+                Acquire::Granted(granted) => {
+                    permit = Some(granted);
+                    break;
+                }
+                // The configured wait is a total, not per round.
+                Acquire::Wait(wait) if rounds < 2 && waited + wait <= budget => {
+                    rounds += 1;
+                    waited += wait;
+                    tokio::time::sleep(wait).await;
+                }
+                Acquire::Wait(wait) => {
+                    remember_wait(&mut shaped_wait, wait);
+                    shaped_out = true;
+                    break;
+                }
+                Acquire::TooLong(wait) => {
+                    remember_wait(&mut shaped_wait, wait);
+                    shaped_out = true;
+                    break;
+                }
+                Acquire::Closed(until) => {
+                    remember_wait(
+                        &mut shaped_wait,
+                        until.duration_since(app.wall_now()).unwrap_or_default(),
+                    );
+                    shaped_out = true;
+                    break;
+                }
+            }
+        }
+        if shaped_out {
+            tracing::warn!(stream = %stream, key = %key_name, "key is shaped out, trying the next key");
+            skip.push(key_name.clone());
+            continue;
+        }
+
         let auth_value = upstream.auth_format.replace("{key}", &secret.0);
 
         // For a forward upstream this bounds the whole exchange, not only response headers.
@@ -1454,8 +1590,16 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             version = ?response.version,
             "forwarded"
         );
+        // Only the headers of this attempt's own upstream feed this key's bucket.
+        let shaping = app.shaper.get(&key_name).map(|(bucket, _)| bucket);
+        let observed = shaping.as_ref().map(|_| observe(&response.headers));
         if status.is_success() || status.is_redirection() {
             plugin_states.on_attempt(&key_name, Some(status.as_u16()), &[]);
+            if let (Some(bucket), Some(observed)) = (&shaping, observed) {
+                let now = app.wall_now();
+                note_reported_remaining(bucket, observed, now);
+                bucket.note_success(now);
+            }
             let had_failures = if let Ok(mut health) = app.health.lock() {
                 let had = health.consecutive_failures(&key_name) > 0;
                 health.record_success(&key_name);
@@ -1470,10 +1614,14 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             }
             release_held(app, snapshot, stream, held.take());
             let secrets = [secret.0.as_str(), auth_value.as_str()];
+            // A decoded body is read whole below, so its permit can go as soon as that
+            // read ends. Everything else streams to the client with the permit attached.
+            let buffered = response.is_decoded() && !is_event_stream(&response.headers);
             let response = match settle_body(response).await {
                 Ok(response) => response,
                 Err(response) => return Ok(*response),
             };
+            let permit = if buffered { None } else { permit };
             return Ok(stream_response(
                 plugin_states,
                 &key_name,
@@ -1481,6 +1629,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 response,
                 parts.method == Method::HEAD,
                 &secrets,
+                permit,
             ));
         }
 
@@ -1523,6 +1672,33 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 other => other,
             }
         };
+        // The first pass of a quota confirmation leaves the bucket untouched, so the
+        // same key can be tried again before shaping takes it out of this request.
+        let confirming = matches!(outcome, Outcome::KeyFailure(FailureClass::QuotaExhausted))
+            && upstream.confirm_quota
+            && status == StatusCode::TOO_MANY_REQUESTS
+            && !confirmed.contains(&key_name);
+        if !confirming {
+            if let (Some(bucket), Some(observed)) = (&shaping, observed) {
+                let now = app.wall_now();
+                note_reported_remaining(bucket, observed, now);
+                if let Outcome::KeyFailure(class) = outcome {
+                    match class {
+                        FailureClass::RateLimited(retry_after) => {
+                            bucket.note_rate_limited(now, retry_after);
+                        }
+                        FailureClass::QuotaExhausted => {
+                            let cooldown = quota_cooldown(snapshot, &key_name, class, now)
+                                .unwrap_or(app.policy.quota_exhausted);
+                            if let Some(until) = now.checked_add(cooldown) {
+                                bucket.note_window_closed(now, until);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         match outcome {
             Outcome::Success | Outcome::PassThrough => {
                 if matches!(outcome, Outcome::Success) {
@@ -1548,11 +1724,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
             }
-            Outcome::KeyFailure(FailureClass::QuotaExhausted)
-                if upstream.confirm_quota
-                    && status == StatusCode::TOO_MANY_REQUESTS
-                    && !confirmed.contains(&key_name) =>
-            {
+            Outcome::KeyFailure(FailureClass::QuotaExhausted) if confirming => {
                 // The key stays in rotation: the next pass picks it again and only a repeat is recorded.
                 tracing::warn!(stream = %stream, key = %key_name, "quota 429, sending it once more before cooling the key");
                 confirmed.push(key_name);
@@ -1593,6 +1765,12 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 pending_failover = Some((key_name, FailureKind::from(class)));
             }
         }
+    }
+
+    if let (Some(wait), None) = (shaped_wait, &last_refusal) {
+        tracing::warn!(stream = %stream, "every key is shaped out");
+        app.plugins().on_event(&Event::RateLimited { stream });
+        return Ok(shaped_response(wait));
     }
 
     Err(Box::new(Spent {
@@ -1647,6 +1825,7 @@ async fn forward_passthrough(
                 response,
                 parts.method == Method::HEAD,
                 &[],
+                None,
             ))
         }
         Ok(Err(err)) => {
@@ -1937,6 +2116,27 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
+/// Holds a shaping permit for as long as its body is streamed. Dropping the body
+/// (including a client disconnect) releases the key's concurrency slot.
+struct Permitted<S> {
+    inner: S,
+    _permit: Option<Permit>,
+}
+
+impl<S> Stream for Permitted<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
 fn stream_response(
     plugin_states: PluginSession,
     key: &str,
@@ -1944,6 +2144,7 @@ fn stream_response(
     response: UpstreamResponse,
     is_head: bool,
     secrets: &[&str],
+    permit: Option<Permit>,
 ) -> Response {
     let mut status = response.status;
     let mut headers = HeaderMap::new();
@@ -1974,7 +2175,10 @@ fn stream_response(
         }
     };
     let body = if !plugin_states.needs_response_hooks() {
-        Body::from_stream(stream(response))
+        Body::from_stream(Permitted {
+            inner: stream(response),
+            _permit: permit,
+        })
     } else {
         let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
@@ -1987,10 +2191,13 @@ fn stream_response(
         if !bodyless && !session.is_empty() {
             headers.remove(header::CONTENT_LENGTH);
         }
-        Body::from_stream(PluginBody {
-            session,
-            inner: stream(response),
-            done: false,
+        Body::from_stream(Permitted {
+            inner: PluginBody {
+                session,
+                inner: stream(response),
+                done: false,
+            },
+            _permit: permit,
         })
     };
     let mut out = Response::new(body);

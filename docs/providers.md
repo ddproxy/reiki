@@ -51,6 +51,27 @@ The credential header is always sent first, ahead of the client's own headers. T
 
 These change how Reiki connects, nothing more. Reiki does not add, rewrite or invent client-identifying headers, and the settings do not change which requests an upstream accepts.
 
+## Outbound limits
+
+An upstream can carry a per-key outbound budget. Keys of an upstream without a `limits` table are never shaped:
+
+```toml
+[upstream.zen.limits]
+preset = "zen-free"          # or "openrouter-free"
+rpm = 20                     # requests per minute
+tpm = 100000                 # estimated tokens per minute (body bytes / 4)
+concurrent = 2               # requests in flight
+daily_requests = 50
+daily_tokens = 250000
+max_wait_secs = 20           # longest Reiki waits for a slot, 1-120
+```
+
+Every field is optional and an explicit `0` means unlimited. A preset seeds the values and explicit fields override them. `min_rpm` sets a floor for learning.
+
+Reiki acquires a slot for the chosen key before it sends the request. A short wait within `max_wait_secs` is slept off; a longer wait, or a closed daily quota, skips that key for this request and tries the next key in the chain. If no key can be used, the client gets `429` with JSON error code `reiki_shaped`, a `Retry-After` header and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
+
+Responses teach the same bucket when they come from that key's own upstream: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and a `remaining: 0` limit header closes it until the reported reset. Shaping state is in memory only, so learned caps and pauses reset when Reiki restarts.
+
 ## Forwarding
 
 A forward upstream hands each request to a listener or a program instead of sending it over the network itself. The listener or program can pass it on to another process, a queue, another harness or a proxy.

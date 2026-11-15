@@ -3,6 +3,8 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -16,6 +18,8 @@ use crate::restore::{collect_strings, opaque_paths, within};
 pub const HEAD: &str = "[[REIKI_";
 pub const TAIL: &str = "]]";
 const PRIVATE_KEY_PLACEHOLDER: &str = "[[REIKI_PRIVATE_KEY_REMOVED]]";
+/// A JSON string value longer than this is not decoded, bounding work per body.
+const MAX_DECODE_LEN: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -28,6 +32,8 @@ struct Found {
     start: usize,
     end: usize,
     kind: Kind,
+    /// The raw span is an escaped JSON string body, so its placeholder basis is the decoded text.
+    json: bool,
 }
 
 /// A placeholder depends only on the value and a per-process salt, so resent history masks identically.
@@ -36,6 +42,9 @@ pub struct Masker {
     /// One automaton over the folded terms, scanned for overlapping matches, or `None` when there are no terms.
     matcher: Option<AhoCorasick>,
     builtin: bool,
+    /// Counts explicit JSON string decodes, so a test can prove escaped-free bodies stay on the fast path.
+    #[cfg(test)]
+    decodes: AtomicUsize,
 }
 
 impl Masker {
@@ -58,11 +67,14 @@ impl Masker {
             salt: process_salt(),
             matcher,
             builtin,
+            #[cfg(test)]
+            decodes: AtomicUsize::new(0),
         }
     }
 
     /// The masked text, or `None` if nothing matched, recording restorable originals in `reverse`.
     pub fn mask(&self, text: &str, reverse: &mut HashMap<String, String>) -> Option<String> {
+        let parsed = serde_json::from_str::<Value>(text).ok();
         let mut found = Vec::new();
         if self.builtin {
             for span in reiki_redact::scan(text) {
@@ -74,27 +86,113 @@ impl Masker {
                     } else {
                         Kind::Secret
                     },
+                    json: false,
                 });
             }
         }
         if let Some(matcher) = &self.matcher {
-            let folded = FoldedText::new(text);
-            for hit in matcher.find_overlapping_iter(folded.text.as_bytes()) {
-                found.push(Found {
-                    start: folded.original_start(hit.start()),
-                    end: folded.original_end(hit.end()),
-                    kind: Kind::Term,
-                });
+            let mut strings = Vec::new();
+            let mut at = 0;
+            if parsed.is_some() && collect_strings(text, &mut at, "", &mut strings, 0).is_some() {
+                // String values are matched on their decoded text; object keys are not scanned.
+                for (start, end, _) in strings {
+                    self.find_terms_in_string(matcher, text, start, end, &mut found);
+                }
+            } else {
+                // A body that is not valid JSON keeps the old raw-text behaviour.
+                self.find_terms_in_text(matcher, text, &mut found);
             }
         }
         // Reasoning signatures and base64 payloads must reach the model byte for byte.
-        let protected = protected_spans(text);
+        let protected = parsed
+            .as_ref()
+            .map_or_else(Vec::new, |value| protected_spans(value, text));
         found.retain(|item| {
             !protected
                 .iter()
                 .any(|&(start, end)| item.start >= start && item.end <= end)
         });
         self.render(text, found, reverse)
+    }
+
+    fn find_terms_in_text(&self, matcher: &AhoCorasick, text: &str, found: &mut Vec<Found>) {
+        let folded = FoldedText::new(text);
+        for hit in matcher.find_overlapping_iter(folded.text.as_bytes()) {
+            found.push(Found {
+                start: folded.original_start(hit.start()),
+                end: folded.original_end(hit.end()),
+                kind: Kind::Term,
+                json: false,
+            });
+        }
+    }
+
+    /// Finds the terms in one JSON string value, mapping each decoded match back to the raw body.
+    fn find_terms_in_string(
+        &self,
+        matcher: &AhoCorasick,
+        text: &str,
+        start: usize,
+        end: usize,
+        found: &mut Vec<Found>,
+    ) {
+        // `collect_strings` includes the surrounding quotes in the span.
+        let body_start = start + 1;
+        let body_end = end.saturating_sub(1);
+        if body_end <= body_start {
+            return;
+        }
+        let body = &text[body_start..body_end];
+        if !body.contains('\\') {
+            // No escapes, so the raw body is the decoded text and no decode is needed.
+            let folded = FoldedText::new(body);
+            for hit in matcher.find_overlapping_iter(folded.text.as_bytes()) {
+                found.push(Found {
+                    start: body_start + folded.original_start(hit.start()),
+                    end: body_start + folded.original_end(hit.end()),
+                    kind: Kind::Term,
+                    json: false,
+                });
+            }
+            return;
+        }
+        if body.len() > MAX_DECODE_LEN {
+            return;
+        }
+        #[cfg(test)]
+        self.decodes.fetch_add(1, Ordering::Relaxed);
+        let Ok(decoded) = serde_json::from_str::<String>(&text[start..end]) else {
+            return;
+        };
+        let Some(raw) = RawOffsets::new(body, &decoded) else {
+            return;
+        };
+        let folded = FoldedText::new(&decoded);
+        for hit in matcher.find_overlapping_iter(folded.text.as_bytes()) {
+            let decoded_start = folded.original_start(hit.start());
+            let decoded_end = folded.original_end(hit.end());
+            if decoded_start >= decoded_end {
+                continue;
+            }
+            let (Some(raw_start), Some(raw_end)) = (raw.map(decoded_start), raw.map(decoded_end))
+            else {
+                continue;
+            };
+            if raw_start >= raw_end {
+                continue;
+            }
+            found.push(Found {
+                start: body_start + raw_start,
+                end: body_start + raw_end,
+                kind: Kind::Term,
+                json: true,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn decode_count(&self) -> usize {
+        self.decodes.load(Ordering::Relaxed)
     }
 
     /// Applies the earlier-then-longer rule to every match and writes the placeholders.
@@ -115,6 +213,7 @@ impl Masker {
             match spans.last_mut() {
                 Some(last) if item.start < last.end => {
                     last.end = last.end.max(item.end);
+                    last.json &= item.json;
                     if item.kind == Kind::PrivateKey {
                         last.kind = Kind::PrivateKey;
                     } else if last.kind == Kind::Term && item.kind == Kind::Secret {
@@ -129,7 +228,16 @@ impl Masker {
         for item in spans {
             out.push_str(&text[copied..item.start]);
             let original = &text[item.start..item.end];
-            out.push_str(&self.placeholder(item.kind, original, reverse));
+            // An escaped term is keyed and restored by its decoded text, so both spellings agree.
+            let masked = if item.json && item.kind == Kind::Term {
+                match decode_string_body(original) {
+                    Some(decoded) => self.placeholder(item.kind, &decoded, reverse),
+                    None => self.placeholder(item.kind, original, reverse),
+                }
+            } else {
+                self.placeholder(item.kind, original, reverse)
+            };
+            out.push_str(&masked);
             copied = item.end;
         }
         out.push_str(&text[copied..]);
@@ -172,12 +280,9 @@ impl Masker {
 }
 
 /// String value spans that sit inside thinking blocks or base64 image/document blocks.
-fn protected_spans(text: &str) -> Vec<(usize, usize)> {
-    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-        return Vec::new();
-    };
+fn protected_spans(parsed: &Value, text: &str) -> Vec<(usize, usize)> {
     let mut opaque = Vec::new();
-    opaque_paths(&parsed, "", &mut opaque);
+    opaque_paths(parsed, "", &mut opaque);
     if opaque.is_empty() {
         return Vec::new();
     }
@@ -195,6 +300,92 @@ fn protected_spans(text: &str) -> Vec<(usize, usize)> {
         })
         .map(|(start, end, _)| (start, end))
         .collect()
+}
+
+/// Maps decoded byte offsets back to offsets in the raw body of a JSON string.
+struct RawOffsets {
+    /// `(decoded_start, raw_start, decoded_end, raw_end)` for each escape.
+    escapes: Vec<(u32, u32, u32, u32)>,
+}
+
+impl RawOffsets {
+    /// Walks the raw body and its decoded text in step, recording every escape boundary.
+    fn new(raw: &str, decoded: &str) -> Option<Self> {
+        let bytes = raw.as_bytes();
+        let mut escapes = Vec::new();
+        let (mut r, mut d) = (0usize, 0usize);
+        while r < bytes.len() {
+            if bytes[r] != b'\\' {
+                // An unescaped character keeps its byte length, so both cursors move together.
+                let len = raw.get(r..)?.chars().next()?.len_utf8();
+                r += len;
+                d += len;
+                continue;
+            }
+            let raw_start = r;
+            let decoded_start = d;
+            let next = *bytes.get(r + 1)?;
+            let raw_len = match next {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => 2,
+                b'u' => {
+                    // A four-byte decoded character can only come from a surrogate pair.
+                    let ch = decoded.get(decoded_start..)?.chars().next()?;
+                    if ch.len_utf8() == 4 {
+                        12
+                    } else {
+                        6
+                    }
+                }
+                _ => return None,
+            };
+            if r + raw_len > bytes.len() {
+                return None;
+            }
+            let ch = decoded.get(decoded_start..)?.chars().next()?;
+            r += raw_len;
+            d += ch.len_utf8();
+            escapes.push((
+                u32::try_from(decoded_start).ok()?,
+                u32::try_from(raw_start).ok()?,
+                u32::try_from(d).ok()?,
+                u32::try_from(r).ok()?,
+            ));
+        }
+        if r != bytes.len() || d != decoded.len() {
+            return None;
+        }
+        Some(Self { escapes })
+    }
+
+    /// The raw offset for a decoded byte offset, or `None` inside a character made by one escape.
+    fn map(&self, offset: usize) -> Option<usize> {
+        let offset = u32::try_from(offset).ok()?;
+        let index = self
+            .escapes
+            .partition_point(|&(decoded_start, _, _, _)| decoded_start <= offset);
+        if index == 0 {
+            return Some(offset as usize);
+        }
+        let (decoded_start, raw_start, decoded_end, raw_end) = self.escapes[index - 1];
+        if offset == decoded_start {
+            Some(raw_start as usize)
+        } else if offset == decoded_end {
+            Some(raw_end as usize)
+        } else if offset > decoded_end {
+            Some((raw_end + (offset - decoded_end)) as usize)
+        } else {
+            None
+        }
+    }
+}
+
+/// Decodes the body of a JSON string (without its quotes) that already parsed as valid JSON.
+fn decode_string_body(raw: &str) -> Option<String> {
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('"');
+    quoted.push_str(raw);
+    quoted.push('"');
+    serde_json::from_str(&quoted).ok()
 }
 
 /// Whether `existing` is the original of the same value, which for a term is any casing of it.
@@ -395,6 +586,135 @@ mod tests {
         assert!(out.starts_with("日本 [[REIKI_TERM_") && out.ends_with("]] 日本"));
     }
 
+    /// The first placeholder in a masked body.
+    fn first_placeholder(text: &str) -> &str {
+        let start = text.find("[[REIKI_").unwrap();
+        let end = text[start..].find("]]").unwrap() + start + 2;
+        &text[start..end]
+    }
+
+    #[test]
+    fn an_escaped_unicode_term_gets_the_same_placeholder_as_the_raw_one() {
+        let m = masker(&["Zürich"], false);
+        let mut raw_reverse = HashMap::new();
+        let raw = m.mask("Zürich", &mut raw_reverse).unwrap();
+        let mut escaped_reverse = HashMap::new();
+        let escaped = m
+            .mask(r#"{"text":"Z\u00fcrich"}"#, &mut escaped_reverse)
+            .unwrap();
+        assert_eq!(first_placeholder(&raw), first_placeholder(&escaped));
+        assert_eq!(raw_reverse.values().next().unwrap(), "Zürich");
+        assert_eq!(escaped_reverse.values().next().unwrap(), "Zürich");
+        assert_eq!(
+            escaped,
+            format!(r#"{{"text":"{}"}}"#, first_placeholder(&escaped))
+        );
+    }
+
+    #[test]
+    fn a_slash_escape_is_masked_as_the_decoded_term() {
+        let m = masker(&["Acme/Corp"], false);
+        let mut reverse = HashMap::new();
+        let out = m.mask(r#"{"path":"Acme\/Corp"}"#, &mut reverse).unwrap();
+        assert_eq!(reverse.values().next().unwrap(), "Acme/Corp");
+        assert_eq!(out, format!(r#"{{"path":"{}"}}"#, first_placeholder(&out)));
+    }
+
+    #[test]
+    fn a_term_split_by_a_unicode_escape_is_masked() {
+        let m = masker(&["AcMe"], false);
+        let mut reverse = HashMap::new();
+        let out = m.mask(r#"{"text":"Ac\u006De"}"#, &mut reverse).unwrap();
+        assert_eq!(reverse.values().next().unwrap(), "Acme");
+        assert_eq!(out, format!(r#"{{"text":"{}"}}"#, first_placeholder(&out)));
+    }
+
+    #[test]
+    fn a_surrogate_pair_in_a_term_maps_to_one_character() {
+        let m = masker(&["Smile 😀"], false);
+        let mut reverse = HashMap::new();
+        let out = m
+            .mask(r#"{"text":"Smile \ud83d\ude00"}"#, &mut reverse)
+            .unwrap();
+        assert_eq!(reverse.values().next().unwrap(), "Smile 😀");
+        assert_eq!(out, format!(r#"{{"text":"{}"}}"#, first_placeholder(&out)));
+    }
+
+    #[test]
+    fn a_match_spanning_an_escape_keeps_the_surrounding_bytes_exact() {
+        let m = masker(&["AcMe"], false);
+        let mut reverse = HashMap::new();
+        let body = r#"{"a":1,"text":"pre Ac\u006De post","z":[true,null,1.50]}"#;
+        let out = m.mask(body, &mut reverse).unwrap();
+        let placeholder = first_placeholder(&out);
+        assert_eq!(
+            out,
+            format!(r#"{{"a":1,"text":"pre {placeholder} post","z":[true,null,1.50]}}"#)
+        );
+        assert_eq!(reverse.values().next().unwrap(), "Acme");
+    }
+
+    #[test]
+    fn invalid_escapes_are_left_alone_without_panicking() {
+        let m = masker(&["AcMe"], false);
+        for body in [
+            r#"{"text":"bad \q AcMe"}"#,
+            r#"{"text":"lone \ud800 AcMe"}"#,
+        ] {
+            let mut reverse = HashMap::new();
+            let out = m.mask(body, &mut reverse).unwrap();
+            assert!(
+                out.contains(r"\q") || out.contains(r"\ud800"),
+                "the invalid escape must stay: {out}"
+            );
+            assert!(!out.contains("AcMe"), "{out}");
+        }
+    }
+
+    #[test]
+    fn builtin_credentials_are_still_masked_in_a_json_body() {
+        let m = masker(&[], true);
+        let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
+        let body = format!(r#"{{"text":"use {key} now"}}"#);
+        let mut reverse = HashMap::new();
+        let out = m.mask(&body, &mut reverse).unwrap();
+        assert!(!out.contains(&key), "{out}");
+        assert_eq!(reverse.values().next().unwrap(), &key);
+    }
+
+    #[test]
+    fn json_object_keys_are_out_of_scope() {
+        let m = masker(&["Falcon"], false);
+        let mut reverse = HashMap::new();
+        let out = m.mask(r#"{"Falcon":"Falcon"}"#, &mut reverse).unwrap();
+        assert_eq!(out.matches("[[REIKI_TERM_").count(), 1, "{out}");
+        assert!(out.starts_with(r#"{"Falcon":"[[REIKI_TERM_"#), "{out}");
+    }
+
+    #[test]
+    fn a_json_body_without_escapes_stays_on_the_fast_path() {
+        let m = masker(&["Falcon"], false);
+        let mut reverse = HashMap::new();
+        let out = m
+            .mask(r#"{"text":"Falcon flies","n":1}"#, &mut reverse)
+            .unwrap();
+        assert!(out.contains("[[REIKI_TERM_"), "{out}");
+        assert_eq!(m.decode_count(), 0, "no string was decoded");
+
+        m.mask(r#"{"text":"Fal\u0063on"}"#, &mut HashMap::new())
+            .unwrap();
+        assert_eq!(m.decode_count(), 1, "the escaped string was decoded");
+    }
+
+    #[test]
+    fn a_string_over_the_decode_limit_is_left_alone() {
+        let m = masker(&["Zürich"], false);
+        let body = format!(r#"{{"text":"{}Z\u00fcrich"}}"#, "x".repeat(MAX_DECODE_LEN));
+        assert!(body.len() > MAX_DECODE_LEN);
+        assert!(m.mask(&body, &mut HashMap::new()).is_none());
+        assert_eq!(m.decode_count(), 0);
+    }
+
     #[test]
     fn maskers_in_one_process_share_the_salt_across_reloads() {
         let a = masker(&["Falcon"], false);
@@ -450,6 +770,7 @@ mod tests {
                     start,
                     end,
                     kind: Kind::Term,
+                    json: false,
                 });
             }
         }

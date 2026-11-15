@@ -60,7 +60,7 @@ What is not: request headers, paths and query strings are not masked, OAuth head
 ## Limits
 
 - This is pattern and list matching, not a data-loss guarantee. Credential detection is heuristic, and a term only matches the exact characters you list.
-- Only the request body is masked, as raw text: header values, the path and the query string are not, and JSON object keys are masked like any other text.
+- Only the request body is masked: header values, the path and the query string are not, and JSON string values are matched after decoding their escapes while object keys are not scanned.
 - Base64 `image` and `document` (PDF) blocks cannot be scanned and are passed through untouched. The same applies to `thinking`, `signature` and `redacted_thinking` payloads, which must stay byte-identical for the provider: a secret written into model reasoning is sent upstream.
 - A model can paraphrase or transform a value instead of repeating the placeholder. Whatever it writes back that is not a placeholder is delivered as it is.
 - A request body with a `Content-Encoding` other than `identity`, or that is not valid UTF-8 text, cannot be masked and is refused with 415 rather than sent raw. `Content-Encoding: identity` is a no-op and does not prevent masking.

@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Placeholder terms match inside JSON-escaped strings (`\u00fc`, `\n`) and mask to the same placeholder as the plain spelling; object keys are not scanned.
 - `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the health scope instead of skipping it; many paths on one model now escalate to a key cooldown.
 - A response with `Content-Encoding: identity` is scrubbed for the upstream key like any plain body; before, the header switched the scrubber off.
 - The labelled peers health view no longer lists per-model cooldowns (`scopes`), which exposed client-chosen model names; `reiki peers` shows control characters in peer-supplied names as `?`.

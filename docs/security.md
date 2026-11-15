@@ -1,8 +1,6 @@
 # Security
 
-Reiki sits between a client (an agent such as opencode or Claude Code, or an application) and the providers it calls. It isolates each side from what the other should not hold.
-
-It does not make either side trustworthy. A client that can read a secret on its own machine can still send it elsewhere, so masking backs up keeping secrets out of reach and does not replace it.
+Reiki sits between a client (an agent such as opencode or Claude Code, or an application) and the providers it calls, isolating each side from what the other should not hold. It does not make either side trustworthy: a client that can read a secret on its own machine can still send it elsewhere, so masking backs up keeping secrets out of reach and does not replace it.
 
 | Reiki keeps | From | Through |
 | --- | --- | --- |
@@ -13,21 +11,21 @@ It does not make either side trustworthy. A client that can read a secret on its
 
 ## Clients and keys
 
-- Clients never see upstream keys, unless an upstream echoes the key back in a form Reiki does not recognise. In error bodies and in successful responses (headers and body, streamed or not) the exact key, its formatted credential, and their JSON-escaped, percent-encoded and base64 (standard and URL-safe, padded or not) forms are replaced; a key base64-encoded inside a larger value, other encodings, and compressed bodies, are not. In a successful body the replacement has the same length, so a content length stays correct. Plugins see the response after this step. A key, or any of those forms, split across two chunks is caught. Reiki removes the client's credential headers (`authorization`, `x-api-key`, `x-goog-api-key`) and any `key` query parameter, then sets the upstream's header from the key file. A passthrough upstream is the exception: it receives the client's own credentials and query string unchanged.
-- The key travels to whoever accepts on an `[upstream.X.forward]` socket or runs as its `command`, in the normal credential header only, with no second copy. A command gets a cleared environment plus `pass_env`. Keep the socket in a directory only the Reiki user and the listener can enter, and set `expect_uid`, which makes Reiki compare the uid of the process that accepted the connection (peer credentials, not the owner of the socket file) and refuse a mismatch. It is optional, so without it whoever binds the path receives the keys. A failed link to the forwarder answers 502 and never cools the key.
+- Clients never see upstream keys, unless an upstream echoes the key back in a form Reiki does not recognise. In error bodies, headers relayed to the client, and successful responses (headers and body, streamed or not) Reiki replaces the exact key, its formatted credential, and their JSON-escaped, percent-encoded and base64 (standard and URL-safe, padded or not) forms with `[redacted]`; a key base64-encoded inside a larger value, other encodings and compressed bodies are not. In a successful body the replacement has the same length, so a content length stays correct. Plugins see the response after this step. A key, or any of those forms, split across two chunks is caught. Reiki removes the client's credential headers (`authorization`, `x-api-key`, `x-goog-api-key`) and any `key` query parameter, then sets the upstream's header from the key file; a passthrough upstream receives the client's own credentials and query string unchanged.
+- The key travels to whoever accepts on an `[upstream.X.forward]` socket or runs as its `command`, only in the normal credential header, with no second copy. A command gets a cleared environment plus `pass_env`. Keep the socket in a directory only the Reiki user and listener can enter, and set `expect_uid`, which makes Reiki compare the uid of the process that accepted the connection (peer credentials, not the socket file's owner) and refuse a mismatch. It is optional, so without it whoever binds the path receives the keys. A failed link to the forwarder answers 502 and never cools the key.
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
-- `reiki hash-token` refuses a token shorter than 16 characters. A `token_sha256` in the config is verified only as 64 hex characters; the length of the token behind it cannot be recovered from a hash, so pick tokens at least 8 characters long and keep them unpredictable.
-- A failed token check is logged with the peer address and path, on both the client and the admin listener, and never the presented token. An address with 10 failures in 60 seconds gets 429 with `Retry-After` until the window passes, and a good login clears its count. Up to 4096 addresses are tracked; when full, the weakest entry makes room. The throttle covers the client listener; a refused CONNECT is logged but not counted.
-- Upstreams come only from the config. A request cannot choose its own destination, so Reiki is not an open proxy.
-- Keys are read from the files named in the config at startup, and again on SIGHUP. Reiki does not check file permissions at startup; `reiki keys --check` reports a key file that the group or other users can read. Create them with mode 0600.
+- `reiki hash-token` refuses a token shorter than 16 characters. A `token_sha256` is verified only as 64 hex characters; the token's length cannot be recovered from a hash, so pick tokens at least 8 characters long and keep them unpredictable.
+- A failed token check is logged with the peer address and path on both the client and admin listener, never the presented token. An address with 10 failures in 60 seconds gets 429 with `Retry-After` until the window passes, and a good login clears its count. Up to 4096 addresses are tracked; when full, the weakest entry makes room. The throttle covers the client listener; a refused CONNECT is logged but not counted.
+- Upstreams come only from the config, so a request cannot choose its own destination and Reiki is not an open proxy.
+- Keys are read from the files named in the config at startup and again on SIGHUP. Reiki does not check file permissions at startup; `reiki keys --check` reports a key file the group or others can read. Create them mode 0600.
 
 ## Network
 
-Reiki listens on `listen`, default `127.0.0.1:4097`. It serves plain HTTP and has no TLS. Keep it on loopback, or put a TLS-terminating proxy in front of it before exposing it. Upstream URLs must be `https`, except loopback addresses used in tests.
+Reiki listens on `listen`, default `127.0.0.1:4097`, serves plain HTTP and has no TLS. Keep it on loopback, or put a TLS-terminating proxy in front before exposing it. Upstream URLs must be `https`, except loopback addresses used in tests.
 
 ## Header handling
 
-Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length`, and the client credential headers. `accept-encoding` is replaced with `identity` so error bodies can be classified, unless the upstream sets `forward_accept_encoding` and the client sent one. Redirects from the upstream are not followed.
+Reiki forwards every request header except hop-by-hop headers (`connection`, `keep-alive`, `proxy-*`, `te`, `trailer`, `transfer-encoding`, `upgrade`), `host`, `content-length` and the client credential headers. `accept-encoding` is replaced with `identity` so error bodies can be classified, unless the upstream sets `forward_accept_encoding` and the client sent one. Redirects from the upstream are not followed.
 
 ## Interception
 
@@ -51,20 +49,19 @@ Plugins are compiled into the binary and run inside the Reiki process, so a plug
 
 ## Limits
 
-- A stream's chain is shared state: two streams that list the same key share its cooldown, and a key rejected with 401, or with a 403 or 400 the upstream attributes to the key, is out of rotation for every stream that lists it until it is rotated and Reiki receives SIGHUP.
+- A stream's chain is shared state: two streams that list the same key share its cooldown.
 - Streams are not a security boundary against each other beyond key separation. Run separate instances for mutually untrusted clients.
 - A stream's `rate_limit_per_minute`, when set, caps that stream's upstream attempts. Every selected-key attempt counts, including retries and a fallback upstream, so a failover cannot spend more calls than the limit allows. A rejected attempt does not reach the upstream or change key health.
 - The optional admin listener (`[admin]`) is a second socket guarded by its own bearer token, compared by hash in constant time. Keep it on loopback. It exposes key names, upstream names and stream routing, but never key values, token hashes or file paths.
 - The optional peer listener (`[peers]` with `enabled` and `publish`) is a third socket that serves only `GET /v1/health` and its event stream `GET /v1/health/stream` behind a read-only peer token, which must differ from the admin and every stream token. It must be on loopback, since it is plain HTTP. It publishes key counts and the soonest cooldown per upstream, which shows a token holder which accounts are under pressure and when they recover; it never carries key values, token hashes, file paths or stream names. See [peers](peers.md#what-a-peer-token-holder-learns).
 
-**Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. With `hold_unauthorized = true` on the upstream, the disable waits until a later key serves the same request, so a request that every key refuses disables none. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
+**Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation for every stream that lists it until it is rotated and Reiki receives SIGHUP. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. With `hold_unauthorized = true` on the upstream, the disable waits until a later key serves the same request, so a request that every key refuses disables none. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
 
 ## Hardening
 
-- The upstream key, the formatted credential and their encoded forms are replaced by `[redacted]` in error bodies and headers relayed to a client.
 - Account-identifying response headers (`openai-organization`, `openai-project`, `anthropic-organization-id`, `set-cookie`, `set-cookie2`) are not relayed.
 - A response body is capped after decoding (gzip, deflate, brotli or zstd included), so a small compressed body cannot expand without bound. The cap is per upstream with `max_decoded_bytes` (default 64 MiB). A decoded response that is not `text/event-stream` is buffered before its head is sent, so an over-limit body becomes a 502 instead of a truncated 200. SSE still streams and ends with an error if it passes the cap.
-- Response bodies are bounded in time too: `response_idle_timeout_secs` (default 300) abandons a body that produces no chunk, and the optional `response_timeout_secs` bounds the whole body after its head. A buffered decoded body that runs out of time answers 504; a streamed body ends with an error, so a stalled upstream cannot hold a client connection forever.
+- Response bodies are bounded in time too: `response_idle_timeout_secs` (default 300) abandons a body that produces no chunk, and optional `response_timeout_secs` bounds the whole body after its head. A buffered decoded body that runs out of time answers 504; a streamed body ends with an error, so a stalled upstream cannot hold a client connection forever.
 - The `placeholders` plugin keeps credential placeholders masked inside tool-call arguments unless `restore_tool_args` is set.
 - A transport failure is replayed only when replay cannot duplicate a side effect: any method when the connect itself failed, and GET, HEAD, PUT, DELETE, OPTIONS or TRACE otherwise. A POST or PATCH whose request may have reached the upstream is answered with 502 (504 on timeout) instead of being sent again on another key. An explicit upstream error response still fails over for every method.
 - If an upstream error body cannot be read to the end, its key is classified from the status and `Retry-After` alone, and the read error is logged without the body.

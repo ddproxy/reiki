@@ -5,15 +5,15 @@ Each provider is an `[upstream.<name>]` table in `reiki.toml`. A client reaches 
 ## How a provider maps
 
 - Set `base_url` to the root the provider's own SDK uses by default.
-- Set the client's base URL to `http://127.0.0.1:4097/<name>`. The SDK then appends its usual paths, and Reiki forwards them to `base_url`.
-- Set `auth_header` and `auth_format` to the way the provider expects the key. The defaults are `authorization` and `Bearer {key}`. A bad pair is refused when the config loads.
-- Clients send their stream token in `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, whichever their SDK uses for the key. The headers win; the query parameter is the last resort.
+- Set the client's base URL to `http://127.0.0.1:4097/<name>`, so the SDK appends its usual paths and Reiki forwards them to `base_url`.
+- Set `auth_header` and `auth_format` to the provider's expectation (defaults `authorization` and `Bearer {key}`); a bad pair is refused when the config loads.
+- Clients send their stream token in `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, whichever their SDK uses. Headers win; the query parameter is last.
 
-One stream can chain keys from several providers. A request only uses keys from the provider named in its path.
+A stream can chain keys from several providers; a request uses only keys from the provider in its path.
 
 ## Rewriting the request body
 
-Some providers name models differently, and some reject parameters others accept. Two optional upstream settings adjust the JSON body before Reiki sends it:
+Two optional upstream settings adjust the JSON body before Reiki sends it:
 
 - `model_aliases = { "gpt-4o" = "opencode/gpt-4o" }` replaces the top-level `model` string when it matches a key.
 - `drop_params = ["stream_options"]` removes the listed top-level keys.
@@ -25,20 +25,19 @@ model_aliases = { "gpt-4o" = "opencode/gpt-4o" }
 drop_params = ["stream_options"]
 ```
 
-Reiki rewrites the body once before it picks a key, so a failover to the next key replays the same bytes. A body that is not a JSON object, a missing or non-string `model`, an unknown model, and a non-matching `drop_params` all pass through byte-for-byte unchanged. Only top-level keys are dropped; nested objects are left alone. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise the bytes are compared exactly.
+Reiki rewrites the body once before picking a key, so failover replays the same bytes. A non-object body, a missing or non-string `model`, an unknown model and a non-matching `drop_params` pass through byte-for-byte. Only top-level keys are dropped; nested objects stay. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise they must match exactly.
 
 ## Transport options
 
-By default Reiki talks to every upstream over HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Optional upstream settings make the relay behave more like a plain pass-through:
+By default Reiki uses HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Optional settings make the relay more of a plain pass-through:
 
-- `http2 = true` negotiates HTTP/2 with that upstream when it offers it over TLS. Without TLS there is nothing to negotiate and the connection stays HTTP/1.1.
-- `forward_accept_encoding = true` sends the client's own `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd responses so error bodies can be read for failover and logging, and the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is.
-- `max_decoded_bytes` caps a response body after decoding, including compressed responses. It defaults to 64 MiB and must be at least 1. A decoded, non-SSE response over the cap becomes a 502 before any of it reaches the client; an SSE response that passes the cap ends with an error.
-- `response_idle_timeout_secs` drops a response body that produces no chunk for that many seconds. It defaults to 300 and must be at least 1. A buffered decoded body answers 504; a streamed body ends with an error.
-- `response_timeout_secs` bounds the whole response body, starting when its head arrives. It is unset by default, so only the idle limit applies; when set it must be at least 1. The separate 120-second request timeout still bounds the wait for the head.
-
-- `title_case_headers = true` sends header names in Title-Case (`Content-Type`, `X-Request-Id`) on HTTP/1.1. HTTP/2 always lowercases them, so it has no effect with `http2 = true`.
-- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's own `Connection` header because it only describes the client's connection. A forward upstream always closes, so `send_keep_alive = true` is refused there.
+- `http2 = true` negotiates HTTP/2 when the upstream offers it over TLS; without TLS the connection stays HTTP/1.1.
+- `forward_accept_encoding = true` sends the client's `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd so error bodies can be read for failover and logging; the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is.
+- `max_decoded_bytes` caps a body after decoding, compressed responses included. Default 64 MiB, at least 1. A decoded non-SSE response over the cap becomes a 502 before anything reaches the client; an SSE response that passes the cap ends with an error.
+- `response_idle_timeout_secs` drops a response body with no chunk for that many seconds. Default 300, at least 1. A buffered decoded body answers 504; a streamed body ends with an error.
+- `response_timeout_secs` bounds the whole body from its head. Unset by default, so only the idle limit applies; at least 1 when set. The separate 120-second request timeout bounds the wait for the head.
+- `title_case_headers = true` sends Title-Case header names (`Content-Type`, `X-Request-Id`) on HTTP/1.1; HTTP/2 always lowercases, so it does nothing with `http2 = true`.
+- `send_keep_alive = true` adds `Connection: keep-alive`. HTTP/1.1 connections persist without it, and Reiki never forwards the client's `Connection` header, which only describes the client's connection. A forward upstream always closes, so this is refused there.
 
 ```toml
 [upstream.zen]
@@ -47,13 +46,13 @@ http2 = true
 forward_accept_encoding = true
 ```
 
-The credential header is always sent first, ahead of the client's own headers. These settings apply to the reverse-proxy routes. Traffic through an intercepted tunnel is relayed as the client sent it; see [tunnel](tunnel.md).
+The credential header goes first, ahead of the client's headers. These settings apply to reverse-proxy routes; an intercepted tunnel relays traffic as the client sent it (see [tunnel](tunnel.md)).
 
-These change how Reiki connects, nothing more. Reiki does not add, rewrite or invent client-identifying headers, and the settings do not change which requests an upstream accepts.
+They change how Reiki connects, not which requests an upstream accepts, and Reiki never adds, rewrites or invents client-identifying headers.
 
 ## Outbound limits
 
-An upstream can carry a per-key outbound budget. Keys of an upstream without a `limits` table are never shaped:
+An upstream with a `limits` table gives each key an outbound budget; without one keys are never shaped:
 
 ```toml
 [upstream.zen.limits]
@@ -66,15 +65,15 @@ daily_tokens = 250000
 max_wait_secs = 20           # longest Reiki waits for a slot, 1-120
 ```
 
-Every field is optional and an explicit `0` means unlimited. A preset seeds the values and explicit fields override them. `min_rpm` sets a floor for learning.
+Every field is optional; an explicit `0` means unlimited, even over a preset. A preset seeds the values and explicit fields override them; `min_rpm` sets a floor for learning.
 
-Reiki acquires a slot for the chosen key before it sends the request. A short wait within `max_wait_secs` is slept off; a longer wait, or a closed daily quota, skips that key for this request and tries the next key in the chain. If no key can be used, the client gets `429` with JSON error code `reiki_shaped`, a `Retry-After` header and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
+Reiki takes a slot for the chosen key before sending. A wait within `max_wait_secs` is slept off; a longer wait or a closed daily quota skips that key for this request and tries the next. If no key is usable, the client gets `429` with JSON error code `reiki_shaped`, `Retry-After` and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
 
-Responses teach the same bucket when they come from that key's own upstream: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and a `remaining: 0` limit header closes it until the reported reset. The learned cap, remaining pause or closed time, and current daily and monthly counters are saved in the state file, so they survive a restart; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
+A response from that key's own upstream teaches the bucket: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and `remaining: 0` closes it until the reported reset. The learned cap, remaining pause or closed time and current daily and monthly counters persist in the state file across restarts; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
 
 ## Forwarding
 
-A forward upstream hands each request to a listener or a program instead of sending it over the network itself. The listener or program can pass it on to another process, a queue, another harness or a proxy.
+A forward upstream hands each request to a listener or a program instead of sending it itself; that process can pass it on to another process, a queue, another harness or a proxy.
 
 Socket target, an already-running listener:
 
@@ -93,11 +92,11 @@ args = ["--config", "/etc/forward.toml"]
 pass_env = ["FORWARD_TARGET"]
 ```
 
-Set exactly one of `socket` or `command`. Add `streaming = true` to relay the answer as it arrives (see below).
+Set exactly one of `socket` or `command`; add `streaming = true` to relay the answer as it arrives (see below).
 
 ### What the forwarder receives
 
-Reiki is the HTTP client and speaks plain HTTP/1.1 with nothing custom. The request line uses the path and query of the upstream URL, and `Host` is the upstream host:
+Reiki is the HTTP client and speaks plain HTTP/1.1. The request line uses the upstream URL's path and query, and `Host` is the upstream host:
 
 ```http
 POST /v1/chat?x=1 HTTP/1.1
@@ -111,17 +110,17 @@ Content-Type: application/json
 {}
 ```
 
-The client's other headers pass through as for a normal upstream. The key is sent only in the upstream's credential header, with no second copy and no Reiki-specific header. On a `passthrough` upstream the client's own credential is forwarded unchanged.
+The other client headers pass through as for a normal upstream. The key is sent only in the upstream's credential header, with no second copy and no Reiki-specific header; a `passthrough` upstream forwards the client's own credential unchanged.
 
-Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `X-Real-IP` are removed (Reiki sets `X-Forwarded-Proto` itself), and so are the hop-by-hop headers and the headers named by the client's `Connection`.
+Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `X-Real-IP` are removed (Reiki sets `X-Forwarded-Proto`), as are hop-by-hop headers and headers named by the client's `Connection`.
 
 ### What Reiki does with the answer
 
-The status must be 200-599. Unless `streaming` is set, the body is buffered whole: up to 8 MiB, 128 headers and 64 KiB per header value. Chunked responses are joined. Reiki sets `content-length` to the buffered length (HEAD keeps the forwarder's length; 204 and 304 carry none) and relays `content-encoding` without decoding it. `Expect` is not passed on, and hop-by-hop headers are removed. In this mode nothing reaches the client until the forwarder finishes.
+The status must be 200-599. Without `streaming`, the body is buffered whole: up to 8 MiB, 128 headers and 64 KiB per header value; chunked responses are joined. Reiki sets `content-length` to the buffered length (HEAD keeps the forwarder's length; 204 and 304 carry none) and relays `content-encoding` without decoding it. `Expect` is not passed on and hop-by-hop headers are removed. Nothing reaches the client until the forwarder finishes.
 
 ### Streaming
 
-`streaming = true` on `[upstream.X.forward]` (socket or command) hands the client the answer as the forwarder produces it, which an event stream such as a chat completion needs:
+`streaming = true` on `[upstream.X.forward]` (socket or command) hands the client the answer as it is produced, which event streams need:
 
 ```toml
 [upstream.zen.forward]
@@ -130,44 +129,43 @@ args = ["/usr/local/lib/reiki/forwarder.ts", "--allow", "opencode.ai"]
 streaming = true
 ```
 
-- The response is returned as soon as its head is in. The forwarder's body then flows through unbuffered, so the 8 MiB cap does not apply.
-- The 120-second request timeout bounds only the wait for the response head, not the body.
-- A `content-length` the forwarder reports is kept; otherwise the client gets a chunked body. `transfer-encoding` and the other hop-by-hop headers are still removed, and `content-encoding` is still relayed as-is.
-- A forwarder that fails after the head has gone out cannot be retried or fall back: the client sees the body end early with an error. A failure before the head is handled as for a buffered answer.
-- A `command` keeps its concurrency slot, and its process, until the body ends or the client disconnects. A client that disconnects ends the child after the usual 1-second grace.
-- Error statuses are still read whole for key classification, so a streaming forwarder's 401 or 429 fails over as before.
-
-A forwarder's own error status (for example 401, 402, 429 or 5xx) is treated exactly like an upstream returning it, so normal key classification and failover apply. A forwarder can acknowledge and queue work by answering at once with 202; no special mode is needed.
+- The response returns as soon as its head is in; the body then flows unbuffered, so the 8 MiB cap does not apply.
+- The 120-second request timeout bounds only the wait for the head, not the body.
+- A reported `content-length` is kept; otherwise the body is chunked. `transfer-encoding` and the other hop-by-hop headers are removed, and `content-encoding` is still relayed as-is.
+- A forwarder that fails after the head cannot be retried or fall back: the client sees the body end early with an error. A failure before the head is handled as for a buffered answer.
+- A `command` keeps its concurrency slot and process until the body ends or the client disconnects; a disconnecting client ends the child after the usual 1-second grace.
+- Error statuses are read whole for key classification, so a streaming forwarder's 401 or 429 fails over as before.
+- A forwarder's own error status (for example 401, 402, 429 or 5xx) is treated like an upstream returning it, so normal classification and failover apply. A forwarder can acknowledge and queue work by answering at once with 202; no special mode is needed.
 
 ### Failures
 
-Any failure of the link to the forwarder answers the client with 502. That covers a failure to connect or start, a wrong uid, a connection closed without a response, a malformed or oversized response, a bad status and a timeout. Reiki logs it at error level without key material. It does not cool the key, does not retry on the same or another key, and does not use a configured `fallback` upstream.
+Any failure of the link answers 502: a failed connect or start, a wrong uid, a connection closed without a response, a malformed or oversized response, a bad status or a timeout. Reiki logs it at error level without key material, does not cool the key, does not retry on the same or another key, and does not use a configured `fallback`.
 
 ### Command specifics
 
 - Reiki spawns the program once per request and speaks HTTP over its stdin and stdout.
 - The environment is cleared except `PATH`, `HOME`, `LANG`, `LC_ALL` and the names in `pass_env`.
 - `stderr` is discarded.
-- The response is returned as soon as it is complete. The program then has 1 second to exit before it is killed.
-- A program still running when the request times out is killed. Processes it started are not.
-- Reiki does not close the program's stdin after writing the request, so the program must read the request using its `Content-Length` and not wait for end of input.
-- At most 16 copies of the command run at once. Set `max_concurrent = N` (N at least 1, valid only with `command`) to change it; a request that would exceed it gets 502.
-- The command is looked up with Reiki's own `PATH` unless it is an absolute path, so prefer an absolute path.
+- The response returns when complete; the program then has 1 second to exit before it is killed.
+- A program still running at the request timeout is killed; processes it started are not.
+- Reiki does not close stdin after writing the request, so the program must read it by `Content-Length`, not wait for end of input.
+- At most 16 copies run at once. Set `max_concurrent = N` (N at least 1, valid only with `command`) to change it; a request over it gets 502.
+- The command is looked up with Reiki's `PATH` unless it is absolute, so prefer an absolute path.
 
 ### Socket specifics
 
-- Reiki connects to an existing listener. It never creates, chmods or deletes the socket.
+- Reiki connects to an existing listener and never creates, chmods or deletes the socket.
 - The path must be absolute and at most 103 bytes. Unix only.
-- With `expect_uid`, Reiki reads the peer's uid after connecting and before writing anything, and refuses with 502 if it differs.
-- Keep the socket in a directory that only the Reiki user and the listener can enter, and set `expect_uid`. See [security](security.md). Inside a rootless container or user namespace, the uid is the mapped one.
-- `reiki check` and startup warn when the socket does not exist yet or is not a socket. They also warn about a group- or world-writable directory without `expect_uid`, even when the socket does not exist yet.
-- Test a listener with `curl --unix-socket PATH http://localhost/...`.
+- With `expect_uid`, Reiki reads the peer's uid after connecting, before writing anything, and refuses with 502 on a mismatch.
+- Keep the socket in a directory only the Reiki user and listener can enter, and set `expect_uid` (see [security](security.md)). In a rootless container or user namespace, the uid is the mapped one.
+- `reiki check` and startup warn when the socket is missing or is not a socket, and about a group- or world-writable directory without `expect_uid`, even when the socket does not exist yet.
+- Test with `curl --unix-socket PATH http://localhost/...`.
 
 ### Limits and restrictions
 
-- `args`, `pass_env` and `max_concurrent` are valid only with `command`. `expect_uid` is valid only with `socket`.
-- A forward upstream cannot be combined with `http2` or `title_case_headers`. Startup rejects these. It can serve an intercepted tunnel host: Reiki still terminates the client's TLS and swaps the key, then hands the request to the forwarder.
-- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response. With it, the timeout bounds the wait for the response head. `response_idle_timeout_secs` and `response_timeout_secs` also bound the body.
+- `args`, `pass_env` and `max_concurrent` need `command`; `expect_uid` needs `socket`.
+- A forward upstream cannot be combined with `http2` or `title_case_headers`; startup rejects both. It can serve an intercepted tunnel host: Reiki terminates the client's TLS and swaps the key, then hands the request to the forwarder.
+- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response; with it, only the wait for the head. `response_idle_timeout_secs` and `response_timeout_secs` also bound the body.
 - A buffered request does not necessarily stop when the client disconnects; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
@@ -179,7 +177,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Covered by tests with invalid keys: a 401 takes the key out of rotation and the request moves to the next key. A 429 `insufficient_quota` body cools the key for the quota period; other 429s cool it for `Retry-After`. Both are covered by unit tests but not exercised with a real exhausted key.
+Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 `insufficient_quota` body cools the key for the quota period; other 429s cool it for `Retry-After`. Both are unit-tested but not exercised with a real exhausted key.
 
 ## OpenCode Zen
 
@@ -190,13 +188,13 @@ base_url = "https://opencode.ai/zen/v1"
 
 Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.opencode.options.baseURL` to that URL and `apiKey` to the stream token.
 
-Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the very next request. Set `confirm_quota = true` on the upstream to send such a 429 once more on the same key, after a 3-second pause, before cooling it; only a repeated quota 429 takes the key out of rotation. It costs a genuinely exhausted key one extra request and 3 seconds per request.
+Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the next request. Set `confirm_quota = true` to send such a 429 once more on the same key after a 3-second pause before cooling it; only a repeated quota 429 takes the key out of rotation. A genuinely exhausted key pays one extra request and 3 seconds per request.
 
-A free-tier account answers a paid model with 402 while its free models keep working, so cooling the whole key for hours would take the free models down with it. A 402 is scoped to the request's route and model instead: the key keeps serving other combinations, and `/status` lists the cooling combination. A model name over 128 bytes is shortened to its first 100 bytes plus a short digest, so it still gets its own scope. A quota 429 still cools the whole key, because it is about the account rather than one model. Choose how many models may be cooling on one key before another failure cools the key with `scope_escalate_after` (default 3, 2 to 16). A key also cools when a failure would bring it to twice that many cooling route-and-model combinations, whatever the models, so many paths on one model cannot crowd out the others; a key cooldown replaces the combination entries.
+A free-tier account answers a paid model with 402 while its free models keep working, so a whole-key cooldown would take them down too. A 402 and a plain rate-limit 429 are scoped to the request's route and model: the key keeps serving other combinations, and `/status` lists the cooling combination under `scopes`. A quota 429 still cools the whole key, because it concerns the account, not one model. `scope_escalate_after` (default 3, 2 to 16) sets how many models may be cooling before another failure cools the key.
 
-Zen's free models only accept requests that carry OpenCode's own headers. Reiki forwards every header except the credential, so the free tier keeps working.
+Zen's free models only accept requests carrying OpenCode's own headers; Reiki forwards every header except the credential, so the free tier keeps working.
 
-A 403 "Model access is disabled" can apply to one endpoint only (OpenCode probes `/responses` before falling back to `/chat/completions`). Reiki tries the next key for that request, leaves the key in rotation, and returns the upstream's answer if no key helps.
+A 403 "Model access is disabled" can apply to one endpoint only (OpenCode probes `/responses` before `/chat/completions`). Reiki tries the next key for that request, leaves the key in rotation, and returns the upstream's answer if no key helps.
 
 ## Anthropic
 
@@ -220,7 +218,7 @@ auth_header = "x-goog-api-key"
 auth_format = "{key}"
 ```
 
-Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`. Reiki treats that as a rejected key. A client that sends the key as a `?key=` query parameter is accepted when no credential header is present, and Reiki removes the parameter before forwarding.
+Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`; Reiki treats that as a rejected key. A client that sends the key as a `?key=` query parameter is accepted when no credential header is present, and Reiki removes the parameter before forwarding.
 
 Covered by tests with an invalid key, including a client authenticating with `x-goog-api-key`.
 
@@ -233,15 +231,15 @@ Any HTTP API that takes its key in a header can be an upstream. For OpenAI-compa
 base_url = "https://openrouter.ai/api/v1"
 ```
 
-Reiki decides whether a key failed from the status code, the `Retry-After` header and a few phrases in the error body. A provider that signals quota or key problems in a different way may need a new rule in `src/classify.rs`. These services have not been tested.
+Reiki decides a key failure from the status code, the `Retry-After` header and a few error-body phrases. A provider that signals quota or key problems differently may need a new rule in `src/classify.rs`. These services are untested.
 
 ## Unauthorized keys
 
-A 401 takes the key out of rotation at once, and one request disables at most one key: a second key that refuses the same request is tried but left alone. A request that every key refuses (a malformed credential header, a model the account cannot use) therefore still costs one good key. Set `hold_unauthorized = true` on the upstream to hold that disable back until a later key serves the same request: only then is the first refusing key disabled. If every key of the upstream refuses, or the request ends in a fallback upstream or an error, no key is disabled. The default is `false`. While a bad key waits for a request to succeed, each request that reaches it pays one extra attempt.
+A 401 takes the key out of rotation at once, and one request disables at most one key: a second key that refuses the same request is tried but left alone. A request that every key refuses (a malformed credential header, a model the account cannot use) therefore still costs one good key. Set `hold_unauthorized = true` to hold that disable back until a later key serves the same request; only then is the first refusing key disabled. If every key of the upstream refuses, or the request ends in a fallback upstream or an error, no key is disabled. The default is `false`. While a bad key waits for a request to succeed, each request that reaches it pays one extra attempt.
 
 ## Relaying errors as they are
 
-Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` on the upstream to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
+Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
 
 ## Falling back to another upstream
 
@@ -253,14 +251,14 @@ upstream = "openrouter"
 model_aliases = { "*" = "openrouter/free" }
 ```
 
-When every key for `zen` in the stream's chain is cooling down or has just failed, Reiki sends the same request to `openrouter` instead of answering 503. The path after the upstream name is kept, so `/zen/chat/completions` becomes `/chat/completions` on the target. Later requests skip the cooling keys and go straight to the target until they recover.
+When every `zen` key in the stream's chain is cooling or has just failed, Reiki sends the same request to `openrouter` instead of answering 503; `/zen/chat/completions` becomes `/chat/completions` on the target. Later requests skip the cooling keys and go straight to the target until they recover.
 
-- It is one hop. The target's own `fallback` is not followed.
-- The body is rewritten for the target: first the fallback's `model_aliases`, then the target's own `model_aliases` and `drop_params`. A `"*"` key matches any model that has no entry of its own, which is how a provider-specific model name is swapped for one the target serves. Without a mapping the model name goes through unchanged.
-- It triggers when no key is left to try, whether the keys failed or every one refused the request (for instance a model that is disabled for them). If the target cannot serve the request either, the client gets the target's answer.
-- Every stream whose chain uses the source upstream must also list at least one key for the target, or the config is rejected at startup.
-- The request log shows the key that served the request, so the target's key name tells you a fallback happened. The `falling back` warning and `reiki_requests_total` for the target upstream count them.
-- The endpoint has to exist on the target: a client that calls an endpoint only the source offers gets the target's own error.
+- It is one hop: the target's own `fallback` is not followed.
+- The body is rewritten for the target: first the fallback's `model_aliases`, then the target's own `model_aliases` and `drop_params`. A `"*"` key matches any model without an entry of its own, which swaps a provider-specific name for one the target serves; without a mapping the name is unchanged.
+- It triggers when no key is left to try, whether they failed or all refused the request (for instance a model disabled for them); if the target cannot serve it either, the client gets the target's answer.
+- Every stream whose chain uses the source upstream must list at least one key for the target, or startup rejects the config.
+- The request log names the key that served the request, so the target's key tells you a fallback happened. The `falling back` warning and the target upstream's `reiki_requests_total` count them.
+- The endpoint must exist on the target: a client that calls one only the source offers gets the target's own error.
 
 ## Passing the client's own credentials through
 

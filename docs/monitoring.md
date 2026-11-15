@@ -1,12 +1,12 @@
 # Monitoring
 
-Reiki can serve a small admin listener with `GET /status`, plus any paths a plugin adds such as `GET /metrics` from the `metrics` plugin. It is off unless you add an `[admin]` table, and it always listens on its own socket, never the client one.
+Reiki can serve a small admin listener with `GET /status` and any plugin-provided path such as `GET /metrics`; it is off unless an `[admin]` table exists and always uses its own socket, never the client one.
 
 ## Admin API
 
-Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API follows a stability promise: v1 only gains fields.
+Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API only gains fields.
 
-`GET /v1/health` and `GET /v1/health/stream`, the coarse summary other instances read, are never served here: it lives on the separate `[peers]` listener with its own read-only token. See [peers](peers.md). While publishing, `/v1/openapi.json` lists them with that listener as their server.
+`GET /v1/health` and `GET /v1/health/stream`, the coarse summary other instances read, are never served here: they live on the separate `[peers]` listener with its own read-only token (see [peers](peers.md)). While publishing, `/v1/openapi.json` lists them with that listener as their server.
 
 ## Configure
 
@@ -16,25 +16,23 @@ listen = "127.0.0.1:4098"                 # must differ from the client `listen`
 token_sha256 = "<sha256 of the admin token>"
 ```
 
-Both fields are required. The admin address is bound at startup, so adding, removing or moving `[admin]` needs a restart; a changed token hash is picked up on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address alongside the client one.
+Both fields are required. The admin address is bound at startup, so adding, removing or moving `[admin]` needs a restart; a changed token hash applies on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`; `reiki check` prints the admin address alongside the client one.
 
 ## Authenticate
 
-Send the admin token as a bearer credential: `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body. The token is hashed and compared in constant time. Anything other than `/status`, `/reload`, `/keys/enable` and a path a configured plugin serves returns 404. The listener serves plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front of it.
+Send `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body; the token is hashed and compared in constant time. Anything other than `/status`, `/reload`, `/keys/enable` or a configured plugin path returns 404. The listener is plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front.
 
 ## GET /status
 
-With `[tunnel.intercept]` configured, the document also has `intercept.ca_not_after` (Unix seconds) and `intercept.ca_days_left`, so an expiring CA can be alerted on.
-
-JSON with a `keys` array and a `streams` array.
+With `[tunnel.intercept]`, the document also has `intercept.ca_not_after` (Unix seconds) and `intercept.ca_days_left`, so an expiring CA can be alerted on. It is JSON with `keys` and `streams` arrays.
 
 Each key:
 
 - `name`, `upstream`
 - `state`: `available`, `cooling` or `out_of_rotation`
 - `retry_after_seconds`: present only while `cooling`
-- `cooldown_class`: present only while `cooling` and the class is known: `rate_limited`, `quota_exhausted` or `transient`, the failure that set the current deadline (same names as `reiki_cooldowns_total`). A cooldown restored from the state file after a restart has no class until the key fails again.
-- `scopes`: present only when one or more route-and-model combinations of this key are cooling; soonest first, at most 16. Each entry has `route`, `model`, `retry_after_seconds` and `cooldown_class`. The key itself may still be `available` for other combinations.
+- `cooldown_class`: present only while `cooling` and known: `rate_limited`, `quota_exhausted` or `transient`, the failure that set the deadline (same names as `reiki_cooldowns_total`). A restored cooldown has no class until the key fails again.
+- `scopes`: present only while route-and-model combinations are cooling; soonest first, at most 16. Each has `route`, `model`, `retry_after_seconds` and `cooldown_class`; the key may still be `available` for others.
 - `consecutive_failures`: consecutive transient failures since the last success
 - `last_status_code`: the upstream status of the key's latest attempt, or `null` before one
 
@@ -57,7 +55,7 @@ reiki keys --token-file /etc/reiki/admin.token
 reiki keys --url http://127.0.0.1:4098 --token-file /etc/reiki/admin.token --json
 ```
 
-It takes `--url` and `--token-file` the same way as `reiki reload`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It exits 0 on success, 1 when the instance refuses the token or the answer, and 2 when it cannot reach the instance or resolve the admin address. The same flags apply to `reiki keys --enable`, and `reiki keys --enable` conflicts with `--check` and `--json`.
+It takes `--url` and `--token-file` like `reiki reload`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. Exit status: 0 on success, 1 when the instance refuses the token or answer, 2 when it cannot reach the instance or resolve the admin address. The same flags apply to `--enable`, which conflicts with `--check` and `--json`.
 
 To check the key files from the config without a running instance, use `reiki keys --check`; see [troubleshooting](troubleshooting.md#key-health).
 
@@ -81,27 +79,27 @@ Responses:
 - `401`: missing or wrong token, as everywhere on the admin listener.
 - `404`: no key with that name is configured. Nothing changed.
 
-A key that was never out of rotation answers `200` and stays available. The endpoint does not reduce cooldown by itself beyond clearing it; see [key health](troubleshooting.md#key-health) for how keys are taken out and what `cooling` means.
+A key that was never out of rotation answers `200` and stays available; the endpoint only clears its cooldown. [Key health](troubleshooting.md#key-health) explains how keys are taken out and what `cooling` means.
 
 ## POST /reload
 
-Applies a changed config like `SIGHUP`, with the same bearer token as `/status`, and returns the result as JSON. A successful reload answers `200`:
+Applies a changed config like `SIGHUP`, with the same bearer token as `/status`, and returns JSON. Success answers `200`:
 
 ```json
 {"ok":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-`changed` names what differs from before, and `restart_needed` lists settings that differ in the file but need a restart, such as `tunnel.listen` or the `[log]` `file`, `format`, `stderr`, `file_max_bytes` and `file_keep`. Add `?dry_run=true` to preview (a `dry_run` other than `true`, `1`, `false` or `0` answers `400` and applies nothing): the answer has `"dry_run":true` and says what a reload would change, and nothing is applied or recorded in `/status`. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
+`changed` names what differs from before, and `restart_needed` lists settings that need a restart, such as `tunnel.listen` or the `[log]` `file`, `format`, `stderr`, `file_max_bytes` and `file_keep`. Add `?dry_run=true` to preview (any other `dry_run` value than `true`, `1`, `false` or `0` answers `400` and applies nothing): the answer has `"dry_run":true`, says what would change, and nothing is applied or recorded in `/status`. A config that fails to parse or validate answers `422` with `{"ok":false,"error":"..."}` and leaves the running state alone. See [reload](troubleshooting.md#reload) for what applies live.
 
 ## GET /metrics
 
-Served by the `metrics` plugin, so it exists only when the binary includes the plugin and the config has a `[plugins.metrics]` table (an empty table is enough). Without that table the path returns 404.
+Served by the `metrics` plugin, so it exists only with the plugin built in and a `[plugins.metrics]` table (an empty table is enough); otherwise the path returns 404.
 
 ```toml
 [plugins.metrics]
 ```
 
-Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts each request once, by client-visible status and serving upstream (the fallback, after a failover); a client that disconnects first counts as 499 (`client_error`). Gauges are sampled at scrape time. Counters live in memory and survive a reload; a changed `[plugins.metrics]` table keeps them and needs a restart. Series for renamed streams, upstreams and keys stay until restart.
+Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts each request once, by client-visible status and serving upstream (the fallback after a failover); a client that disconnects first counts as 499 (`client_error`). Gauges are sampled at scrape time. Counters survive a reload in memory; a changed `[plugins.metrics]` table keeps them and needs a restart, and series for renamed streams, upstreams and keys stay until restart.
 
 | Metric | Type | Labels |
 | --- | --- | --- |
@@ -114,11 +112,11 @@ Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts 
 | `reiki_tokens_total` | counter | `stream`, `upstream`, `direction` |
 | `reiki_keys` | gauge | `state` |
 
-`reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind, such as `ssn` or `iban`, and `action` is `blocked` when the request was rejected for it and `reported` when it went through. The label values are fixed by the plugins and the configured streams, and the counter never holds a matched value. The `detail` label that a plugin can attach to a finding is not a label here: `reiki_findings_total` ignores it so that the number of series does not grow with the names a plugin reports. Use the request log for per-name counts.
+`reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind (`ssn`, `iban`); `action` is `blocked` when the request was rejected for it and `reported` when it went through. Label values are fixed by the plugins and configured streams, and the counter never holds a matched value. A plugin's `detail` label is ignored so series do not grow with reported names; use the request log for per-name counts.
 
-`reiki_plugin_rejections_total` counts requests a plugin stopped: it returned a rejection (the `phi`, `finance` and `controlled` plugins do when they block), or it skipped or panicked under `on_error = "reject"`, which answers 503. `plugin` is the plugin's name and `stream` the stream the request came in on, so the series are bounded by the plugins built into the binary times the configured streams. A request rate-limited by the stream counts under `reiki_rate_limit_rejections_total` instead.
+`reiki_plugin_rejections_total` counts requests a plugin stopped: a rejection (the `phi`, `finance` and `controlled` plugins do when they block), or a skip or panic under `on_error = "reject"`, which answers 503. `plugin` is its name and `stream` the incoming stream, so series are bounded by built-in plugins times configured streams. A stream-rate-limited request counts under `reiki_rate_limit_rejections_total` instead.
 
-`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. `reiki_cooldowns_total` is also labelled `scope`, either `key` or `model`: a model-scoped cooldown covers only one route and model, which are deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
+`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. `reiki_cooldowns_total` also has `scope` (`key` or `model`): a model-scoped cooldown covers one route and model, deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
@@ -126,7 +124,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
 
 ## GET /usage
 
-Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` counted since start. `requests` counts only responses that carried `usage`. Tokens come from the `usage` object a provider returns: `prompt_tokens` and `completion_tokens`, or `input_tokens` and `output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB, and responses with no `usage`, count nothing. A compressed response is not read, so its usage is not counted. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
+Served by the `metrics` plugin with the same bearer auth as `/status`, and under `/v1/usage`. Returns JSON per stream and upstream with `input` and `output` tokens and `requests` since start; `requests` counts only responses carrying `usage`. Tokens come from the provider's `usage` object: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`. For an event stream they come from whichever events carry `usage`, so Anthropic's `message_start` and `message_delta` are combined. JSON bodies over 1 MiB and responses without `usage` count nothing; a compressed response is not read, so its usage is not counted. The same totals are `reiki_tokens_total{stream,upstream,direction}` in `/metrics`.
 
 ```json
 {"stream":{"upstream":{"input":10,"output":20,"requests":1}}}

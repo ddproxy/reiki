@@ -1,6 +1,6 @@
 # Hub
 
-Status: configuration only, not active. Behind the `hub` cargo feature (not in the default set) Reiki parses and validates the tables below. It opens no listener, builds no client and contacts no hub. A binary built without the feature refuses a config that contains any of them. Without these tables nothing changes.
+Status: configuration only. Behind the `hub` cargo feature (not in the default set), Reiki parses and validates the tables below but opens no listener, builds no client and contacts no hub. A binary without the feature refuses such a config; without these tables nothing changes.
 
 ## Tables
 
@@ -40,5 +40,5 @@ daily_tokens = 0
 - Hub, edge and account names: lowercase letters, digits and `-`, at most 63 characters.
 - A key belongs to one account only, and an account needs at least one key.
 - An edge's `allow_from` and a hub's `accounts` name existing accounts.
-- A hub token must differ from the admin token and from every stream token. The same secret in two places would let a weaker holder act with a stronger one's rights.
+- A hub token must differ from the admin token and every stream token; the same secret in two places would let a weaker holder act with a stronger one's rights.
 - A hub may not list its own listener, which would loop back to itself.

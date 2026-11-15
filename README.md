@@ -7,11 +7,11 @@
 
 # Reiki
 
-Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client, and keeps credentials and sensitive terms in the client's prompts away from the provider.
+Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client and credentials and sensitive terms in prompts away from the provider.
 
-- **Key isolation.** Upstream keys live in files only Reiki reads. The client authenticates with a revocable stream token and never sees a key. Reiki redacts a key that an upstream echoes back in an error; [security](docs/security.md#clients-and-keys) lists the exception.
-- **Secret and term masking.** The `placeholders` plugin swaps credentials and a list of sensitive terms in a request for stable placeholders before it reaches the provider, and restores them in the response. Private keys are removed outright, and credentials stay masked inside tool-call arguments by default.
-- **Controlled egress.** Upstreams come only from the config, and the optional CONNECT tunnel allows only listed destinations. Interception can bring chosen hosts under the same rules, with a name-constrained CA.
+- **Key isolation.** Upstream keys live in files only Reiki reads; the client authenticates with a revocable stream token and never sees a key. Reiki redacts a key an upstream echoes back in an error; [security](docs/security.md#clients-and-keys) lists the exception.
+- **Secret and term masking.** The `placeholders` plugin swaps credentials and listed sensitive terms in a request for stable placeholders before the provider sees them, and restores them in the response. Private keys are removed outright, and credentials stay masked inside tool-call arguments by default.
+- **Controlled egress.** Upstreams come only from the config, and the optional CONNECT tunnel allows only listed destinations. Interception brings chosen hosts under the same rules with a name-constrained CA.
 - **Outbound data checks.** The `phi` plugin blocks or reports PHI and NPPI identifiers in a request before it reaches the provider. See [docs/phi.md](docs/phi.md).
 - **Auditable traffic.** The `requestlog` plugin records what the client sent and received, with credentials masked, to a file and a live socket. Failed logins are logged and throttled.
 - **Key failover.** A stream's chain of keys, and optionally a fallback upstream, takes over on a rate limit, exhausted quota or disabled key, so the client sees one stable endpoint.
@@ -74,7 +74,7 @@ listen = "127.0.0.1:4098"                  # must differ from `listen`
 token_sha256 = "<sha256 of the admin token>"
 ```
 
-- A **stream** is one client with its own token and key chain. Streams never share cooldown state unless they list the same key.
+- A **stream** is one client with its own token and key chain; streams share cooldown state only when they list the same key.
 - `rate_limit_per_minute` caps a stream's upstream attempts per minute. Every selected-key attempt counts, including retries and a fallback upstream. Reiki answers an over-limit attempt with 429 and `Retry-After` before sending it, so the upstream and key state are untouched. The counter is in memory and resets on reload.
 - `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
 - `model_aliases` rewrites the top-level `model` of a JSON body and `drop_params` removes top-level keys, once before the first attempt so every key replay sends the same body. See [docs/providers.md](docs/providers.md#rewriting-the-request-body).

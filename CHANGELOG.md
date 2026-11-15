@@ -1,34 +1,34 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 ### Added
 
-- Key health is kept per route and model as well as per key. A 402 or a plain rate-limit 429 cools only that route and model on the key, so a free-tier account's paid-model 402 no longer locks out its free model; a 401, a quota 429, a transient failure or a request with no model still cools the key, and three models cooling on one key escalate to the key (`scope_escalate_after`, default 3). `/status`, `reiki keys --json` and the labelled peers view list cooling combinations under `scopes`, and `/status`, the labelled `/v1/health` key view and `reiki keys --json` report a cooling key's `cooldown_class` (`rate_limited`, `quota_exhausted`, `transient` and so on); a cooldown restored from the state file has no class.
-- `reiki top` (included in release binaries; from source, cargo feature `top`, off by default): a live terminal view of every `[peers.NAME]` instance. It follows each peer's health stream with the same pinned client as `reiki peers --watch`, falls back to polling, shows provider bars and per-peer cards with class-aware cooldown bars, marks stale or unreachable peers, and restores the terminal on exit, error or panic. `--once` prints plain text and exits. See [top](docs/top.md). Its `tui` feature (`ratatui` 0.30 and `crossterm` 0.29, off by default) holds the terminal layer (style mapping, scroll and filter state, key bindings and drawing), and the `reiki-top` crate's pure view model renders a fleet as styled plain lines (title, provider bars, per-peer cards with class-aware cooldown bars, host load, disk and sessions); the data layer and view model depend only on serde.
-- An optional `[upstream.NAME.limits]` table (`preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs`) is parsed and validated; an explicit zero means unlimited, even over a preset value. Keys of an upstream with a `limits` table get a per-key budget, backed by provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses (`zen-free` and `openrouter-free` presets). A short wait is slept off (the configured wait is a total), a longer wait or a closed daily window skips the key for that request without touching its health, and when no key can be used the client gets `429 reiki_shaped` with `Retry-After` and `x-reiki-origin: local`. A concurrency slot is held until the response body ends or the client disconnects. A provider 429, a quota response or a `remaining: 0` header teaches the key's bucket. The learned cap, pauses, closed windows and daily and monthly counters are saved in the state file and restored after a restart (not for a rotated or re-pointed key). See [providers](docs/providers.md#outbound-limits).
-- An optional `[hubs]`, `[hub]` and `[accounts]` config, behind a `hub` cargo feature, is parsed and validated only; no hub is contacted or served yet. See [hub](docs/hub.md). Edge tokens must differ from each other and from the peer tokens, the hub listener from the client, admin and tunnel listeners, and a hub `timeout_secs` is 1 to 3600, `ca_file` may not be empty, and `accounts` may not repeat a label.
+- Key health per route and model. A 402 or a plain rate-limit 429 cools only that route and model on the key, so a free-tier account's paid-model 402 no longer locks out its free models; other failures still cool the key, and three cooling models escalate to it (`scope_escalate_after`, default 3). `/status` and the metrics report the scope.
+- Outbound shaping. An `[upstream.NAME.limits]` table (`rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs`, or a `preset`) gives each key a budget with provider-side buckets, a learned rate cap and persisted state. A key out of budget is skipped; if none is usable the client gets a 429 `reiki_shaped` with `Retry-After`. Token use is corrected from the response `usage`.
+- `cooldown_class` (`rate_limited`, `quota_exhausted`, `transient`) in `/status`, `reiki keys --json` and the labelled peers view.
+- `reiki top`, a live terminal view of the configured peers (included in release binaries; from source, cargo feature `top`).
+- An optional `[hubs]`, `[hub]` and `[accounts]` config behind the `hub` cargo feature. It is parsed and validated only. See [hub](docs/hub.md).
+- `[peers] max_connections_per_addr` (default 4).
 
 ### Changed
 
-- `reiki_cooldowns_total` gains a `scope` label (`key` or `model`), so existing series gain a label.
+- `reiki_cooldowns_total` gains a `scope` label (`key` or `model`).
+- A 402 or plain 429 now cools a route and model, not the whole key.
+- Placeholder ids are stable across a config reload (one salt per process); a restart still changes them.
+- The peers listener closes the connection after a 401 or 429, and failed loopback logins lock out per address. Tunnelled peers share that address.
+- A response body that is not an event stream has a 300 s default total timeout (`response_timeout_secs` overrides it), and compressed input is capped at twice the decoded cap, 1 MiB minimum.
+- A forwarder socket in a group- or other-writable directory without the sticky bit needs `expect_uid`, and upstream keys under 8 bytes are refused.
 
 ### Fixed
 
-- A response body that is not an event stream now has a 300 s default total timeout (`response_timeout_secs` overrides it), and the compressed bytes read are capped at twice the decoded cap (1 MiB minimum), so a trickling or endless-but-empty upstream cannot hold a request and its key forever.
-- A forwarder socket in a directory that group or others can write to, with no sticky bit and no `expect_uid`, is refused at config load; upstream keys under 8 bytes are refused, since the scrubber skips them.
-- The peers listener caps open connections per source address (`[peers] max_connections_per_addr`, default 4) and closes the connection after a 401 or 429.
-- Failed peer logins from loopback are locked out per address like any other, instead of a shared delay; tunnelled peers share that address. Session counts in the peers view are documented as client-reported.
-- Outbound shaping replaces its `body / 4` token estimate with the `usage` the response reports (JSON or SSE, uncompressed bodies); without usage the estimate stands.
-- Placeholder terms match inside JSON-escaped strings (`\u00fc`, `\n`) and mask to the same placeholder as the plain spelling; object keys are not scanned.
-- `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the health scope instead of skipping it; many paths on one model now escalate to a key cooldown.
-- A response with `Content-Encoding: identity` is scrubbed for the upstream key like any plain body; before, the header switched the scrubber off.
-- The labelled peers health view no longer lists per-model cooldowns (`scopes`), which exposed client-chosen model names; `reiki peers` shows control characters in peer-supplied names as `?`.
-- The `placeholders` plugin leaves Anthropic `thinking` and `redacted_thinking` blocks (and their `signature` and `data`, in requests, JSON responses and SSE deltas) and base64 `image` and `document` blocks byte-identical, so a second turn no longer fails thinking-signature validation and media is not corrupted.
-- Placeholder ids stay the same across a config reload (one salt per process), so prompt caching and signed history survive a reload; a restart still changes them.
-- A placeholder fragment held at the end of an Anthropic content block is flushed inside that block as a complete `content_block_delta` before its `content_block_stop`, and no longer carries into the next block.
-- The body rewrite compares the `model` value, the `model` key and `drop_params` keys after decoding JSON escapes, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o` and `stream\u005foptions` is dropped. A malformed escape is a non-match.
-- Saved key health is not restored onto a key that was re-pointed at another upstream (same name and secret). The state file records each key's upstream; older state without it still restores.
+- A response with `Content-Encoding: identity` is scrubbed for the upstream key.
+- The peers health view no longer lists per-model cooldowns, and `reiki peers` shows control characters in peer names as `?`.
+- `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the scope; many paths on one model escalate to a key cooldown.
+- The `placeholders` plugin leaves Anthropic `thinking` and `redacted_thinking` blocks and base64 `image` and `document` blocks byte-identical, so a second turn no longer fails signature validation.
+- Placeholder terms match inside JSON-escaped strings, and a fragment held at the end of an Anthropic content block is flushed inside that block.
+- The body rewrite compares `model`, its key and `drop_params` keys after decoding JSON escapes.
+- Saved key health is not restored onto a key re-pointed at another upstream.
 
 ## 0.9.1
 

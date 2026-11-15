@@ -212,7 +212,8 @@ fn config_with_shaper(
     let mut map = HashMap::new();
     for (name, secret) in keys {
         text.push_str(&format!(
-            "[keys.{name}]\nupstream = \"zen\"\nfile = \"/unused/{name}\"\n"
+            "[keys.{name}]\nupstream = \"zen\"\nfile = \"{}/{name}\"\n",
+            key_dir().display()
         ));
         map.insert((*name).to_owned(), Secret::new(*secret));
     }
@@ -1203,6 +1204,66 @@ async fn a_provider_429_lowers_the_bucket_so_the_next_request_waits() {
         started.elapsed()
     );
     assert_eq!(h.mock.keys_called(), ["up-a", "up-a"]);
+}
+
+#[tokio::test]
+async fn a_provider_429_is_saved_and_a_restart_waits_on_the_learned_bucket() {
+    let state =
+        std::env::temp_dir().join(format!("reiki-shaper-state-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let limits = "[upstream.zen.limits]\nrpm = 10\nmax_wait_secs = 5\n";
+
+    let h = harness_with_shaper(&streams, limits, now).await;
+    h.app.set_state_path(state.clone());
+    h.mock.script(
+        "up-a",
+        vec![Reply::Status(
+            429,
+            "Rate limit exceeded",
+            Some(("retry-after", "1")),
+        )],
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
+    let text = std::fs::read_to_string(&state).unwrap();
+    assert!(text.contains("[shaper.a]"), "state was {text}");
+    assert!(text.contains("pause_secs = 1"), "state was {text}");
+
+    // Clear the key health so only the shaper's pause remains; enabling persists again.
+    let admin = h.admin.as_ref().unwrap();
+    assert_eq!(
+        h.client
+            .post(format!("{admin}/v1/keys/enable?key=a"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let h2 = harness_with_shaper(&streams, limits, now).await;
+    h2.app.set_state_path(state.clone());
+    h2.app.load_persisted_state();
+    let started = Instant::now();
+    let res = h2.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "the restored pause did not delay the request: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(h2.mock.keys_called(), ["up-a"]);
+
+    let _ = std::fs::remove_file(&state);
 }
 
 #[tokio::test]

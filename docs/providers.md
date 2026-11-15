@@ -70,7 +70,7 @@ Every field is optional and an explicit `0` means unlimited. A preset seeds the 
 
 Reiki acquires a slot for the chosen key before it sends the request. A short wait within `max_wait_secs` is slept off; a longer wait, or a closed daily quota, skips that key for this request and tries the next key in the chain. If no key can be used, the client gets `429` with JSON error code `reiki_shaped`, a `Retry-After` header and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
 
-Responses teach the same bucket when they come from that key's own upstream: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and a `remaining: 0` limit header closes it until the reported reset. Shaping state is in memory only, so learned caps and pauses reset when Reiki restarts.
+Responses teach the same bucket when they come from that key's own upstream: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and a `remaining: 0` limit header closes it until the reported reset. The learned cap, remaining pause or closed time, and current daily and monthly counters are saved in the state file, so they survive a restart; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
 
 ## Forwarding
 

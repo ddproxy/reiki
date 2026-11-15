@@ -23,7 +23,7 @@ use crate::config::{Config, PeersConfig};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
 use crate::rewrite::rewrite_body;
-use crate::shaper::bucket::{Bucket, Permit};
+use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit};
 use crate::shaper::headers::{observe, Observed};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
@@ -260,6 +260,9 @@ pub struct App {
     health: Mutex<KeyState>,
     /// Per-key outbound buckets, kept across reloads for an unchanged window.
     shaper: Shaper,
+    /// The shaper snapshot last written and when, so natural expiry of a pause or
+    /// closed window is not mistaken for a change.
+    shaper_saved: Mutex<(BTreeMap<String, BucketSnapshot>, Option<SystemTime>)>,
     policy: Policy,
     standard: Standard,
     faithful: Faithful,
@@ -328,6 +331,7 @@ impl App {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             shaper,
+            shaper_saved: Mutex::new((BTreeMap::new(), None)),
             policy,
             standard: Standard::try_new().expect("cannot build the upstream HTTP client"),
             faithful: Faithful::new(),
@@ -451,14 +455,20 @@ impl App {
         }
     }
 
-    /// Apply persisted key health. Missing or corrupt state is ignored.
+    /// Apply persisted key health and shaper state. Missing or corrupt state is ignored.
     pub fn load_persisted_state(&self) {
         let Some(path) = self.state_path.get() else {
             return;
         };
         let config = self.snapshot();
-        let saved = crate::state::load(path, &config.config);
-        self.restore_state(saved);
+        let loaded = crate::state::load_state(path, &config.config);
+        let now = self.wall_now();
+        self.shaper.restore(&loaded.shaper, now);
+        self.restore_state(loaded.health);
+        *self
+            .shaper_saved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (self.shaper.snapshot(now), Some(now));
     }
 
     fn restore_state(&self, saved: HashMap<String, SavedHealth>) {
@@ -486,12 +496,36 @@ impl App {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .snapshot(Instant::now());
-        crate::state::save(
-            path,
-            &health,
-            &self.snapshot().keys,
-            &self.snapshot().config,
-        );
+        let now = self.wall_now();
+        let shaper = self.shaper.snapshot(now);
+        let config = self.snapshot();
+        crate::state::save_with_shaper(path, &health, &shaper, &config.keys, &config.config);
+        *self
+            .shaper_saved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (shaper, Some(now));
+    }
+
+    /// Saves after the shaper learns something, skipping a write when its durable
+    /// facts are unchanged.
+    fn persist_shaper(&self) {
+        if self.state_path.get().is_none() {
+            return;
+        }
+        let now = self.wall_now();
+        let shaper = self.shaper.snapshot(now);
+        {
+            let saved = self
+                .shaper_saved
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(saved_at) = saved.1 {
+                if shaper_unchanged(&saved.0, saved_at, now, &shaper) {
+                    return;
+                }
+            }
+        }
+        self.persist_state();
     }
 
     /// Re-enables a key that was taken out of rotation and persists the change. Returns false
@@ -1374,6 +1408,40 @@ fn remember_wait(smallest: &mut Option<Duration>, wait: Duration) {
     *smallest = Some(smallest.map_or(wait, |current| current.min(wait)));
 }
 
+/// True when `now`'s snapshot holds the same facts as the one saved at `saved_at`;
+/// a pause or closed window simply running down is not a change.
+fn shaper_unchanged(
+    saved: &BTreeMap<String, BucketSnapshot>,
+    saved_at: SystemTime,
+    now: SystemTime,
+    current: &BTreeMap<String, BucketSnapshot>,
+) -> bool {
+    if saved.len() != current.len() {
+        return false;
+    }
+    let elapsed = now.duration_since(saved_at).unwrap_or_default();
+    saved.iter().all(|(key, old)| {
+        current.get(key).is_some_and(|new| {
+            old.learned_rpm == new.learned_rpm
+                && old.daily == new.daily
+                && old.monthly == new.monthly
+                && same_remaining(old.pause, new.pause, elapsed)
+                && same_remaining(old.closed, new.closed, elapsed)
+        })
+    })
+}
+
+fn same_remaining(saved: Option<Duration>, current: Option<Duration>, elapsed: Duration) -> bool {
+    match saved {
+        None => current.is_none(),
+        Some(saved) => {
+            let expected = saved.saturating_sub(elapsed);
+            // A window that has run out is a change, so the stale entry is cleared.
+            !expected.is_zero() && current == Some(expected)
+        }
+    }
+}
+
 /// A bucket has no pause-only call, so a response that reports zero remaining
 /// closes the bucket until its reset.
 fn note_reported_remaining(bucket: &Bucket, observed: Observed, now: SystemTime) {
@@ -1599,6 +1667,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 let now = app.wall_now();
                 note_reported_remaining(bucket, observed, now);
                 bucket.note_success(now);
+                app.persist_shaper();
             }
             let had_failures = if let Ok(mut health) = app.health.lock() {
                 let had = health.consecutive_failures(&key_name) > 0;
@@ -1697,6 +1766,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                         _ => {}
                     }
                 }
+                app.persist_shaper();
             }
         }
         match outcome {

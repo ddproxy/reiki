@@ -1,11 +1,12 @@
 pub mod bucket;
 pub mod headers;
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
-use crate::shaper::bucket::{Bucket, Decision, Permit, Window};
+use crate::shaper::bucket::{Bucket, BucketSnapshot, Decision, Permit, Window};
 
 /// Limits for a single key: its rate-limit window and the maximum time
 /// a caller is willing to wait for a slot.
@@ -76,6 +77,28 @@ impl Shaper {
     pub fn get(&self, key: &str) -> Option<(Arc<Bucket>, Duration)> {
         let map = self.map.read().unwrap_or_else(|e| e.into_inner());
         map.get(key).map(|(b, _, w)| (Arc::clone(b), *w))
+    }
+
+    /// The durable state of every shaped key that has any.
+    pub fn snapshot(&self, now: SystemTime) -> BTreeMap<String, BucketSnapshot> {
+        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter_map(|(key, (bucket, _, _))| {
+                let snapshot = bucket.snapshot(now);
+                (!snapshot.is_empty()).then(|| (key.clone(), snapshot))
+            })
+            .collect()
+    }
+
+    /// Applies saved state to the keys that are still shaped; unknown keys are ignored.
+    pub fn restore(&self, saved: impl Borrow<BTreeMap<String, BucketSnapshot>>, now: SystemTime) {
+        let saved = saved.borrow();
+        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
+        for (key, snapshot) in saved {
+            if let Some((bucket, _, _)) = map.get(key) {
+                bucket.restore(snapshot, now);
+            }
+        }
     }
 
     /// Returns true if no keys are currently shaped.
@@ -214,6 +237,44 @@ mod tests {
             !Arc::ptr_eq(&bucket1, &bucket2),
             "bucket Arc should be different"
         );
+    }
+
+    #[test]
+    fn snapshot_keeps_only_keys_with_something_to_restore() {
+        let shaper = Shaper::new();
+        let mut wanted = BTreeMap::new();
+        wanted.insert("key1".to_string(), limits(10, 5));
+        wanted.insert("key2".to_string(), limits(10, 5));
+        shaper.sync(&wanted);
+
+        let (bucket, _) = shaper.get("key1").unwrap();
+        bucket.lower_to(at(1000), 2);
+
+        let saved = shaper.snapshot(at(1000));
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key("key1"));
+        assert!(!saved.contains_key("key2"));
+
+        let restored = Shaper::new();
+        restored.sync(&wanted);
+        restored.restore(&saved, at(1000));
+        assert_eq!(restored.snapshot(at(1000)), saved);
+    }
+
+    #[test]
+    fn restore_ignores_keys_that_are_no_longer_shaped() {
+        let shaper = Shaper::new();
+        let mut wanted = BTreeMap::new();
+        wanted.insert("key1".to_string(), limits(10, 5));
+        shaper.sync(&wanted);
+
+        let (bucket, _) = shaper.get("key1").unwrap();
+        bucket.lower_to(at(1000), 2);
+        let mut saved = shaper.snapshot(at(1000));
+        saved.insert("gone".to_string(), saved["key1"]);
+
+        shaper.restore(saved, at(1000));
+        assert_eq!(shaper.snapshot(at(1000)).len(), 1);
     }
 
     #[test]

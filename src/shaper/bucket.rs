@@ -2,6 +2,7 @@
 //! rpm and tpm use a sliding grant log (a fixed minute allows 2x at its edge);
 //! daily and monthly quotas are fixed UTC windows, as providers bill them.
 
+use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +12,8 @@ use crate::classify::{civil_from_days, days_from_civil};
 const MINUTE: Duration = Duration::from_secs(60);
 const DAY: i64 = 86_400;
 const MAX_PAUSE: Duration = Duration::from_secs(24 * 3_600);
+/// A restored pause or closed window longer than this is not trusted.
+const MAX_RESTORED_STATE: Duration = Duration::from_secs(31 * 24 * 3_600);
 /// No slot time is computable for concurrency; re-check after this.
 const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 /// Bounds memory when rpm is unlimited.
@@ -55,6 +58,36 @@ pub enum Decision {
     Wait(Duration),
     /// Daily or monthly window exhausted until this instant.
     Closed(SystemTime),
+}
+
+/// The durable part of a bucket: learned cap, the remaining pause and closed
+/// time, and the current quota windows. The sliding minute log is omitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketSnapshot {
+    /// Learned rpm below the configured ceiling; `None` means the ceiling applies.
+    pub learned_rpm: Option<u32>,
+    pub pause: Option<Duration>,
+    pub closed: Option<Duration>,
+    pub daily: Option<QuotaSnapshot>,
+    pub monthly: Option<QuotaSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    /// Unix seconds when the window started.
+    pub start: i64,
+    pub requests: u32,
+    pub tokens: u64,
+}
+
+impl BucketSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.learned_rpm.is_none()
+            && self.pause.is_none()
+            && self.closed.is_none()
+            && self.daily.is_none()
+            && self.monthly.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +150,62 @@ impl Bucket {
             window,
             state: Arc::new(Mutex::new(State::default())),
         }
+    }
+
+    /// The facts worth keeping across a restart, expressed relative to `now`.
+    pub fn snapshot(&self, now: SystemTime) -> BucketSnapshot {
+        let w = &self.window;
+        let s = lock(&self.state);
+        BucketSnapshot {
+            learned_rpm: (s.learned_rpm != 0).then_some(s.learned_rpm),
+            pause: remaining(s.paused_until, now),
+            closed: remaining(s.closed_until, now),
+            daily: quota_snapshot(&s.day, w.daily_requests, w.daily_tokens),
+            monthly: quota_snapshot(&s.month, w.monthly_requests, w.monthly_tokens),
+        }
+    }
+
+    /// Applies a snapshot anchored to `now`. Hostile values are clamped: a pause,
+    /// closed time or cap above the configured ceiling never outlasts them.
+    pub fn restore(&self, snapshot: impl Borrow<BucketSnapshot>, now: SystemTime) {
+        let snapshot = snapshot.borrow();
+        let w = &self.window;
+        let mut s = lock(&self.state);
+        let reset = reset_secs(w);
+        let now_secs = secs(now);
+
+        s.learned_rpm = 0;
+        if let Some(cap) = snapshot.learned_rpm.filter(|cap| *cap > 0) {
+            let cap = cap.max(floor(w));
+            s.set_cap(w, if w.rpm > 0 { cap.min(w.rpm) } else { cap });
+        }
+        s.paused_until = snapshot
+            .pause
+            .filter(|d| !d.is_zero())
+            .map(|d| now + d.min(MAX_RESTORED_STATE));
+        s.closed_until = snapshot
+            .closed
+            .filter(|d| !d.is_zero())
+            .map(|d| now + d.min(MAX_RESTORED_STATE));
+
+        restore_quota(
+            &mut s.day,
+            snapshot.daily,
+            Period::Day,
+            now_secs,
+            reset,
+            w.daily_requests,
+            w.daily_tokens,
+        );
+        restore_quota(
+            &mut s.month,
+            snapshot.monthly,
+            Period::Month,
+            now_secs,
+            reset,
+            w.monthly_requests,
+            w.monthly_tokens,
+        );
     }
 
     pub fn try_acquire(&self, now: SystemTime, estimate: u64) -> Decision {
@@ -357,6 +446,50 @@ impl Period {
 fn exhausted(q: &Quota, requests: u32, tokens: u64, estimate: u64) -> bool {
     (requests > 0 && q.requests >= requests)
         || (tokens > 0 && q.tokens > 0 && q.tokens.saturating_add(estimate) > tokens)
+}
+
+/// Restores a quota only into the window it was saved from; a later window starts at zero.
+fn restore_quota(
+    quota: &mut Quota,
+    saved: Option<QuotaSnapshot>,
+    period: Period,
+    now: i64,
+    reset: i64,
+    requests: u32,
+    tokens: u64,
+) {
+    quota.roll(period, now, reset);
+    let Some(saved) = saved.filter(|saved| saved.start == quota.start) else {
+        return;
+    };
+    quota.requests = if requests > 0 {
+        saved.requests.min(requests)
+    } else {
+        saved.requests
+    };
+    quota.tokens = if tokens > 0 {
+        saved.tokens.min(tokens)
+    } else {
+        saved.tokens
+    };
+}
+
+fn remaining(until: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+    until
+        .and_then(|until| until.duration_since(now).ok())
+        .filter(|d| !d.is_zero())
+}
+
+/// Only a quota with a configured limit and some use is worth saving.
+fn quota_snapshot(q: &Quota, requests: u32, tokens: u64) -> Option<QuotaSnapshot> {
+    if (requests == 0 && tokens == 0) || (q.requests == 0 && q.tokens == 0) {
+        return None;
+    }
+    Some(QuotaSnapshot {
+        start: q.start,
+        requests: q.requests,
+        tokens: q.tokens,
+    })
 }
 
 fn floor(w: &Window) -> u32 {
@@ -716,6 +849,137 @@ mod tests {
         let b = Bucket::new(Window::default());
         b.note_window_closed(t0, t0);
         grant(&b, t0, 0);
+    }
+
+    #[test]
+    fn snapshot_restores_learned_cap() {
+        let t0 = at(2026, 11, 14, 12, 0, 0);
+        let b = rpm(20);
+        for _ in 0..10 {
+            grant(&b, t0, 0);
+        }
+        b.note_rate_limited(t0, None);
+        let saved = b.snapshot(t0);
+        assert_eq!(saved.learned_rpm, Some(8));
+
+        let restored = rpm(20);
+        restored.restore(saved, t0);
+        assert_eq!(restored.snapshot(t0), saved);
+        let t1 = plus(t0, 60);
+        for _ in 0..8 {
+            grant(&restored, t1, 0);
+        }
+        assert_eq!(wait(&restored, t1, 0), MINUTE);
+    }
+
+    #[test]
+    fn snapshot_restores_a_pause() {
+        let t0 = at(2026, 11, 14, 12, 0, 0);
+        let b = rpm(10);
+        b.note_rate_limited(t0, Some(Duration::from_secs(30)));
+        let saved = b.snapshot(t0);
+        assert_eq!(saved.pause, Some(Duration::from_secs(30)));
+
+        let restored = rpm(10);
+        restored.restore(saved, t0);
+        assert_eq!(wait(&restored, t0, 0), Duration::from_secs(30));
+        assert_eq!(restored.snapshot(t0), saved);
+    }
+
+    #[test]
+    fn snapshot_restores_a_closed_daily_window() {
+        let t0 = at(2026, 11, 14, 12, 0, 0);
+        let b = Bucket::new(Window {
+            daily_requests: 2,
+            ..Window::default()
+        });
+        grant(&b, t0, 0);
+        grant(&b, plus(t0, 1), 0);
+        let saved = b.snapshot(plus(t0, 2));
+        assert_eq!(saved.daily.unwrap().requests, 2);
+
+        let restored = Bucket::new(Window {
+            daily_requests: 2,
+            ..Window::default()
+        });
+        restored.restore(saved, plus(t0, 2));
+        assert_eq!(closed(&restored, plus(t0, 2), 0), at(2026, 11, 15, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_restart_in_a_later_window_starts_the_counters_at_zero() {
+        let t0 = at(2026, 11, 14, 12, 0, 0);
+        let window = Window {
+            daily_requests: 1,
+            monthly_requests: 1,
+            ..Window::default()
+        };
+        let b = Bucket::new(window.clone());
+        grant(&b, t0, 0);
+        let saved = b.snapshot(t0);
+        assert!(saved.daily.is_some() && saved.monthly.is_some());
+
+        let later = at(2026, 12, 2, 12, 0, 0);
+        let restored = Bucket::new(window);
+        restored.restore(saved, later);
+        let next = restored.snapshot(later);
+        assert_eq!((next.daily, next.monthly), (None, None));
+        grant(&restored, later, 0);
+    }
+
+    #[test]
+    fn hostile_snapshot_values_are_clamped() {
+        let t0 = at(2026, 11, 14, 12, 0, 0);
+        let window = Window {
+            rpm: 10,
+            daily_requests: 2,
+            daily_tokens: 100,
+            monthly_requests: 3,
+            monthly_tokens: 200,
+            ..Window::default()
+        };
+        let reset = reset_secs(&window);
+        let (day_start, _) = Period::Day.bounds(secs(t0), reset);
+        let (month_start, _) = Period::Month.bounds(secs(t0), reset);
+        let hostile = BucketSnapshot {
+            learned_rpm: Some(u32::MAX),
+            pause: Some(Duration::from_secs(90 * 86_400)),
+            closed: Some(Duration::from_secs(90 * 86_400)),
+            daily: Some(QuotaSnapshot {
+                start: day_start,
+                requests: u32::MAX,
+                tokens: u64::MAX,
+            }),
+            monthly: Some(QuotaSnapshot {
+                start: month_start,
+                requests: u32::MAX,
+                tokens: u64::MAX,
+            }),
+        };
+
+        let b = Bucket::new(window);
+        b.restore(hostile, t0);
+        let saved = b.snapshot(t0);
+        // A cap at the ceiling is stored as no learned cap.
+        assert_eq!(saved.learned_rpm, None);
+        assert_eq!(saved.pause, Some(MAX_RESTORED_STATE));
+        assert_eq!(saved.closed, Some(MAX_RESTORED_STATE));
+        assert_eq!(
+            saved.daily,
+            Some(QuotaSnapshot {
+                start: day_start,
+                requests: 2,
+                tokens: 100,
+            })
+        );
+        assert_eq!(
+            saved.monthly,
+            Some(QuotaSnapshot {
+                start: month_start,
+                requests: 3,
+                tokens: 200,
+            })
+        );
     }
 
     #[test]

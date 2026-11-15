@@ -71,6 +71,11 @@ pub trait Plugin: Send + Sync {
     /// empty, call after which the plugin must release anything it held back.
     fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {}
 
+    /// Called once when the process is stopping, after requests in flight have finished or the
+    /// drain time ran out. A plugin that buffers output (a log writer) writes it out here and
+    /// returns; it must not wait for long.
+    fn on_shutdown(&self) {}
+
     /// False when a changed config table cannot be applied to a running instance, because the
     /// plugin holds a file, a socket or counters that a rebuild would lose. A reload then keeps the
     /// running instance and reports that a restart is needed.

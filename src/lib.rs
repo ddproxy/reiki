@@ -6,7 +6,9 @@ pub mod config;
 pub mod forward;
 pub mod intercept;
 pub mod keys;
+pub mod lifecycle;
 pub mod logging;
+pub mod notify;
 #[cfg(feature = "peers")]
 pub mod peers;
 pub mod plugins;

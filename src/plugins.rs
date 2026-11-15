@@ -440,6 +440,13 @@ impl PluginChain {
         self.entries.iter().map(|e| e.plugin.name())
     }
 
+    /// Tells each plugin the process is stopping, so a buffering plugin can write out what it holds.
+    pub fn shutdown(&self) {
+        for entry in &self.entries {
+            entry.plugin.on_shutdown();
+        }
+    }
+
     /// Every file a plugin in this chain reads, for the watcher.
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         self.entries

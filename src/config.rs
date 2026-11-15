@@ -60,6 +60,8 @@ pub enum ConfigError {
     BadTunnel(String),
     BadLog(String),
     BadReload(String),
+    /// `[service]` has a value out of range.
+    BadService(String),
     BadAuth(String),
     BadPeers(String),
     /// The config has a `[hubs]`, `[hub]` or `[accounts]` table, but this binary was built without
@@ -166,6 +168,7 @@ impl fmt::Display for ConfigError {
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
             Self::BadReload(reason) => write!(f, "invalid [reload]: {reason}"),
+            Self::BadService(reason) => write!(f, "invalid [service]: {reason}"),
             Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
             Self::BadPeers(reason) => write!(f, "invalid [peers]: {reason}"),
             Self::HubFeatureOff => {
@@ -230,6 +233,8 @@ pub struct Config {
     /// Reloading the config when its files change.
     #[serde(default)]
     pub reload: ReloadConfig,
+    #[serde(default)]
+    pub service: ServiceConfig,
     /// Failed token checks on the client and admin listeners.
     #[serde(default)]
     pub auth: AuthConfig,
@@ -585,6 +590,28 @@ impl Default for ReloadConfig {
 
 fn default_reload_interval() -> u64 {
     5
+}
+
+/// `[service]`: how the process stops.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    /// After SIGTERM or SIGINT, how long requests already in flight may take before the
+    /// listeners are closed. Keep the unit's `TimeoutStopSec` above it.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_secs: u64,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_timeout_secs: default_shutdown_timeout(),
+        }
+    }
+}
+
+fn default_shutdown_timeout() -> u64 {
+    25
 }
 
 /// `[auth]`: how failed token checks on the client and admin listeners are slowed down.
@@ -1524,6 +1551,12 @@ impl Config {
                 return Err(ConfigError::AdminListenConflict);
             }
         }
+        if !(1..=300).contains(&self.service.shutdown_timeout_secs) {
+            return Err(ConfigError::BadService(format!(
+                "shutdown_timeout_secs must be 1 to 300 (got {})",
+                self.service.shutdown_timeout_secs
+            )));
+        }
         if !(1..=3600).contains(&self.reload.interval_secs) {
             return Err(ConfigError::BadReload(format!(
                 "interval_secs must be between 1 and 3600, got {}",
@@ -2193,6 +2226,23 @@ pub struct AccountLimits {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_service_table_defaults_and_validates() {
+        assert_eq!(Config::parse("").unwrap().service.shutdown_timeout_secs, 25);
+        let set = Config::parse("[service]\nshutdown_timeout_secs = 60\n").unwrap();
+        assert_eq!(set.service.shutdown_timeout_secs, 60);
+        for bad in ["0", "301"] {
+            let text = format!("[service]\nshutdown_timeout_secs = {bad}\n");
+            let error = Config::parse(&text).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::BadService(_)),
+                "{bad}: {error}"
+            );
+            assert!(error.to_string().contains("[service]"), "{error}");
+        }
+        assert!(Config::parse("[service]\nunknown = 1\n").is_err());
+    }
+
     #[test]
     fn the_auth_backoff_defaults_and_validates() {
         let config = Config::parse("").unwrap();

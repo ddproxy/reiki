@@ -17,7 +17,23 @@ use tokio::sync::Semaphore;
 use tower_service::Service;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+static DRAIN_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Sets how long a listener waits for requests in flight after its shutdown future completes.
+/// Set once at startup; later calls are ignored.
+pub fn set_drain_timeout(timeout: Duration) {
+    let _ = DRAIN_TIMEOUT.set(timeout);
+}
+
+/// The drain time in force.
+pub fn drain_timeout() -> Duration {
+    DRAIN_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_DRAIN_TIMEOUT)
+}
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A flood of refused connections logs one line per interval, not one per connection.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
@@ -217,6 +233,7 @@ async fn run(
     let slots = Arc::new(Semaphore::new(max_connections));
     let addr_limit = max_connections_per_addr.map(|limit| Arc::new(AddrLimit::new(limit)));
     tokio::pin!(shutdown);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut drops = DropWarning::new();
     loop {
         let accepted = tokio::select! {
@@ -248,16 +265,17 @@ async fn run(
         };
         let router = router.clone();
         let tls = tls.as_ref().map(|source| source());
+        let stop_rx = stop_rx.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let _addr_slot = addr_slot;
             let result = match tls {
-                None => connection(stream, router, peer, header_read_timeout).await,
+                None => connection(stream, router, peer, header_read_timeout, stop_rx).await,
                 Some(config) => {
                     let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, accept).await {
                         Ok(Ok(stream)) => {
-                            connection(stream, router, peer, header_read_timeout).await
+                            connection(stream, router, peer, header_read_timeout, stop_rx).await
                         }
                         Ok(Err(error)) => {
                             tracing::debug!(%peer, %error, "TLS handshake failed");
@@ -275,9 +293,12 @@ async fn run(
             }
         });
     }
+    // Stop listening so new connections are refused, and tell open ones to finish up.
+    drop(listener);
+    stop_tx.send_replace(true);
     // Let in-flight requests finish, but not forever.
     let all = u32::try_from(max_connections).unwrap_or(u32::MAX);
-    let _ = tokio::time::timeout(DRAIN_TIMEOUT, slots.acquire_many(all)).await;
+    let _ = tokio::time::timeout(drain_timeout(), slots.acquire_many(all)).await;
 }
 
 async fn connection<IO>(
@@ -285,6 +306,7 @@ async fn connection<IO>(
     router: Router,
     peer: std::net::SocketAddr,
     header_read_timeout: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), hyper::Error>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -295,11 +317,24 @@ where
         req.extensions_mut().insert(crate::auth::Peer(peer.ip()));
         async move { router.call(req).await }
     });
-    hyper::server::conn::http1::Builder::new()
+    let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
-        .serve_connection(TokioIo::new(io), service)
-        .await
+        .serve_connection(TokioIo::new(io), service);
+    tokio::pin!(conn);
+    // The guard `wait_for` returns is not `Send`, so it is dropped inside this block.
+    let stopping = async {
+        let _ = stop.wait_for(|stopping| *stopping).await;
+    };
+    tokio::select! {
+        result = conn.as_mut() => result,
+        // On shutdown an idle keep-alive connection closes at once and a busy one closes
+        // after its current response, so the drain does not wait on idle clients.
+        () = stopping => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    }
 }
 
 #[cfg(test)]

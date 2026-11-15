@@ -546,6 +546,12 @@ impl App {
         self.persist_state_now();
     }
 
+    /// Tells the plugins the process is stopping. Blocks while a plugin writes out what it holds.
+    pub fn shutdown_plugins(&self) {
+        let chain = Arc::clone(&self.plugins.read().unwrap_or_else(PoisonError::into_inner));
+        chain.shutdown();
+    }
+
     /// Writes the state now and waits for it. Used at shutdown, so a queued wake is not lost.
     pub fn flush_state(&self) {
         self.persist_state_now();

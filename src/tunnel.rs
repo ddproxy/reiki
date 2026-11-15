@@ -294,7 +294,11 @@ pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS));
     let peers: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>> = Arc::default();
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            () = crate::lifecycle::stopped() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, peer)) = accepted else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
@@ -317,6 +321,10 @@ pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
             }
         });
     }
+    // Open tunnels get the drain time, then they are cut with the process.
+    drop(listener);
+    let all = u32::try_from(MAX_TUNNELS).unwrap_or(u32::MAX);
+    let _ = tokio::time::timeout(crate::serve::drain_timeout(), slots.acquire_many(all)).await;
 }
 
 /// Counts one open tunnel for a peer address and releases it on drop.

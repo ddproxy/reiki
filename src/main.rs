@@ -610,6 +610,12 @@ async fn main() {
     for text in reiki::forward::socket_warnings(&config) {
         tracing::warn!("{text}");
     }
+    reiki::serve::set_drain_timeout(std::time::Duration::from_secs(
+        config.service.shutdown_timeout_secs,
+    ));
+    reiki::lifecycle::spawn_signal_handler();
+    reiki::lifecycle::warn_if_open_files_low();
+    reiki::notify::spawn_watchdog();
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
     app.start_state_writer();
@@ -622,15 +628,23 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|e| fail(&format!("cannot bind {listen}: {e}")));
+    // The other listeners drain with the client one; their tasks are joined before exit.
+    let mut listeners: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(addr) = &admin_listen {
         let admin_listener = tokio::net::TcpListener::bind(addr)
             .await
             .unwrap_or_else(|e| fail(&format!("cannot bind admin {addr}: {e}")));
         tracing::info!(%addr, "reiki admin listening");
         let admin_router = reiki::admin::router(Arc::clone(&app));
-        tokio::spawn(async move {
-            reiki::serve::serve(admin_listener, admin_router, 64, std::future::pending()).await;
-        });
+        listeners.push(tokio::spawn(async move {
+            reiki::serve::serve(
+                admin_listener,
+                admin_router,
+                64,
+                reiki::lifecycle::stopped(),
+            )
+            .await;
+        }));
     }
     #[cfg(feature = "peers")]
     if let Some(addr) = &peer_listen {
@@ -647,7 +661,7 @@ async fn main() {
             config_connections_per_addr,
         )
         .unwrap_or_else(|e| fail(&format!("peers: {e}")));
-        tokio::spawn(served);
+        listeners.push(tokio::spawn(served));
     }
     if let Some(tunnel) = &tunnel_config {
         let tunnel_listener = tokio::net::TcpListener::bind(&tunnel.listen)
@@ -663,15 +677,22 @@ async fn main() {
         }
         let built = Arc::new(built);
         app.set_tunnel(Arc::clone(&built));
-        tokio::spawn(reiki::tunnel::serve(tunnel_listener, built));
+        listeners.push(tokio::spawn(reiki::tunnel::serve(tunnel_listener, built)));
     }
     tracing::info!(%listen, "reiki listening");
+    reiki::notify::ready(&format!("listening on {listen}"));
     let flush = Arc::clone(&app);
-    reiki::serve::serve(listener, router(app), 1024, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await;
+    reiki::serve::serve(listener, router(app), 1024, reiki::lifecycle::stopped()).await;
+    // The client listener has drained; the others started draining at the same moment.
+    let grace = reiki::serve::drain_timeout() + std::time::Duration::from_secs(2);
+    for task in listeners {
+        let _ = tokio::time::timeout(grace, task).await;
+    }
+    // Writing out the request log blocks, so it stays off the async threads.
+    let plugins = Arc::clone(&flush);
+    let _ = tokio::task::spawn_blocking(move || plugins.shutdown_plugins()).await;
     flush.flush_state();
+    tracing::info!("stopped");
 }
 
 #[cfg(test)]

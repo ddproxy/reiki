@@ -79,6 +79,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `[hubs]`, `[hub]` and `[accounts]` (behind the `hub` feature) are parsed and validated only; nothing is served or contacted yet. See [docs/hub.md](docs/hub.md).
 - `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
 - `[reload]` with `watch = true` reloads the config when the config or key files change, so a deploy only has to write the file. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).
+- `[service]` sets how long a clean stop (SIGTERM, SIGINT) lets requests in flight finish. Reiki also speaks the systemd readiness and watchdog protocol. See [docs/service.md](docs/service.md).
 - `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).
 - `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
 - `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.

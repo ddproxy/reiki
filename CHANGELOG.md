@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Reiki stops cleanly on SIGTERM and SIGINT: listeners (client, admin, peers, tunnel) stop accepting at once, idle keep-alive connections close, requests in flight get `[service] shutdown_timeout_secs` (default 25), then the request log and state file are written and it exits 0. A second signal exits at once. See [service](docs/service.md).
+- systemd integration with no new dependency: `Type=notify` readiness (`READY=1`, `STOPPING=1`) and `WatchdogSec=` pings that stop when the async runtime is wedged. A warning at start when the open-file limit is below 4096.
+- Plugins get an `on_shutdown` hook; the request log writes out its queue there.
+
 ### Fixed
 
+- SIGTERM, which is what systemd sends, no longer kills Reiki on the spot with no drain and no flush; it was only Ctrl-C that stopped cleanly.
+- A listener now closes when it is told to stop, so connections during the drain are refused instead of left waiting, and idle keep-alive connections no longer hold the drain for its whole length.
 - The key-health state file is written by a background thread instead of inline on the request that records a failure, so a burst of failures on a slow disk no longer queues requests behind an fsync; writes that arrive meanwhile coalesce, and shutdown on Ctrl-C flushes the last one.
 - An upstream error body is scrubbed of the key before it is cut to 64 KiB, so a key echoed across the cut no longer leaks its head. A relayed error body over the cap is cut with `x-reiki-truncated: 1` instead of silently.
 

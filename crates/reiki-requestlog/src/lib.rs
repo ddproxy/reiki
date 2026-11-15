@@ -266,6 +266,29 @@ impl Plugin for RequestLog {
         false
     }
 
+    /// Asks the writer to write out what is queued and waits for it, for a few seconds at most.
+    /// The process exits without dropping the plugin, so this is the only chance to flush.
+    fn on_shutdown(&self) {
+        let (Some(tx), Some(writer)) = (self.tx.as_ref(), self.writer.as_ref()) else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut event = Some(Event::Shutdown);
+        while let Some(pending) = event.take() {
+            match tx.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full(back)) if std::time::Instant::now() < deadline => {
+                    event = Some(back);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+        while !writer.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn on_event(&self, event: &reiki_plugin::Event<'_>) {
         if let reiki_plugin::Event::Finding {
             id,

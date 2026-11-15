@@ -170,7 +170,7 @@ pub fn serve_with_per_addr(
     let publisher = Arc::clone(app.peer_publisher());
     let _ = publisher.listener_tls.set(loaded.is_some());
     let routes = router(app);
-    let shutdown = std::future::pending();
+    let shutdown = crate::lifecycle::stopped();
     let Some(loaded) = loaded else {
         return Ok(Box::pin(crate::serve::serve_per_addr(
             listener,

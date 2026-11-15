@@ -6,7 +6,7 @@ It is read-only: nothing here changes a key or serves traffic.
 
 ## Build
 
-Terminal support is the `top` cargo feature, which is not in the default set. It implies `peers`:
+Release binaries include `reiki top`. From source it is the `top` cargo feature, which is not in the default set and implies `peers`:
 
 ```bash
 cargo build --features top

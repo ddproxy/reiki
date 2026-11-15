@@ -78,7 +78,7 @@ fn write_issued(dir: &Dir, label: &str, key_mode: u32) -> Files {
 }
 
 fn publisher_text(dir: &Dir, addr: SocketAddr, files: &Files, extra: &str) -> String {
-    let key_file = dir.write("zen-a", "k\n", 0o600);
+    let key_file = dir.write("zen-a", "upstream-key\n", 0o600);
     format!(
         "[upstream.zen]\nbase_url = \"https://example.com/v1\"\n\
          [keys.zen-a]\nupstream = \"zen\"\nfile = \"{}\"\n\

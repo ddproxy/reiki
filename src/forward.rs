@@ -498,7 +498,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::{Method, Request};
 
-    use crate::config::Config;
+    use crate::config::{Config, ConfigError};
     use crate::upstream::{Call, Transport};
 
     use super::{socket_warnings, Forwarder};
@@ -614,10 +614,66 @@ file = "/etc/reiki/keys/zen-a"
     }
 
     #[test]
-    fn socket_in_0777_warns_and_expect_uid_suppresses() {
+    fn a_socket_in_a_group_or_other_writable_directory_without_the_sticky_bit_is_refused_at_load() {
+        for mode in [0o775, 0o777] {
+            let dir = temp_dir();
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            unixfs::PermissionsExt::set_mode(&mut perms, mode);
+            fs::set_permissions(&dir, perms).unwrap();
+            let path = dir.join("sock");
+            let text = minimal_base(&format!(
+                "[upstream.zen.forward]\nsocket = \"{}\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n",
+                path.display()
+            ));
+            let err = Config::parse(&text).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadForward { .. }),
+                "mode {mode:04o}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("expect_uid"), "mode {mode:04o}: {message}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_socket_in_a_sticky_or_private_directory_is_allowed_without_expect_uid() {
+        for mode in [0o1777, 0o700] {
+            let dir = temp_dir();
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            unixfs::PermissionsExt::set_mode(&mut perms, mode);
+            fs::set_permissions(&dir, perms).unwrap();
+            let path = dir.join("sock");
+            let text = minimal_base(&format!(
+                "[upstream.zen.forward]\nsocket = \"{}\"\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n",
+                path.display()
+            ));
+            Config::parse(&text).unwrap_or_else(|err| panic!("mode {mode:04o}: {err}"));
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn expect_uid_allows_a_socket_in_a_writable_directory() {
         let dir = temp_dir();
         let mut perms = fs::metadata(&dir).unwrap().permissions();
         unixfs::PermissionsExt::set_mode(&mut perms, 0o777);
+        fs::set_permissions(&dir, perms).unwrap();
+        let path = dir.join("sock");
+        let text = minimal_base(&format!(
+            "[upstream.zen.forward]\nsocket = \"{}\"\nexpect_uid = 1000\n[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n",
+            path.display()
+        ));
+        Config::parse(&text).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_in_a_sticky_writable_directory_warns_and_expect_uid_suppresses() {
+        let dir = temp_dir();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        // Sticky: allowed at load, so the warning path is what is left to test here.
+        unixfs::PermissionsExt::set_mode(&mut perms, 0o1777);
         fs::set_permissions(&dir, perms).unwrap();
         let path = dir.join("sock");
         let _listener = UnixListener::bind(&path).unwrap();
@@ -639,10 +695,11 @@ file = "/etc/reiki/keys/zen-a"
     }
 
     #[test]
-    fn a_missing_socket_in_a_writable_directory_still_warns_about_the_directory() {
+    fn a_missing_socket_in_a_sticky_writable_directory_still_warns_about_the_directory() {
         let dir = temp_dir();
         let mut perms = fs::metadata(&dir).unwrap().permissions();
-        unixfs::PermissionsExt::set_mode(&mut perms, 0o777);
+        // Sticky: allowed at load, so the warning path is what is left to test here.
+        unixfs::PermissionsExt::set_mode(&mut perms, 0o1777);
         fs::set_permissions(&dir, perms).unwrap();
         let path = dir.join("later.sock");
         let text = minimal_base(&format!(

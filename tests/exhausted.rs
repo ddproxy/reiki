@@ -39,7 +39,7 @@ async fn a_chain_of_limited_keys_answers_promptly() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut keys = String::new();
     for n in 1..=4 {
-        std::fs::write(dir.join(format!("k{n}")), format!("key-{n}")).unwrap();
+        std::fs::write(dir.join(format!("k{n}")), format!("upstream-key-{n}")).unwrap();
         keys.push_str(&format!(
             "[keys.k{n}]\nupstream = \"api\"\nfile = \"{}\"\n",
             dir.join(format!("k{n}")).display()

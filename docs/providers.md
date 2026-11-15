@@ -160,7 +160,8 @@ Any failure of the link answers 502: a failed connect or start, a wrong uid, a c
 - The path must be absolute and at most 103 bytes. Unix only.
 - With `expect_uid`, Reiki reads the peer's uid after connecting, before writing anything, and refuses with 502 on a mismatch.
 - Keep the socket in a directory only the Reiki user and listener can enter, and set `expect_uid` (see [security](security.md)). In a rootless container or user namespace, the uid is the mapped one.
-- `reiki check` and startup warn when the socket is missing or is not a socket, and about a group- or world-writable directory without `expect_uid`, even when the socket does not exist yet.
+- Startup refuses to load a socket in a group- or world-writable directory that has no sticky bit unless `expect_uid` is set: without both, whoever can write the directory could swap the socket and receive every credential. Sticky directories such as /tmp stay allowed.
+- `reiki check` and startup warn when the socket is missing or is not a socket, and about a sticky group- or world-writable directory without `expect_uid`, even when the socket does not exist yet.
 - Test with `curl --unix-socket PATH http://localhost/...`.
 
 ### Limits and restrictions

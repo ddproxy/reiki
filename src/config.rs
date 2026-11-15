@@ -1362,6 +1362,30 @@ impl Config {
                             reason: "socket forwarding needs a Unix platform".to_owned(),
                         });
                     }
+                    // A local user who can swap the socket at this path would receive every
+                    // Authorization header. A sticky directory stops the swap, so /tmp stays
+                    // allowed; otherwise `expect_uid` is the only check, so it is mandatory.
+                    #[cfg(unix)]
+                    if forward.expect_uid.is_none() {
+                        let writable = socket
+                            .parent()
+                            .and_then(|dir| std::fs::metadata(dir).ok())
+                            .map(|meta| {
+                                use std::os::unix::fs::PermissionsExt as _;
+                                let mode = meta.permissions().mode();
+                                mode & 0o022 != 0 && mode & 0o1000 == 0
+                            })
+                            .unwrap_or(false);
+                        if writable {
+                            return Err(ConfigError::BadForward {
+                                upstream: name.clone(),
+                                reason: format!(
+                                    "socket `{}` is in a directory group or others can write to that has no sticky bit; set `expect_uid` or keep the socket in a directory only the service user can write",
+                                    socket.display()
+                                ),
+                            });
+                        }
+                    }
                 }
                 if upstream.http2 {
                     return Err(ConfigError::BadForward {

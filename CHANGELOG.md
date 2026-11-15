@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- A forwarder socket in a directory that group or others can write to, with no sticky bit and no `expect_uid`, is refused at config load; upstream keys under 8 bytes are refused, since the scrubber skips them.
 - The peers listener caps open connections per source address (`[peers] max_connections_per_addr`, default 4) and closes the connection after a 401 or 429.
 - Failed peer logins from loopback are locked out per address like any other, instead of a shared delay; tunnelled peers share that address. Session counts in the peers view are documented as client-reported.
 - Outbound shaping replaces its `body / 4` token estimate with the `usage` the response reports (JSON or SSE, uncompressed bodies); without usage the estimate stands.

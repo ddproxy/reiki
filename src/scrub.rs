@@ -11,8 +11,9 @@ use std::task::{Context, Poll};
 use axum::body::Bytes;
 use futures_core::Stream;
 
-/// A secret shorter than this is more likely ordinary text than a key.
-const MIN_SECRET: usize = 8;
+/// A secret shorter than this is more likely ordinary text than a key. `load_keys` refuses a
+/// configured key below it: an echoed key that short would never be scrubbed.
+pub(crate) const MIN_SECRET: usize = 8;
 
 type ByteResult = Result<Bytes, std::io::Error>;
 

@@ -99,6 +99,7 @@ impl fmt::Debug for Secret {
 pub enum LoadError {
     Read { key: String, source: std::io::Error },
     Empty(String),
+    Short { key: String, len: usize },
 }
 
 impl fmt::Display for LoadError {
@@ -106,6 +107,11 @@ impl fmt::Display for LoadError {
         match self {
             Self::Read { key, source } => write!(f, "cannot read key file for `{key}`: {source}"),
             Self::Empty(key) => write!(f, "key file for `{key}` is empty"),
+            Self::Short { key, len } => write!(
+                f,
+                "key file for `{key}` holds {len} bytes; a key must be at least {} bytes so an echoed copy can be scrubbed",
+                crate::scrub::MIN_SECRET
+            ),
         }
     }
 }
@@ -114,7 +120,7 @@ impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::Empty(_) => None,
+            Self::Empty(_) | Self::Short { .. } => None,
         }
     }
 }
@@ -129,6 +135,12 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
         let value = raw.trim();
         if value.is_empty() {
             return Err(LoadError::Empty(name.clone()));
+        }
+        if value.len() < crate::scrub::MIN_SECRET {
+            return Err(LoadError::Short {
+                key: name.clone(),
+                len: value.len(),
+            });
         }
         keys.insert(name.clone(), Secret::new(value));
     }
@@ -3041,5 +3053,36 @@ mod tests {
         let (body, error) = read_limited(response).await;
         assert_eq!(&body[..], b"quota");
         assert!(error.is_some(), "a read error must not look like EOF");
+    }
+
+    #[test]
+    fn load_keys_refuses_a_key_too_short_to_be_scrubbed() {
+        let dir = std::env::temp_dir().join(format!(
+            "reiki-short-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k"), "abc\n").unwrap();
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.com\"\n\
+             [keys.k]\nupstream = \"zen\"\nfile = \"{}\"\n",
+            dir.join("k").display()
+        );
+        let config = Config::parse(&text).unwrap();
+        let err = load_keys(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("8"),
+            "the error names the minimum length: {err}"
+        );
+        assert!(err.contains("k"), "the error names the key: {err}");
+        // A key of exactly the minimum length loads.
+        std::fs::write(dir.join("k"), "eight-by\n").unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert!(load_keys(&config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

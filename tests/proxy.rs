@@ -2346,7 +2346,8 @@ async fn a_sighup_reload_does_not_revive_the_old_state_of_a_rotated_key() {
     // than they are and would normally be trusted on a replay.
     let write_config = |a_secret: &str| {
         std::fs::write(dir.join("a"), a_secret).unwrap();
-        std::fs::write(dir.join("b"), "up-b").unwrap();
+        // At least 8 bytes, or the reload refuses the file at load.
+        std::fs::write(dir.join("b"), "upstream-b").unwrap();
         let text = format!(
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
@@ -2403,7 +2404,8 @@ async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_s
 
     let write_config = |a_secret: &str, extra: &str| {
         std::fs::write(dir.join("a"), a_secret).unwrap();
-        std::fs::write(dir.join("b"), "up-b").unwrap();
+        // At least 8 bytes, or the reload refuses the file at load.
+        std::fs::write(dir.join("b"), "upstream-b").unwrap();
         let text = format!(
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\

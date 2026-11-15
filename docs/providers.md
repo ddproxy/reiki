@@ -242,7 +242,7 @@ A 401 takes the key out of rotation at once, and one request disables at most on
 
 ## Relaying errors as they are
 
-Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply.
+Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply. An error body is relayed up to 64 KiB, scrubbed of the upstream key first; a longer body is cut there and the response carries `x-reiki-truncated: 1`.
 
 ## Falling back to another upstream
 

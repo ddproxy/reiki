@@ -294,6 +294,8 @@ pub struct App {
     state_path: OnceLock<PathBuf>,
     /// Held across snapshot and write, so a stale snapshot cannot land after a newer one.
     persist_lock: Mutex<()>,
+    /// Wakes the state writer thread; absent until [`App::start_state_writer`] runs.
+    persist_tx: OnceLock<std::sync::mpsc::SyncSender<()>>,
     /// Overrides the wall clock for tests; production reads the system clock.
     /// The override advances with real time, and tests may set it again to jump.
     wall_clock: RwLock<Option<(SystemTime, Instant)>>,
@@ -362,6 +364,7 @@ impl App {
             header_timeout,
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
+            persist_tx: OnceLock::new(),
             wall_clock: RwLock::new(None),
             ca_not_after: RwLock::new(None),
             logins: LoginThrottle::new(throttle),
@@ -506,7 +509,49 @@ impl App {
         }
     }
 
+    /// Starts the thread that writes the state file. From then on [`App::persist_state`] only
+    /// wakes it, so a request that records a failure never waits on a disk. A wake that arrives
+    /// while a write runs is kept and becomes one more write that reads the latest state, so
+    /// a burst of failures costs a few writes, not one each.
+    pub fn start_state_writer(self: &Arc<Self>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        if self.persist_tx.set(tx).is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("reiki-state".to_owned())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    let Some(app) = weak.upgrade() else {
+                        break;
+                    };
+                    app.persist_state_now();
+                }
+            });
+        if let Err(error) = spawned {
+            // The receiver went with the closure, so `persist_state` falls back to writing inline.
+            tracing::warn!(%error, "cannot start the state writer; writing inline");
+        }
+    }
+
+    /// Saves the state, by waking the writer thread when there is one.
     fn persist_state(&self) {
+        if let Some(tx) = self.persist_tx.get() {
+            match tx.try_send(()) {
+                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => return,
+                Err(std::sync::mpsc::TrySendError::Disconnected(())) => {}
+            }
+        }
+        self.persist_state_now();
+    }
+
+    /// Writes the state now and waits for it. Used at shutdown, so a queued wake is not lost.
+    pub fn flush_state(&self) {
+        self.persist_state_now();
+    }
+
+    fn persist_state_now(&self) {
         let Some(path) = self.state_path.get() else {
             return;
         };
@@ -1770,7 +1815,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             .map(str::to_owned);
         let response_headers = response.headers.clone();
         let secrets = [secret.0.as_str(), auth_value.as_str()];
-        let (snippet, read_error) = read_limited(response).await;
+        let (snippet, read_error, truncated) = read_error_body(response, &secrets).await;
         if let Some(error) = &read_error {
             tracing::warn!(
                 stream = %stream,
@@ -1780,8 +1825,19 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 "could not read the whole upstream error body; classifying by status"
             );
         }
-        let snippet = scrub(snippet, &secrets);
-        let response_headers = scrub_headers(response_headers, &secrets);
+        let mut response_headers = scrub_headers(response_headers, &secrets);
+        if truncated {
+            tracing::warn!(
+                stream = %stream,
+                key = %key_name,
+                status = status.as_u16(),
+                "the upstream error body is longer than the cap and is cut"
+            );
+            response_headers.insert(
+                HeaderName::from_static("x-reiki-truncated"),
+                HeaderValue::from_static("1"),
+            );
+        }
         plugin_states.on_attempt(&key_name, Some(status.as_u16()), &snippet);
         let text = if read_error.is_some() {
             String::new()
@@ -2188,14 +2244,20 @@ fn is_pre_send(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
 }
 
-async fn read_limited(mut response: UpstreamResponse) -> (Bytes, Option<std::io::Error>) {
+async fn read_limited(
+    mut response: UpstreamResponse,
+    extra: usize,
+) -> (Bytes, Option<std::io::Error>) {
+    // One byte past the cap and the longest secret form, so the caller can tell a body that
+    // ends at the cap from one that goes on, and can scrub a secret that straddles the cap.
+    let limit = MAX_ERROR_BODY.saturating_add(extra).saturating_add(1);
     let mut collected = Vec::new();
     while let Some(chunk) = response.chunk().await {
         match chunk {
             Ok(chunk) => {
-                let room = MAX_ERROR_BODY.saturating_sub(collected.len());
+                let room = limit.saturating_sub(collected.len());
                 collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                if collected.len() >= MAX_ERROR_BODY {
+                if collected.len() >= limit {
                     break;
                 }
             }
@@ -2203,6 +2265,23 @@ async fn read_limited(mut response: UpstreamResponse) -> (Bytes, Option<std::io:
         }
     }
     (Bytes::from(collected), None)
+}
+
+/// Reads an upstream error body, scrubs the secrets from it and only then cuts it to
+/// `MAX_ERROR_BODY`. Cutting first would leave the head of a secret that straddles the cut.
+/// The flag says the body went on past the cut.
+async fn read_error_body(
+    response: UpstreamResponse,
+    secrets: &[&str],
+) -> (Bytes, Option<std::io::Error>, bool) {
+    let longest = crate::scrub::forms(secrets).first().map_or(0, Vec::len);
+    let (body, error) = read_limited(response, longest).await;
+    let body = scrub(body, secrets);
+    if body.len() > MAX_ERROR_BODY {
+        (body.slice(..MAX_ERROR_BODY), error, true)
+    } else {
+        (body, error, false)
+    }
 }
 
 /// True for a response the client consumes incrementally, so it must not be held back.
@@ -3050,9 +3129,67 @@ mod tests {
             axum::http::Version::HTTP_11,
             futures_util::stream::iter(chunks),
         );
-        let (body, error) = read_limited(response).await;
+        let (body, error) = read_limited(response, 0).await;
         assert_eq!(&body[..], b"quota");
         assert!(error.is_some(), "a read error must not look like EOF");
+    }
+
+    fn error_response(chunks: Vec<Vec<u8>>) -> UpstreamResponse {
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            chunks.into_iter().map(|c| Ok(Bytes::from(c))).collect();
+        UpstreamResponse::from_stream(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            axum::http::Version::HTTP_11,
+            futures_util::stream::iter(chunks),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_secret_straddling_the_cap_is_scrubbed_before_the_cut() {
+        let key = "sk-straddle-0123456789abcdef0123456789";
+        for offset in [3, 10, key.len() - 1] {
+            // The key starts `offset` bytes before the cap, so only its head fits.
+            let mut body = vec![b'x'; MAX_ERROR_BODY - offset];
+            body.extend_from_slice(key.as_bytes());
+            body.extend(std::iter::repeat_n(b'y', 100));
+            let (cut, error, truncated) = read_error_body(error_response(vec![body]), &[key]).await;
+            assert!(error.is_none());
+            assert!(truncated);
+            assert!(cut.len() <= MAX_ERROR_BODY);
+            assert!(
+                !String::from_utf8_lossy(&cut).contains("sk-"),
+                "offset {offset}: the head of the key reached the client"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_straddling_the_cap_across_chunks_is_scrubbed() {
+        let key = "sk-chunked-0123456789abcdef0123456789";
+        let mut first = vec![b'x'; MAX_ERROR_BODY - 8];
+        first.extend_from_slice(&key.as_bytes()[..8]);
+        let second = key.as_bytes()[8..].to_vec();
+        let (cut, _, truncated) =
+            read_error_body(error_response(vec![first, second, vec![b'z'; 50]]), &[key]).await;
+        assert!(truncated);
+        assert!(!String::from_utf8_lossy(&cut).contains("sk-"));
+    }
+
+    #[tokio::test]
+    async fn a_body_ending_exactly_at_the_cap_is_not_flagged_and_a_longer_one_is() {
+        let exact = vec![b'a'; MAX_ERROR_BODY];
+        let (body, _, truncated) = read_error_body(error_response(vec![exact]), &[]).await;
+        assert_eq!(body.len(), MAX_ERROR_BODY);
+        assert!(!truncated);
+        let longer = vec![b'a'; MAX_ERROR_BODY + 1];
+        let (body, _, truncated) = read_error_body(error_response(vec![longer]), &[]).await;
+        assert_eq!(body.len(), MAX_ERROR_BODY);
+        assert!(truncated);
+        let short = b"small".to_vec();
+        let (body, _, truncated) = read_error_body(error_response(vec![short]), &[]).await;
+        assert_eq!(&body[..], b"small");
+        assert!(!truncated);
     }
 
     #[test]

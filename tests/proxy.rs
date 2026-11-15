@@ -1519,6 +1519,64 @@ async fn a_provider_429_is_saved_and_a_restart_waits_on_the_learned_bucket() {
 }
 
 #[tokio::test]
+async fn the_state_writer_saves_off_the_request_path_and_a_flush_waits_for_it() {
+    let state =
+        std::env::temp_dir().join(format!("reiki-state-writer-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.app.set_state_path(state.clone());
+    h.app.start_state_writer();
+    h.mock
+        .script("up-a", vec![Reply::Status(401, "invalid api key", None)]);
+    let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(res.status(), 200, "the next key served the request");
+    // The write happens on the writer thread, so give it a moment.
+    let mut written = false;
+    for _ in 0..60 {
+        if std::fs::metadata(&state).is_ok_and(|m| m.len() > 0) {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(written, "the writer never saved the failure");
+
+    // A flush does not return before the file is current.
+    let _ = std::fs::remove_file(&state);
+    assert!(h.app.enable_key("a"));
+    h.app.flush_state();
+    assert!(
+        std::fs::metadata(&state).is_ok_and(|m| m.len() > 0),
+        "flush_state returned before the state was on disk"
+    );
+    let _ = std::fs::remove_file(&state);
+}
+
+#[tokio::test]
+async fn a_burst_of_failures_does_not_block_on_the_state_writer() {
+    let state = std::env::temp_dir().join(format!("reiki-state-burst-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&state);
+    let h = harness(&one_stream(), Policy::default()).await;
+    h.app.set_state_path(state.clone());
+    h.app.start_state_writer();
+    for _ in 0..20 {
+        h.mock.script(
+            "up-a",
+            vec![Reply::Status(
+                429,
+                "Rate limit exceeded",
+                Some(("retry-after", "1")),
+            )],
+        );
+        let res = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+        assert!(res.status().is_success() || res.status() == 503);
+    }
+    h.app.flush_state();
+    assert!(std::fs::metadata(&state).is_ok_and(|m| m.len() > 0));
+    let _ = std::fs::remove_file(&state);
+}
+
+#[tokio::test]
 async fn a_response_reporting_no_remaining_requests_closes_the_window() {
     let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
     let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
@@ -2552,6 +2610,30 @@ async fn pass_errors_relays_a_403_without_taking_the_key_out_of_rotation() {
         ["up-a", "up-b"],
         "without the option a 403 still fails over to the next key"
     );
+}
+
+#[tokio::test]
+async fn a_relayed_error_body_over_the_cap_is_cut_and_marked() {
+    let h = harness_with_upstream(&one_stream(), "pass_errors = true\n", Policy::default()).await;
+    let big = vec![b'e'; 70 * 1024];
+    h.mock.script("up-a", vec![Reply::Bytes(400, big, vec![])]);
+    let cut = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(cut.status(), 400);
+    assert_eq!(
+        cut.headers()
+            .get("x-reiki-truncated")
+            .and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "a cut body says so"
+    );
+    let body = cut.bytes().await.unwrap();
+    assert_eq!(body.len(), 64 * 1024);
+
+    h.mock
+        .script("up-a", vec![Reply::Status(400, "small error", None)]);
+    let whole = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
+    assert!(whole.headers().get("x-reiki-truncated").is_none());
+    assert_eq!(whole.text().await.unwrap(), "small error");
 }
 
 #[tokio::test]

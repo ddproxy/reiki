@@ -612,6 +612,7 @@ async fn main() {
     }
     let app = App::new(config, keys, Policy::default(), plugins);
     app.set_state_path(reiki::state::path_for(&cli.config));
+    app.start_state_writer();
     app.set_config_path(cli.config.clone());
     app.set_logging(Arc::clone(&logging));
     tokio::spawn(reiki::reload::watch(Arc::clone(&app)));
@@ -665,10 +666,12 @@ async fn main() {
         tokio::spawn(reiki::tunnel::serve(tunnel_listener, built));
     }
     tracing::info!(%listen, "reiki listening");
+    let flush = Arc::clone(&app);
     reiki::serve::serve(listener, router(app), 1024, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await;
+    flush.flush_state();
 }
 
 #[cfg(test)]

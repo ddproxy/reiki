@@ -111,7 +111,7 @@ Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-a
 | Timeout or broken connection on GET, HEAD, PUT, DELETE, OPTIONS or TRACE | Retry once on the same key |
 | Timeout or broken connection on POST or PATCH | Do not replay; answer 502, or 504 for a timeout |
 | 403 that is a CDN block page | Pass through unchanged |
-| Other 4xx | Pass through unchanged |
+| Other 4xx | Pass through unchanged (a body over 64 KiB is cut and the response carries `x-reiki-truncated: 1`) |
 
 An upstream response such as a 429 or 5xx moves the request to the next key as long as no response bytes have reached the client. A transport failure is different: only an idempotent method, or any method when the connection could not be established, is replayed, so an uncertain POST or PATCH is not sent twice. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
 

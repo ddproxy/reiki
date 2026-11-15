@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The key-health state file is written by a background thread instead of inline on the request that records a failure, so a burst of failures on a slow disk no longer queues requests behind an fsync; writes that arrive meanwhile coalesce, and shutdown on Ctrl-C flushes the last one.
+- An upstream error body is scrubbed of the key before it is cut to 64 KiB, so a key echoed across the cut no longer leaks its head. A relayed error body over the cap is cut with `x-reiki-truncated: 1` instead of silently.
+
 ## 0.10.1
 
 ### Added

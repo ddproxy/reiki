@@ -1621,9 +1621,21 @@ impl Config {
         if !(1..=3600).contains(&entry.timeout_secs) {
             return Some("timeout_secs must be between 1 and 3600".to_owned());
         }
-        for label in &entry.accounts {
+        if entry
+            .ca_file
+            .as_deref()
+            .is_some_and(|f| f.trim().is_empty())
+        {
+            return Some(
+                "ca_file must not be empty; leave it out to use the built-in roots".to_owned(),
+            );
+        }
+        for (i, label) in entry.accounts.iter().enumerate() {
             if !self.has_account(label) {
                 return Some(format!("accounts names an unknown account `{label}`"));
+            }
+            if entry.accounts[..i].contains(label) {
+                return Some(format!("accounts lists `{label}` twice"));
             }
         }
         None
@@ -3389,6 +3401,20 @@ socket = "/run/forwarder.sock"
         fn a_mapped_loopback_hub_url_is_seen_as_itself() {
             let text = edit(HUB_URL, "https://[::ffff:127.0.0.1]:4443");
             assert!(hub_error(&text).contains("lists itself"));
+        }
+
+        #[test]
+        fn a_hub_refuses_an_empty_ca_file_and_a_repeated_account() {
+            let empty = hub_error(&edit(
+                "ca_file = \"/etc/reiki/hub/ca.pem\"",
+                "ca_file = \"  \"",
+            ));
+            assert!(empty.contains("ca_file must not be empty"), "{empty}");
+            let twice = hub_error(&edit(
+                "token_file = \"/etc/reiki/hub/edge.token\"\naccounts = [\"acct-a\"]",
+                "token_file = \"/etc/reiki/hub/edge.token\"\naccounts = [\"acct-a\", \"acct-a\"]",
+            ));
+            assert!(twice.contains("twice"), "{twice}");
         }
 
         #[test]

@@ -24,7 +24,7 @@
 - The labelled peers health view no longer lists per-model cooldowns (`scopes`), which exposed client-chosen model names; `reiki peers` shows control characters in peer-supplied names as `?`.
 - The `placeholders` plugin leaves Anthropic `thinking` and `redacted_thinking` blocks (and their `signature` and `data`, in requests, JSON responses and SSE deltas) and base64 `image` and `document` blocks byte-identical, so a second turn no longer fails thinking-signature validation and media is not corrupted.
 - Placeholder ids stay the same across a config reload (one salt per process), so prompt caching and signed history survive a reload; a restart still changes them.
-- A placeholder fragment held at the end of an Anthropic stream is flushed before `message_stop`, not after it.
+- A placeholder fragment held at the end of an Anthropic content block is flushed inside that block as a complete `content_block_delta` before its `content_block_stop`, and no longer carries into the next block.
 - The body rewrite compares the `model` value, the `model` key and `drop_params` keys after decoding JSON escapes, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o` and `stream\u005foptions` is dropped. A malformed escape is a non-match.
 - Saved key health is not restored onto a key that was re-pointed at another upstream (same name and secret). The state file records each key's upstream; older state without it still restores.
 

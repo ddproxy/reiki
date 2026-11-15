@@ -1,6 +1,7 @@
 //! Puts original values back into responses, including event streams that split a placeholder.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{Map, Value};
@@ -129,12 +130,63 @@ fn event_ends_message(event: &str) -> bool {
     })
 }
 
+/// The content block index an Anthropic `content_block_stop` data line names, if any.
+fn block_stop_index(event: &str) -> Option<usize> {
+    event.lines().find_map(|line| {
+        line.strip_prefix("data:")
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+            .and_then(|payload| {
+                let value = serde_json::from_str::<Value>(payload).ok()?;
+                (value["type"].as_str() == Some("content_block_stop"))
+                    .then(|| value["index"].as_u64().map(|i| i as usize))?
+            })
+    })
+}
+
+/// The payload's `type` and `index` — the event kind when no `event:` line names one.
+fn payload_kind_index(payload: &str) -> (String, Option<usize>) {
+    match serde_json::from_str::<Value>(payload) {
+        Ok(value) => (
+            value["type"].as_str().unwrap_or_default().to_owned(),
+            value["index"].as_u64().map(|i| i as usize),
+        ),
+        Err(_) => (String::new(), None),
+    }
+}
+
 /// Where a held tail belongs: a JSON key or array index, or the text of a payload that is not JSON.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Seg {
     Key(String),
     Index(usize),
     Raw,
+}
+
+/// What identifies a held tail: the event kind, the content block index when the event has one, and
+/// the field path. The block index is what keeps a tail held in one block out of the next.
+type HeldKey = (String, Option<usize>, Vec<Seg>);
+
+/// The envelope of the data line that held a tail, so its flush is a complete event.
+#[derive(Clone)]
+struct Frame {
+    /// The `data:` payload as it arrived, replayed with the held text in place of the tail.
+    raw: Arc<str>,
+    /// Event lines before the data line, such as `event: content_block_delta`.
+    pre: Arc<str>,
+    /// The data line's own line ending, CRLF included.
+    eol: Arc<str>,
+    /// Lines after the data line, including the blank line that ends the event.
+    post: Arc<str>,
+    /// The event kind: the SSE `event:` name, else the payload's `type`, else empty.
+    kind: String,
+    /// The content block index the event names, when it has one.
+    index: Option<usize>,
+}
+
+/// A held tail plus the framing of the event that held it.
+struct HeldData {
+    text: String,
+    frame: Frame,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,8 +200,9 @@ enum Mode {
 pub struct Restorer {
     mode: Mode,
     buf: Vec<u8>,
-    /// Partial placeholders held back per field until the next event completes them.
-    held: HashMap<Vec<Seg>, String>,
+    /// Partial placeholders held back per event kind, content block and field until the next event
+    /// completes them.
+    held: HashMap<HeldKey, HeldData>,
     cap: usize,
     given_up: bool,
     /// Whether credentials are restored inside tool-call arguments too.
@@ -391,35 +444,62 @@ impl Restorer {
         if event_ends_message(text) {
             out.push_str(&self.flush());
         }
+        if let Some(index) = block_stop_index(text) {
+            // The block's tails go out as complete deltas before the stop event.
+            out.push_str(&self.flush_block(index));
+        }
+        let mut before = String::new();
+        let mut name: Option<Arc<str>> = None;
         for line in text.split_inclusive('\n') {
             let body = line.trim_end_matches(['\r', '\n']);
             let eol = &line[body.len()..];
+            let after = before.len() + line.len();
             match body.strip_prefix("data:") {
                 Some(rest) => {
                     let payload = rest.strip_prefix(' ').unwrap_or(rest);
+                    let (kind, index) = payload_kind_index(payload);
                     if payload.trim() == "[DONE]" {
                         out.push_str(&self.flush());
                     }
+                    let frame = Frame {
+                        raw: Arc::from(payload),
+                        pre: Arc::from(before.as_str()),
+                        eol: Arc::from(eol),
+                        post: Arc::from(&text[after..]),
+                        kind: name.as_deref().map(str::to_owned).unwrap_or(kind),
+                        index,
+                    };
                     out.push_str("data: ");
-                    out.push_str(&self.payload(payload, reverse));
+                    out.push_str(&self.payload(payload, reverse, &frame));
                     out.push_str(eol);
                 }
-                None => out.push_str(line),
+                None => {
+                    if let Some(event_name) = body.strip_prefix("event:") {
+                        name = Some(Arc::from(event_name.trim()));
+                    }
+                    out.push_str(line);
+                }
             }
+            before.push_str(line);
         }
         out.into_bytes()
     }
 
-    fn payload(&mut self, payload: &str, reverse: &HashMap<String, String>) -> String {
+    fn payload(
+        &mut self,
+        payload: &str,
+        reverse: &HashMap<String, String>,
+        frame: &Frame,
+    ) -> String {
         if payload.trim() == "[DONE]" {
             return payload.to_owned();
         }
         match serde_json::from_str::<Value>(payload) {
             Ok(mut value) => {
-                self.walk(&mut Vec::new(), false, false, &mut value, reverse);
+                self.walk(&mut Vec::new(), false, false, &mut value, reverse, frame);
                 value.to_string()
             }
-            Err(_) => self.text_at(&[Seg::Raw], false, payload, reverse),
+            Err(_) => self.text_at(&[Seg::Raw], false, payload, reverse, frame),
         }
     }
 
@@ -432,17 +512,18 @@ impl Restorer {
         opaque: bool,
         value: &mut Value,
         reverse: &HashMap<String, String>,
+        frame: &Frame,
     ) {
         match value {
             Value::String(text) => {
                 if !opaque {
-                    *text = self.text_at(at, in_call, text, reverse);
+                    *text = self.text_at(at, in_call, text, reverse, frame);
                 }
             }
             Value::Array(items) => {
                 for (i, item) in items.iter_mut().enumerate() {
                     at.push(Seg::Index(i));
-                    self.walk(at, in_call, opaque, item, reverse);
+                    self.walk(at, in_call, opaque, item, reverse, frame);
                     at.pop();
                 }
             }
@@ -452,7 +533,14 @@ impl Restorer {
                 for (key, item) in map.iter_mut() {
                     at.push(Seg::Key(key.clone()));
                     let opaque = opaque || protected.contains(&key.as_str());
-                    self.walk(at, in_call || in_tool_call(key), opaque, item, reverse);
+                    self.walk(
+                        at,
+                        in_call || in_tool_call(key),
+                        opaque,
+                        item,
+                        reverse,
+                        frame,
+                    );
                     at.pop();
                 }
             }
@@ -467,29 +555,81 @@ impl Restorer {
         in_call: bool,
         text: &str,
         reverse: &HashMap<String, String>,
+        frame: &Frame,
     ) -> String {
-        let mut combined = self.held.remove(at).unwrap_or_default();
+        let key = (frame.kind.clone(), frame.index, at.to_vec());
+        let mut combined = self
+            .held
+            .remove(&key)
+            .map(|held| held.text)
+            .unwrap_or_default();
         combined.push_str(text);
         let restored = restore(&combined, reverse, self.tool_args || !in_call);
         let keep = incomplete_start(&restored);
         if keep == restored.len() {
             return restored;
         }
-        self.held.insert(at.to_vec(), restored[keep..].to_owned());
+        self.held.insert(
+            key,
+            HeldData {
+                text: restored[keep..].to_owned(),
+                frame: frame.clone(),
+            },
+        );
         restored[..keep].to_owned()
     }
 
-    /// Every held tail as its own event, so a stream that ends mid-placeholder still delivers its text.
+    /// Every held tail as its own complete event, so a stream that ends mid-placeholder still
+    /// delivers its text.
     fn flush(&mut self) -> String {
-        let mut held: Vec<(Vec<Seg>, String)> = self.held.drain().collect();
-        held.sort();
-        held.iter()
-            .map(|(at, text)| match at.as_slice() {
-                [Seg::Raw] => format!("data: {text}\n\n"),
-                _ => format!("data: {}\n\n", field_event(at, text)),
-            })
-            .collect()
+        self.flush_where(|_| true)
     }
+
+    /// The held tails of content block `index`, so nothing held leaks into another block.
+    fn flush_block(&mut self, index: usize) -> String {
+        self.flush_where(|(_, i, _)| *i == Some(index))
+    }
+
+    fn flush_where(&mut self, keep: impl Fn(&HeldKey) -> bool) -> String {
+        let mut keys: Vec<HeldKey> = self.held.keys().filter(|key| keep(key)).cloned().collect();
+        keys.sort();
+        let mut out = String::new();
+        for key in keys {
+            if let Some(data) = self.held.remove(&key) {
+                out.push_str(&flush_event(&key, &data));
+            }
+        }
+        out
+    }
+}
+
+/// Rebuilds one held tail as a complete event, with the framing of the event that held it.
+fn flush_event((_, _, at): &HeldKey, data: &HeldData) -> String {
+    let payload = match at.as_slice() {
+        [Seg::Raw] => data.text.clone(),
+        _ => serde_json::from_str::<Value>(&data.frame.raw)
+            .ok()
+            .and_then(|mut value| set_at(&mut value, at, &data.text).map(|_| value.to_string()))
+            .unwrap_or_else(|| field_event(at, &data.text).to_string()),
+    };
+    format!(
+        "{}data: {payload}{}{}",
+        data.frame.pre, data.frame.eol, data.frame.post
+    )
+}
+
+/// Puts `text` at `at` in `value`; nothing to do when the path does not lead there.
+fn set_at(value: &mut Value, at: &[Seg], text: &str) -> Option<()> {
+    let mut cur = value;
+    for seg in at {
+        cur = match seg {
+            Seg::Key(k) => cur.get_mut(k.as_str())?,
+            Seg::Index(i) => cur.get_mut(*i)?,
+            Seg::Raw => return None,
+        };
+    }
+    *cur = Value::String(text.to_owned());
+    Some(())
 }
 
 /// Byte spans (quotes included) of every string value in valid JSON, with their field path.
@@ -611,6 +751,45 @@ mod tests {
                 v["choices"][0]["delta"]["content"]
                     .as_str()
                     .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// A complete Anthropic `content_block_delta` event.
+    fn cb_delta(index: usize, delta_type: &str, field: &str, text: &str) -> String {
+        let mut delta = Map::new();
+        delta.insert("type".to_owned(), Value::String(delta_type.to_owned()));
+        delta.insert(field.to_owned(), Value::String(text.to_owned()));
+        let payload = serde_json::json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": Value::Object(delta),
+        });
+        format!("event: content_block_delta\ndata: {payload}\n\n")
+    }
+
+    fn cb_stop(index: usize) -> String {
+        format!(
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
+        )
+    }
+
+    /// The `(index, delta type, text)` of every `content_block_delta` in `stream`, in order.
+    fn anthropic_deltas(stream: &[u8]) -> Vec<(usize, String, String)> {
+        String::from_utf8_lossy(stream)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .filter(|value| value["type"] == "content_block_delta")
+            .map(|value| {
+                let index = value["index"].as_u64().unwrap_or(0) as usize;
+                let kind = value["delta"]["type"].as_str().unwrap_or("").to_owned();
+                let text = value["delta"]["text"]
+                    .as_str()
+                    .or_else(|| value["delta"]["partial_json"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                (index, kind, text)
             })
             .collect()
     }
@@ -951,5 +1130,139 @@ mod tests {
         let mut chunk = Bytes::from(body);
         restorer.feed(&mut chunk, true, &secret_reverse());
         assert_eq!(&chunk[..], body.as_bytes());
+    }
+
+    #[test]
+    fn a_held_tail_does_not_leak_into_the_next_block() {
+        // Block 0 ends mid-placeholder; block 1 carries the tail and more text.
+        let stream = [
+            cb_delta(0, "text_delta", "text", "hello [[REI"),
+            cb_stop(0),
+            cb_delta(1, "text_delta", "text", "KI_TERM_aaaaaaaaaaaaaaaa]] world"),
+            cb_stop(1),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_owned(),
+        ]
+        .concat();
+        let out = run_stream(&[stream.as_bytes()]);
+        assert_eq!(
+            anthropic_deltas(&out),
+            vec![
+                (0, "text_delta".to_owned(), "hello ".to_owned()),
+                (0, "text_delta".to_owned(), "[[REI".to_owned()),
+                (
+                    1,
+                    "text_delta".to_owned(),
+                    "KI_TERM_aaaaaaaaaaaaaaaa]] world".to_owned()
+                ),
+            ]
+        );
+        assert!(
+            !String::from_utf8_lossy(&out).contains("Falcon"),
+            "the block-0 tail leaked into block 1"
+        );
+    }
+
+    #[test]
+    fn a_held_tail_flushes_before_the_stop_as_a_content_block_delta() {
+        let stream = [
+            cb_delta(0, "text_delta", "text", "tail [["),
+            cb_stop(0),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_owned(),
+        ]
+        .concat();
+        let out = String::from_utf8(run_stream(&[stream.as_bytes()])).unwrap();
+        let flush = out
+            .split("\n\n")
+            .find(|event| event.contains("\"text\":\"[[\""))
+            .expect("flush event");
+        assert!(flush.starts_with("event: content_block_delta\n"), "{flush}");
+        assert!(flush.contains("\"index\":0"), "{flush}");
+        assert!(flush.contains("\"type\":\"text_delta\""), "{flush}");
+        assert!(
+            out.find("\"text\":\"[[\"").unwrap() < out.find("event: content_block_stop").unwrap(),
+            "the flush must precede the stop event:\n{out}"
+        );
+        assert_eq!(
+            anthropic_deltas(out.as_bytes()),
+            vec![
+                (0, "text_delta".to_owned(), "tail ".to_owned()),
+                (0, "text_delta".to_owned(), "[[".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_input_json_delta_tail_flushes_as_input_json_delta() {
+        let stream = [
+            cb_delta(0, "input_json_delta", "partial_json", "{\"cmd\": \"[[REI"),
+            cb_stop(0),
+        ]
+        .concat();
+        let out = run_stream(&[stream.as_bytes()]);
+        assert_eq!(
+            anthropic_deltas(&out),
+            vec![
+                (0, "input_json_delta".to_owned(), "{\"cmd\": \"".to_owned()),
+                (0, "input_json_delta".to_owned(), "[[REI".to_owned()),
+            ]
+        );
+        let text = String::from_utf8_lossy(&out);
+        let flush = text
+            .split("\n\n")
+            .find(|event| event.contains("\"partial_json\":\"[[REI\""))
+            .expect("flush event");
+        assert!(flush.starts_with("event: content_block_delta\n"), "{flush}");
+        assert!(flush.contains("\"type\":\"input_json_delta\""), "{flush}");
+        assert!(flush.contains("\"index\":0"), "{flush}");
+    }
+
+    #[test]
+    fn a_placeholder_completed_in_the_same_block_is_joined_as_before() {
+        let stream = [
+            cb_delta(0, "text_delta", "text", "hi [[REI"),
+            cb_delta(0, "text_delta", "text", "KI_TERM_aaaaaaaaaaaaaaaa]] there"),
+            cb_stop(0),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_owned(),
+        ]
+        .concat();
+        let out = run_stream(&[stream.as_bytes()]);
+        assert_eq!(
+            anthropic_deltas(&out),
+            vec![
+                (0, "text_delta".to_owned(), "hi ".to_owned()),
+                (0, "text_delta".to_owned(), "Falcon there".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_events_with_nothing_held_are_byte_exact() {
+        let stream = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n"
+                .to_owned(),
+            cb_delta(0, "text_delta", "text", "hello world"),
+            cb_stop(0),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_owned(),
+        ]
+        .concat();
+        let out = run_stream(&[stream.as_bytes()]);
+        assert_eq!(out, stream.as_bytes());
+    }
+
+    #[test]
+    fn an_openai_held_tail_flushes_as_a_chunk_before_done() {
+        let e = event("x [");
+        let out = String::from_utf8(run_stream(&[e.as_bytes(), b"data: [DONE]\n\n"])).unwrap();
+        let flush = out
+            .split("\n\n")
+            .find(|event| event.contains("\"content\":\"[\""))
+            .expect("flush event");
+        assert!(flush.starts_with("data: {"), "{flush}");
+        assert!(flush.contains("\"choices\":[{\"delta\":{"), "{flush}");
+        assert!(
+            out.find("\"content\":\"[\"").unwrap() < out.find("data: [DONE]").unwrap(),
+            "the flush must precede [DONE]:\n{out}"
+        );
+        assert_eq!(contents(out.as_bytes()), "x [");
     }
 }

@@ -15,6 +15,8 @@
 
 ### Fixed
 
+- The peers listener caps open connections per source address (`[peers] max_connections_per_addr`, default 4) and closes the connection after a 401 or 429.
+- Failed peer logins from loopback are locked out per address like any other, instead of a shared delay; tunnelled peers share that address. Session counts in the peers view are documented as client-reported.
 - Outbound shaping replaces its `body / 4` token estimate with the `usage` the response reports (JSON or SSE, uncompressed bodies); without usage the estimate stands.
 - Placeholder terms match inside JSON-escaped strings (`\u00fc`, `\n`) and mask to the same placeholder as the plain spelling; object keys are not scanned.
 - `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the health scope instead of skipping it; many paths on one model now escalate to a key cooldown.

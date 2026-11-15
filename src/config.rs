@@ -285,6 +285,8 @@ pub struct PeersConfig {
     pub max_subscribers_per_peer: u32,
     /// Open stream connections allowed for one peer token.
     pub max_subscribers_per_token: u32,
+    /// Open TCP connections allowed from one remote address.
+    pub max_connections_per_addr: u32,
     /// Published cooldowns are rounded up to a multiple of this; 0 publishes them exactly.
     pub cooldown_bucket_secs: u64,
     /// PEM certificate chain the peer listener serves HTTPS with; set with `tls_key`.
@@ -339,6 +341,8 @@ struct PeersSettings {
     max_subscribers_per_peer: u32,
     #[serde(default = "default_max_subscribers_per_token")]
     max_subscribers_per_token: u32,
+    #[serde(default = "default_max_connections_per_addr")]
+    max_connections_per_addr: u32,
     #[serde(default)]
     tokens: Vec<PeerToken>,
     #[serde(default = "default_cooldown_bucket_secs")]
@@ -357,6 +361,10 @@ fn default_cooldown_bucket_secs() -> u64 {
 
 fn default_max_subscribers_per_token() -> u32 {
     8
+}
+
+fn default_max_connections_per_addr() -> u32 {
+    4
 }
 
 fn default_stream_interval_secs() -> u64 {
@@ -443,6 +451,7 @@ impl TryFrom<toml::Table> for PeersConfig {
             max_subscribers: settings.max_subscribers,
             max_subscribers_per_peer: settings.max_subscribers_per_peer,
             max_subscribers_per_token: settings.max_subscribers_per_token,
+            max_connections_per_addr: settings.max_connections_per_addr,
             cooldown_bucket_secs: settings.cooldown_bucket_secs,
             tls_cert: settings.tls_cert,
             tls_key: settings.tls_key,
@@ -1566,6 +1575,12 @@ impl Config {
             return Some(format!(
                 "max_subscribers_per_token must be between 1 and 256, got {}",
                 peers.max_subscribers_per_token
+            ));
+        }
+        if !(1..=256).contains(&peers.max_connections_per_addr) {
+            return Some(format!(
+                "max_connections_per_addr must be between 1 and 256, got {}",
+                peers.max_connections_per_addr
             ));
         }
         let header = peers.session_header.as_str();
@@ -3134,6 +3149,7 @@ socket = "/run/forwarder.sock"
         assert_eq!(peers.stream_interval_secs, 5);
         assert_eq!(peers.max_subscribers, 16);
         assert_eq!(peers.max_subscribers_per_peer, 4);
+        assert_eq!(peers.max_connections_per_addr, 4);
         assert_eq!(peers.cooldown_bucket_secs, 300);
         assert!(Config::parse(&with_peers("[peers]\ncooldown_bucket_secs = 0\n")).is_ok());
         assert!(
@@ -3267,6 +3283,14 @@ socket = "/run/forwarder.sock"
             (
                 "[peers]\nmax_subscribers = 2\nmax_subscribers_per_peer = 3\n".to_owned(),
                 "max_subscribers_per_peer",
+            ),
+            (
+                "[peers]\nmax_connections_per_addr = 0\n".to_owned(),
+                "max_connections_per_addr",
+            ),
+            (
+                "[peers]\nmax_connections_per_addr = 257\n".to_owned(),
+                "max_connections_per_addr",
             ),
         ] {
             let reason = peers_error(&peers);

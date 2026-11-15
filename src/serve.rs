@@ -3,8 +3,10 @@
 //! `axum::serve` gives hyper no timer, so a client that never finishes its headers holds a
 //! connection open forever. This loop adds a header-read timeout and a cap on open connections.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -49,6 +51,56 @@ impl DropWarning {
     }
 }
 
+/// Open connections from one remote address, so one source cannot hold every global slot.
+struct AddrLimit {
+    limit: usize,
+    active: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl AddrLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<AddrSlot> {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = active.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(AddrSlot {
+            limit: Arc::clone(self),
+            ip,
+        })
+    }
+
+    fn release(&self, ip: IpAddr) {
+        let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = active.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&ip);
+            }
+        }
+    }
+}
+
+/// Holds one address slot until the connection ends.
+struct AddrSlot {
+    limit: Arc<AddrLimit>,
+    ip: IpAddr,
+}
+
+impl Drop for AddrSlot {
+    fn drop(&mut self) {
+        self.limit.release(self.ip);
+    }
+}
+
 /// Serves `router` until `shutdown` completes, refusing connections beyond `max_connections`.
 pub async fn serve(
     listener: TcpListener,
@@ -56,11 +108,33 @@ pub async fn serve(
     max_connections: usize,
     shutdown: impl Future<Output = ()>,
 ) {
-    serve_with(
+    run(
         listener,
         router,
         max_connections,
+        None,
         HEADER_READ_TIMEOUT,
+        None,
+        shutdown,
+    )
+    .await;
+}
+
+/// [`serve`] with a cap on open connections from each remote address.
+pub async fn serve_per_addr(
+    listener: TcpListener,
+    router: Router,
+    max_connections: usize,
+    max_connections_per_addr: usize,
+    shutdown: impl Future<Output = ()>,
+) {
+    run(
+        listener,
+        router,
+        max_connections,
+        Some(max_connections_per_addr),
+        HEADER_READ_TIMEOUT,
+        None,
         shutdown,
     )
     .await;
@@ -82,6 +156,28 @@ pub async fn serve_tls(
         listener,
         router,
         max_connections,
+        None,
+        HEADER_READ_TIMEOUT,
+        Some(tls),
+        shutdown,
+    )
+    .await;
+}
+
+/// [`serve_tls`] with a cap on open connections from each remote address.
+pub async fn serve_tls_per_addr(
+    listener: TcpListener,
+    router: Router,
+    max_connections: usize,
+    max_connections_per_addr: usize,
+    tls: TlsSource,
+    shutdown: impl Future<Output = ()>,
+) {
+    run(
+        listener,
+        router,
+        max_connections,
+        Some(max_connections_per_addr),
         HEADER_READ_TIMEOUT,
         Some(tls),
         shutdown,
@@ -101,6 +197,7 @@ pub async fn serve_with(
         listener,
         router,
         max_connections,
+        None,
         header_read_timeout,
         None,
         shutdown,
@@ -112,11 +209,13 @@ async fn run(
     listener: TcpListener,
     router: Router,
     max_connections: usize,
+    max_connections_per_addr: Option<usize>,
     header_read_timeout: Duration,
     tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()>,
 ) {
     let slots = Arc::new(Semaphore::new(max_connections));
+    let addr_limit = max_connections_per_addr.map(|limit| Arc::new(AddrLimit::new(limit)));
     tokio::pin!(shutdown);
     let mut drops = DropWarning::new();
     loop {
@@ -128,6 +227,19 @@ async fn run(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
+        let addr_slot = match &addr_limit {
+            Some(limit) => match limit.acquire(peer.ip()) {
+                Some(slot) => Some(slot),
+                None => {
+                    tracing::debug!(
+                        %peer,
+                        "per-address connection limit reached, dropping connection"
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
         let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
             if let Some(count) = drops.note(Instant::now()) {
                 tracing::warn!(%peer, count, "connection limit reached, dropping connections");
@@ -138,6 +250,7 @@ async fn run(
         let tls = tls.as_ref().map(|source| source());
         tokio::spawn(async move {
             let _slot = slot;
+            let _addr_slot = addr_slot;
             let result = match tls {
                 None => connection(stream, router, peer, header_read_timeout).await,
                 Some(config) => {
@@ -192,6 +305,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_per_address_limit_counts_open_connections_and_frees_slots() {
+        let limit = Arc::new(AddrLimit::new(2));
+        let a = "192.0.2.1".parse().unwrap();
+        let b = "192.0.2.2".parse().unwrap();
+        let first = limit.acquire(a).expect("first slot");
+        let second = limit.acquire(a).expect("second slot");
+        assert!(limit.acquire(a).is_none(), "the address limit is reached");
+        let other = limit.acquire(b).expect("another address has its own slots");
+        drop(second);
+        let again = limit
+            .acquire(a)
+            .expect("a closed connection frees its slot");
+        drop((first, again, other));
+        assert!(limit.acquire(a).is_some(), "every slot returned");
+        assert!(limit.acquire(b).is_some(), "and the other address too");
+    }
 
     #[test]
     fn the_connection_limit_warning_is_spaced_and_counts_the_drops() {

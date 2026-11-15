@@ -313,18 +313,32 @@ async fn key_labels_appear_only_when_exposed() {
 }
 
 #[tokio::test]
-async fn failed_peer_logins_from_loopback_never_lock_out_a_valid_token() {
-    // Every tunnelled peer arrives from loopback; per-address lockout is a unit test in the
-    // publisher with distinct addresses.
+async fn a_refused_peer_login_asks_to_close_the_connection() {
     let rig = Rig::new("").await;
-    let started = std::time::Instant::now();
-    for _ in 0..10 {
+    let res = rig
+        .client
+        .get(format!("{}/v1/health", rig.peer))
+        .bearer_auth("stale")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+    assert_eq!(
+        res.headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close")
+    );
+}
+
+#[tokio::test]
+async fn loopback_failures_lock_out_the_address_but_not_the_admin_listener() {
+    // Every tunnelled peer arrives from loopback, so a stale token locks out the other peers
+    // behind that address too. The peer listener's counts stay separate from the admin's.
+    let rig = Rig::new("").await;
+    for _ in 0..9 {
         assert_eq!(rig.peer_get("/v1/health", Some("stale")).await.0, 401);
     }
-    assert!(
-        started.elapsed() >= Duration::from_secs(4),
-        "each failure is slowed"
-    );
     let res = rig
         .client
         .get(format!("{}/v1/health", rig.peer))
@@ -332,7 +346,27 @@ async fn failed_peer_logins_from_loopback_never_lock_out_a_valid_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "a valid token still gets in");
+    assert_eq!(
+        res.status(),
+        200,
+        "below the threshold a valid token gets in"
+    );
+    assert_eq!(rig.peer_get("/v1/health", Some("stale")).await.0, 401);
+    let res = rig
+        .client
+        .get(format!("{}/v1/health", rig.peer))
+        .bearer_auth(PEER_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 429, "the address is locked out");
+    assert!(res.headers().contains_key(reqwest::header::RETRY_AFTER));
+    assert_eq!(
+        res.headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close")
+    );
     let res = rig
         .client
         .get(format!("{}/v1/status", rig.admin))
@@ -344,7 +378,7 @@ async fn failed_peer_logins_from_loopback_never_lock_out_a_valid_token() {
 }
 
 #[tokio::test]
-async fn a_stale_token_behind_the_shared_address_does_not_lock_out_another_peer() {
+async fn concurrent_stale_logins_still_lock_out_the_shared_address() {
     let second = "second-peer-token-behind-the-tunnel";
     let rig = Rig::new(&format!(
         "[[peers.tokens]]\nname = \"peer-b\"\ntoken_sha256 = \"{}\"\n",
@@ -353,12 +387,12 @@ async fn a_stale_token_behind_the_shared_address_does_not_lock_out_another_peer(
     .await;
     let stale = (0..12).map(|_| rig.peer_get("/v1/health", Some("revoked-token")));
     for (code, _) in futures_util::future::join_all(stale).await {
-        assert_eq!(code, 401);
+        assert!(matches!(code, 401 | 429), "{code}");
     }
     for token in [PEER_TOKEN, second] {
         assert_eq!(
             rig.peer_get("/v1/health", Some(token)).await.0,
-            200,
+            429,
             "{token}"
         );
     }

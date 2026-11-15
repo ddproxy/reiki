@@ -66,14 +66,20 @@ fn health_schema() -> Value {
                 },
             },
             "sessions": {
-                "description": "Only with expose_host_stats; streams only with expose_key_labels too",
+                "description": "Only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder",
                 "type": "object",
                 "properties": {
                     "window_seconds": {"type": "integer"},
-                    "active_sessions": {"type": "integer"},
+                    "active_sessions": {
+                        "type": "integer",
+                        "description": "Client-reported distinct values of session_header in the window, not a count of verified devices",
+                    },
                     "streams": {"type": "array", "items": {"type": "object", "properties": {
                         "stream": {"type": "string"},
-                        "active_sessions": {"type": "integer"},
+                        "active_sessions": {
+                            "type": "integer",
+                            "description": "Client-reported distinct values of session_header for this stream",
+                        },
                     }}},
                 },
             },

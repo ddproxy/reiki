@@ -12,4 +12,4 @@ pub mod tls;
 
 pub use openapi::openapi_paths;
 pub(crate) use publisher::TlsReload;
-pub use publisher::{router, serve, Publisher};
+pub use publisher::{router, serve, serve_with_per_addr, Publisher};

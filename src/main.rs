@@ -529,6 +529,11 @@ async fn main() {
         .peers
         .as_ref()
         .map_or(0, |peers| peers.max_subscribers as usize);
+    #[cfg(feature = "peers")]
+    let config_connections_per_addr = config
+        .peers
+        .as_ref()
+        .map_or(4, |peers| peers.max_connections_per_addr as usize);
     if peer_listen.as_deref() == Some(listen.as_str()) {
         fail("peers listen must differ from the client listen address");
     }
@@ -625,8 +630,13 @@ async fn main() {
         tracing::info!(%addr, "reiki peer health listening");
         // Room for every stream subscriber plus plain health polls.
         let max_open = config_subscribers + 16;
-        let served = reiki::peers::serve(peer_listener, Arc::clone(&app), max_open)
-            .unwrap_or_else(|e| fail(&format!("peers: {e}")));
+        let served = reiki::peers::serve_with_per_addr(
+            peer_listener,
+            Arc::clone(&app),
+            max_open,
+            config_connections_per_addr,
+        )
+        .unwrap_or_else(|e| fail(&format!("peers: {e}")));
         tokio::spawn(served);
     }
     if let Some(tunnel) = &tunnel_config {

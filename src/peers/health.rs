@@ -167,8 +167,8 @@ pub(crate) fn disk_dirs(app: &App, config: &Config) -> Vec<(&'static str, std::p
     dirs
 }
 
-/// Distinct session ids in the window: a total, and per stream only with `expose_key_labels`,
-/// since stream names identify clients.
+/// Client-reported distinct session ids in the window: a total, and per stream only with
+/// `expose_key_labels`, since stream names identify clients.
 pub(crate) fn sessions(app: &App, peers: &PeersConfig) -> Value {
     let window = Duration::from_secs(peers.session_window_secs);
     let counts = app

@@ -20,8 +20,6 @@ use super::sessions::Sessions;
 use super::stream::{ensure_ticker, Frames, Hub, Limits, Refused, HEARTBEAT, STREAM_PATH};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
-/// How long a failed login waits for its 401 when every caller shares one source address.
-const SHARED_FAILURE_DELAY: Duration = Duration::from_millis(500);
 
 /// The address a caller is told apart by, or `None` for one arriving from loopback. Tunnels
 /// (`ssh -L`, WireGuard forwarding) and a local TLS-terminating proxy all connect from loopback,
@@ -155,6 +153,16 @@ pub fn serve(
     app: Arc<App>,
     max_connections: usize,
 ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>, String> {
+    serve_with_per_addr(listener, app, max_connections, 4)
+}
+
+/// [`serve`] with an explicit cap on open connections per remote address.
+pub fn serve_with_per_addr(
+    listener: tokio::net::TcpListener,
+    app: Arc<App>,
+    max_connections: usize,
+    max_connections_per_addr: usize,
+) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>, String> {
     let loaded = match app.snapshot().config.peers.as_ref() {
         Some(peers) => super::tls::load(peers)?,
         None => None,
@@ -164,10 +172,11 @@ pub fn serve(
     let routes = router(app);
     let shutdown = std::future::pending();
     let Some(loaded) = loaded else {
-        return Ok(Box::pin(crate::serve::serve(
+        return Ok(Box::pin(crate::serve::serve_per_addr(
             listener,
             routes,
             max_connections,
+            max_connections_per_addr,
             shutdown,
         )));
     };
@@ -178,10 +187,11 @@ pub fn serve(
             .current_tls()
             .unwrap_or_else(|| Arc::clone(&fallback))
     });
-    Ok(Box::pin(crate::serve::serve_tls(
+    Ok(Box::pin(crate::serve::serve_tls_per_addr(
         listener,
         routes,
         max_connections,
+        max_connections_per_addr,
         source,
         shutdown,
     )))
@@ -208,16 +218,23 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return not_found();
     }
     let peer = req.extensions().get::<Peer>().map(|p| p.0);
-    let token = match authorize(&app, peers, peer, req.headers()).await {
-        Ok(token) => token,
-        Err(refusal) => return *refusal,
+    let mut response = match authorize(&app, peers, peer, req.headers()).await {
+        Ok(token) if path == STREAM_PATH => subscribe(&app, peers, peer, token).await,
+        Ok(_) => {
+            let body = super::health::document(&app, peers).await.to_string();
+            text_response(StatusCode::OK, "application/json", body)
+        }
+        Err(refusal) => *refusal,
     };
-    let mut response = if path == STREAM_PATH {
-        subscribe(&app, peers, peer, token).await
-    } else {
-        let body = super::health::document(&app, peers).await.to_string();
-        text_response(StatusCode::OK, "application/json", body)
-    };
+    // Never let a refused credential keep a keep-alive slot alive for the next guess.
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -281,11 +298,10 @@ async fn subscribe(
 /// opens this listener, and returns the matching token's name. Failures are logged with the peer
 /// address, never the token.
 ///
-/// From a distinct address, failures count per address (IPv6 by /64) and lock it out as on the
-/// other listeners. From loopback, where every tunnelled peer shares the address, they count in
-/// one shared bucket that only delays each failed attempt and never refuses a valid token, so
-/// one peer with a stale token cannot lock the others out. A success never clears a count here,
-/// so valid requests between guesses do not reset it.
+/// Failures count per source address (IPv6 by /64), loopback included, and lock that address out
+/// as on the other listeners. A success never clears a count here, so valid requests between
+/// guesses do not reset it. Peers behind one tunnel share the loopback address and therefore its
+/// lockout; keep tokens high entropy so a stale one is not guessed.
 async fn authorize<'a>(
     app: &App,
     peers: &'a PeersConfig,
@@ -293,12 +309,10 @@ async fn authorize<'a>(
     headers: &HeaderMap,
 ) -> Result<&'a str, Box<Response>> {
     let logins = app.peer_publisher().logins();
-    let source = distinct_source(peer);
-    if let Some(ip) = source {
-        if let Some(wait) = logins.blocked(ip, Instant::now()) {
-            tracing::warn!(?peer, "too many failed peer logins, refusing");
-            return Err(Box::new(throttled(wait)));
-        }
+    let key = peer.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    if let Some(wait) = logins.blocked(key, Instant::now()) {
+        tracing::warn!(?peer, "too many failed peer logins, refusing");
+        return Err(Box::new(throttled(wait)));
     }
     match token_matches(peers, headers) {
         Ok(name) => {
@@ -306,19 +320,8 @@ async fn authorize<'a>(
             Ok(name)
         }
         Err(reason) => {
-            let key = source.unwrap_or(IpAddr::from([0, 0, 0, 0]));
             let failures = logins.fail(key, Instant::now());
-            if source.is_some() {
-                tracing::warn!(?peer, reason, failures, "failed peer login");
-            } else {
-                tracing::warn!(
-                    ?peer,
-                    reason,
-                    shared_failures = failures,
-                    "failed peer login from loopback"
-                );
-                tokio::time::sleep(SHARED_FAILURE_DELAY).await;
-            }
+            tracing::warn!(?peer, reason, failures, "failed peer login");
             Err(Box::new(unauthorized()))
         }
     }
@@ -439,41 +442,37 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn loopback_failures_are_shared_slowed_and_never_lock_out_a_valid_token() {
-        let app = app();
-        let started = Instant::now();
-        let failures: Vec<_> = (0..12)
-            .map(|i| {
-                let app = Arc::clone(&app);
-                let ip = if i % 2 == 0 { "127.0.0.1" } else { "::1" };
-                tokio::spawn(async move { status(&app, ip, "stale-token").await })
-            })
-            .collect();
-        for failure in failures {
-            assert_eq!(failure.await.unwrap(), 401);
+    async fn refusal(app: &App, ip: &str, token: &str) -> Response {
+        let snapshot = app.snapshot();
+        let peers = snapshot.config.peers.as_ref().unwrap();
+        match authorize(app, peers, Some(ip.parse().unwrap()), &bearer(token)).await {
+            Ok(_) => panic!("expected a refusal"),
+            Err(response) => *response,
         }
-        assert!(
-            started.elapsed() >= SHARED_FAILURE_DELAY,
-            "each failure is delayed"
+    }
+
+    #[tokio::test]
+    async fn loopback_failures_lock_out_the_address_even_for_a_valid_token() {
+        let app = app();
+        for _ in 0..9 {
+            assert_eq!(status(&app, "127.0.0.1", "stale-token").await, 401);
+        }
+        assert_eq!(
+            status(&app, "127.0.0.1", GOOD).await,
+            200,
+            "below the threshold a valid token still gets in"
         );
-        let started = Instant::now();
-        assert_eq!(status(&app, "127.0.0.1", GOOD).await, 200);
-        assert_eq!(status(&app, "127.0.0.1", OTHER).await, 200);
-        assert_eq!(status(&app, "::ffff:127.0.0.1", OTHER).await, 200);
+        assert_eq!(status(&app, "127.0.0.1", "stale-token").await, 401);
+        let response = refusal(&app, "127.0.0.1", GOOD).await;
+        assert_eq!(response.status(), 429);
         assert!(
-            started.elapsed() < SHARED_FAILURE_DELAY,
-            "no delay for a valid token"
+            response.headers().contains_key(header::RETRY_AFTER),
+            "the lockout says when to retry"
         );
-        let shared = app
-            .peer_publisher()
-            .logins()
-            .fail(IpAddr::from([0, 0, 0, 0]), Instant::now());
-        assert_eq!(shared, 13, "every loopback failure went to one bucket");
         assert_eq!(
             status(&app, "192.0.2.9", GOOD).await,
             200,
-            "and none to a distinct address"
+            "a distinct address has its own count"
         );
     }
 }

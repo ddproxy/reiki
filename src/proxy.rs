@@ -23,7 +23,7 @@ use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
 use crate::rewrite::{request_model, rewrite_body};
-use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit};
+use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
 use crate::shaper::headers::{observe, Observed};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
@@ -1419,6 +1419,9 @@ fn remember_wait(smallest: &mut Option<Duration>, wait: Duration) {
 
 /// True when `now`'s snapshot holds the same facts as the one saved at `saved_at`;
 /// a pause or closed window simply running down is not a change.
+/// How long quota counters may drift from the saved copy before they are saved again.
+const COUNTER_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
 fn shaper_unchanged(
     saved: &BTreeMap<String, BucketSnapshot>,
     saved_at: SystemTime,
@@ -1432,12 +1435,28 @@ fn shaper_unchanged(
     saved.iter().all(|(key, old)| {
         current.get(key).is_some_and(|new| {
             old.learned_rpm == new.learned_rpm
-                && old.daily == new.daily
-                && old.monthly == new.monthly
+                && same_counters(old.daily, new.daily, elapsed)
+                && same_counters(old.monthly, new.monthly, elapsed)
                 && same_remaining(old.pause, new.pause, elapsed)
                 && same_remaining(old.closed, new.closed, elapsed)
         })
     })
+}
+
+/// Quota counters move with every request, so only a new window or a long enough gap counts
+/// as a change; otherwise every success on a daily-limited key would rewrite the state file.
+fn same_counters(
+    saved: Option<QuotaSnapshot>,
+    current: Option<QuotaSnapshot>,
+    elapsed: Duration,
+) -> bool {
+    match (saved, current) {
+        (None, None) => true,
+        (Some(old), Some(new)) => {
+            old.start == new.start && (old == new || elapsed < COUNTER_SAVE_INTERVAL)
+        }
+        _ => false,
+    }
 }
 
 fn same_remaining(saved: Option<Duration>, current: Option<Duration>, elapsed: Duration) -> bool {
@@ -1518,6 +1537,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     let mut confirmed: Vec<String> = Vec::new();
     // The shortest wait any shaped-out key reported, for the local 429.
     let mut shaped_wait: Option<Duration> = None;
+    // Time already slept on this request, across keys: the wait budget is per request.
+    let mut waited = Duration::ZERO;
     for _ in 0..max_attempts {
         let Some(key_name) =
             snapshot.pick(&app.health, stream, upstream_name, &skip, scope.as_ref())
@@ -1553,7 +1574,6 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             .shaper
             .get(&key_name)
             .map_or(Duration::ZERO, |(_, wait)| wait);
-        let mut waited = Duration::ZERO;
         let mut rounds = 0;
         loop {
             match app
@@ -1761,12 +1781,16 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             if let (Some(bucket), Some(observed)) = (&shaping, observed) {
                 let now = app.wall_now();
                 note_reported_remaining(bucket, observed, now);
+                // A failure that only cools one model on the key says nothing about the
+                // key's own budget, so it must not pause or close the whole bucket.
                 if let Outcome::KeyFailure(class) = outcome {
+                    let key_wide =
+                        failure_scope(class, Some(status.as_u16()), scope.as_ref()).is_none();
                     match class {
-                        FailureClass::RateLimited(retry_after) => {
+                        FailureClass::RateLimited(retry_after) if key_wide => {
                             bucket.note_rate_limited(now, retry_after);
                         }
-                        FailureClass::QuotaExhausted => {
+                        FailureClass::QuotaExhausted if key_wide => {
                             let cooldown = quota_cooldown(snapshot, &key_name, class, now)
                                 .unwrap_or(app.policy.quota_exhausted);
                             if let Some(until) = now.checked_add(cooldown) {

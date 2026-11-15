@@ -19,28 +19,52 @@ pub fn rewrite_body(body: Bytes, aliases: &BTreeMap<String, String>, drop: &[Str
 /// Most bytes a model name may have before it is treated as unusable for scoping.
 const MAX_MODEL_BYTES: usize = 128;
 
+/// Members scanned before `request_model` gives up, so a body of millions of tiny members
+/// costs a bounded scan.
+const MAX_SCANNED_MEMBERS: usize = 4096;
+
 /// The top-level `model` string of a request body, decoded. `None` for a missing,
-/// non-string or over-long model, or a body that is not a JSON object.
+/// non-string or over-long model, a body that is not a JSON object, a body with several
+/// `model` members (parsers disagree on which one wins) or one with too many members.
 pub(crate) fn request_model(body: &[u8]) -> Option<String> {
-    let members = top_level_members(body)?;
-    let member = members.iter().find(|member| {
-        let key = &body[member.start..member.key_end];
-        if member.key.contains(&b'\\') {
-            decode_json_string(key).as_deref() == Some("model")
-        } else {
-            member.key == b"model"
+    let mut found: Option<(usize, usize, usize, bool)> = None;
+    let mut seen = 0usize;
+    let mut ambiguous = false;
+    scan_members(body, |start, key_end, value_start, value_end, is_string| {
+        seen += 1;
+        if seen > MAX_SCANNED_MEMBERS {
+            ambiguous = true;
+            return false;
         }
+        let key = &body[start + 1..key_end - 1];
+        let is_model = if key.contains(&b'\\') {
+            decode_json_string(&body[start..key_end]).as_deref() == Some("model")
+        } else {
+            key == b"model"
+        };
+        if is_model {
+            if found.is_some() {
+                ambiguous = true;
+                return false;
+            }
+            found = Some((value_start, value_end, start, is_string));
+        }
+        true
     })?;
-    if !member.is_string {
+    if ambiguous {
         return None;
     }
-    let raw = &body[member.value_start + 1..member.value_end - 1];
+    let (value_start, value_end, _, is_string) = found?;
+    if !is_string {
+        return None;
+    }
+    let raw = &body[value_start + 1..value_end - 1];
     // Every escape shrinks by at most sixfold, so this bounds the decoded allocation.
     if raw.len() > MAX_MODEL_BYTES * 6 {
         return None;
     }
     let model = if raw.contains(&b'\\') {
-        decode_json_string(&body[member.value_start..member.value_end])?
+        decode_json_string(&body[value_start..value_end])?
     } else {
         std::str::from_utf8(raw).ok()?.to_owned()
     };
@@ -137,45 +161,60 @@ fn rewrite(body: &[u8], aliases: &BTreeMap<String, String>, drop: &[String]) -> 
     Some(out)
 }
 
-fn top_level_members(body: &[u8]) -> Option<Vec<Member>> {
+/// Calls `visit(start, key_end, value_start, value_end, is_string)` for each top-level member
+/// of the JSON object in `body`; `visit` returns false to stop early. `None` for a body that
+/// is not one well-formed object (a scan stopped early is not checked to the end).
+fn scan_members(
+    body: &[u8],
+    mut visit: impl FnMut(usize, usize, usize, usize, bool) -> bool,
+) -> Option<()> {
     let mut i = skip_ws(body, 0);
     if body.get(i) != Some(&b'{') {
         return None;
     }
     i += 1;
-    let mut members = Vec::new();
     loop {
         i = skip_ws(body, i);
         if body.get(i) == Some(&b'}') {
-            return (skip_ws(body, i + 1) == body.len()).then_some(members);
+            return (skip_ws(body, i + 1) == body.len()).then_some(());
         }
         if body.get(i) != Some(&b'"') {
             return None;
         }
         let start = i;
         let key_end = scan_string(body, i)?;
-        let key = body[start + 1..key_end - 1].to_vec();
         i = skip_ws(body, key_end);
         if body.get(i) != Some(&b':') {
             return None;
         }
         i = skip_ws(body, i + 1);
         let (value_end, is_string) = scan_value(body, i)?;
-        members.push(Member {
-            start,
-            key_end,
-            value_start: i,
-            value_end,
-            key,
-            is_string,
-        });
+        if !visit(start, key_end, i, value_end, is_string) {
+            return Some(());
+        }
         i = skip_ws(body, value_end);
         match body.get(i) {
             Some(b',') => i += 1,
-            Some(b'}') => return (skip_ws(body, i + 1) == body.len()).then_some(members),
+            Some(b'}') => return (skip_ws(body, i + 1) == body.len()).then_some(()),
             _ => return None,
         }
     }
+}
+
+fn top_level_members(body: &[u8]) -> Option<Vec<Member>> {
+    let mut members = Vec::new();
+    scan_members(body, |start, key_end, value_start, value_end, is_string| {
+        members.push(Member {
+            start,
+            key_end,
+            value_start,
+            value_end,
+            key: body[start + 1..key_end - 1].to_vec(),
+            is_string,
+        });
+        true
+    })?;
+    Some(members)
 }
 
 fn scan_value(body: &[u8], i: usize) -> Option<(usize, bool)> {
@@ -391,10 +430,21 @@ mod tests {
         assert_eq!(request_model(br#"{"messages":[{"model":"nested"}]}"#), None);
         assert_eq!(request_model(br#"{"model":123}"#), None);
         assert_eq!(request_model(br#"{"model":null}"#), None);
-        assert_eq!(
-            request_model(br#"{"model":"one","model":"two"}"#).as_deref(),
-            Some("one")
+    }
+
+    #[test]
+    fn request_model_refuses_what_parsers_could_read_two_ways() {
+        // Parsers disagree on which duplicate member wins, so there is no single model.
+        assert_eq!(request_model(br#"{"model":"a","model":"b"}"#), None);
+        assert_eq!(request_model(br#"{"model":"a","mo\u0064el":"b"}"#), None);
+        // A body of countless tiny members is not scanned to the end.
+        let many = format!(
+            "{{{}\"model\":\"x\"}}",
+            "\"a\":1,".repeat(MAX_SCANNED_MEMBERS)
         );
+        assert_eq!(request_model(many.as_bytes()), None);
+        let few = format!("{{{}\"model\":\"x\"}}", "\"a\":1,".repeat(100));
+        assert_eq!(request_model(few.as_bytes()).as_deref(), Some("x"));
     }
 
     #[test]

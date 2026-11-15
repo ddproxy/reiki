@@ -758,8 +758,7 @@ impl Default for LimitsConfig {
 impl LimitsConfig {
     /// The window these limits describe and how long a request may wait for a slot.
     /// The preset seeds the window; explicit fields are applied on top.
-    /// Zero fields leave the preset's value (or unlimited) in place: a zero
-    /// cannot be told apart from an unset field, and zero means unlimited.
+    /// An explicit zero means unlimited and overrides the preset's value for that field.
     pub fn to_window(&self) -> Result<(bucket::Window, Duration), String> {
         let mut window = bucket::Window::default();
         if let Some(name) = &self.preset {

@@ -182,7 +182,7 @@ impl Bucket {
         s.paused_until = snapshot
             .pause
             .filter(|d| !d.is_zero())
-            .map(|d| now + d.min(MAX_RESTORED_STATE));
+            .map(|d| now + d.min(MAX_PAUSE));
         s.closed_until = snapshot
             .closed
             .filter(|d| !d.is_zero())
@@ -962,7 +962,7 @@ mod tests {
         let saved = b.snapshot(t0);
         // A cap at the ceiling is stored as no learned cap.
         assert_eq!(saved.learned_rpm, None);
-        assert_eq!(saved.pause, Some(MAX_RESTORED_STATE));
+        assert_eq!(saved.pause, Some(MAX_PAUSE));
         assert_eq!(saved.closed, Some(MAX_RESTORED_STATE));
         assert_eq!(
             saved.daily,

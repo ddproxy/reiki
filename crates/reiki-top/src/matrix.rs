@@ -96,9 +96,14 @@ impl HostSummary {
 pub struct Row {
     pub peer: String,
     pub cells: Vec<Cell>,
+    /// Cooling combinations per column, in column order; 0 where the peer has no such upstream
+    /// or its data is stale.
+    pub combos: Vec<u32>,
     pub host: HostSummary,
     pub error: Option<String>,
     pub stale: bool,
+    /// How long ago this host received the peer's data; `None` when it never did.
+    pub age: Option<Duration>,
 }
 
 /// The matrix itself. `build` keeps the caller's peer order in `rows`;
@@ -142,30 +147,30 @@ impl Matrix {
         let mut rows = Vec::with_capacity(peers.len());
         for name in peers {
             let view = fleet.peer(name, now);
-            let stale = view.as_ref().is_none_or(|v| v.stale);
-            let host = view
-                .as_ref()
+            let fresh = view.as_ref().filter(|v| !v.stale);
+            let upstream = |col: &Column| {
+                fresh.and_then(|v| v.health.upstreams.iter().find(|u| u.name == col.upstream))
+            };
+            let host = fresh
                 .map(|v| HostSummary::from_health(v.health))
                 .unwrap_or_default();
-            let cells = columns
-                .iter()
-                .map(|col| match &view {
-                    None => Cell::Stale,
-                    Some(v) if v.stale => Cell::Stale,
-                    Some(v) => v
-                        .health
-                        .upstreams
-                        .iter()
-                        .find(|u| u.name == col.upstream)
-                        .map_or(Cell::Absent, cell_of),
-                })
-                .collect();
             rows.push(Row {
                 peer: name.clone(),
-                cells,
+                cells: columns
+                    .iter()
+                    .map(|col| match fresh {
+                        None => Cell::Stale,
+                        Some(_) => upstream(col).map_or(Cell::Absent, cell_of),
+                    })
+                    .collect(),
+                combos: columns
+                    .iter()
+                    .map(|col| upstream(col).map_or(0, |u| u.cooling_combinations))
+                    .collect(),
                 host,
                 error: fleet.error(name).map(str::to_owned),
-                stale,
+                stale: fresh.is_none(),
+                age: view.as_ref().map(|v| v.age),
             });
         }
         for (i, col) in columns.iter_mut().enumerate() {
@@ -184,14 +189,21 @@ pub fn order_peers(matrix: &Matrix) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..matrix.rows.len()).collect();
     idx.sort_by(|&a, &b| {
         let (ra, rb) = (&matrix.rows[a], &matrix.rows[b]);
-        problem(rb)
-            .cmp(&problem(ra))
+        is_problem(rb)
+            .cmp(&is_problem(ra))
             .then_with(|| ra.peer.cmp(&rb.peer))
     });
     idx
 }
 
-fn problem(row: &Row) -> bool {
+/// Maps a display position to a position in `0..len`, wrapping, so a selection left over from a
+/// longer list still points at a row. `None` when there are no rows.
+pub fn resolve(selected: Option<usize>, len: usize) -> Option<usize> {
+    (len > 0).then(|| selected.unwrap_or(0) % len)
+}
+
+/// Whether a row needs attention: stale, or any cell that is not fully healthy or absent.
+pub fn is_problem(row: &Row) -> bool {
     row.stale
         || row.cells.iter().any(|c| {
             matches!(
@@ -219,12 +231,14 @@ pub enum Metric {
 
 /// Per-peer ring buffer of samples. Bounded: `capacity` samples per peer, at most 64 peers
 /// (least recently pushed dropped first).
+#[derive(Clone)]
 pub struct History {
     capacity: usize,
     seq: u64,
     peers: HashMap<String, Ring>,
 }
 
+#[derive(Clone)]
 struct Ring {
     samples: VecDeque<Sample>,
     last_push: u64,
@@ -341,7 +355,7 @@ fn cell_of(upstream: &Upstream) -> Cell {
 }
 
 /// The class of the labelled cooling key with the soonest cooldown, when labels are published.
-fn cooldown_class(upstream: &Upstream) -> Option<String> {
+pub fn cooldown_class(upstream: &Upstream) -> Option<String> {
     upstream
         .keys
         .as_ref()?
@@ -774,6 +788,81 @@ mod tests {
         let b = Matrix::build(&f, &peers, t0);
         assert_eq!(a, b);
         assert_eq!(order_peers(&a), order_peers(&b));
+    }
+
+    #[test]
+    fn cooling_combinations_are_carried_per_column_and_zero_when_absent() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(
+                r#"{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    "soonest_cooldown_seconds":null,"last_status_class":null,
+                    "cooling_combinations":2}"#,
+            ),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &doc(
+                r#"{"name":"gem","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    "soonest_cooldown_seconds":null,"last_status_class":null,
+                    "cooling_combinations":5}"#,
+            ),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-c",
+            &doc(
+                r#"{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    "soonest_cooldown_seconds":null,"last_status_class":null,
+                    "cooling_combinations":9}"#,
+            ),
+            t0 - Duration::from_secs(91),
+        );
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0);
+        assert_eq!(
+            m.columns
+                .iter()
+                .map(|c| c.upstream.as_str())
+                .collect::<Vec<_>>(),
+            ["zen", "gem"],
+            "the stale peer still names zen, so it has two peers"
+        );
+        assert_eq!(m.rows[0].combos, vec![2, 0]);
+        assert_eq!(m.rows[1].combos, vec![0, 5], "absent is zero");
+        assert_eq!(m.rows[2].combos, vec![0, 0], "stale data counts nothing");
+    }
+
+    #[test]
+    fn rows_carry_their_age_and_never_seen_peers_have_none() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &doc(&upstream("zen", 1, 0, 0)), t0);
+        add(
+            &mut f,
+            "peer-b",
+            &doc(&upstream("zen", 1, 0, 0)),
+            t0 - Duration::from_secs(91),
+        );
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0);
+        assert_eq!(m.rows[0].age, Some(Duration::ZERO));
+        assert_eq!(m.rows[1].age, Some(Duration::from_secs(91)));
+        assert_eq!(m.rows[2].age, None);
+    }
+
+    #[test]
+    fn resolve_wraps_and_has_no_rows_for_an_empty_list() {
+        assert_eq!(resolve(None, 3), Some(0));
+        assert_eq!(resolve(Some(1), 3), Some(1));
+        assert_eq!(resolve(Some(4), 3), Some(1), "wraps past the end");
+        assert_eq!(resolve(Some(usize::MAX), 3), Some(usize::MAX % 3));
+        assert_eq!(resolve(Some(0), 0), None);
+        assert_eq!(resolve(None, 0), None);
     }
 
     #[test]

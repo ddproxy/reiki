@@ -105,8 +105,9 @@ enum Command {
     /// Show a live terminal view of every `[peers.<name>]` instance's key health.
     ///
     /// Follows each peer's `/v1/health/stream`, polling while a stream is down, and draws a
-    /// provider summary and one card per peer. `--once` polls once and prints plain text. Needs
-    /// the `top` build feature and an enabled `[peers]` table with at least one peer.
+    /// peers-by-providers matrix with the selected peer's detail below it. `--once` polls once
+    /// and prints plain text. `--full` shows the per-peer text view instead. Needs the `top`
+    /// build feature and an enabled `[peers]` table with at least one peer.
     #[cfg(feature = "top")]
     Top {
         /// Poll every peer once, print the fleet as plain text and exit.
@@ -115,6 +116,9 @@ enum Command {
         /// Seconds between redraws; the default is 1.
         #[arg(long)]
         interval: Option<u64>,
+        /// Show the per-peer text view instead of the matrix.
+        #[arg(long)]
+        full: bool,
     },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
@@ -460,9 +464,14 @@ async fn main() {
         std::process::exit(reiki::peers::client::run(config.peers.as_ref(), *json, *watch).await);
     }
     #[cfg(feature = "top")]
-    if let Some(Command::Top { once, interval }) = &cli.command {
+    if let Some(Command::Top {
+        once,
+        interval,
+        full,
+    }) = &cli.command
+    {
         let config = load_peers_config(&cli.config);
-        std::process::exit(reiki::top::run(config.peers.as_ref(), *once, *interval).await);
+        std::process::exit(reiki::top::run(config.peers.as_ref(), *once, *interval, *full).await);
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();

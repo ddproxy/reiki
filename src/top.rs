@@ -5,9 +5,11 @@
 //! stream fails. The reducer turns those messages into a [`Fleet`]; the view model and the
 //! ratatui layer live in the dependency-free `reiki-top` crate.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
+use reiki_top::matrix::{is_problem, order_peers, resolve, History, HostSummary, Matrix, Sample};
 use reiki_top::ui::{self, crossterm, ratatui};
 use reiki_top::{view, Fleet, Health};
 use tokio::sync::mpsc;
@@ -28,8 +30,14 @@ pub(crate) enum FeedEvent {
     Down(String),
 }
 
-/// The `reiki top` command: validates the `[peers]` config, then runs once or live.
-pub async fn run(peers: Option<&PeersConfig>, once: bool, interval: Option<u64>) -> i32 {
+/// The `reiki top` command: validates the `[peers]` config, then runs once or live. `full`
+/// selects the per-peer text view instead of the matrix.
+pub async fn run(
+    peers: Option<&PeersConfig>,
+    once: bool,
+    interval: Option<u64>,
+    full: bool,
+) -> i32 {
     let peers = match client::ready(peers) {
         Ok(peers) => peers,
         Err(e) => {
@@ -38,20 +46,25 @@ pub async fn run(peers: Option<&PeersConfig>, once: bool, interval: Option<u64>)
         }
     };
     if once {
-        run_once(peers).await
+        run_once(peers, full).await
     } else {
-        run_live(peers, interval).await
+        run_live(peers, interval, full).await
     }
 }
 
 /// Polls every peer once, prints the fleet as plain text and returns 0 when at least one peer
 /// answered, 1 when none did.
-pub async fn run_once(peers: &PeersConfig) -> i32 {
-    run_once_to(peers, &mut io::stdout(), &mut io::stderr()).await
+pub async fn run_once(peers: &PeersConfig, full: bool) -> i32 {
+    run_once_to(peers, full, &mut io::stdout(), &mut io::stderr()).await
 }
 
 /// [`run_once`] with the output handles passed in, so tests need no terminal.
-async fn run_once_to(peers: &PeersConfig, out: &mut impl Write, err: &mut impl Write) -> i32 {
+async fn run_once_to(
+    peers: &PeersConfig,
+    full: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
     let poll = Duration::from_secs(peers.poll_interval_secs);
     let names: Vec<String> = peers.peers.keys().cloned().collect();
     let mut tasks = Vec::new();
@@ -88,7 +101,13 @@ async fn run_once_to(peers: &PeersConfig, out: &mut impl Write, err: &mut impl W
         }
     }
 
-    let lines = view::render(&fleet, &names, Instant::now(), 100);
+    // No history on a single poll, so the matrix draws no sparklines.
+    let lines = if full {
+        view::render(&fleet, &names, now, 100)
+    } else {
+        let matrix = Matrix::build(&fleet, &names, now);
+        view::render_matrix(&matrix, &History::new(0), None, 100)
+    };
     for line in lines {
         let _ = writeln!(out, "{}", line.plain_text());
     }
@@ -229,7 +248,7 @@ impl<C: ScreenControl> Drop for Guard<C> {
 type Screen = ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>;
 
 /// Follows the feeds and draws the fleet until the user quits.
-pub async fn run_live(peers: &PeersConfig, interval: Option<u64>) -> i32 {
+pub async fn run_live(peers: &PeersConfig, interval: Option<u64>, full: bool) -> i32 {
     if !io::stdout().is_terminal() {
         eprintln!("reiki: stdout is not a terminal; use `reiki top --once`");
         return 2;
@@ -260,11 +279,27 @@ pub async fn run_live(peers: &PeersConfig, interval: Option<u64>) -> i32 {
         }
     };
     let redraw = Duration::from_secs(interval.unwrap_or(1).max(1));
-    let code = live_loop(&mut terminal, peers, rx, redraw).await;
+    let code = live_loop(&mut terminal, peers, rx, redraw, full).await;
     for task in tasks {
         task.abort();
     }
     code
+}
+
+/// The picture pause keeps: the fleet and the sparkline history as they were when paused.
+#[derive(Clone)]
+struct Frozen {
+    fleet: Fleet,
+    history: History,
+    at: Instant,
+}
+
+fn freeze(fleet: &Fleet, history: &History, at: Instant) -> Frozen {
+    Frozen {
+        fleet: fleet.clone(),
+        history: history.clone(),
+        at,
+    }
 }
 
 async fn live_loop(
@@ -272,14 +307,24 @@ async fn live_loop(
     peers: &PeersConfig,
     mut rx: mpsc::Receiver<(String, FeedEvent)>,
     redraw: Duration,
+    full: bool,
 ) -> i32 {
     let poll = Duration::from_secs(peers.poll_interval_secs);
     let all: Vec<String> = peers.peers.keys().cloned().collect();
     let mut fleet = Fleet::new(poll.saturating_mul(3));
-    let mut state = ui::UiState::default();
+    let mut history = History::new(History::DEFAULT_CAPACITY);
+    let mut last_sample: HashMap<String, Instant> = HashMap::new();
+    let mut state = ui::UiState {
+        mode: if full {
+            ui::Mode::Full
+        } else {
+            ui::Mode::Matrix
+        },
+        ..ui::UiState::default()
+    };
     // Pause freezes the picture, not just the redraws, so a peer that goes quiet cannot keep
     // looking fresh on a screen that is minutes old.
-    let mut frozen: Option<(Fleet, Instant)> = None;
+    let mut frozen: Option<Frozen> = None;
 
     #[cfg(unix)]
     let mut terminate =
@@ -304,8 +349,14 @@ async fn live_loop(
             },
             // Return so the guard puts the terminal back before the process ends.
             () = terminated(&mut terminate) => return 0,
-            // Also while paused, so the age of the frozen picture keeps counting.
-            _ = frame_tick.tick() => draw_now = true,
+            // Also while paused, so the age of the frozen picture keeps counting. Samples
+            // come from the redraw tick, not from feed events, so a chatty peer gets no more.
+            _ = frame_tick.tick() => {
+                if frozen.is_none() {
+                    sample_fleet(&mut history, &fleet, &all, Instant::now(), &mut last_sample, redraw);
+                }
+                draw_now = true;
+            }
             _ = key_tick.tick() => loop {
                 match crossterm::event::poll(Duration::ZERO) {
                     Ok(true) => {}
@@ -328,22 +379,25 @@ async fn live_loop(
                 let Some(action) = ui::map_key(key) else {
                     continue;
                 };
-                let (shown, shown_at) = match &frozen {
-                    Some((snapshot, at)) => (snapshot, *at),
-                    None => (&fleet, Instant::now()),
+                let (shown, shown_history, shown_at) = match &frozen {
+                    Some(f) => (&f.fleet, &f.history, f.at),
+                    None => (&fleet, &history, Instant::now()),
                 };
-                let (total, viewport) = match measure(terminal, shown, shown_at, &all, &state) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        eprintln!("reiki: cannot size the terminal: {e}");
-                        return 1;
-                    }
-                };
-                if !apply_action(&mut state, action, &all, total, viewport) {
+                let (total, viewport) =
+                    match measure(terminal, shown, shown_history, shown_at, &all, &state) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("reiki: cannot size the terminal: {e}");
+                            return 1;
+                        }
+                    };
+                let problem = selected_peer(shown, &all, shown_at, state.selected)
+                    .is_some_and(|(_, problem)| problem);
+                if !apply_action(&mut state, action, &all, total, viewport, problem) {
                     return 0;
                 }
                 match (state.paused, frozen.is_some()) {
-                    (true, false) => frozen = Some((fleet.clone(), Instant::now())),
+                    (true, false) => frozen = Some(freeze(&fleet, &history, Instant::now())),
                     (false, true) => frozen = None,
                     _ => {}
                 }
@@ -351,11 +405,17 @@ async fn live_loop(
             },
         }
         if draw_now {
-            let (shown, shown_at, paused_for) = match &frozen {
-                Some((snapshot, at)) => (snapshot, *at, Some(at.elapsed())),
-                None => (&fleet, Instant::now(), None),
+            let (shown, shown_history, shown_at, paused_for) = match &frozen {
+                Some(f) => (&f.fleet, &f.history, f.at, Some(f.at.elapsed())),
+                None => (&fleet, &history, Instant::now(), None),
             };
-            if let Err(e) = render_screen(terminal, shown, shown_at, paused_for, &all, &state) {
+            let shown = Shown {
+                fleet: shown,
+                history: shown_history,
+                now: shown_at,
+                paused_for,
+            };
+            if let Err(e) = render_screen(terminal, &shown, &all, &state) {
                 eprintln!("reiki: cannot draw: {e}");
                 return 1;
             }
@@ -378,20 +438,35 @@ async fn terminated(_signal: &mut Option<()>) {
     std::future::pending::<()>().await;
 }
 
-/// Applies one key action, turning a Tab selection into the one-peer filter.
+/// Applies one key action. In matrix view the arrows and j/k move the selection and Enter opens
+/// the detail pane; in full view they scroll and Tab filters to one peer.
 fn apply_action(
     state: &mut ui::UiState,
     action: ui::Action,
     all: &[String],
     total: usize,
     viewport: usize,
+    problem_selected: bool,
 ) -> bool {
+    let action = match (state.mode, action) {
+        (ui::Mode::Matrix, ui::Action::ScrollUp) => ui::Action::PrevPeer,
+        (ui::Mode::Matrix, ui::Action::ScrollDown) => ui::Action::NextPeer,
+        (_, action) => action,
+    };
+    if action == ui::Action::ToggleDetail {
+        if state.mode == ui::Mode::Matrix {
+            state.toggle_detail(problem_selected);
+        }
+        return true;
+    }
     let previous = state.selected;
     let keep = state.apply(action, total, viewport);
     if action == ui::Action::ClearFilter {
         state.selected = None;
     }
-    if action == ui::Action::ClearFilter || state.selected != previous {
+    if state.mode == ui::Mode::Full
+        && (action == ui::Action::ClearFilter || state.selected != previous)
+    {
         state.filter.peer = match state.selected {
             Some(index) if !all.is_empty() => Some(all[index % all.len()].clone()),
             _ => None,
@@ -400,27 +475,135 @@ fn apply_action(
     keep
 }
 
-/// The peers the filter lets through, in the caller's order.
+/// The peers on screen: the Tab filter applies to the full view only.
 fn visible_cts(all: &[String], state: &ui::UiState) -> Vec<String> {
-    match &state.filter.peer {
-        Some(name) => vec![name.clone()],
-        None => all.to_vec(),
+    match (&state.filter.peer, state.mode) {
+        (Some(name), ui::Mode::Full) => vec![name.clone()],
+        _ => all.to_vec(),
     }
 }
 
-/// The line count and body height a scroll action has to stay inside.
+/// The selected peer's name and whether it needs attention, in matrix display order.
+fn selected_peer(
+    fleet: &Fleet,
+    all: &[String],
+    now: Instant,
+    selected: Option<usize>,
+) -> Option<(String, bool)> {
+    let matrix = Matrix::build(fleet, all, now);
+    let order = order_peers(&matrix);
+    let row = &matrix.rows[order[resolve(selected, order.len())?]];
+    Some((row.peer.clone(), is_problem(row)))
+}
+
+/// What one frame draws: the top area, and the selected peer's detail card when it is open.
+struct Parts {
+    lines: Vec<view::Line>,
+    detail: Option<Vec<view::Line>>,
+}
+
+fn build_parts(
+    fleet: &Fleet,
+    history: &History,
+    all: &[String],
+    now: Instant,
+    state: &ui::UiState,
+    width: usize,
+) -> Parts {
+    match state.mode {
+        ui::Mode::Full => Parts {
+            lines: view::render(fleet, &visible_cts(all, state), now, width),
+            detail: None,
+        },
+        ui::Mode::Matrix => {
+            let matrix = Matrix::build(fleet, all, now);
+            let order = order_peers(&matrix);
+            let pos = resolve(state.selected, order.len());
+            let detail = pos.and_then(|pos| {
+                let row = &matrix.rows[order[pos]];
+                state
+                    .detail_open(is_problem(row))
+                    .then(|| view::peer_detail(fleet, &row.peer, now, width))
+            });
+            Parts {
+                lines: view::render_matrix(&matrix, history, pos, width),
+                detail,
+            }
+        }
+    }
+}
+
+/// Pushes one host sample for each fresh peer, at most once per `every`. Called from the redraw
+/// tick, so the sparkline's time axis is the redraw interval whatever the feeds do.
+fn sample_fleet(
+    history: &mut History,
+    fleet: &Fleet,
+    names: &[String],
+    now: Instant,
+    last: &mut HashMap<String, Instant>,
+    every: Duration,
+) {
+    // A tick that lands a few milliseconds early would skip a whole interval, so accept ninety
+    // percent of one.
+    let due_after = every - every / 10;
+    for name in names {
+        let Some(peer) = fleet.peer(name, now) else {
+            continue;
+        };
+        if peer.stale {
+            continue;
+        }
+        if last
+            .get(name)
+            .is_some_and(|t| now.saturating_duration_since(*t) < due_after)
+        {
+            continue;
+        }
+        let host = HostSummary::from_health(peer.health);
+        history.push(
+            name,
+            Sample {
+                load1: host.load1,
+                disk_percent: host.disk_percent,
+                sessions: host.sessions,
+            },
+        );
+        last.insert(name.clone(), now);
+    }
+}
+
+/// The line count and body height a scroll action has to stay inside. In matrix view only an
+/// open detail pane scrolls.
 fn measure(
     terminal: &Screen,
     fleet: &Fleet,
+    history: &History,
     now: Instant,
     all: &[String],
     state: &ui::UiState,
 ) -> io::Result<(usize, usize)> {
     let size = terminal.size()?;
-    let visible = visible_cts(all, state);
-    let lines = view::render(fleet, &visible, now, usize::from(size.width));
-    // One footer row and a two-row border.
-    Ok((lines.len(), usize::from(size.height.saturating_sub(3))))
+    let parts = build_parts(fleet, history, all, now, state, usize::from(size.width));
+    Ok(match (state.mode, parts.detail) {
+        (ui::Mode::Full, _) => (
+            parts.lines.len(),
+            // One footer row and a two-row border.
+            usize::from(size.height.saturating_sub(3)),
+        ),
+        (ui::Mode::Matrix, Some(card)) => (
+            card.len(),
+            usize::from(ui::detail_height(size.height).saturating_sub(2)),
+        ),
+        (ui::Mode::Matrix, None) => (0, 0),
+    })
+}
+
+/// The data one frame is drawn from: the live picture or the frozen one.
+struct Shown<'a> {
+    fleet: &'a Fleet,
+    history: &'a History,
+    now: Instant,
+    paused_for: Option<Duration>,
 }
 
 /// The footer status. A paused screen is a snapshot, so it says how old that snapshot is.
@@ -436,21 +619,36 @@ fn status_line(fresh: usize, total: usize, paused_for: Option<Duration>) -> Stri
 
 fn render_screen(
     terminal: &mut Screen,
-    fleet: &Fleet,
-    now: Instant,
-    paused_for: Option<Duration>,
+    shown: &Shown<'_>,
     all: &[String],
     state: &ui::UiState,
 ) -> io::Result<()> {
     let visible = visible_cts(all, state);
     let fresh = visible
         .iter()
-        .filter(|name| fleet.peer(name, now).is_some_and(|peer| !peer.stale))
+        .filter(|name| {
+            shown
+                .fleet
+                .peer(name, shown.now)
+                .is_some_and(|peer| !peer.stale)
+        })
         .count();
-    let status = status_line(fresh, visible.len(), paused_for);
+    let status = status_line(fresh, visible.len(), shown.paused_for);
     terminal.draw(|frame| {
-        let lines = view::render(fleet, &visible, now, usize::from(frame.area().width));
-        ui::draw(frame, &lines, state, &status);
+        let parts = build_parts(
+            shown.fleet,
+            shown.history,
+            all,
+            shown.now,
+            state,
+            usize::from(frame.area().width),
+        );
+        match state.mode {
+            ui::Mode::Full => ui::draw(frame, &parts.lines, state, &status),
+            ui::Mode::Matrix => {
+                ui::draw_matrix(frame, &parts.lines, parts.detail.as_deref(), state, &status);
+            }
+        }
     })?;
     Ok(())
 }
@@ -462,6 +660,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use reiki_top::matrix::Metric;
 
     const DOC: &str = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
         {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
@@ -600,17 +799,241 @@ mod tests {
     #[test]
     fn tab_filters_to_one_ct_and_c_clears_it() {
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
-        let mut state = ui::UiState::default();
-        assert!(apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3));
+        let mut state = ui::UiState {
+            mode: ui::Mode::Full,
+            ..ui::UiState::default()
+        };
+        assert!(apply_action(
+            &mut state,
+            ui::Action::NextPeer,
+            &all,
+            10,
+            3,
+            false
+        ));
         assert_eq!(state.filter.peer.as_deref(), Some("peer-a"));
         assert_eq!(visible_cts(&all, &state), ["peer-a"]);
-        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3);
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
         assert_eq!(state.filter.peer.as_deref(), Some("peer-b"));
-        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3);
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
         assert_eq!(state.filter.peer.as_deref(), Some("peer-a"), "it wraps");
-        apply_action(&mut state, ui::Action::ClearFilter, &all, 10, 3);
+        apply_action(&mut state, ui::Action::ClearFilter, &all, 10, 3, false);
         assert_eq!(state.filter.peer, None);
         assert_eq!(visible_cts(&all, &state), all);
+    }
+
+    #[test]
+    fn tab_moves_the_selection_in_matrix_view_and_filters_in_full_view() {
+        let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
+        assert_eq!(state.selected, Some(1));
+        assert_eq!(state.filter.peer, None, "the matrix does not filter");
+        state.toggle_mode();
+        apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
+        assert_eq!(
+            state.filter.peer.as_deref(),
+            Some("peer-a"),
+            "wraps to the first"
+        );
+        assert_eq!(state.selected, Some(2));
+    }
+
+    #[test]
+    fn arrows_and_jk_move_the_selection_in_matrix_view_and_scroll_in_full_view() {
+        let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::ScrollDown, &all, 10, 3, false);
+        assert_eq!((state.selected, state.scroll), (Some(0), 0));
+        apply_action(&mut state, ui::Action::ScrollUp, &all, 10, 3, false);
+        assert_eq!(state.selected, Some(0), "never underflows");
+        state.toggle_mode();
+        apply_action(&mut state, ui::Action::ScrollDown, &all, 10, 3, false);
+        assert_eq!((state.selected, state.scroll), (Some(0), 1));
+    }
+
+    #[test]
+    fn enter_toggles_the_detail_only_in_matrix_view() {
+        let all = vec!["peer-a".to_owned()];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, true);
+        assert!(
+            !state.detail_open(true),
+            "closes the automatically open pane"
+        );
+        apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, true);
+        assert!(state.detail_open(true));
+        state.toggle_mode();
+        let before = state.clone();
+        apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, true);
+        assert_eq!(state, before, "Enter does nothing in the full view");
+    }
+
+    #[test]
+    fn the_matrix_screen_opens_the_detail_card_of_the_selected_problem_peer() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(DOC.to_owned()),
+            now,
+        );
+        apply_feed(
+            &mut fleet,
+            "peer-b",
+            FeedEvent::Snapshot(
+                r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+                 "soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#
+                    .to_owned(),
+            ),
+            now,
+        );
+        let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
+        let history = History::new(0);
+        let state = ui::UiState::default();
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        let card = parts
+            .detail
+            .expect("peer-b is a problem, so the pane opens");
+        assert!(
+            card[0].plain_text().starts_with("peer-b  instance"),
+            "{card:?}"
+        );
+
+        let mut closed = state.clone();
+        closed.detail = Some(false);
+        assert!(build_parts(&fleet, &history, &all, now, &closed, 100)
+            .detail
+            .is_none());
+        let mut full = state.clone();
+        full.toggle_mode();
+        assert!(build_parts(&fleet, &history, &all, now, &full, 100)
+            .detail
+            .is_none());
+    }
+
+    #[test]
+    fn samples_are_pushed_once_per_interval_not_per_event() {
+        let every = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let mut fleet = fleet();
+        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
+            "sessions":{"active_sessions":4}}"#;
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(doc.to_owned()),
+            t0,
+        );
+        let names = vec!["peer-a".to_owned()];
+        let mut history = History::new(History::DEFAULT_CAPACITY);
+        let mut last = HashMap::new();
+        let count = |h: &History| h.series("peer-a", Metric::Sessions).len();
+
+        sample_fleet(&mut history, &fleet, &names, t0, &mut last, every);
+        assert_eq!(count(&history), 1);
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Heartbeat,
+            t0 + Duration::from_millis(500),
+        );
+        sample_fleet(
+            &mut history,
+            &fleet,
+            &names,
+            t0 + Duration::from_millis(500),
+            &mut last,
+            every,
+        );
+        assert_eq!(count(&history), 1, "half an interval is not due");
+        sample_fleet(
+            &mut history,
+            &fleet,
+            &names,
+            t0 + Duration::from_secs(1),
+            &mut last,
+            every,
+        );
+        assert_eq!(count(&history), 2);
+        sample_fleet(
+            &mut history,
+            &fleet,
+            &names,
+            t0 + Duration::from_millis(1200),
+            &mut last,
+            every,
+        );
+        assert_eq!(
+            count(&history),
+            2,
+            "the next is due one interval after the last"
+        );
+    }
+
+    #[test]
+    fn a_stale_peer_is_not_sampled() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(Duration::from_secs(30));
+        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
+            "sessions":{"active_sessions":4}}"#;
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(doc.to_owned()),
+            t0,
+        );
+        let mut history = History::new(History::DEFAULT_CAPACITY);
+        let mut last = HashMap::new();
+        sample_fleet(
+            &mut history,
+            &fleet,
+            &["peer-a".to_owned()],
+            t0 + Duration::from_secs(40),
+            &mut last,
+            Duration::from_secs(1),
+        );
+        assert!(history.series("peer-a", Metric::Sessions).is_empty());
+    }
+
+    #[test]
+    fn a_frozen_screen_keeps_the_history_it_had_when_frozen() {
+        let now = Instant::now();
+        let mut history = History::new(History::DEFAULT_CAPACITY);
+        history.push(
+            "peer-a",
+            Sample {
+                sessions: Some(1),
+                ..Sample::default()
+            },
+        );
+        let frozen = freeze(&fleet(), &history, now);
+        history.push(
+            "peer-a",
+            Sample {
+                sessions: Some(2),
+                ..Sample::default()
+            },
+        );
+        assert_eq!(frozen.history.series("peer-a", Metric::Sessions), vec![8]);
+        assert_eq!(history.series("peer-a", Metric::Sessions), vec![4, 8]);
+    }
+
+    #[tokio::test]
+    async fn run_once_prints_the_matrix_unless_full_is_asked() {
+        let url = health_server().await;
+        let token = token_file("once-matrix");
+        let peers = reader(&url, &token);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(run_once_to(&peers, false, &mut out, &mut err).await, 0);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Fleet 1/1 fresh"), "{out}");
+        assert!(out.contains("zen"), "{out}");
+        assert!(!out.contains("Providers"), "{out}");
     }
 
     #[derive(Clone, Default)]
@@ -700,7 +1123,7 @@ mod tests {
         let peers = reader(&url, &token);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_once_to(&peers, &mut out, &mut err).await;
+        let code = run_once_to(&peers, true, &mut out, &mut err).await;
         let out = String::from_utf8(out).unwrap();
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
         assert!(out.contains("Providers"), "{out}");
@@ -720,7 +1143,7 @@ mod tests {
         let peers = reader(&format!("http://127.0.0.1:{port}"), &token);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_once_to(&peers, &mut out, &mut err).await;
+        let code = run_once_to(&peers, true, &mut out, &mut err).await;
         let out = String::from_utf8(out).unwrap();
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, 1);

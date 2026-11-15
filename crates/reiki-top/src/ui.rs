@@ -13,8 +13,10 @@ use ratatui::Frame;
 
 use crate::view::{self, Span, Style};
 
-/// The key hints on the footer's right side.
-const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all";
+/// The key hints on the footer's right side, full view.
+const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix";
+/// The key hints on the footer's right side, matrix view.
+const HINTS_MATRIX: &str = "q quit  j/k peer  Enter detail  PgUp/PgDn scroll  p pause  v full view";
 
 /// The filter the caller applies before rendering; this layer only stores it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,6 +39,19 @@ pub enum Action {
     NextPeer,
     PrevPeer,
     ClearFilter,
+    /// Opens or closes the selected peer's detail pane; the caller knows whether it is a problem.
+    ToggleDetail,
+    /// Switches between the matrix and the full text view.
+    ToggleMode,
+}
+
+/// Which screen the live view shows. The matrix is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Matrix,
+    /// The per-peer text view, with the Tab peer filter.
+    Full,
 }
 
 /// The scrolling and filter state the caller keeps between frames.
@@ -47,6 +62,10 @@ pub struct UiState {
     /// An index into the caller's peer list, not a line number.
     pub selected: Option<usize>,
     pub paused: bool,
+    pub mode: Mode,
+    /// `None` opens the detail pane only while the selected peer is a problem; `Some` is an
+    /// explicit choice made with Enter.
+    pub detail: Option<bool>,
 }
 
 /// The last top line that still fills the viewport, or the last line when the viewport is
@@ -56,6 +75,26 @@ fn max_scroll(total_lines: usize, viewport: usize) -> usize {
 }
 
 impl UiState {
+    /// Whether the detail pane is open, given whether the selected peer needs attention.
+    pub fn detail_open(&self, problem_selected: bool) -> bool {
+        self.detail.unwrap_or(problem_selected)
+    }
+
+    /// Flips the detail pane from what is showing now, so the first Enter on a problem peer
+    /// closes its automatically open pane.
+    pub fn toggle_detail(&mut self, problem_selected: bool) {
+        self.detail = Some(!self.detail_open(problem_selected));
+    }
+
+    /// Switches view. Each view starts at its top.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            Mode::Matrix => Mode::Full,
+            Mode::Full => Mode::Matrix,
+        };
+        self.scroll = 0;
+    }
+
     /// Applies one key action. Returns false only for [`Action::Quit`]; a false return leaves
     /// the state untouched. Scroll is clamped to the last line, so any view size is safe.
     pub fn apply(&mut self, action: Action, total_lines: usize, viewport: usize) -> bool {
@@ -77,6 +116,9 @@ impl UiState {
                 self.selected = Some(self.selected.map_or(0, |i| i.saturating_sub(1)));
             }
             Action::ClearFilter => self.filter = Filter::default(),
+            Action::ToggleMode => self.toggle_mode(),
+            // Needs the selected peer's problem flag, so the caller calls `toggle_detail`.
+            Action::ToggleDetail => {}
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
         true
@@ -103,6 +145,8 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Tab => Action::NextPeer,
         KeyCode::BackTab => Action::PrevPeer,
         KeyCode::Char('c') => Action::ClearFilter,
+        KeyCode::Enter | KeyCode::Char('e') => Action::ToggleDetail,
+        KeyCode::Char('v') | KeyCode::Char('E') => Action::ToggleMode,
         _ => return None,
     };
     Some(action)
@@ -158,6 +202,73 @@ pub fn draw(frame: &mut Frame, lines: &[view::Line], state: &UiState, status: &s
         }
     }
 
+    let footer_area = Rect::new(area.x, footer_y, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(footer_text(state, status, HINTS)),
+        footer_area,
+    );
+}
+
+/// The detail pane's total height for a terminal of `screen_height` rows: a third of the body
+/// above the footer, or none when that would be too short to hold a border and a line.
+pub fn detail_height(screen_height: u16) -> u16 {
+    let third = screen_height.saturating_sub(1) / 3;
+    if third >= 3 {
+        third
+    } else {
+        0
+    }
+}
+
+/// Draws the matrix over the body, then the selected peer's detail card in a bordered pane
+/// when `detail` is given. `state.scroll` scrolls the detail pane; the matrix is not scrolled.
+pub fn draw_matrix(
+    frame: &mut Frame,
+    lines: &[view::Line],
+    detail: Option<&[view::Line]>,
+    state: &UiState,
+    status: &str,
+) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let body_height = area.height.saturating_sub(1);
+    let footer_y = area.y.saturating_add(body_height);
+    let detail_rows = detail.map_or(0, |_| detail_height(area.height));
+
+    if body_height > 0 {
+        let top_rows = body_height.saturating_sub(detail_rows);
+        if top_rows > 0 {
+            let top = Rect::new(area.x, area.y, area.width, top_rows);
+            frame.render_widget(Paragraph::new(to_ratatui(lines)), top);
+        }
+        if let (Some(card), true) = (detail, detail_rows > 0) {
+            let pane = Rect::new(
+                area.x,
+                area.y.saturating_add(top_rows),
+                area.width,
+                detail_rows,
+            );
+            let block = Block::default().borders(Borders::ALL);
+            let inner = block.inner(pane);
+            frame.render_widget(block, pane);
+            if inner.width > 0 && inner.height > 0 {
+                let viewport = usize::from(inner.height);
+                let start = state.scroll.min(max_scroll(card.len(), viewport));
+                let end = start.saturating_add(viewport).min(card.len());
+                frame.render_widget(Paragraph::new(to_ratatui(&card[start..end])), inner);
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(footer_text(state, status, HINTS_MATRIX)),
+        Rect::new(area.x, footer_y, area.width, 1),
+    );
+}
+
+fn footer_text(state: &UiState, status: &str, hints: &str) -> String {
     let mut footer = String::new();
     if state.paused {
         footer.push_str("(paused)  ");
@@ -166,9 +277,8 @@ pub fn draw(frame: &mut Frame, lines: &[view::Line], state: &UiState, status: &s
     if !status.is_empty() {
         footer.push_str("  ");
     }
-    footer.push_str(HINTS);
-    let footer_area = Rect::new(area.x, footer_y, area.width, 1);
-    frame.render_widget(Paragraph::new(footer), footer_area);
+    footer.push_str(hints);
+    footer
 }
 
 #[cfg(test)]
@@ -343,6 +453,8 @@ mod tests {
                 peer: Some("peer-a".to_owned()),
                 provider: Some("zen".to_owned()),
             },
+            mode: Mode::Full,
+            detail: Some(true),
         };
         let before = state.clone();
         assert!(!state.apply(Action::Quit, 10, 3));
@@ -430,7 +542,26 @@ mod tests {
                 Some(Action::ClearFilter),
             ),
             (KeyCode::Char('x'), KeyModifiers::NONE, None),
-            (KeyCode::Enter, KeyModifiers::NONE, None),
+            (
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                Some(Action::ToggleDetail),
+            ),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleDetail),
+            ),
+            (
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleMode),
+            ),
+            (
+                KeyCode::Char('E'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleMode),
+            ),
         ];
         for (code, modifiers, expected) in cases {
             let event = KeyEvent::new(code, modifiers);
@@ -448,6 +579,120 @@ mod tests {
         ] {
             let event = KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Release);
             assert_eq!(map_key(event), None, "{code:?} release");
+        }
+    }
+
+    #[test]
+    fn the_default_screen_is_the_matrix_with_an_automatic_detail_pane() {
+        let state = UiState::default();
+        assert_eq!(state.mode, Mode::Matrix);
+        assert!(state.detail_open(true), "a problem peer opens it");
+        assert!(!state.detail_open(false));
+    }
+
+    #[test]
+    fn enter_toggles_the_detail_pane_against_what_is_showing() {
+        let mut state = UiState::default();
+        state.toggle_detail(true);
+        assert_eq!(state.detail, Some(false), "closing an auto-open pane");
+        assert!(!state.detail_open(true));
+        state.toggle_detail(true);
+        assert!(state.detail_open(true), "reopens");
+        let mut quiet = UiState::default();
+        quiet.toggle_detail(false);
+        assert!(quiet.detail_open(false), "opens a healthy peer on request");
+    }
+
+    #[test]
+    fn v_switches_between_matrix_and_full_and_resets_scroll() {
+        let mut state = UiState {
+            scroll: 5,
+            ..UiState::default()
+        };
+        state.toggle_mode();
+        assert_eq!(state.mode, Mode::Full);
+        assert_eq!(state.scroll, 0, "each view starts at the top");
+        state.toggle_mode();
+        assert_eq!(state.mode, Mode::Matrix);
+    }
+
+    fn rendered_matrix(
+        lines: &[view::Line],
+        detail: Option<&[view::Line]>,
+        state: &UiState,
+        status: &str,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal");
+        terminal
+            .draw(|frame| draw_matrix(frame, lines, detail, state, status))
+            .expect("drawing succeeds");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_matrix_footer_hints_the_matrix_keys() {
+        let buffer = rendered_matrix(&numbered(1), None, &UiState::default(), "ok", 100, 8);
+        let footer = row_text(&buffer, 7);
+        assert!(footer.contains("Enter detail"), "{footer:?}");
+        assert!(footer.contains("v full view"), "{footer:?}");
+    }
+
+    #[test]
+    fn the_detail_pane_is_a_bordered_third_under_the_matrix() {
+        let rows = numbered(3);
+        let card = vec![line("peer-b  instance peer-b"), line("    b  cooling")];
+        let buffer = rendered_matrix(&rows, Some(&card), &UiState::default(), "ok", 40, 20);
+        // Body is 19 rows; the pane takes 19 / 3 = 6, so its top border is row 13.
+        assert_eq!(row_text(&buffer, 13), format!("┌{}┐", "─".repeat(38)));
+        assert_eq!(
+            row_text(&buffer, 14),
+            format!("│{:<38}│", "peer-b  instance peer-b")
+        );
+        assert_eq!(row_text(&buffer, 0), format!("{:<40}", "line 0"));
+        let closed = rendered_matrix(&rows, None, &UiState::default(), "ok", 40, 20);
+        assert!(!(0..20).any(|r| row_text(&closed, r).starts_with('┌')));
+    }
+
+    #[test]
+    fn the_detail_scroll_shows_its_own_window() {
+        let rows = numbered(2);
+        let card = numbered(12);
+        let state = UiState {
+            scroll: 4,
+            ..UiState::default()
+        };
+        let buffer = rendered_matrix(&rows, Some(&card), &state, "ok", 40, 20);
+        assert_eq!(row_text(&buffer, 14), format!("│{:<38}│", "line 4"));
+        let far = UiState {
+            scroll: 99,
+            ..UiState::default()
+        };
+        let buffer = rendered_matrix(&rows, Some(&card), &far, "ok", 40, 20);
+        // The pane has four inner rows, from row 14; the last page starts at 12 - 4.
+        assert_eq!(
+            row_text(&buffer, 17),
+            format!("│{:<38}│", "line 11"),
+            "clamped to the last page"
+        );
+    }
+
+    #[test]
+    fn tiny_matrix_screens_do_not_panic() {
+        let card = numbered(4);
+        for (width, height) in [(0, 0), (1, 1), (3, 2), (2, 1), (40, 1), (40, 4), (40, 9)] {
+            let buffer = rendered_matrix(
+                &numbered(3),
+                Some(&card),
+                &UiState::default(),
+                "ok",
+                width,
+                height,
+            );
+            assert_eq!(buffer.area.width, width);
+            assert_eq!(buffer.area.height, height);
         }
     }
 

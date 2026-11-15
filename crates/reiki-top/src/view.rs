@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::matrix::{order_peers, resolve, Cell, History, Matrix, Metric, Row};
 use crate::Fleet;
 
 /// How a span should read on the terminal. `Plain` is the caller's default.
@@ -181,65 +182,77 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
     }
 
     for name in peer_order {
-        let Some(peer) = fleet.peer(name, now) else {
-            out.push(line(
-                vec![
-                    span(format!("{name}  "), Style::Title),
-                    span("no data", Style::Dim),
-                ],
-                width,
-            ));
-            if let Some(error) = fleet.error(name) {
-                out.push(error_line(error, width));
-            }
-            continue;
-        };
-        let mut header = vec![
-            span(format!("{name}  "), Style::Title),
-            span(format!("instance {}", peer.health.instance), Style::Plain),
-        ];
-        for seg in host_segments(peer.health) {
-            header.push(span(format!("  {seg}"), Style::Plain));
-        }
-        if let Some(n) = peer
-            .health
-            .sessions
-            .as_ref()
-            .and_then(|s| s.get("active_sessions"))
-            .and_then(Value::as_u64)
-        {
-            header.push(span(format!("  sessions {n}"), Style::Plain));
-        }
-        if peer.stale {
-            header.push(span(
-                format!("  stale {}", fmt_duration(peer.age)),
-                Style::Dim,
-            ));
-        }
-        out.push(line(header, width));
-        if let Some(error) = fleet.error(name) {
-            out.push(error_line(error, width));
-        }
-
-        for u in &peer.health.upstreams {
-            out.push(line(
-                vec![
-                    span(format!("  {}: ", u.name), Style::Plain),
-                    span(format!("{} healthy", u.healthy_keys), Style::Good),
-                    span(format!("  {} cooling", u.cooling_keys), Style::Warn),
-                    span(format!("  {} disabled", u.disabled_keys), Style::Bad),
-                ],
-                width,
-            ));
-            if let Some(keys) = &u.keys {
-                for k in keys {
-                    out.push(key_line(k, width));
-                }
-            }
-        }
+        peer_card(fleet, name, now, width, &mut out);
     }
 
     out
+}
+
+/// One peer's card: its header, any feed error, and each upstream's counts and key rows.
+pub fn peer_detail(fleet: &Fleet, name: &str, now: Instant, width: usize) -> Vec<Line> {
+    let mut out = Vec::new();
+    peer_card(fleet, name, now, width, &mut out);
+    out
+}
+
+fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Vec<Line>) {
+    let Some(peer) = fleet.peer(name, now) else {
+        out.push(line(
+            vec![
+                span(format!("{name}  "), Style::Title),
+                span("no data", Style::Dim),
+            ],
+            width,
+        ));
+        if let Some(error) = fleet.error(name) {
+            out.push(error_line(error, width));
+        }
+        return;
+    };
+    let mut header = vec![
+        span(format!("{name}  "), Style::Title),
+        span(format!("instance {}", peer.health.instance), Style::Plain),
+    ];
+    for seg in host_segments(peer.health) {
+        header.push(span(format!("  {seg}"), Style::Plain));
+    }
+    if let Some(n) = peer
+        .health
+        .sessions
+        .as_ref()
+        .and_then(|s| s.get("active_sessions"))
+        .and_then(Value::as_u64)
+    {
+        header.push(span(format!("  sessions {n}"), Style::Plain));
+    }
+    if peer.stale {
+        header.push(span(
+            format!("  stale {}", fmt_duration(peer.age)),
+            Style::Dim,
+        ));
+    }
+    out.push(line(header, width));
+    if let Some(error) = fleet.error(name) {
+        out.push(error_line(error, width));
+    }
+
+    for u in &peer.health.upstreams {
+        let mut spans = vec![
+            span(format!("  {}: ", u.name), Style::Plain),
+            span(format!("{} healthy", u.healthy_keys), Style::Good),
+            span(format!("  {} cooling", u.cooling_keys), Style::Warn),
+            span(format!("  {} disabled", u.disabled_keys), Style::Bad),
+        ];
+        if let Some(class) = crate::matrix::cooldown_class(u) {
+            spans.push(span(format!("  class {class}"), Style::Warn));
+        }
+        out.push(line(spans, width));
+        if let Some(keys) = &u.keys {
+            for k in keys {
+                out.push(key_line(k, width));
+            }
+        }
+    }
 }
 
 /// A peer's last feed failure, dim so it never reads as health.
@@ -307,6 +320,399 @@ fn key_line(k: &crate::KeyView, width: usize) -> Line {
     line(spans, width)
 }
 
+/// Sparkline levels, lowest to highest.
+const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Longest peer name drawn; longer names are clipped.
+const NAME_MAX: usize = 16;
+/// Longest provider header drawn at full width.
+const LABEL_MAX: usize = 24;
+/// Samples in a sparkline.
+const SPARK_LEN: usize = 8;
+/// Below this width the matrix draws only the fleet line and peer names.
+const NAMES_ONLY_BELOW: usize = 20;
+/// Spaces between columns.
+const GAP: usize = 2;
+const GAP_TEXT: &str = "  ";
+/// Header labels for the host columns, in the order `host_figures` returns them.
+const HOST_LABELS: [&str; 3] = ["load", "disk", "sess"];
+
+/// Header label widths tried in order; the sparkline is dropped after the third.
+const FITS: [(usize, bool); 4] = [(LABEL_MAX, true), (6, true), (3, true), (3, false)];
+
+/// The peers-by-providers matrix: a fleet line with one tally per provider, a header, then one
+/// row per peer in [`order_peers`] order. `selected` is a display position, wrapped to the row
+/// count; `None` draws no marker. Sparklines come from `history`, so an empty history draws
+/// none. Too narrow for the columns, it falls back to one chip line per peer.
+pub fn render_matrix(
+    matrix: &Matrix,
+    history: &History,
+    selected: Option<usize>,
+    width: usize,
+) -> Vec<Line> {
+    let order = order_peers(matrix);
+    let selected = selected.and_then(|s| resolve(Some(s), order.len()));
+    let fresh = matrix.rows.iter().filter(|r| !r.stale).count();
+    let mut title = vec![span(
+        format!("Fleet {fresh}/{} fresh", matrix.rows.len()),
+        Style::Title,
+    )];
+    for col in &matrix.columns {
+        let style = if col.healthy_peers == col.peers_with {
+            Style::Good
+        } else if col.healthy_peers == 0 {
+            Style::Bad
+        } else {
+            Style::Warn
+        };
+        title.push(span(
+            format!(
+                "   {} {}",
+                clip(&col.upstream, LABEL_MAX),
+                col.total_label()
+            ),
+            style,
+        ));
+    }
+
+    if order.is_empty() {
+        return vec![line(title, width)];
+    }
+    if width < NAMES_ONLY_BELOW {
+        let mut out = vec![line(title, width)];
+        for (pos, &i) in order.iter().enumerate() {
+            let name = clip(&matrix.rows[i].peer, width);
+            out.push(line(
+                vec![
+                    marker(selected == Some(pos)),
+                    span(name, name_style(selected == Some(pos))),
+                ],
+                width,
+            ));
+        }
+        return out;
+    }
+
+    for (label_max, spark) in FITS {
+        let grid = Grid::new(matrix, &order, history, label_max, spark);
+        if grid.width() <= width {
+            return grid.lines(title, selected, width);
+        }
+    }
+    chip_lines(matrix, &order, history, title, selected, width)
+}
+
+/// One peer's chip line per row: its providers with their cell, then load and disk.
+fn chip_lines(
+    matrix: &Matrix,
+    order: &[usize],
+    history: &History,
+    title: Vec<Span>,
+    selected: Option<usize>,
+    width: usize,
+) -> Vec<Line> {
+    let mut out = vec![line(title, width)];
+    for (pos, &i) in order.iter().enumerate() {
+        let row = &matrix.rows[i];
+        let is_selected = selected == Some(pos);
+        let mut spans = vec![
+            marker(is_selected),
+            span(clip(&row.peer, NAME_MAX), name_style(is_selected)),
+        ];
+        match host_area(row, history, false) {
+            HostArea::Stale(text, style) => {
+                spans.push(span(format!("  {text}"), style));
+            }
+            HostArea::Figures(figures) => {
+                for (c, (col, cell)) in matrix.columns.iter().zip(&row.cells).enumerate() {
+                    if *cell == Cell::Absent {
+                        continue;
+                    }
+                    let (text, style) = cell_text(cell, row.combos.get(c).copied().unwrap_or(0));
+                    spans.push(span(
+                        format!("  {} {text}", clip(&col.upstream, LABEL_MAX)),
+                        style,
+                    ));
+                }
+                let (load, _) = &figures[0];
+                if load != "-" {
+                    spans.push(span(format!("  load {load}"), Style::Plain));
+                }
+                if let Some(pct) = row.host.disk_percent {
+                    spans.push(span(format!("  disk {}%", disk_percent(pct)), Style::Plain));
+                }
+            }
+        }
+        out.push(line(trim_end(spans), width));
+    }
+    out
+}
+
+/// The column layout for one header width and sparkline setting.
+struct Grid<'a> {
+    matrix: &'a Matrix,
+    order: &'a [usize],
+    /// Header per column, clipped to the layout's label width.
+    labels: Vec<String>,
+    /// Width of each column, the wider of its header and cells.
+    widths: Vec<usize>,
+    /// Peer names clipped to `NAME_MAX`, padded to the widest.
+    name_w: usize,
+    /// Text of each row's cells, padded per column later.
+    cells: Vec<Vec<(String, Style)>>,
+    host: Vec<HostArea>,
+    host_w: [usize; 3],
+}
+
+impl<'a> Grid<'a> {
+    fn new(
+        matrix: &'a Matrix,
+        order: &'a [usize],
+        history: &History,
+        label_max: usize,
+        spark: bool,
+    ) -> Self {
+        let labels: Vec<String> = matrix
+            .columns
+            .iter()
+            .map(|c| clip(&c.upstream, label_max))
+            .collect();
+        let cells: Vec<Vec<(String, Style)>> = order
+            .iter()
+            .map(|&i| {
+                let row = &matrix.rows[i];
+                row.cells
+                    .iter()
+                    .zip(&row.combos)
+                    .map(|(cell, &n)| cell_text(cell, n))
+                    .collect()
+            })
+            .collect();
+        let widths = (0..labels.len())
+            .map(|c| {
+                cells
+                    .iter()
+                    .filter_map(|row| row.get(c))
+                    .map(|(text, _)| text.chars().count())
+                    .fold(labels[c].chars().count(), usize::max)
+            })
+            .collect();
+        let name_w = order
+            .iter()
+            .map(|&i| clip(&matrix.rows[i].peer, NAME_MAX).chars().count())
+            .max()
+            .unwrap_or(0);
+        let host: Vec<HostArea> = order
+            .iter()
+            .map(|&i| host_area(&matrix.rows[i], history, spark))
+            .collect();
+        let mut host_w = HOST_LABELS.map(str::len);
+        for area in &host {
+            if let HostArea::Figures(figures) = area {
+                for (w, (text, _)) in host_w.iter_mut().zip(figures) {
+                    *w = (*w).max(text.chars().count());
+                }
+            }
+        }
+        Self {
+            matrix,
+            order,
+            labels,
+            widths,
+            name_w,
+            cells,
+            host,
+            host_w,
+        }
+    }
+
+    fn width(&self) -> usize {
+        let columns: usize = self.widths.iter().map(|w| GAP + w).sum();
+        let host: usize = self.host_w.iter().map(|w| GAP + w).sum();
+        2 + self.name_w + columns + host
+    }
+
+    fn lines(&self, title: Vec<Span>, selected: Option<usize>, width: usize) -> Vec<Line> {
+        let mut out = vec![line(title, width)];
+
+        let mut head = vec![span(" ".repeat(2 + self.name_w), Style::Plain)];
+        for (label, w) in self.labels.iter().zip(&self.widths) {
+            head.push(span(GAP_TEXT, Style::Plain));
+            head.push(span(pad(label, *w), Style::Title));
+        }
+        for (label, w) in HOST_LABELS.iter().zip(self.host_w) {
+            head.push(span(GAP_TEXT, Style::Plain));
+            head.push(span(pad(label, w), Style::Title));
+        }
+        out.push(line(trim_end(head), width));
+
+        for (pos, (&i, (cells, host))) in self
+            .order
+            .iter()
+            .zip(self.cells.iter().zip(&self.host))
+            .enumerate()
+        {
+            let is_selected = selected == Some(pos);
+            let row = &self.matrix.rows[i];
+            let mut spans = vec![
+                marker(is_selected),
+                span(
+                    pad(&clip(&row.peer, NAME_MAX), self.name_w),
+                    name_style(is_selected),
+                ),
+            ];
+            for ((text, style), w) in cells.iter().zip(&self.widths) {
+                spans.push(span(GAP_TEXT, Style::Plain));
+                spans.push(span(pad(text, *w), *style));
+            }
+            match host {
+                HostArea::Stale(text, style) => {
+                    spans.push(span(GAP_TEXT, Style::Plain));
+                    spans.push(span(text.clone(), *style));
+                }
+                HostArea::Figures(figures) => {
+                    for ((text, style), w) in figures.iter().zip(self.host_w) {
+                        spans.push(span(GAP_TEXT, Style::Plain));
+                        spans.push(span(pad(text, w), *style));
+                    }
+                }
+            }
+            out.push(line(trim_end(spans), width));
+        }
+        out
+    }
+}
+
+/// What a row's host area shows: three figures, or the age of a stale or never-seen peer.
+enum HostArea {
+    Figures([(String, Style); 3]),
+    Stale(String, Style),
+}
+
+fn host_area(row: &Row, history: &History, spark: bool) -> HostArea {
+    if row.stale {
+        let text = match row.age {
+            Some(age) => format!("stale {}", fmt_duration(age)),
+            None => "no data".to_owned(),
+        };
+        return HostArea::Stale(text, Style::Dim);
+    }
+    let load = match row.host.load1 {
+        None => dash(),
+        Some(load) => {
+            let mut text = fmt_load(load);
+            if spark {
+                let levels = history.series(&row.peer, Metric::Load1);
+                let tail = &levels[levels.len().saturating_sub(SPARK_LEN)..];
+                if !tail.is_empty() {
+                    text.push(' ');
+                    text.extend(tail.iter().map(|&l| SPARK[l.min(7) as usize]));
+                }
+            }
+            (text, Style::Plain)
+        }
+    };
+    let disk = match row.host.disk_percent {
+        None => dash(),
+        Some(pct) => {
+            let p = disk_percent(pct);
+            let style = if p < 75 {
+                Style::Good
+            } else if p < 90 {
+                Style::Warn
+            } else {
+                Style::Bad
+            };
+            let filled = (p as usize * 8 + 50) / 100;
+            (format!("{p:>3}% {}", bar(filled, 8)), style)
+        }
+    };
+    let sess = match row.host.sessions {
+        None => dash(),
+        Some(n) if n > 9999 => ("9999+".to_owned(), Style::Plain),
+        Some(n) => (n.to_string(), Style::Plain),
+    };
+    HostArea::Figures([load, disk, sess])
+}
+
+fn dash() -> (String, Style) {
+    ("-".to_owned(), Style::Dim)
+}
+
+/// Whole percent, clamped; NaN becomes 0 through the cast.
+fn disk_percent(pct: f64) -> u32 {
+    pct.round().clamp(0.0, 100.0) as u32
+}
+
+/// One load figure in at most four characters: a non-finite value shows as a dash.
+fn fmt_load(load: f64) -> String {
+    if !load.is_finite() {
+        "-".to_owned()
+    } else if load >= 1000.0 {
+        "999+".to_owned()
+    } else {
+        format!("{load:.1}")
+    }
+}
+
+/// Glyph, soonest cooldown and cooling combinations for one cell, and its colour.
+fn cell_text(cell: &Cell, combos: u32) -> (String, Style) {
+    let (glyph, soonest, style) = match cell {
+        Cell::Absent => return ("·".to_owned(), Style::Dim),
+        Cell::Stale => return ("?".to_owned(), Style::Dim),
+        Cell::Healthy => ("■", None, Style::Good),
+        Cell::Partial { soonest, .. } => ("◐", *soonest, Style::Warn),
+        Cell::Cooling { soonest, .. } => ("■", *soonest, Style::Bad),
+        Cell::Disabled => ("⊘", None, Style::Bad),
+    };
+    let mut text = glyph.to_owned();
+    if let Some(d) = soonest {
+        text.push(' ');
+        text.push_str(&fmt_duration(d));
+    }
+    if combos > 0 {
+        text.push_str(&format!("+{combos}"));
+    }
+    (text, style)
+}
+
+/// Drops the padding after the last column, so a line ends with its text.
+fn trim_end(mut spans: Vec<Span>) -> Vec<Span> {
+    while let Some(last) = spans.last_mut() {
+        let kept = last.text.trim_end().len();
+        last.text.truncate(kept);
+        if !last.text.is_empty() {
+            break;
+        }
+        spans.pop();
+    }
+    spans
+}
+
+fn marker(selected: bool) -> Span {
+    span(if selected { "> " } else { "  " }, name_style(selected))
+}
+
+fn name_style(selected: bool) -> Style {
+    if selected {
+        Style::Title
+    } else {
+        Style::Plain
+    }
+}
+
+/// The first `n` characters, never splitting one.
+fn clip(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}
+
+/// Pads with spaces to `width` characters; a longer text is returned as it is.
+fn pad(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    let mut out = text.to_owned();
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(len)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -316,6 +722,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::matrix::{Cell, Column, History, HostSummary, Matrix, Row, Sample};
     use crate::Health;
 
     fn fleet() -> Fleet {
@@ -372,6 +779,484 @@ mod tests {
              "soonest_cooldown_seconds":{cooldown},"last_status_class":"4xx",
              "keys":[{{"name":"b","state":"cooling","cooldown_seconds":{cooldown}{class}}}]}}]}}"#
         )
+    }
+
+    /// Three peers with mismatched providers: peer-a zen only; peer-b openrouter (partial) and
+    /// gemini; peer-c zen cooling and gemini with two cooling combinations.
+    fn three_peers(t0: Instant) -> (Fleet, Vec<String>) {
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}],
+            "host":{"load_average":[0.4,0.5,0.6],"disks":[{"used_percent":30.0}]},
+            "sessions":{"active_sessions":1}}"#,
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+            {"name":"openrouter","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":240,"last_status_class":"4xx"},
+            {"name":"gemini","healthy_keys":2,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#,
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-c",
+            r#"{"instance":"peer-c","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":45,"last_status_class":"4xx"},
+            {"name":"gemini","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+             "cooling_combinations":2}]}"#,
+            t0,
+        );
+        (f, names(&["peer-a", "peer-b", "peer-c"]))
+    }
+
+    fn names(peers: &[&str]) -> Vec<String> {
+        peers.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    fn matrix_lines(f: &Fleet, peers: &[String], t0: Instant, width: usize) -> Vec<Line> {
+        let m = Matrix::build(f, peers, t0);
+        render_matrix(&m, &History::new(0), None, width)
+    }
+
+    /// Char index of each occurrence of `needle` in `text`.
+    fn positions(text: &str, needle: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = text[from..].find(needle) {
+            let byte = from + at;
+            out.push(text[..byte].chars().count());
+            from = byte + needle.len();
+        }
+        out
+    }
+
+    fn first(text: &str, needle: &str) -> usize {
+        positions(text, needle)[0]
+    }
+
+    #[test]
+    fn matrix_title_tallies_count_only_peers_with_the_provider() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let lines = matrix_lines(&f, &peers, t0, 100);
+        assert_eq!(
+            lines[0].plain_text(),
+            "Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1"
+        );
+    }
+
+    #[test]
+    fn matrix_rows_are_problem_first_and_absent_cells_are_dots() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let lines = matrix_lines(&f, &peers, t0, 100);
+        let rows: Vec<String> = lines[2..].iter().map(Line::plain_text).collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].starts_with("  peer-b"), "{rows:?}");
+        assert!(rows[1].starts_with("  peer-c"), "{rows:?}");
+        assert!(rows[2].starts_with("  peer-a"), "{rows:?}");
+
+        let header = lines[1].plain_text();
+        let gemini = first(&header, "gemini");
+        let zen = first(&header, "zen");
+        let openrouter = first(&header, "openrouter");
+        // Columns are left aligned, so every glyph sits under its provider's header.
+        assert_eq!(positions(&rows[0], "■"), vec![gemini]);
+        assert_eq!(positions(&rows[0], "·"), vec![zen]);
+        assert_eq!(positions(&rows[0], "◐"), vec![openrouter]);
+        assert_eq!(positions(&rows[1], "■"), vec![gemini, zen]);
+        assert_eq!(
+            positions(&rows[1], "■+2"),
+            vec![gemini],
+            "combinations suffix"
+        );
+        assert_eq!(positions(&rows[1], "■ 45s"), vec![zen]);
+        assert_eq!(positions(&rows[2], "·"), vec![gemini, openrouter]);
+        assert!(rows[0].contains("◐ 4m00s"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn every_cell_state_has_its_glyph_text_and_colour() {
+        let cells = [
+            (Cell::Healthy, 0, "■", Style::Good),
+            (Cell::Healthy, 2, "■+2", Style::Good),
+            (
+                Cell::Partial {
+                    cooling: 1,
+                    total: 3,
+                    soonest: Some(Duration::from_secs(240)),
+                },
+                2,
+                "◐ 4m00s+2",
+                Style::Warn,
+            ),
+            (
+                Cell::Cooling {
+                    soonest: Some(Duration::from_secs(45)),
+                    class: None,
+                },
+                0,
+                "■ 45s",
+                Style::Bad,
+            ),
+            (
+                Cell::Cooling {
+                    soonest: None,
+                    class: Some("rate_limited".to_owned()),
+                },
+                0,
+                "■",
+                Style::Bad,
+            ),
+            (Cell::Disabled, 0, "⊘", Style::Bad),
+            (Cell::Absent, 3, "·", Style::Dim),
+            (Cell::Stale, 4, "?", Style::Dim),
+        ];
+        let rows = cells
+            .iter()
+            .enumerate()
+            .map(|(i, (cell, combos, _, _))| Row {
+                peer: format!("peer-{i}"),
+                cells: vec![cell.clone()],
+                combos: vec![*combos],
+                host: HostSummary::default(),
+                error: None,
+                stale: matches!(cell, Cell::Stale),
+                age: None,
+            })
+            .collect();
+        let m = Matrix {
+            columns: vec![Column {
+                upstream: "zen".to_owned(),
+                peers_with: cells.len(),
+                healthy_peers: 1,
+            }],
+            rows,
+        };
+        let lines = render_matrix(&m, &History::new(0), None, 100);
+        for (_, _, text, style) in cells {
+            let found = lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.text.trim_end() == text && s.style == style);
+            assert!(found, "{text:?} as {style:?} in {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_stale_row_shows_its_age_and_a_never_seen_peer_says_no_data() {
+        let row = |peer: &str, age: Option<Duration>| Row {
+            peer: peer.to_owned(),
+            cells: vec![Cell::Stale],
+            combos: vec![0],
+            host: HostSummary::default(),
+            error: Some("poll: cannot connect".to_owned()),
+            stale: true,
+            age,
+        };
+        let m = Matrix {
+            columns: vec![Column {
+                upstream: "zen".to_owned(),
+                peers_with: 1,
+                healthy_peers: 0,
+            }],
+            rows: vec![
+                row("host-1", Some(Duration::from_secs(120))),
+                row("edge-1", None),
+            ],
+        };
+        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let host_1 = lines[3].plain_text();
+        assert!(host_1.contains("stale 2m00s"), "{host_1}");
+        assert!(!host_1.contains("poll"), "errors stay in the detail pane");
+        assert!(
+            lines[2].plain_text().contains("no data"),
+            "edge-1 sorts first"
+        );
+        let stale = lines[3]
+            .spans
+            .iter()
+            .find(|s| s.text.starts_with("stale"))
+            .unwrap();
+        assert_eq!(stale.style, Style::Dim);
+    }
+
+    #[test]
+    fn narrow_widths_shorten_headers_then_fall_back_to_chips() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let at_60 = matrix_lines(&f, &peers, t0, 60);
+        assert!(at_60[1].plain_text().contains("openro"), "{:?}", at_60[1]);
+        assert!(!at_60[1].plain_text().contains("openrouter"));
+
+        let at_30 = matrix_lines(&f, &peers, t0, 30);
+        assert_eq!(at_30.len(), 4, "fleet line plus one chip line per peer");
+        assert!(at_30[1].plain_text().starts_with("  peer-b  gemini ■"));
+        assert!(at_30[3]
+            .plain_text()
+            .starts_with("  peer-a  zen ■  load 0.4"));
+        for line in &at_30 {
+            assert!(line.plain_text().chars().count() <= 30);
+        }
+    }
+
+    #[test]
+    fn tiny_widths_never_overflow_or_panic() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        for width in [0, 1, 19] {
+            let lines = matrix_lines(&f, &peers, t0, width);
+            for line in &lines {
+                assert!(line.plain_text().chars().count() <= width, "width {width}");
+            }
+        }
+        let lines = matrix_lines(&f, &peers, t0, 19);
+        assert_eq!(lines.len(), 4, "fleet line and names only");
+        assert_eq!(lines[1].plain_text(), "  peer-b");
+        assert!(matrix_lines(&f, &peers, t0, 0)
+            .iter()
+            .all(|l| l.plain_text().is_empty()));
+    }
+
+    #[test]
+    fn a_sparkline_follows_the_history_and_the_disk_bar_shows_the_percent() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let m = Matrix::build(&f, &peers, t0);
+        let mut history = History::new(60);
+        for load in [0.0_f64, 0.5, 1.0] {
+            history.push(
+                "peer-a",
+                Sample {
+                    load1: Some(load),
+                    ..Sample::default()
+                },
+            );
+        }
+        let lines = render_matrix(&m, &history, None, 100);
+        let a = lines[4].plain_text();
+        assert!(a.contains("0.4 ▁▅█"), "{a}");
+        assert!(a.contains(" 30% ██░░░░░░"), "{a}");
+        assert!(lines[2].plain_text().contains("-"), "b has no load");
+    }
+
+    #[test]
+    fn disk_bars_are_coloured_by_threshold() {
+        let disk = |pct: f64| Row {
+            peer: "peer-a".to_owned(),
+            cells: vec![],
+            combos: vec![],
+            host: HostSummary {
+                load1: None,
+                disk_percent: Some(pct),
+                sessions: None,
+            },
+            error: None,
+            stale: false,
+            age: Some(Duration::ZERO),
+        };
+        let m = Matrix {
+            columns: vec![],
+            rows: vec![disk(53.0), disk(80.0), disk(95.0), disk(100.0)],
+        };
+        let lines = render_matrix(&m, &History::new(0), None, 100);
+        for (line, (text, style)) in lines[2..].iter().zip([
+            ("53% ████░░░░", Style::Good),
+            ("80% ██████░░", Style::Warn),
+            ("95% ████████", Style::Bad),
+            ("100% ████████", Style::Bad),
+        ]) {
+            let span = line
+                .spans
+                .iter()
+                .find(|s| {
+                    s.text
+                        .trim_start()
+                        .starts_with(text.split(' ').next().unwrap())
+                })
+                .unwrap_or_else(|| panic!("{text} in {line:?}"));
+            assert_eq!(span.text.trim_start(), text, "{line:?}");
+            assert_eq!(span.style, style, "{text}");
+        }
+    }
+
+    #[test]
+    fn hostile_names_are_sanitised_clipped_and_bounded() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let long = "n".repeat(80);
+        add(
+            &mut f,
+            &format!("p\u{1b}[2J{long}"),
+            r#"{"instance":"x","observed_at":"t","upstreams":[
+            {"name":"zé\u0007","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":null},
+            {"name":"名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前","healthy_keys":1,
+             "cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,
+             "last_status_class":null}]}"#,
+            t0,
+        );
+        let peers = vec![format!("p\u{1b}[2J{long}")];
+        for width in [0, 1, 5, 19, 20, 30, 60, 100, 200] {
+            for line in matrix_lines(&f, &peers, t0, width) {
+                let text = line.plain_text();
+                assert!(!text.contains('\u{1b}'), "{text:?}");
+                assert!(text.chars().count() <= width, "width {width}: {text:?}");
+            }
+        }
+        let wide = matrix_lines(&f, &peers, t0, 100);
+        let text = wide[2].plain_text();
+        assert!(text.contains("p?[2J"), "{text:?}");
+        // The escape's five characters count toward the sixteen-character name limit.
+        assert!(
+            text.contains(&format!("p?[2J{}", "n".repeat(11))),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains(&"n".repeat(12)),
+            "name clipped to 16: {text:?}"
+        );
+        assert!(wide[1].plain_text().contains("zé?"), "{:?}", wide[1]);
+    }
+
+    #[test]
+    fn huge_and_nan_host_numbers_stay_short() {
+        let row = |load: f64, sessions: u64| Row {
+            peer: "peer-a".to_owned(),
+            cells: vec![],
+            combos: vec![],
+            host: HostSummary {
+                load1: Some(load),
+                disk_percent: Some(100.0),
+                sessions: Some(sessions),
+            },
+            error: None,
+            stale: false,
+            age: Some(Duration::ZERO),
+        };
+        let m = Matrix {
+            columns: vec![],
+            rows: vec![row(1e308, u64::MAX), row(f64::NAN, 3)],
+        };
+        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let first_row = lines[2].plain_text();
+        assert!(first_row.contains("999+"), "{first_row}");
+        assert!(first_row.contains("9999+"), "{first_row}");
+        let second = lines[3].plain_text();
+        assert!(second.contains("  -  "), "NaN load shows a dash: {second}");
+        assert!(second.trim_end().ends_with('3'), "{second}");
+    }
+
+    #[test]
+    fn selection_marks_one_row_and_wraps_past_the_end() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let m = Matrix::build(&f, &peers, t0);
+        let lines = render_matrix(&m, &History::new(0), Some(4), 100);
+        let marked: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.plain_text().starts_with("> "))
+            .collect();
+        assert_eq!(marked.len(), 1, "exactly one marked row");
+        assert!(
+            marked[0].plain_text().starts_with("> peer-c"),
+            "4 wraps to 1"
+        );
+    }
+
+    #[test]
+    fn the_detail_card_names_the_soonest_cooling_class() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &keyed_doc(Some(16260), Some("quota_exhausted")),
+            t0,
+        );
+        let card = peer_detail(&f, "peer-a", t0, 100);
+        assert!(
+            texts(&card)
+                .iter()
+                .any(|l| l == "  zen: 0 healthy  1 cooling  0 disabled  class quota_exhausted"),
+            "{:?}",
+            texts(&card)
+        );
+    }
+
+    #[test]
+    fn matrix_lines_end_with_their_text_not_padding() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        for line in matrix_lines(&f, &peers, t0, 100).iter().skip(1) {
+            let text = line.plain_text();
+            assert_eq!(text, text.trim_end(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_row_with_fewer_combos_than_cells_draws_zero_for_the_rest() {
+        let row = Row {
+            peer: "peer-a".to_owned(),
+            cells: vec![Cell::Healthy, Cell::Healthy],
+            combos: vec![3],
+            host: HostSummary::default(),
+            error: None,
+            stale: false,
+            age: Some(Duration::ZERO),
+        };
+        let m = Matrix {
+            columns: vec![
+                Column {
+                    upstream: "zen".to_owned(),
+                    peers_with: 1,
+                    healthy_peers: 1,
+                },
+                Column {
+                    upstream: "gem".to_owned(),
+                    peers_with: 1,
+                    healthy_peers: 1,
+                },
+            ],
+            rows: vec![row],
+        };
+        let lines = render_matrix(&m, &History::new(0), None, 100);
+        assert!(lines[2].plain_text().contains("■+3"));
+        let narrow = render_matrix(&m, &History::new(0), None, 25);
+        assert!(narrow[1].plain_text().contains("zen ■+3"), "{narrow:?}");
+    }
+
+    #[test]
+    fn no_peers_draw_only_the_fleet_line() {
+        let m = Matrix {
+            columns: vec![],
+            rows: vec![],
+        };
+        let lines = render_matrix(&m, &History::new(0), Some(5), 100);
+        assert_eq!(texts(&lines), ["Fleet 0/0 fresh"]);
+    }
+
+    #[test]
+    fn the_detail_card_is_the_full_views_card_for_that_peer() {
+        let t0 = Instant::now();
+        let (f, _) = three_peers(t0);
+        let all = render(&f, &names(&["peer-b"]), t0, 100);
+        let card = peer_detail(&f, "peer-b", t0, 100);
+        assert!(
+            all.ends_with(&card),
+            "the card is the tail of the full view"
+        );
+        assert!(card[0].plain_text().starts_with("peer-b  instance"));
     }
 
     #[test]

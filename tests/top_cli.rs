@@ -88,9 +88,9 @@ async fn once_prints_the_fleet_and_exits_by_whether_any_peer_answered() {
         .await
         .unwrap();
     assert_eq!(code, 0, "{out}{err}");
-    assert!(out.contains("Providers"), "{out}");
-    assert!(out.contains("zen"), "{out}");
-    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("Fleet 1/1 fresh"), "{out}");
+    assert!(!out.contains("Providers"), "matrix is the default: {out}");
+    assert!(out.contains("zen 1/1"), "{out}");
     assert!(err.is_empty(), "{err}");
 
     let config = dir.write(

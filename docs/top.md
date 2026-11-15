@@ -1,6 +1,8 @@
 # reiki top
 
-`reiki top` is a live terminal view of key health for every instance under `[peers.NAME]`. It reads the same `/v1/health` and `/v1/health/stream` as `reiki peers`, with the same per-peer token and CA rules, and draws one screen: a provider summary, then one card per peer with each upstream's healthy, cooling and disabled key counts, per-key labels and cooldowns, and host load and sessions when the publisher exposes them.
+`reiki top` is a live terminal view of key health for every instance under `[peers.NAME]`. It reads the same `/v1/health` and `/v1/health/stream` as `reiki peers`, with the same per-peer token and CA rules.
+
+The default screen is a peers-by-providers matrix: one row per peer, one column per provider, then host load, disk and sessions. Problem peers sort first. Below the matrix, the selected peer's detail card (keys, cooldowns, class, last error) opens in a bordered pane.
 
 It is read-only: nothing here changes a key or serves traffic.
 
@@ -21,12 +23,54 @@ It needs `[peers] enabled = true` and at least one `[peers.NAME]` table, exactly
 ## Use
 
 ```bash
-reiki top                 # live view; q quits
-reiki top --once          # poll every peer once, print plain text and exit
+reiki top                 # live matrix; q quits
+reiki top --full          # live per-peer text view instead
+reiki top --once          # poll every peer once, print the matrix as text and exit
+reiki top --once --full   # poll once, print the per-peer text view
 reiki top --interval 2    # redraw every two seconds instead of every second
 ```
 
-- Live mode follows each peer's stream and polls once when a stream cannot be opened, ends or goes quiet. Both failing puts the reason on that peer's card as a dim line. Data older than three `poll_interval_secs` is stale and drawn dim, never as healthy; a peer with no answer shows `no data`.
-- Keys: `q` or `Esc` quits; `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll; `p` freezes the screen as a snapshot and shows its age (updates keep arriving; resuming shows the live view); `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
-- Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
-- `--once` polls each peer once and prints the same view as plain text, 100 columns wide and without colour. It exits 0 when at least one peer answered, 1 when none did, and 2 on a config problem.
+### The matrix
+
+```
+Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
+          gemini  zen    openrouter  load      disk           sess
+  peer-b  ■       ·      ◐ 4m00s     -         -              -
+> peer-c  ■+2     ■ 45s  ·           -         -              -
+  peer-a  ·       ■      ·           0.4 ▁▅█▄   30% ██░░░░░░  1
+```
+
+- The first line counts fresh peers, then one `provider healthy/with` tally per provider. Only peers that publish a provider count towards it.
+- Cells: `■` healthy (green); `◐` partly healthy, with the soonest cooldown (yellow); `■` with a cooldown, no healthy key (red); `⊘` every key out of rotation (red); `·` the peer does not use this provider (dim); `?` the peer is stale (dim).
+- A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it.
+- `load` is the one-minute load with a sparkline of recent samples. `disk` is the fullest disk: green under 75%, yellow to 89%, red from 90%. `sess` is active sessions. A `-` means the peer does not publish that figure.
+- A stale row shows `stale <age>` in place of host figures. Its error goes to the detail pane.
+- The sparkline is built from samples taken once per redraw interval while the screen is live. `--once` has no history, so it shows the number only.
+- Mismatched providers: a peer that does not use a provider shows `·`, and the tally leaves it out of both counts.
+
+### Keys
+
+In the matrix:
+
+- `j`/`k`, the arrows, `Tab`/`Shift-Tab`: move the selection to the next or previous peer.
+- `Enter` or `e`: open or close the detail pane. A problem peer's pane opens by itself; Enter flips it.
+- `PgUp`/`PgDn`, `g`/`Home`, `G`/`End`: scroll the detail pane.
+- `v` or `E`: switch to the full view.
+- `p`: freeze the screen as a snapshot and show its age; updates keep arriving, and resuming shows the live view. The frozen snapshot keeps its sparklines.
+- `q` or `Esc` quits.
+
+In the full view (`v` or `--full`):
+
+- `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll.
+- `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
+- `p` freezes, `v` returns to the matrix, `q` or `Esc` quits.
+
+Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
+
+### Narrow terminals
+
+The matrix shortens provider headers to six, then three characters, drops the sparkline, and as a last resort prints one chip line per peer with only the providers it uses. Below 20 columns it draws the fleet line and peer names. It never draws past the terminal width.
+
+### `--once`
+
+`--once` polls each peer once and prints the matrix as plain text, 100 columns wide and without colour. `--once --full` prints the per-peer text view instead. It exits 0 when at least one peer answered, 1 when none did, and 2 on a config problem.

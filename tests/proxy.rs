@@ -1742,6 +1742,66 @@ async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_s
 }
 
 #[tokio::test]
+async fn a_402_is_per_request_when_the_upstream_says_so() {
+    let paid = || Reply::Status(402, "no payment method for this model", None);
+    let h = harness_with_upstream(
+        &[("client-a", "tok-a", &["a"][..])],
+        "payment_required_per_request = true\n",
+        Policy::default(),
+    )
+    .await;
+    h.mock.script("up-a", vec![paid()]);
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "paid model")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        402,
+        "the upstream's own answer reaches the caller"
+    );
+    assert_eq!(
+        h.post("tok-a", "/zen/x", "free model")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.mock.keys_called(),
+        ["up-a", "up-a"],
+        "the key was never cooled"
+    );
+}
+
+#[tokio::test]
+async fn a_402_cools_the_key_by_default() {
+    let h =
+        harness_with_upstream(&[("client-a", "tok-a", &["a"][..])], "", Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(402, "no payment method", None)]);
+    let first = h
+        .post("tok-a", "/zen/x", "1")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(first, 200);
+    let second = h
+        .post("tok-a", "/zen/x", "2")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(
+        second, 200,
+        "the key is cooling, so nothing reaches the upstream"
+    );
+    assert_eq!(h.mock.keys_called(), ["up-a"]);
+}
+
+#[tokio::test]
 async fn confirm_quota_sends_a_quota_429_again_on_the_same_key_before_cooling_it() {
     let quota = || Reply::Status(429, "Free usage exceeded, subscribe to Go", None);
     let h = harness_with_upstream(&one_stream(), "confirm_quota = true\n", Policy::default()).await;

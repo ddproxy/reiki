@@ -679,6 +679,10 @@ pub struct Upstream {
     /// the key. For upstreams that sometimes answer a good key with a spurious quota 429.
     #[serde(default)]
     pub confirm_quota: bool,
+    /// Treat a 402 as a refusal of this one request instead of an exhausted key. For upstreams
+    /// where a free account answers a paid model with 402 while its free models keep working.
+    #[serde(default)]
+    pub payment_required_per_request: bool,
     /// Hold back the disable of the first key a request finds unauthorized until a later key
     /// serves that same request, so one bad request cannot take a good key out of rotation.
     #[serde(default)]

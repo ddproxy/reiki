@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
+/// One cooling route-and-model combination on a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyScope {
+    pub route: String,
+    pub model: String,
+    pub retry_after_seconds: u64,
+    pub cooldown_class: String,
+}
+
 /// One key's health as `reiki keys` prints it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KeyHealth {
@@ -18,6 +27,9 @@ pub struct KeyHealth {
     pub streams: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_class: Option<String>,
+    /// Cooling combinations, soonest first; omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<KeyScope>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +49,8 @@ struct StatusKey {
     last_status_code: Option<u16>,
     #[serde(default)]
     cooldown_class: Option<String>,
+    #[serde(default)]
+    scopes: Vec<KeyScope>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +85,7 @@ pub fn parse_status(body: &str) -> Result<Vec<KeyHealth>, String> {
             last_status_code: key.last_status_code,
             streams,
             cooldown_class: key.cooldown_class,
+            scopes: key.scopes,
         });
     }
     Ok(keys)
@@ -262,6 +277,7 @@ mod tests {
             last_status_code: None,
             streams: streams.iter().map(|s| (*s).to_owned()).collect(),
             cooldown_class: None,
+            scopes: Vec::new(),
         }
     }
 
@@ -270,7 +286,7 @@ mod tests {
         let body = r#"{"keys":[
             {"name":"b","upstream":"zen","state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429},
             {"name":"a","upstream":"zen","state":"out_of_rotation"},
-            {"name":"c","upstream":"zen","state":"available"}],
+            {"name":"c","upstream":"zen","state":"available","scopes":[{"route":"/responses","model":"gpt-big","retry_after_seconds":9,"cooldown_class":"quota_exhausted"}]}],
           "streams":[{"name":"s2","chain":["a","b"]},{"name":"s1","chain":["b"]}]}"#;
         let keys = parse_status(body).unwrap();
         let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
@@ -280,6 +296,9 @@ mod tests {
         assert_eq!(keys[0].streams, ["s2", "s1"]);
         assert_eq!(keys[0].cooldown_class.as_deref(), Some("quota_exhausted"));
         assert_eq!(keys[2].cooldown_class, None);
+        assert_eq!(keys[2].scopes.len(), 1);
+        assert_eq!(keys[2].scopes[0].model, "gpt-big");
+        assert!(keys[0].scopes.is_empty());
         assert_eq!(keys[1].state, "disabled");
         assert!(keys[2].streams.is_empty());
         assert!(parse_status(

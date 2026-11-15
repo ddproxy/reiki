@@ -134,6 +134,22 @@ impl FailureKind {
     }
 }
 
+/// Whether a cooldown applies to the whole key or only to one route and model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownScope {
+    Key,
+    Model,
+}
+
+impl CooldownScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Model => "model",
+        }
+    }
+}
+
 /// Something the relay did; key names come from the config, never secrets.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -150,8 +166,12 @@ pub enum Event<'a> {
         key: &'a str,
         kind: FailureKind,
     },
-    /// A key went on cooldown.
-    Cooldown { key: &'a str, kind: FailureKind },
+    /// A key or one of its route-and-model combinations went on cooldown.
+    Cooldown {
+        key: &'a str,
+        kind: FailureKind,
+        scope: CooldownScope,
+    },
     /// A stream's rate limit turned a request away before any key was picked.
     RateLimited { stream: &'a str },
     /// A plugin stopped a request: it returned `Reject`, or it skipped under `on_error = "reject"`.

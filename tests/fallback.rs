@@ -157,15 +157,30 @@ async fn while_the_first_upstream_cools_down_later_requests_skip_it() {
     let rig = start(FALLBACK, "[\"z\", \"r\"]").await;
     post(&rig, "{\"model\":\"a\"}").await;
 
-    let (status, _) = post(&rig, "{\"model\":\"b\"}").await;
+    let (status, _) = post(&rig, "{\"model\":\"a\"}").await;
 
     assert_eq!(status, 200);
     assert_eq!(
         rig.zen.0.lock().unwrap().len(),
         1,
-        "no second try on the cooling key"
+        "no second try on the cooling model"
     );
     assert_eq!(rig.other.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_402_for_one_model_does_not_cool_the_key_for_another() {
+    let rig = start(FALLBACK, "[\"z\", \"r\"]").await;
+    post(&rig, "{\"model\":\"a\"}").await;
+
+    let (status, _) = post(&rig, "{\"model\":\"b\"}").await;
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        rig.zen.0.lock().unwrap().len(),
+        2,
+        "model b still reaches the first upstream, which refuses it on its own"
+    );
 }
 
 const FREE_TIER: &str = "{\"type\":\"error\",\"error\":{\"type\":\"FreeTierError\",\"message\":\"OpenCode's free tier can only be used from within OpenCode.\"}}";

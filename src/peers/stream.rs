@@ -333,10 +333,10 @@ impl Watcher {
         }
         let observed_at = crate::reload::rfc3339(app.wall_now());
         let upstreams = {
-            let health = app.health().lock().unwrap_or_else(PoisonError::into_inner);
+            let mut health = app.health().lock().unwrap_or_else(PoisonError::into_inner);
             super::health::upstreams(
                 &snapshot.config,
-                &health,
+                &mut health,
                 std::time::Instant::now(),
                 peers.expose_key_labels,
                 peers.cooldown_bucket_secs,

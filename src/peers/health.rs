@@ -32,7 +32,7 @@ fn status_class(status: Option<u16>) -> Value {
 /// One entry per upstream that uses Reiki's keys, in config order.
 pub(crate) fn upstreams(
     config: &Config,
-    health: &KeyState,
+    health: &mut KeyState,
     now: Instant,
     labels: bool,
     bucket: u64,
@@ -74,6 +74,23 @@ pub(crate) fn upstreams(
                         item["cooldown_class"] = json!(class.name());
                     }
                 }
+                let scopes = health.cooling_scopes(key, now);
+                if !scopes.is_empty() {
+                    item["scopes"] = Value::Array(
+                        scopes
+                            .iter()
+                            .take(16)
+                            .map(|cooling| {
+                                json!({
+                                    "route": &cooling.scope.route,
+                                    "model": &cooling.scope.model,
+                                    "retry_after_seconds": ceil_secs(cooling.remaining, bucket),
+                                    "cooldown_class": cooling.class.name(),
+                                })
+                            })
+                            .collect(),
+                    );
+                }
                 listed.push(item);
             }
         }
@@ -110,13 +127,13 @@ const DEFAULT_INSTANCE: &str = "reiki";
 pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
     let snapshot = app.snapshot();
     let upstreams = {
-        let health = app
+        let mut health = app
             .health()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         upstreams(
             &snapshot.config,
-            &health,
+            &mut health,
             Instant::now(),
             peers.expose_key_labels,
             peers.cooldown_bucket_secs,
@@ -221,7 +238,7 @@ mod tests {
         );
         health.record_status("a", Some(429));
         health.disable("b");
-        let out = upstreams(&config, &health, now, false, 0);
+        let out = upstreams(&config, &mut health, now, false, 0);
         assert_eq!(
             out.len(),
             2,
@@ -246,7 +263,7 @@ mod tests {
         let config = config();
         let mut health = KeyState::default();
         health.disable("c");
-        let out = upstreams(&config, &health, Instant::now(), true, 0);
+        let out = upstreams(&config, &mut health, Instant::now(), true, 0);
         let keys = out[1]["keys"].as_array().unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(
@@ -289,11 +306,11 @@ mod tests {
                 now,
             );
         }
-        let zen = &upstreams(&config, &health, now, true, 300)[1];
+        let zen = &upstreams(&config, &mut health, now, true, 300)[1];
         assert_eq!(zen["soonest_cooldown_seconds"], 300);
         assert_eq!(zen["keys"][0]["cooldown_seconds"], 300);
         assert_eq!(zen["keys"][1]["cooldown_seconds"], 600);
-        let exact = &upstreams(&config, &health, now, true, 0)[1];
+        let exact = &upstreams(&config, &mut health, now, true, 0)[1];
         assert_eq!(exact["soonest_cooldown_seconds"], 10);
         assert_eq!(exact["keys"][1]["cooldown_seconds"], 301);
     }
@@ -306,7 +323,7 @@ mod tests {
         let policy = Policy::default();
         health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
         health.disable("c");
-        let zen = &upstreams(&config, &health, now, true, 0)[1];
+        let zen = &upstreams(&config, &mut health, now, true, 0)[1];
         assert_eq!(zen["keys"][0]["cooldown_class"], "quota_exhausted");
         assert!(
             zen["keys"][1].get("cooldown_class").is_none(),
@@ -325,7 +342,7 @@ mod tests {
         let now = Instant::now();
         let policy = Policy::default();
         health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
-        let zen = &upstreams(&config, &health, now, false, 0)[1];
+        let zen = &upstreams(&config, &mut health, now, false, 0)[1];
         let fields: Vec<&str> = zen
             .as_object()
             .unwrap()

@@ -4,15 +4,19 @@
 
 ### Added
 
+- Key health is kept per route and model as well as per key. A 402 or a plain rate-limit 429 cools only that route and model on the key, so a free-tier account's paid-model 402 no longer locks out its free model; a 401, a quota 429, a transient failure or a request with no model still cools the key, and three models cooling on one key escalate to the key (`scope_escalate_after`, default 3). `/status`, `reiki keys --json` and the labelled peers view list cooling combinations under `scopes`.
 - `reiki top` (cargo feature `top`, off by default): a live terminal view of every `[peers.NAME]` instance. It follows each peer's health stream with the same pinned client as `reiki peers --watch`, falls back to polling, shows provider bars and per-peer cards with class-aware cooldown bars, marks stale or unreachable peers, and restores the terminal on exit, error or panic. `--once` prints plain text and exits. See [top](docs/top.md).
 - `reiki-top` gains an optional `tui` feature (`ratatui` 0.30 and `crossterm` 0.29, off by default) with the terminal layer for the planned `reiki top`: style mapping, scroll and filter state, key bindings and drawing. The data layer and view model still depend only on serde.
-- New upstream setting `payment_required_per_request`: a 402 refuses that one request instead of cooling the key for hours. A free-tier account answers a paid model with 402 while its free models keep working. Off by default; leave it off where a 402 means no credit is left.
 - The `reiki-top` crate gains a pure view model that renders a fleet as styled plain lines (title, provider bars, per-peer cards with class-aware cooldown bars, host load, disk and sessions). It is the base of the planned `reiki top` terminal view.
 - An optional `[upstream.NAME.limits]` table (`preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs`) is parsed and validated. An explicit zero means unlimited, even over a preset value. 
 - Outbound shaping: keys of an upstream with a `limits` table get a per-key budget. A short wait is slept off (the configured wait is a total), a longer wait or a closed daily window skips the key for that request without touching its health, and when no key can be used the client gets `429 reiki_shaped` with `Retry-After` and `x-reiki-origin: local`. A concurrency slot is held until the response body ends or the client disconnects. A provider 429, a quota response or a `remaining: 0` header teaches the key's bucket. The learned cap, pauses, closed windows and daily and monthly counters are saved in the state file and restored after a restart (not for a rotated or re-pointed key). See [providers](docs/providers.md#outbound-limits).
 - `/status` and the labelled `/v1/health` key view report `cooldown_class` (`rate_limited`, `quota_exhausted`, `transient` and so on) for a cooling key, and `reiki keys --json` includes it. A cooldown restored from the state file has no class.
 - Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.
 - An optional `[hubs]`, `[hub]` and `[accounts]` config, behind a `hub` cargo feature, is parsed and validated only; no hub is contacted or served yet. See [hub](docs/hub.md). Edge tokens must differ from each other and from the peer tokens, the hub listener from the client, admin and tunnel listeners, and a hub `timeout_secs` is 1 to 3600, `ca_file` may not be empty, and `accounts` may not repeat a label.
+
+### Changed
+
+- `reiki_cooldowns_total` gains a `scope` label (`key` or `model`), so existing series gain a label.
 
 ### Fixed
 

@@ -1803,6 +1803,7 @@ mod tests {
         chain.on_event(&Event::Cooldown {
             key: "k",
             kind: reiki_plugin::FailureKind::Transient,
+            scope: reiki_plugin::CooldownScope::Key,
         });
         assert_eq!(count(), 0);
         chain.on_event(&Event::RateLimited { stream: "one" });

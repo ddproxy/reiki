@@ -34,6 +34,7 @@ Each key:
 - `state`: `available`, `cooling` or `out_of_rotation`
 - `retry_after_seconds`: present only while `cooling`
 - `cooldown_class`: present only while `cooling` and the class is known: `rate_limited`, `quota_exhausted` or `transient`, the failure that set the current deadline (same names as `reiki_cooldowns_total`). A cooldown restored from the state file after a restart has no class until the key fails again.
+- `scopes`: present only when one or more route-and-model combinations of this key are cooling; soonest first, at most 16. Each entry has `route`, `model`, `retry_after_seconds` and `cooldown_class`. The key itself may still be `available` for other combinations.
 - `consecutive_failures`: consecutive transient failures since the last success
 - `last_status_code`: the upstream status of the key's latest attempt, or `null` before one
 
@@ -49,7 +50,7 @@ The response carries no key values, token hashes or file paths.
 
 ## Check key health
 
-`reiki keys` calls `GET /status` and prints one row per key: its name, upstream, state (`ok`, `cooling` or `disabled`), cooldown seconds remaining, last status code and the streams whose chain includes it. `reiki keys --json` prints a JSON document with a `keys` array instead. `reiki keys --enable <name>` calls `POST /keys/enable` to re-enable a key that was taken out of rotation.
+`reiki keys` calls `GET /status` and prints one row per key: its name, upstream, state (`ok`, `cooling` or `disabled`), cooldown seconds remaining, last status code and the streams whose chain includes it. `reiki keys --json` prints a JSON document with a `keys` array instead, carrying each key's `scopes` array when it has cooling combinations. The table itself does not show scopes. `reiki keys --enable <name>` calls `POST /keys/enable` to re-enable a key that was taken out of rotation.
 
 ```bash
 reiki keys --token-file /etc/reiki/admin.token
@@ -106,7 +107,7 @@ Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts 
 | --- | --- | --- |
 | `reiki_requests_total` | counter | `stream`, `upstream`, `status` |
 | `reiki_failovers_total` | counter | `stream`, `key`, `class` |
-| `reiki_cooldowns_total` | counter | `key`, `class` |
+| `reiki_cooldowns_total` | counter | `key`, `class`, `scope` |
 | `reiki_rate_limit_rejections_total` | counter | `stream` |
 | `reiki_plugin_rejections_total` | counter | `plugin`, `stream` |
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
@@ -117,7 +118,7 @@ Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts 
 
 `reiki_plugin_rejections_total` counts requests a plugin stopped: it returned a rejection (the `phi`, `finance` and `controlled` plugins do when they block), or it skipped or panicked under `on_error = "reject"`, which answers 503. `plugin` is the plugin's name and `stream` the stream the request came in on, so the series are bounded by the plugins built into the binary times the configured streams. A request rate-limited by the stream counts under `reiki_rate_limit_rejections_total` instead.
 
-`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. The `reiki_keys` gauge always reports all three states, even at zero.
+`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. `reiki_cooldowns_total` is also labelled `scope`, either `key` or `model`: a model-scoped cooldown covers only one route and model, which are deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics

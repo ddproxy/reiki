@@ -16,6 +16,37 @@ pub fn rewrite_body(body: Bytes, aliases: &BTreeMap<String, String>, drop: &[Str
     }
 }
 
+/// Most bytes a model name may have before it is treated as unusable for scoping.
+const MAX_MODEL_BYTES: usize = 128;
+
+/// The top-level `model` string of a request body, decoded. `None` for a missing,
+/// non-string or over-long model, or a body that is not a JSON object.
+pub(crate) fn request_model(body: &[u8]) -> Option<String> {
+    let members = top_level_members(body)?;
+    let member = members.iter().find(|member| {
+        let key = &body[member.start..member.key_end];
+        if member.key.contains(&b'\\') {
+            decode_json_string(key).as_deref() == Some("model")
+        } else {
+            member.key == b"model"
+        }
+    })?;
+    if !member.is_string {
+        return None;
+    }
+    let raw = &body[member.value_start + 1..member.value_end - 1];
+    // Every escape shrinks by at most sixfold, so this bounds the decoded allocation.
+    if raw.len() > MAX_MODEL_BYTES * 6 {
+        return None;
+    }
+    let model = if raw.contains(&b'\\') {
+        decode_json_string(&body[member.value_start..member.value_end])?
+    } else {
+        std::str::from_utf8(raw).ok()?.to_owned()
+    };
+    (model.len() <= MAX_MODEL_BYTES).then_some(model)
+}
+
 struct Member {
     start: usize,
     key_end: usize,
@@ -337,6 +368,59 @@ mod tests {
             String::from_utf8(out.to_vec()).unwrap(),
             r#"{"model":"zen","temperature":0}"#
         );
+    }
+
+    #[test]
+    fn request_model_reads_only_a_top_level_string_model() {
+        assert_eq!(
+            request_model(br#"{"model":"gpt-4o"}"#).as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            request_model(br#"{"messages":[],"model":"free","stream":true}"#).as_deref(),
+            Some("free")
+        );
+        assert_eq!(
+            request_model(br#"{"model":"gpt\u002d4o"}"#).as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            request_model(br#"{"mo\u0064el":"escaped-key"}"#).as_deref(),
+            Some("escaped-key")
+        );
+        assert_eq!(request_model(br#"{"messages":[{"model":"nested"}]}"#), None);
+        assert_eq!(request_model(br#"{"model":123}"#), None);
+        assert_eq!(request_model(br#"{"model":null}"#), None);
+        assert_eq!(
+            request_model(br#"{"model":"one","model":"two"}"#).as_deref(),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn request_model_never_panics_on_odd_bodies() {
+        for body in [
+            b"not json".as_slice(),
+            b"",
+            b"{",
+            br#"{"model":"unterminated}"#,
+            br#"{"model":"\u00zz"}"#,
+            br#"[{"model":"array"}]"#,
+            br#"{"model":"\ud800"}"#,
+            b"{\"model\":\"\xff\"}",
+        ] {
+            let _ = request_model(body);
+        }
+        let huge = format!(r#"{{"model":"{}"}}"#, "x".repeat(4096));
+        assert_eq!(request_model(huge.as_bytes()), None, "over the cap");
+        let escaped = format!(r#"{{"model":"{}"}}"#, "\\u0041".repeat(4096));
+        assert_eq!(
+            request_model(escaped.as_bytes()),
+            None,
+            "escaped input over the cap is refused before decoding"
+        );
+        let at_cap = format!(r#"{{"model":"{}"}}"#, "x".repeat(128));
+        assert_eq!(request_model(at_cap.as_bytes()).unwrap().len(), 128);
     }
 
     #[test]

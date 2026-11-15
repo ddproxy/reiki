@@ -635,6 +635,13 @@ fn default_max_wait_secs() -> u64 {
     20
 }
 
+fn default_scope_escalate_after() -> u32 {
+    DEFAULT_SCOPE_ESCALATE_AFTER
+}
+
+/// Default number of cooling models before another combination failure cools the key.
+pub(crate) const DEFAULT_SCOPE_ESCALATE_AFTER: u32 = 3;
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
@@ -679,10 +686,10 @@ pub struct Upstream {
     /// the key. For upstreams that sometimes answer a good key with a spurious quota 429.
     #[serde(default)]
     pub confirm_quota: bool,
-    /// Treat a 402 as a refusal of this one request instead of an exhausted key. For upstreams
-    /// where a free account answers a paid model with 402 while its free models keep working.
-    #[serde(default)]
-    pub payment_required_per_request: bool,
+    /// Cool the whole key once this many different models are cooling on it and another
+    /// combination failure arrives. Defaults to 3.
+    #[serde(default = "default_scope_escalate_after")]
+    pub scope_escalate_after: u32,
     /// Hold back the disable of the first key a request finds unauthorized until a later key
     /// serves that same request, so one bad request cannot take a good key out of rotation.
     #[serde(default)]
@@ -1245,6 +1252,15 @@ impl Config {
                 return Err(ConfigError::BadUpstream {
                     upstream: name.clone(),
                     reason: "response_timeout_secs must be at least 1".to_owned(),
+                });
+            }
+            if !(2..=16).contains(&upstream.scope_escalate_after) {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: format!(
+                        "scope_escalate_after must be between 2 and 16, got {}",
+                        upstream.scope_escalate_after
+                    ),
                 });
             }
             if let Some(limits) = &upstream.limits {
@@ -2515,6 +2531,36 @@ chain = ["zen-a"]
         let upstream = &config.upstream["zen"];
         assert_eq!(upstream.model_aliases["gpt-4o"], "opencode/gpt-4o");
         assert_eq!(upstream.drop_params, ["stream_options", "reasoning_effort"]);
+    }
+
+    #[test]
+    fn scope_escalate_after_defaults_and_is_bounded() {
+        let text = |value: &str| {
+            format!(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{value}\n\
+                 [keys.zen-a]\nupstream = \"zen\"\nfile = \"/etc/reiki/keys/zen-a\"\n\
+                 [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+            )
+        };
+        assert_eq!(
+            Config::parse(&text("")).unwrap().upstream["zen"].scope_escalate_after,
+            3
+        );
+        for value in [2, 16] {
+            assert_eq!(
+                Config::parse(&text(&format!("scope_escalate_after = {value}")))
+                    .unwrap()
+                    .upstream["zen"]
+                    .scope_escalate_after,
+                value
+            );
+        }
+        for value in [0, 1, 17, 100] {
+            assert!(
+                Config::parse(&text(&format!("scope_escalate_after = {value}"))).is_err(),
+                "{value}"
+            );
+        }
     }
 
     #[test]

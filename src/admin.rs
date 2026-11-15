@@ -164,11 +164,11 @@ async fn status(
     let snapshot = app.snapshot();
     let now = Instant::now();
     let body = {
-        let health = app
+        let mut health = app
             .health()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        build_status(&snapshot, &health, now)
+        build_status(&snapshot, &mut health, now)
     };
     let body = {
         let mut body = body;
@@ -482,7 +482,7 @@ pub(crate) fn text_response(
 
 /// Snapshot of key health and stream routing for operators. Carries no key
 /// material, token hashes or file paths.
-fn build_status(snapshot: &Snapshot, health: &KeyState, now: Instant) -> String {
+fn build_status(snapshot: &Snapshot, health: &mut KeyState, now: Instant) -> String {
     let mut out = String::from("{\"keys\":[");
     for (index, (name, key)) in snapshot.config.keys.iter().enumerate() {
         if index > 0 {
@@ -511,6 +511,28 @@ fn build_status(snapshot: &Snapshot, health: &KeyState, now: Instant) -> String 
                     out.push('"');
                 }
             }
+        }
+        // Soonest first. A field that is absent for a healthy key keeps the old output byte-identical.
+        let scopes = health.cooling_scopes(name, now);
+        if !scopes.is_empty() {
+            out.push_str(",\"scopes\":[");
+            for (index, cooling) in scopes.iter().take(16).enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"route\":");
+                out.push_str(&json_string(&cooling.scope.route));
+                out.push_str(",\"model\":");
+                out.push_str(&json_string(&cooling.scope.model));
+                out.push_str(",\"retry_after_seconds\":");
+                let secs =
+                    cooling.remaining.as_secs() + u64::from(cooling.remaining.subsec_nanos() > 0);
+                out.push_str(&secs.max(1).to_string());
+                out.push_str(",\"cooldown_class\":\"");
+                out.push_str(cooling.class.name());
+                out.push_str("\"}");
+            }
+            out.push(']');
         }
         out.push('}');
     }

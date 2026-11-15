@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
-    AdminCtx, AdminReply, ChunkCtx, Event, FailureKind, KeyCounts, Plugin, RequestCtx,
-    ResponseHeadCtx, HOST_KEYS,
+    AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, KeyCounts, Plugin,
+    RequestCtx, ResponseHeadCtx, HOST_KEYS,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
@@ -55,7 +55,9 @@ impl Plugin for MetricsPlugin {
             Event::Failover { stream, key, kind } => {
                 self.metrics.record_failover(stream, key, kind);
             }
-            Event::Cooldown { key, kind } => self.metrics.record_cooldown(key, kind),
+            Event::Cooldown { key, kind, scope } => {
+                self.metrics.record_cooldown(key, kind, scope);
+            }
             Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
             Event::PluginRejected { stream, plugin } => {
                 self.metrics.record_plugin_rejection(stream, plugin);
@@ -316,7 +318,7 @@ fn usage_in(value: &serde_json::Value) -> (Option<u64>, Option<u64>) {
 struct Inner {
     requests: BTreeMap<(String, String, &'static str), u64>,
     failovers: BTreeMap<(String, String, &'static str), u64>,
-    cooldowns: BTreeMap<(String, &'static str), u64>,
+    cooldowns: BTreeMap<(String, &'static str, &'static str), u64>,
     rate_limit_rejections: BTreeMap<String, u64>,
     plugin_rejections: BTreeMap<(String, String), u64>,
     findings: BTreeMap<(String, String, String, &'static str), u64>,
@@ -362,11 +364,11 @@ impl Metrics {
         });
     }
 
-    pub fn record_cooldown(&self, key: &str, class: FailureKind) {
+    pub fn record_cooldown(&self, key: &str, class: FailureKind, scope: CooldownScope) {
         self.with(|inner| {
             *inner
                 .cooldowns
-                .entry((key.to_owned(), class.label()))
+                .entry((key.to_owned(), class.label(), scope.label()))
                 .or_insert(0) += 1;
         });
     }
@@ -474,12 +476,13 @@ impl Metrics {
             "# HELP reiki_cooldowns_total Keys put on cooldown or taken out of rotation.\n",
         );
         out.push_str("# TYPE reiki_cooldowns_total counter\n");
-        for ((key, class), count) in &inner.cooldowns {
+        for ((key, class, scope), count) in &inner.cooldowns {
             let _ = writeln!(
                 out,
-                "reiki_cooldowns_total{{key=\"{}\",class=\"{}\"}} {}",
+                "reiki_cooldowns_total{{key=\"{}\",class=\"{}\",scope=\"{}\"}} {}",
                 escape_label(key),
                 class,
+                scope,
                 count
             );
         }
@@ -635,7 +638,7 @@ mod tests {
         metrics.record_request("client", "zen", StatusClass::Success);
         metrics.record_request("client", "zen", StatusClass::Success);
         metrics.record_failover("client", "zen-a", FailureKind::RateLimited);
-        metrics.record_cooldown("zen-a", FailureKind::QuotaExhausted);
+        metrics.record_cooldown("zen-a", FailureKind::QuotaExhausted, CooldownScope::Key);
         metrics.record_rate_limit_rejection("client");
 
         let text = metrics.render(KeyCounts {
@@ -651,7 +654,9 @@ mod tests {
         assert!(text.contains(
             "reiki_failovers_total{stream=\"client\",key=\"zen-a\",class=\"rate_limited\"} 1"
         ));
-        assert!(text.contains("reiki_cooldowns_total{key=\"zen-a\",class=\"quota_exhausted\"} 1"));
+        assert!(text.contains(
+            "reiki_cooldowns_total{key=\"zen-a\",class=\"quota_exhausted\",scope=\"key\"} 1"
+        ));
         assert!(text.contains("reiki_rate_limit_rejections_total{stream=\"client\"} 1"));
         assert!(text.contains("reiki_keys{state=\"available\"} 1"));
         assert!(text.contains("reiki_keys{state=\"cooling\"} 2"));
@@ -770,6 +775,7 @@ mod tests {
         plugin.on_event(&Event::Cooldown {
             key: "k",
             kind: FailureKind::RateLimited,
+            scope: CooldownScope::Key,
         });
         let keys = KeyCounts {
             available: 4,
@@ -781,7 +787,7 @@ mod tests {
         ));
         assert!(reply
             .body
-            .contains("reiki_cooldowns_total{key=\"k\",class=\"rate_limited\"} 1"));
+            .contains("reiki_cooldowns_total{key=\"k\",class=\"rate_limited\",scope=\"key\"} 1"));
         assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
         assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
         assert!(!plugin.uses_bodies());

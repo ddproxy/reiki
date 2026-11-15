@@ -2,6 +2,47 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::classify::FailureClass;
+use reiki_plugin::CooldownScope;
+
+/// A route and model combination a failure can be confined to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Scope {
+    pub route: String,
+    pub model: String,
+}
+
+/// Collapse id-like path segments so `/files/123` and `/files/456` share a scope.
+pub fn scope_route(rest: &str) -> String {
+    let path = rest.split('?').next().unwrap_or(rest);
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        let id_like = !segment.is_empty()
+            && (segment.bytes().all(|b| b.is_ascii_digit()) || segment.chars().count() > 24);
+        if id_like {
+            out.push('*');
+        } else {
+            out.push_str(segment);
+        }
+    }
+    // The route comes from the request line, so bound what a stored combination can hold.
+    let mut end = out.len().min(MAX_ROUTE_BYTES);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
+}
+
+/// A cooling combination, soonest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoolingScope {
+    pub scope: Scope,
+    pub remaining: Duration,
+    pub class: FailureClass,
+}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -28,11 +69,23 @@ pub enum Strategy {
     RoundRobin,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScopeHealth {
+    cooling_until: Instant,
+    class: FailureClass,
+}
+
+/// Most combinations one key remembers. Bounds memory against a stream of request models.
+const MAX_SCOPES: usize = 64;
+const MAX_ROUTE_BYTES: usize = 256;
+
 #[derive(Debug, Default, Clone)]
 struct KeyHealth {
     cooling_until: Option<Instant>,
     /// The failure that set `cooling_until`. Stale once the deadline passes, so readers gate on it.
     cooling_class: Option<FailureClass>,
+    /// Route-and-model cooldowns; in memory only, never persisted.
+    scopes: HashMap<Scope, ScopeHealth>,
     disabled: bool,
     transient_failures: u32,
     last_status: Option<u16>,
@@ -53,6 +106,66 @@ impl KeyHealth {
                 true
             }
         }
+    }
+
+    fn scope_cooling_remaining(&self, scope: &Scope, now: Instant) -> Option<Duration> {
+        self.scopes
+            .get(scope)?
+            .cooling_until
+            .checked_duration_since(now)
+            .filter(|duration| !duration.is_zero())
+    }
+
+    fn prune_scopes(&mut self, now: Instant) {
+        self.scopes.retain(|_, health| health.cooling_until > now);
+    }
+
+    fn cooling_models(&self, now: Instant) -> usize {
+        let mut models: Vec<&str> = Vec::new();
+        for (scope, health) in &self.scopes {
+            if health.cooling_until > now && !models.contains(&scope.model.as_str()) {
+                models.push(&scope.model);
+            }
+        }
+        models.len()
+    }
+
+    /// Cools one combination, evicting the soonest-ending entry when the map is full.
+    /// Returns false when an existing, later deadline already covers this failure.
+    fn cool_scope(
+        &mut self,
+        scope: &Scope,
+        until: Instant,
+        class: FailureClass,
+        now: Instant,
+    ) -> bool {
+        self.prune_scopes(now);
+        if let Some(existing) = self.scopes.get_mut(scope) {
+            if existing.cooling_until >= until {
+                return false;
+            }
+            existing.cooling_until = until;
+            existing.class = class;
+            return true;
+        }
+        if self.scopes.len() >= MAX_SCOPES {
+            if let Some(victim) = self
+                .scopes
+                .iter()
+                .min_by_key(|(_, health)| health.cooling_until)
+                .map(|(scope, _)| scope.clone())
+            {
+                self.scopes.remove(&victim);
+            }
+        }
+        self.scopes.insert(
+            scope.clone(),
+            ScopeHealth {
+                cooling_until: until,
+                class,
+            },
+        );
+        true
     }
 }
 
@@ -85,10 +198,17 @@ pub struct SavedHealth {
 
 impl KeyState {
     pub fn is_available(&self, key: &str, now: Instant) -> bool {
-        match self.health.get(key) {
-            None => true,
-            Some(h) => !h.disabled && h.cooling_until.is_none_or(|until| until <= now),
-        }
+        self.is_available_for(key, None, now)
+    }
+
+    /// A key is usable when neither the key nor the request's combination is cooling.
+    pub fn is_available_for(&self, key: &str, scope: Option<&Scope>, now: Instant) -> bool {
+        let Some(h) = self.health.get(key) else {
+            return true;
+        };
+        !h.disabled
+            && h.cooling_until.is_none_or(|until| until <= now)
+            && scope.is_none_or(|scope| h.scope_cooling_remaining(scope, now).is_none())
     }
 
     pub fn status(&self, key: &str, now: Instant) -> KeyStatus {
@@ -177,12 +297,39 @@ impl KeyState {
             KeyHealth {
                 cooling_until: saved.cooling.map(|cooling| now + cooling),
                 cooling_class: None,
+                scopes: HashMap::new(),
                 disabled: saved.disabled,
                 transient_failures: saved.transient_failures,
                 last_status: None,
                 status_seq: 0,
             },
         );
+    }
+
+    /// Every cooling combination on a key, soonest first, dropping expired entries.
+    pub fn cooling_scopes(&mut self, key: &str, now: Instant) -> Vec<CoolingScope> {
+        let Some(h) = self.health.get_mut(key) else {
+            return Vec::new();
+        };
+        h.prune_scopes(now);
+        let mut cooling: Vec<CoolingScope> = h
+            .scopes
+            .iter()
+            .filter_map(|(scope, health)| {
+                Some(CoolingScope {
+                    scope: scope.clone(),
+                    remaining: health.cooling_until.checked_duration_since(now)?,
+                    class: health.class,
+                })
+            })
+            .collect();
+        cooling.sort_by(|a, b| {
+            a.remaining
+                .cmp(&b.remaining)
+                .then_with(|| a.scope.route.cmp(&b.scope.route))
+                .then_with(|| a.scope.model.cmp(&b.scope.model))
+        });
+        cooling
     }
 
     /// Record a key-level failure. Returns true when the key is now out of rotation.
@@ -207,32 +354,70 @@ impl KeyState {
         now: Instant,
         quota_cooldown: Option<Duration>,
     ) -> bool {
+        self.record_failure_scoped(key, class, policy, now, quota_cooldown, None, 0)
+            .is_some()
+    }
+
+    /// Records a failure, on `scope` when the caller says it belongs to a combination, and
+    /// otherwise on the key. After `escalate_after` models are cooling on one key, the next
+    /// combination failure cools the key instead. Returns what was cooled, if anything.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_failure_scoped(
+        &mut self,
+        key: &str,
+        class: FailureClass,
+        policy: &Policy,
+        now: Instant,
+        quota_cooldown: Option<Duration>,
+        scope: Option<&Scope>,
+        escalate_after: u32,
+    ) -> Option<CooldownScope> {
         let h = self.health.entry(key.to_owned()).or_default();
         match class {
             FailureClass::Unauthorized => {
                 h.disabled = true;
-                true
+                Some(CooldownScope::Key)
             }
             FailureClass::RateLimited(retry_after) => {
                 let until = now + retry_after.unwrap_or(policy.rate_limited_default);
-                h.cool_until(until, class)
+                Self::cool_failure(h, scope, until, class, now, escalate_after)
             }
             FailureClass::QuotaExhausted => {
                 let until = now + quota_cooldown.unwrap_or(policy.quota_exhausted);
-                h.cool_until(until, class)
+                Self::cool_failure(h, scope, until, class, now, escalate_after)
             }
             // Request-scoped: the proxy skips the key for this request and never records it.
-            FailureClass::AccessDisabled => false,
+            FailureClass::AccessDisabled => None,
             FailureClass::Transient => {
                 h.transient_failures += 1;
                 if h.transient_failures >= policy.transient_threshold {
                     h.transient_failures = 0;
                     h.cool_until(now + policy.transient, class)
+                        .then_some(CooldownScope::Key)
                 } else {
-                    false
+                    None
                 }
             }
         }
+    }
+
+    fn cool_failure(
+        h: &mut KeyHealth,
+        scope: Option<&Scope>,
+        until: Instant,
+        class: FailureClass,
+        now: Instant,
+        escalate_after: u32,
+    ) -> Option<CooldownScope> {
+        let Some(scope) = scope else {
+            return h.cool_until(until, class).then_some(CooldownScope::Key);
+        };
+        h.prune_scopes(now);
+        if escalate_after >= 2 && h.cooling_models(now) >= escalate_after as usize {
+            return h.cool_until(until, class).then_some(CooldownScope::Key);
+        }
+        h.cool_scope(scope, until, class, now)
+            .then_some(CooldownScope::Model)
     }
 
     pub fn record_success(&mut self, key: &str) {
@@ -258,10 +443,26 @@ impl KeyState {
     /// Time until the first key of the chain becomes usable again. `None` when every key
     /// is disabled, which has no recovery time.
     pub fn soonest_recovery(&self, chain: &[String], now: Instant) -> Option<Duration> {
+        self.soonest_recovery_for(chain, None, now)
+    }
+
+    /// Like `soonest_recovery`, but a key also waits for the request's combination cooldown.
+    pub fn soonest_recovery_for(
+        &self,
+        chain: &[String],
+        scope: Option<&Scope>,
+        now: Instant,
+    ) -> Option<Duration> {
         chain
             .iter()
             .filter(|k| !self.is_disabled(k))
-            .map(|k| self.cooling_remaining(k, now).unwrap_or(Duration::ZERO))
+            .map(|k| {
+                let key_wait = self.cooling_remaining(k, now).unwrap_or(Duration::ZERO);
+                let scope_wait = scope
+                    .and_then(|scope| self.health.get(k)?.scope_cooling_remaining(scope, now))
+                    .unwrap_or(Duration::ZERO);
+                key_wait.max(scope_wait)
+            })
             .min()
     }
 }
@@ -300,13 +501,32 @@ impl Chain {
     }
 
     pub fn pick(&mut self, state: &KeyState, now: Instant) -> Option<&str> {
-        self.pick_where(state, now, |_| true)
+        self.pick_scoped(state, now, None)
+    }
+
+    pub fn pick_scoped(
+        &mut self,
+        state: &KeyState,
+        now: Instant,
+        scope: Option<&Scope>,
+    ) -> Option<&str> {
+        self.pick_where_scoped(state, now, scope, |_| true)
     }
 
     pub fn pick_where(
         &mut self,
         state: &KeyState,
         now: Instant,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<&str> {
+        self.pick_where_scoped(state, now, None, accept)
+    }
+
+    pub fn pick_where_scoped(
+        &mut self,
+        state: &KeyState,
+        now: Instant,
+        scope: Option<&Scope>,
         accept: impl Fn(&str) -> bool,
     ) -> Option<&str> {
         let n = self.keys.len();
@@ -317,9 +537,9 @@ impl Chain {
             Strategy::Sticky => self.cursor % n,
             Strategy::RoundRobin => (self.cursor + 1) % n,
         };
-        let found = (0..n)
-            .map(|offset| (start + offset) % n)
-            .find(|&i| accept(&self.keys[i]) && state.is_available(&self.keys[i], now))?;
+        let found = (0..n).map(|offset| (start + offset) % n).find(|&i| {
+            accept(&self.keys[i]) && state.is_available_for(&self.keys[i], scope, now)
+        })?;
         self.cursor = found;
         Some(&self.keys[found])
     }
@@ -778,5 +998,139 @@ mod tests {
         let mut restored = KeyState::default();
         restored.restore("a", saved["a"], now);
         assert_eq!(restored.consecutive_failures("a"), 1);
+    }
+
+    #[test]
+    fn scope_routes_drop_the_query_and_collapse_id_like_segments() {
+        assert_eq!(scope_route("/responses?stream=true"), "/responses");
+        assert_eq!(scope_route("/chat/completions"), "/chat/completions");
+        assert_eq!(
+            scope_route("/files/123/download/abcdefghijklmnopqrstuvwxyz"),
+            "/files/*/download/*"
+        );
+        assert_eq!(scope_route(""), "");
+        let long = format!("/{}", "é/".repeat(300));
+        assert!(scope_route(&long).len() <= MAX_ROUTE_BYTES);
+        assert!(scope_route(&long).starts_with("/é/é"));
+    }
+
+    fn scope(route: &str, model: &str) -> Scope {
+        Scope {
+            route: route.to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_combination_failure_cools_only_that_route_and_model() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let paid = scope("/responses", "gpt-big");
+        let free = scope("/chat/completions", "free-model");
+
+        assert_eq!(
+            state.record_failure_scoped(
+                "a",
+                FailureClass::RateLimited(Some(secs(10))),
+                &policy,
+                now,
+                None,
+                Some(&paid),
+                3,
+            ),
+            Some(CooldownScope::Model)
+        );
+        assert!(state.is_available("a", now), "the key itself stays usable");
+        assert!(!state.is_available_for("a", Some(&paid), now));
+        assert!(state.is_available_for("a", Some(&free), now));
+        assert!(state.is_available_for("a", None, now));
+
+        let cooling = state.cooling_scopes("a", now);
+        assert_eq!(cooling.len(), 1);
+        assert_eq!(cooling[0].scope, paid);
+        assert_eq!(cooling[0].remaining, secs(10));
+        assert_eq!(cooling[0].class, FailureClass::RateLimited(Some(secs(10))));
+        assert!(state.cooling_scopes("a", now + secs(10)).is_empty());
+    }
+
+    #[test]
+    fn enough_distinct_cooling_models_escalate_to_the_key() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        for model in ["m1", "m2", "m3"] {
+            assert_eq!(
+                state.record_failure_scoped(
+                    "a",
+                    FailureClass::RateLimited(Some(secs(10))),
+                    &policy,
+                    now,
+                    None,
+                    Some(&scope("/chat", model)),
+                    3,
+                ),
+                Some(CooldownScope::Model),
+                "{model} is still a combination cooldown"
+            );
+        }
+        assert!(
+            state.is_available("a", now),
+            "three models cool, the key is still usable"
+        );
+        assert_eq!(
+            state.record_failure_scoped(
+                "a",
+                FailureClass::RateLimited(Some(secs(10))),
+                &policy,
+                now,
+                None,
+                Some(&scope("/chat", "m4")),
+                3,
+            ),
+            Some(CooldownScope::Key),
+            "the fourth combination failure escalates"
+        );
+        assert!(!state.is_available("a", now));
+    }
+
+    #[test]
+    fn the_combination_map_is_bounded_and_evicts_the_soonest_ending() {
+        // Straight at the map: escalation would otherwise cool the key long before 64 models.
+        let mut health = KeyHealth::default();
+        let now = Instant::now();
+        for index in 0..1_000u64 {
+            health.cool_scope(
+                &scope("/chat", &format!("model-{index}")),
+                now + secs(20 + index % 40),
+                FailureClass::RateLimited(None),
+                now,
+            );
+        }
+        assert_eq!(health.scopes.len(), MAX_SCOPES);
+        assert!(health
+            .scopes
+            .values()
+            .all(|h| h.cooling_until >= now + secs(20)));
+    }
+
+    #[test]
+    fn many_distinct_models_escalate_to_the_key_instead_of_filling_the_map() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        for index in 0..1_000u64 {
+            state.record_failure_scoped(
+                "a",
+                FailureClass::RateLimited(Some(secs(30))),
+                &policy,
+                now,
+                None,
+                Some(&scope("/chat", &format!("model-{index}"))),
+                16,
+            );
+        }
+        assert!(matches!(state.status("a", now), KeyStatus::Cooling(_)));
+        assert!(state.health["a"].scopes.len() <= 16);
     }
 }

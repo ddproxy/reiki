@@ -17,12 +17,12 @@ use crate::auth::{
     constant_time_eq, extract_token, sha256_hex, strip_query_key, LoginThrottle, Peer,
     ThrottleSettings,
 };
-use crate::chain::{Chain, KeyState, Policy, SavedHealth};
+use crate::chain::{scope_route, Chain, KeyState, Policy, SavedHealth, Scope};
 use crate::classify::{classify, FailureClass, Outcome};
-use crate::config::{Config, PeersConfig};
+use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
-use crate::rewrite::rewrite_body;
+use crate::rewrite::{request_model, rewrite_body};
 use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit};
 use crate::shaper::headers::{observe, Observed};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
@@ -226,6 +226,7 @@ impl Snapshot {
         stream: &str,
         upstream: &str,
         skip: &[String],
+        scope: Option<&Scope>,
     ) -> Option<String> {
         let health = health.lock().unwrap_or_else(PoisonError::into_inner);
         let mut chain = self
@@ -235,20 +236,25 @@ impl Snapshot {
             .unwrap_or_else(PoisonError::into_inner);
         let keys = &self.config.keys;
         chain
-            .pick_where(&health, Instant::now(), |k| {
+            .pick_where_scoped(&health, Instant::now(), scope, |k| {
                 !skip.iter().any(|s| s == k) && keys.get(k).is_some_and(|c| c.upstream == upstream)
             })
             .map(str::to_owned)
     }
 
-    fn soonest_recovery(&self, health: &Mutex<KeyState>, stream: &str) -> Option<Duration> {
+    fn soonest_recovery(
+        &self,
+        health: &Mutex<KeyState>,
+        stream: &str,
+        scope: Option<&Scope>,
+    ) -> Option<Duration> {
         let health = health.lock().unwrap_or_else(PoisonError::into_inner);
         let chain = self
             .chains
             .get(stream)?
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        health.soonest_recovery(chain.keys(), Instant::now())
+        health.soonest_recovery_for(chain.keys(), scope, Instant::now())
     }
 }
 
@@ -1365,7 +1371,7 @@ async fn dispatch_body(
                 let mut session = spent.plugin_states;
                 finish_buffered(&mut session, &key, serving_upstream, status, &headers, body)
             }
-            None => exhausted(snapshot, &app.health, stream),
+            None => exhausted(snapshot, &app.health, stream, spent.scope.as_ref()),
         },
     }
 }
@@ -1374,11 +1380,13 @@ async fn dispatch_body(
 struct Spent {
     refusal: Option<(String, StatusCode, HeaderMap, Bytes)>,
     plugin_states: PluginSession,
+    /// The route-and-model combination of the request that ran out of keys.
+    scope: Option<Scope>,
     /// The forwarder link failed, which is final: no fallback upstream is tried.
     link_failed: bool,
 }
 
-fn forwarder_failed(key: String, plugin_states: PluginSession) -> Box<Spent> {
+fn forwarder_failed(key: String, plugin_states: PluginSession, scope: Option<Scope>) -> Box<Spent> {
     Box::new(Spent {
         refusal: Some((
             key,
@@ -1387,6 +1395,7 @@ fn forwarder_failed(key: String, plugin_states: PluginSession) -> Box<Spent> {
             Bytes::from_static(FORWARDER_FAILED_BODY),
         )),
         plugin_states,
+        scope,
         link_failed: true,
     })
 }
@@ -1487,6 +1496,12 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     } = fwd;
 
     let url = target_url(upstream, rest, parts.uri.query().and_then(strip_query_key));
+    // The combination failures are confined to. It is derived from the rewritten body every
+    // key sends, so a fallback that remaps the model gets its own scope.
+    let scope = request_model(&body).map(|model| Scope {
+        route: scope_route(rest),
+        model,
+    });
 
     // Enough attempts to walk the chain once, plus one retry of a transient failure.
     let max_attempts = snapshot
@@ -1504,7 +1519,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     // The shortest wait any shaped-out key reported, for the local 429.
     let mut shaped_wait: Option<Duration> = None;
     for _ in 0..max_attempts {
-        let Some(key_name) = snapshot.pick(&app.health, stream, upstream_name, &skip) else {
+        let Some(key_name) =
+            snapshot.pick(&app.health, stream, upstream_name, &skip, scope.as_ref())
+        else {
             break;
         };
         // Only count a failover once the next key is actually in hand, so a dead
@@ -1606,7 +1623,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     };
                     tracing::error!(error = %reason, "forwarder failed");
                     plugin_states.on_attempt(&key_name, None, &[]);
-                    return Err(forwarder_failed(key_name, plugin_states));
+                    return Err(forwarder_failed(key_name, plugin_states, scope));
                 }
                 let timed_out = failed.is_err();
                 let pre_send = matches!(&failed, Ok(Err(error)) if is_pre_send(error));
@@ -1618,6 +1635,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     &key_name,
                     FailureClass::Transient,
                     None,
+                    scope.as_ref(),
                 );
                 // A POST or PATCH may already have reached the upstream, so replaying it
                 // could duplicate a side effect. Only a connect failure is unambiguously
@@ -1731,15 +1749,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         let outcome = if upstream.pass_errors {
             Outcome::PassThrough
         } else {
-            match classify(status.as_u16(), retry_after.as_deref(), &text) {
-                Outcome::KeyFailure(FailureClass::QuotaExhausted)
-                    if upstream.payment_required_per_request
-                        && status == StatusCode::PAYMENT_REQUIRED =>
-                {
-                    Outcome::KeyFailure(FailureClass::AccessDisabled)
-                }
-                other => other,
-            }
+            classify(status.as_u16(), retry_after.as_deref(), &text)
         };
         // The first pass of a quota confirmation leaves the bucket untouched, so the
         // same key can be tried again before shaping takes it out of this request.
@@ -1826,6 +1836,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     &key_name,
                     class,
                     Some(status.as_u16()),
+                    scope.as_ref(),
                 );
                 // A first transient 5xx does not cool the key; skip it so the walk moves on.
                 if matches!(class, FailureClass::Transient) {
@@ -1846,6 +1857,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     Err(Box::new(Spent {
         refusal: last_refusal,
         plugin_states,
+        scope,
         link_failed: false,
     }))
 }
@@ -1983,7 +1995,24 @@ fn release_held(app: &App, snapshot: &Snapshot, stream: &str, held: Option<(Stri
             &key,
             FailureClass::Unauthorized,
             Some(status),
+            None,
         );
+    }
+}
+
+/// Combination failures: a plain rate-limit and a 402. A quota 429, a transient, a 401
+/// and every failure without a model stay key-scoped.
+fn failure_scope(
+    class: FailureClass,
+    status: Option<u16>,
+    scope: Option<&Scope>,
+) -> Option<&Scope> {
+    match class {
+        FailureClass::RateLimited(_) => scope,
+        FailureClass::QuotaExhausted if status == Some(StatusCode::PAYMENT_REQUIRED.as_u16()) => {
+            scope
+        }
+        _ => None,
     }
 }
 
@@ -1994,8 +2023,18 @@ fn record(
     key: &str,
     class: FailureClass,
     status: Option<u16>,
+    scope: Option<&Scope>,
 ) {
     let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now());
+    let scoped = failure_scope(class, status, scope);
+    let escalate_after = snapshot
+        .config
+        .keys
+        .get(key)
+        .and_then(|key| snapshot.config.upstream.get(&key.upstream))
+        .map_or(DEFAULT_SCOPE_ESCALATE_AFTER, |upstream| {
+            upstream.scope_escalate_after
+        });
     if let Ok(mut health) = app.health.lock() {
         // A reload that rotated this key's secret already reset its health; the old
         // secret's failure must not disable the new one.
@@ -2005,13 +2044,21 @@ fn record(
             tracing::debug!(stream, key, ?class, "ignoring failure from a rotated key");
             return;
         }
-        let cooled =
-            health.record_failure_with(key, class, &app.policy, Instant::now(), quota_cooldown);
+        let cooled = health.record_failure_scoped(
+            key,
+            class,
+            &app.policy,
+            Instant::now(),
+            quota_cooldown,
+            scoped,
+            escalate_after,
+        );
         health.record_status(key, status);
-        if cooled {
+        if let Some(cooled_scope) = cooled {
             app.plugins().on_event(&Event::Cooldown {
                 key,
                 kind: FailureKind::from(class),
+                scope: cooled_scope,
             });
         }
         let cooling_secs = health
@@ -2022,7 +2069,7 @@ fn record(
             key,
             ?class,
             ?status,
-            cooled,
+            cooled = cooled.is_some(),
             ?cooling_secs,
             "upstream key failed"
         );
@@ -2044,13 +2091,18 @@ fn quota_cooldown(
     snapshot.config.quota_reset(key)?.next_after(now)
 }
 
-fn exhausted(snapshot: &Snapshot, health: &Mutex<KeyState>, stream: &str) -> Response {
+fn exhausted(
+    snapshot: &Snapshot,
+    health: &Mutex<KeyState>,
+    stream: &str,
+    scope: Option<&Scope>,
+) -> Response {
     let mut response = json_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "reiki_exhausted",
         "every key in this stream's chain is unavailable",
     );
-    if let Some(wait) = snapshot.soonest_recovery(health, stream) {
+    if let Some(wait) = snapshot.soonest_recovery(health, stream, scope) {
         let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
         if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -2566,10 +2618,10 @@ mod tests {
         assert!(health.is_poisoned());
 
         assert_eq!(
-            snapshot.pick(&health, "s", "zen", &[]),
+            snapshot.pick(&health, "s", "zen", &[], None),
             Some("a".to_owned())
         );
-        assert!(snapshot.soonest_recovery(&health, "s").is_some());
+        assert!(snapshot.soonest_recovery(&health, "s", None).is_some());
     }
 
     #[test]

@@ -192,7 +192,7 @@ Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.openco
 
 Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the very next request. Set `confirm_quota = true` on the upstream to send such a 429 once more on the same key, after a 3-second pause, before cooling it; only a repeated quota 429 takes the key out of rotation. It costs a genuinely exhausted key one extra request and 3 seconds per request.
 
-A free-tier account answers a paid model with 402 while its free models keep working, so one request for a paid model (OpenCode asks for a small model to title sessions) would cool the whole key for hours. Set `payment_required_per_request = true` on the upstream to treat a 402 as a refusal of that request only: the key stays in rotation and the upstream's answer goes back to the caller. Leave it off where a 402 means the account has no credit left (OpenRouter).
+A free-tier account answers a paid model with 402 while its free models keep working, so cooling the whole key for hours would take the free models down with it. A 402 is scoped to the request's route and model instead: the key keeps serving other combinations, and `/status` lists the cooling combination. A quota 429 still cools the whole key, because it is about the account rather than one model. Choose how many models may be cooling on one key before another failure cools the key with `scope_escalate_after` (default 3, 2 to 16).
 
 Zen's free models only accept requests that carry OpenCode's own headers. Reiki forwards every header except the credential, so the free tier keeps working.
 

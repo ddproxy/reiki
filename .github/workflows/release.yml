@@ -71,7 +71,7 @@ jobs:
           esac
           dir="$RUNNER_TEMP/peers-smoke"
           mkdir -p "$dir"
-          printf 'k\n' > "$dir/key"
+          printf 'smoke-key-0000\n' > "$dir/key"
           chmod 600 "$dir/key"
           base="[upstream.zen]
           base_url = \"https://example.com/v1\"

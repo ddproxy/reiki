@@ -2040,6 +2040,20 @@ fn failure_scope(
     }
 }
 
+/// True when the body is in a content coding Reiki did not decode, so a key echoed in it
+/// cannot be found. `identity` is a legal no-op and counts as plain.
+fn is_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |text| {
+                text.split(',')
+                    .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        })
+}
+
 fn record(
     app: &App,
     snapshot: &Snapshot,
@@ -2309,7 +2323,7 @@ fn stream_response(
     if let Some(length) = response.headers.get(header::CONTENT_LENGTH) {
         headers.insert(header::CONTENT_LENGTH, length.clone());
     }
-    let scrubber = if response.headers.contains_key(header::CONTENT_ENCODING) {
+    let scrubber = if is_encoded(&response.headers) {
         None
     } else {
         crate::scrub::StreamScrubber::new(secrets)
@@ -2449,6 +2463,24 @@ fn buffered_response(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_content_coding_is_plain_and_anything_else_is_not() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            headers
+        };
+        assert!(!is_encoded(&HeaderMap::new()));
+        assert!(!is_encoded(&with("identity")));
+        assert!(!is_encoded(&with(" Identity , identity ")));
+        assert!(is_encoded(&with("gzip")));
+        assert!(is_encoded(&with("identity, gzip")));
+        assert!(is_encoded(&with("x-unknown")));
+    }
+
     use super::*;
     use crate::plugins::Registration;
     use reiki_plugin::{ChunkCtx, Plugin};

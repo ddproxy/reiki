@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- A response with `Content-Encoding: identity` is scrubbed for the upstream key like any plain body; before, the header switched the scrubber off.
+- The labelled peers health view no longer lists per-model cooldowns (`scopes`), which exposed client-chosen model names; `reiki peers` shows control characters in peer-supplied names as `?`.
 - The `placeholders` plugin leaves Anthropic `thinking` and `redacted_thinking` blocks (and their `signature` and `data`, in requests, JSON responses and SSE deltas) and base64 `image` and `document` blocks byte-identical, so a second turn no longer fails thinking-signature validation and media is not corrupted.
 - Placeholder ids stay the same across a config reload (one salt per process), so prompt caching and signed history survive a reload; a restart still changes them.
 - A placeholder fragment held at the end of an Anthropic stream is flushed before `message_stop`, not after it.

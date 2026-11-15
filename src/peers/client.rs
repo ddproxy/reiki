@@ -345,6 +345,15 @@ pub fn render_table(reports: &[PeerReport]) -> String {
             ]);
         }
     }
+    // A peer chooses its instance and upstream names, and they go to a terminal.
+    for cell in rows.iter_mut().flatten() {
+        if cell.chars().any(char::is_control) {
+            *cell = cell
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect();
+        }
+    }
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -742,6 +751,15 @@ pub async fn watch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_characters_from_a_peer_are_shown_as_question_marks() {
+        let mut report = PeerReport::unknown("peer-a", "down".to_owned());
+        report.instance = Some("evil\u{1b}[2Jname".to_owned());
+        let table = render_table(&[report]);
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+        assert!(table.contains("evil?[2Jname"), "{table:?}");
+    }
+
     use super::*;
 
     #[test]

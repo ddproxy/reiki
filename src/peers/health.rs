@@ -74,23 +74,6 @@ pub(crate) fn upstreams(
                         item["cooldown_class"] = json!(class.name());
                     }
                 }
-                let scopes = health.cooling_scopes(key, now);
-                if !scopes.is_empty() {
-                    item["scopes"] = Value::Array(
-                        scopes
-                            .iter()
-                            .take(16)
-                            .map(|cooling| {
-                                json!({
-                                    "route": &cooling.scope.route,
-                                    "model": &cooling.scope.model,
-                                    "retry_after_seconds": ceil_secs(cooling.remaining, bucket),
-                                    "cooldown_class": cooling.class.name(),
-                                })
-                            })
-                            .collect(),
-                    );
-                }
                 listed.push(item);
             }
         }

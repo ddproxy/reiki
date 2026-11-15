@@ -27,16 +27,6 @@ fn upstream_schema() -> Value {
                     "cooldown_class": {"type": "string",
                         "enum": ["rate_limited", "quota_exhausted", "transient"],
                         "description": "Only while cooling, and only when the class is known"},
-                    "scopes": {
-                        "description": "Combination cooldowns, soonest first; omitted when none",
-                        "type": "array",
-                        "items": {"type": "object", "properties": {
-                            "route": {"type": "string"},
-                            "model": {"type": "string"},
-                            "retry_after_seconds": {"type": "integer", "minimum": 1},
-                            "cooldown_class": {"type": "string"},
-                        }},
-                    },
                 }},
             },
         },

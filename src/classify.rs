@@ -23,6 +23,14 @@ impl From<FailureClass> for reiki_plugin::FailureKind {
     }
 }
 
+impl FailureClass {
+    /// The same name as the `class` label of `reiki_cooldowns_total`, so operators see one
+    /// vocabulary across `/status`, the peer view and metrics.
+    pub fn name(self) -> &'static str {
+        reiki_plugin::FailureKind::from(self).label()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Success,
@@ -281,6 +289,15 @@ pub fn classify_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_names_match_the_cooldown_metric_labels() {
+        assert_eq!(FailureClass::RateLimited(None).name(), "rate_limited");
+        assert_eq!(FailureClass::QuotaExhausted.name(), "quota_exhausted");
+        assert_eq!(FailureClass::AccessDisabled.name(), "access_disabled");
+        assert_eq!(FailureClass::Unauthorized.name(), "unauthorized");
+        assert_eq!(FailureClass::Transient.name(), "transient");
+    }
 
     #[test]
     fn success_and_redirects_are_delivered() {

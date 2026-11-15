@@ -16,6 +16,8 @@ pub struct KeyHealth {
     pub cooldown_seconds: Option<u64>,
     pub last_status_code: Option<u16>,
     pub streams: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_class: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +35,8 @@ struct StatusKey {
     retry_after_seconds: Option<u64>,
     #[serde(default)]
     last_status_code: Option<u16>,
+    #[serde(default)]
+    cooldown_class: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +70,7 @@ pub fn parse_status(body: &str) -> Result<Vec<KeyHealth>, String> {
             cooldown_seconds,
             last_status_code: key.last_status_code,
             streams,
+            cooldown_class: key.cooldown_class,
         });
     }
     Ok(keys)
@@ -256,13 +261,14 @@ mod tests {
             cooldown_seconds: None,
             last_status_code: None,
             streams: streams.iter().map(|s| (*s).to_owned()).collect(),
+            cooldown_class: None,
         }
     }
 
     #[test]
     fn parse_status_keeps_key_order_and_lists_streams_in_status_order() {
         let body = r#"{"keys":[
-            {"name":"b","upstream":"zen","state":"cooling","retry_after_seconds":7,"last_status_code":429},
+            {"name":"b","upstream":"zen","state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429},
             {"name":"a","upstream":"zen","state":"out_of_rotation"},
             {"name":"c","upstream":"zen","state":"available"}],
           "streams":[{"name":"s2","chain":["a","b"]},{"name":"s1","chain":["b"]}]}"#;
@@ -272,6 +278,8 @@ mod tests {
         assert_eq!(keys[0].state, "cooling");
         assert_eq!(keys[0].cooldown_seconds, Some(7));
         assert_eq!(keys[0].streams, ["s2", "s1"]);
+        assert_eq!(keys[0].cooldown_class.as_deref(), Some("quota_exhausted"));
+        assert_eq!(keys[2].cooldown_class, None);
         assert_eq!(keys[1].state, "disabled");
         assert!(keys[2].streams.is_empty());
         assert!(parse_status(

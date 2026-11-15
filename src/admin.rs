@@ -505,6 +505,11 @@ fn build_status(snapshot: &Snapshot, health: &KeyState, now: Instant) -> String 
             KeyStatus::Cooling(remaining) => {
                 out.push_str(",\"state\":\"cooling\",\"retry_after_seconds\":");
                 out.push_str(&remaining.as_secs().max(1).to_string());
+                if let Some(class) = health.cooling_class(name, now) {
+                    out.push_str(",\"cooldown_class\":\"");
+                    out.push_str(class.name());
+                    out.push('"');
+                }
             }
         }
         out.push('}');

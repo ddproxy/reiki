@@ -167,6 +167,27 @@ async fn the_json_output_reports_disabled_keys_and_their_streams() {
     assert!(!out.contains("upstream-secret"), "{out}");
 }
 
+#[tokio::test]
+async fn the_json_output_carries_the_cooldown_class() {
+    let rig = Rig::new().await;
+    rig.set_status(429);
+    assert_ne!(rig.send().await, 200, "the only key cooled");
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_keys(&["--json", "--url", &url, "--token-file", &token])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let keys = body["keys"].as_array().unwrap();
+    let a = keys.iter().find(|key| key["name"] == "a").unwrap();
+    assert_eq!(a["state"], "cooling");
+    assert_eq!(a["cooldown_class"], "rate_limited");
+    let b = keys.iter().find(|key| key["name"] == "b").unwrap();
+    assert!(b.get("cooldown_class").is_none(), "{b}");
+}
+
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);

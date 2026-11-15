@@ -4,6 +4,7 @@
 
 ### Added
 
+- `/status` and the labelled `/v1/health` key view report `cooldown_class` (`rate_limited`, `quota_exhausted`, `transient` and so on) for a cooling key, and `reiki keys --json` includes it. A cooldown restored from the state file has no class.
 - Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.
 - An optional `[hubs]`, `[hub]` and `[accounts]` config, behind a `hub` cargo feature, is parsed and validated only; no hub is contacted or served yet. See [hub](docs/hub.md). Edge tokens must differ from each other and from the peer tokens, the hub listener from the client, admin and tunnel listeners, and a hub `timeout_secs` is 1 to 3600.
 

@@ -68,7 +68,13 @@ pub(crate) fn upstreams(
                 }
             };
             if labels {
-                listed.push(json!({"name": key, "state": state, "cooldown_seconds": wait}));
+                let mut item = json!({"name": key, "state": state, "cooldown_seconds": wait});
+                if wait.is_some() {
+                    if let Some(class) = health.cooling_class(key, now) {
+                        item["cooldown_class"] = json!(class.name());
+                    }
+                }
+                listed.push(item);
             }
         }
         let mut entry = json!({
@@ -290,6 +296,54 @@ mod tests {
         let exact = &upstreams(&config, &health, now, true, 0)[1];
         assert_eq!(exact["soonest_cooldown_seconds"], 10);
         assert_eq!(exact["keys"][1]["cooldown_seconds"], 301);
+    }
+
+    #[test]
+    fn labels_name_the_cooldown_class_of_a_cooling_key_only() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        health.disable("c");
+        let zen = &upstreams(&config, &health, now, true, 0)[1];
+        assert_eq!(zen["keys"][0]["cooldown_class"], "quota_exhausted");
+        assert!(
+            zen["keys"][1].get("cooldown_class").is_none(),
+            "b is available"
+        );
+        assert!(
+            zen["keys"][2].get("cooldown_class").is_none(),
+            "c is out of rotation"
+        );
+    }
+
+    #[test]
+    fn the_unlabelled_view_never_carries_a_cooldown_class() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        let zen = &upstreams(&config, &health, now, false, 0)[1];
+        let fields: Vec<&str> = zen
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "cooling_keys",
+                "disabled_keys",
+                "healthy_keys",
+                "last_status_class",
+                "name",
+                "soonest_cooldown_seconds"
+            ]
+        );
+        assert!(!zen.to_string().contains("cooldown_class"));
     }
 
     #[test]

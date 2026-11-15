@@ -1424,6 +1424,10 @@ async fn admin_status_reports_key_and_stream_state_without_secrets() {
     assert!(body.contains("\"state\":\"available\""), "body was {body}");
     assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
     assert!(body.contains("\"retry_after_seconds\":"), "body was {body}");
+    assert!(
+        body.contains("\"cooldown_class\":\"rate_limited\""),
+        "body was {body}"
+    );
     assert!(body.contains("\"current_key\":\"b\""), "body was {body}");
     assert!(!body.contains("up-a"), "status leaked a key value: {body}");
     assert!(!body.contains("tok-a"), "status leaked a token: {body}");
@@ -1611,6 +1615,12 @@ async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
     assert!(
         (17_990..=18_000).contains(&b),
         "key b cooled for {b}s; body was {body}"
+    );
+    assert_eq!(
+        body.matches("\"cooldown_class\":\"quota_exhausted\"")
+            .count(),
+        2,
+        "body was {body}"
     );
 }
 

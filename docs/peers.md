@@ -98,7 +98,7 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192
 - `last_status_class` is `2xx`, `4xx` or `5xx` for the latest attempt on any of the upstream's keys, or `null` before one or when the attempt got no response.
 - `observed_at` is this host's UTC clock when the answer was built, for people and logs.
 - `age_seconds` is how old the figures were when the answer was sent. Everything is read as the answer is built, so it is `0`; it is there so that a reader judges freshness by its own receive time plus this age, which needs no agreement between the two clocks. `key` events on the stream carry it too.
-- With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`, bucketed the same way.
+- With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`, bucketed the same way. A cooling key also carries `cooldown_class` (`rate_limited`, `quota_exhausted` or `transient`, as in `/status`) when the class is known.
 - The answer never holds key values, token hashes, key file paths, stream names or request counts, and is sent with `Cache-Control: no-store`.
 
 ### Host stats and sessions

@@ -31,6 +31,8 @@ pub enum Strategy {
 #[derive(Debug, Default, Clone)]
 struct KeyHealth {
     cooling_until: Option<Instant>,
+    /// The failure that set `cooling_until`. Stale once the deadline passes, so readers gate on it.
+    cooling_class: Option<FailureClass>,
     disabled: bool,
     transient_failures: u32,
     last_status: Option<u16>,
@@ -40,12 +42,14 @@ struct KeyHealth {
 
 impl KeyHealth {
     /// Extends a cooldown but never shortens an existing one. Returns true only when the
-    /// deadline moves later, so a shorter failure does not emit a second Cooldown event.
-    fn cool_until(&mut self, until: Instant) -> bool {
+    /// deadline moves later, so a shorter failure does not emit a second Cooldown event and
+    /// does not relabel the cooldown it could not extend.
+    fn cool_until(&mut self, until: Instant, class: FailureClass) -> bool {
         match self.cooling_until {
             Some(existing) if existing >= until => false,
             _ => {
                 self.cooling_until = Some(until);
+                self.cooling_class = Some(class);
                 true
             }
         }
@@ -141,6 +145,13 @@ impl KeyState {
             .filter(|d| !d.is_zero())
     }
 
+    /// The failure class behind the key's current cooldown. `None` when the key is not cooling,
+    /// or when the cooldown came from a state file, which does not record a class.
+    pub fn cooling_class(&self, key: &str, now: Instant) -> Option<FailureClass> {
+        self.cooling_remaining(key, now)?;
+        self.health.get(key)?.cooling_class
+    }
+
     /// Every known key's health, for persistence. Cooldowns are expressed as a
     /// remaining duration rather than an instant.
     pub fn snapshot(&self, now: Instant) -> HashMap<String, SavedHealth> {
@@ -165,6 +176,7 @@ impl KeyState {
             key.to_owned(),
             KeyHealth {
                 cooling_until: saved.cooling.map(|cooling| now + cooling),
+                cooling_class: None,
                 disabled: saved.disabled,
                 transient_failures: saved.transient_failures,
                 last_status: None,
@@ -203,11 +215,11 @@ impl KeyState {
             }
             FailureClass::RateLimited(retry_after) => {
                 let until = now + retry_after.unwrap_or(policy.rate_limited_default);
-                h.cool_until(until)
+                h.cool_until(until, class)
             }
             FailureClass::QuotaExhausted => {
                 let until = now + quota_cooldown.unwrap_or(policy.quota_exhausted);
-                h.cool_until(until)
+                h.cool_until(until, class)
             }
             // Request-scoped: the proxy skips the key for this request and never records it.
             FailureClass::AccessDisabled => false,
@@ -215,7 +227,7 @@ impl KeyState {
                 h.transient_failures += 1;
                 if h.transient_failures >= policy.transient_threshold {
                     h.transient_failures = 0;
-                    h.cool_until(now + policy.transient)
+                    h.cool_until(now + policy.transient, class)
                 } else {
                     false
                 }
@@ -323,6 +335,91 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_shorter_failure_does_not_relabel_a_quota_cooldown() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        state.record_failure(
+            "a",
+            FailureClass::RateLimited(Some(secs(20))),
+            &policy,
+            now + secs(1),
+        );
+        assert_eq!(
+            state.cooling_class("a", now + secs(1)),
+            Some(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn a_longer_failure_takes_over_the_cooling_class() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::RateLimited(Some(secs(30))), &policy, now);
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, now + secs(1));
+        assert_eq!(
+            state.cooling_class("a", now + secs(1)),
+            Some(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn a_transient_only_cooldown_reports_transient() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::Transient, &policy, now);
+        assert_eq!(state.cooling_class("a", now), None, "not cooling yet");
+        state.record_failure("a", FailureClass::Transient, &policy, now);
+        assert_eq!(state.cooling_class("a", now), Some(FailureClass::Transient));
+    }
+
+    #[test]
+    fn the_cooling_class_ends_with_the_cooldown() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        assert_eq!(
+            state.cooling_class("a", now + policy.quota_exhausted - secs(1)),
+            Some(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(state.cooling_class("a", now + policy.quota_exhausted), None);
+    }
+
+    #[test]
+    fn enabling_a_key_clears_its_cooling_class() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        state.enable("a");
+        assert_eq!(state.cooling_class("a", now), None);
+        state.record_failure("a", FailureClass::RateLimited(Some(secs(10))), &policy, now);
+        assert_eq!(
+            state.cooling_class("a", now),
+            Some(FailureClass::RateLimited(Some(secs(10))))
+        );
+    }
+
+    #[test]
+    fn a_restored_cooldown_has_no_class() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        state.record_failure("a", FailureClass::QuotaExhausted, &Policy::default(), now);
+        let saved = state.snapshot(now);
+        let mut restored = KeyState::default();
+        restored.restore("a", saved["a"], now);
+        assert_eq!(
+            restored.cooling_remaining("a", now),
+            Some(Policy::default().quota_exhausted)
+        );
+        assert_eq!(restored.cooling_class("a", now), None);
     }
 
     #[test]

@@ -33,6 +33,7 @@ Each key:
 - `name`, `upstream`
 - `state`: `available`, `cooling` or `out_of_rotation`
 - `retry_after_seconds`: present only while `cooling`
+- `cooldown_class`: present only while `cooling` and the class is known: `rate_limited`, `quota_exhausted` or `transient`, the failure that set the current deadline (same names as `reiki_cooldowns_total`). A cooldown restored from the state file after a restart has no class until the key fails again.
 - `consecutive_failures`: consecutive transient failures since the last success
 - `last_status_code`: the upstream status of the key's latest attempt, or `null` before one
 

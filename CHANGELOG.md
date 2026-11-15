@@ -1,12 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.10.1
 
 ### Added
 
-- `reiki top` opens on a peers-by-providers matrix: one coloured cell per peer and provider (a provider a peer does not use is a dim dot, not a failure), host load with a sparkline, a disk bar and sessions, problem peers first, and a detail pane for the selected peer. `v` shows the full per-peer text view, `--full` starts in it, and `--once` prints the matrix as plain text. It falls back to one line per peer on a narrow terminal, and pause freezes the screen with its age.
-- The peers health document reports `cooling_combinations` per upstream, the number of route and model combinations cooling, as a count only. Model-level throttling is no longer invisible in `reiki peers` and `reiki top`.
-- `reiki top`: a peers-by-providers model for the coming matrix view (providers a peer does not use are their own state, not a failure).
+- `reiki top` opens on a peers-by-providers matrix: one coloured cell per peer and provider (a provider a peer does not use is a dim dot, not a failure), host load with a sparkline, a disk bar and sessions, problem peers first, and a detail pane for the selected peer. `v` shows the full per-peer text view, `--full` starts in it, and `--once` prints the matrix as plain text. It scrolls with the selection, falls back to one line per peer on a narrow terminal, and pause freezes the screen with its age.
+- The peers health document reports `cooling_combinations` per upstream, the number of route and model combinations cooling, as a count only, so model-level throttling is visible in `reiki peers` and `reiki top`.
+- `make install` builds with `reiki top` and installs `reiki` into `~/.local/bin`, or `/usr/local/bin` as root (`PREFIX=` and `DESTDIR=` override).
+
+### Changed
+
+- `reiki top` and `reiki peers` show control characters and invisible format characters (bidi overrides, zero-width marks) in peer-supplied names as `?`, and measure names in terminal columns.
 
 ## 0.10.0
 

@@ -226,19 +226,10 @@ impl Fleet {
         if let Some(class) = event.last_status_class {
             upstream.last_status_class = Some(class);
         }
+        // The event carries the whole upstream entry, so its key list replaces ours and a
+        // removed key does not linger until the next snapshot.
         if let Some(incoming) = event.keys {
-            let mut merged = upstream.keys.take().unwrap_or_default();
-            for key in incoming {
-                match merged.iter_mut().find(|k| k.name == key.name) {
-                    Some(existing) => {
-                        existing.state = key.state;
-                        existing.cooldown_seconds = key.cooldown_seconds;
-                        existing.cooldown_class = key.cooldown_class;
-                    }
-                    None => merged.push(key),
-                }
-            }
-            upstream.keys = Some(merged);
+            upstream.keys = Some(incoming);
         }
         Ok(())
     }
@@ -442,8 +433,8 @@ mod tests {
         let a = &upstream.keys.as_ref().unwrap()[0];
         assert_eq!(a.state, "cooling");
         assert_eq!(a.cooldown_class.as_deref(), Some("rate_limited"));
-        // A key the event does not mention is left alone.
-        assert_eq!(upstream.keys.as_ref().unwrap()[2].state, "out_of_rotation");
+        // The event is the whole upstream entry, so a key it omits is gone.
+        assert_eq!(upstream.keys.as_ref().unwrap().len(), 2);
     }
 
     #[test]

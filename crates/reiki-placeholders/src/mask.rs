@@ -324,6 +324,21 @@ mod tests {
     }
 
     #[test]
+    fn a_text_document_is_masked_but_a_base64_one_is_left_alone() {
+        let m = masker(&[], true);
+        let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
+        let text_doc = format!(
+            r#"{{"type":"document","source":{{"type":"text","media_type":"text/plain","data":"use {key}"}}}}"#
+        );
+        let out = m.mask(&text_doc, &mut HashMap::new()).unwrap();
+        assert!(!out.contains(&key), "{out}");
+        let base64_doc = format!(
+            r#"{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{key}"}}}}"#
+        );
+        assert!(m.mask(&base64_doc, &mut HashMap::new()).is_none());
+    }
+
+    #[test]
     fn credentials_are_masked_and_restorable() {
         let m = masker(&[], true);
         let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");

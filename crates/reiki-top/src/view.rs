@@ -38,11 +38,15 @@ impl Line {
     }
 }
 
+/// Peer-supplied strings reach the terminal, so control characters (escape sequences
+/// included) are shown as `?`.
 fn span(text: impl Into<String>, style: Style) -> Span {
-    Span {
-        text: text.into(),
-        style,
-    }
+    let text: String = text
+        .into()
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    Span { text, style }
 }
 
 /// Truncates every line to `width` characters, never inside a multi-byte char.
@@ -305,6 +309,12 @@ fn key_line(k: &crate::KeyView, width: usize) -> Line {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_characters_from_a_peer_never_reach_the_screen() {
+        let spans = [span("evil\u{1b}[2J\u{7}name", Style::Plain)];
+        assert_eq!(spans[0].text, "evil?[2J?name");
+    }
+
     use super::*;
     use crate::Health;
 

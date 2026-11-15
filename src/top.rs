@@ -278,6 +278,11 @@ async fn live_loop(
     let mut fleet = Fleet::new(poll.saturating_mul(3));
     let mut state = ui::UiState::default();
 
+    #[cfg(unix)]
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(not(unix))]
+    let mut terminate: Option<()> = None;
     let mut frame_tick = tokio::time::interval(redraw);
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut key_tick = tokio::time::interval(Duration::from_millis(100));
@@ -294,6 +299,8 @@ async fn live_loop(
                 }
                 None => return 0,
             },
+            // Return so the guard puts the terminal back before the process ends.
+            () = terminated(&mut terminate) => return 0,
             _ = frame_tick.tick() => draw_now = !state.paused,
             _ = key_tick.tick() => loop {
                 match crossterm::event::poll(Duration::ZERO) {
@@ -337,6 +344,21 @@ async fn live_loop(
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn terminated(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminated(_signal: &mut Option<()>) {
+    std::future::pending::<()>().await;
 }
 
 /// Applies one key action, turning a Tab selection into the one-peer filter.

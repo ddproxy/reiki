@@ -15,7 +15,7 @@ const SECRET_HEAD: &str = "[[REIKI_SECRET_";
 
 /// Field names under which a model's tool call carries its arguments.
 const TOOL_CALL_MARKERS: &[&str] = &[
-    "tool_calls",
+    "tool_call",
     "function_call",
     "functionCall",
     "tool_use",
@@ -166,22 +166,32 @@ fn declares_tool_call(map: &serde_json::Map<String, Value>) -> bool {
     })
 }
 
-/// True for model reasoning and binary payloads, whose bytes must never be rewritten.
-pub(crate) fn is_opaque(map: &serde_json::Map<String, Value>) -> bool {
-    map.get("type").and_then(Value::as_str).is_some_and(|t| {
-        matches!(
-            t,
-            "thinking"
-                | "redacted_thinking"
-                | "thinking_delta"
-                | "signature_delta"
-                | "image"
-                | "document"
-        )
-    })
+/// The fields of an object whose bytes must never be rewritten: signed reasoning and base64
+/// media. Anything else in those objects, a text document included, is ordinary content.
+pub(crate) fn protected_keys(map: &serde_json::Map<String, Value>) -> &'static [&'static str] {
+    let kind = map.get("type").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "thinking" => &["thinking", "signature"],
+        "redacted_thinking" => &["data"],
+        "thinking_delta" => &["thinking"],
+        "signature_delta" => &["signature"],
+        "image" | "document" => {
+            let base64 = map
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str)
+                == Some("base64");
+            if base64 {
+                &["source"]
+            } else {
+                &[]
+            }
+        }
+        _ => &[],
+    }
 }
 
-/// Paths of every object in `value` that must stay byte-identical.
+/// Paths of every field in `value` that must stay byte-identical.
 pub(crate) fn opaque_paths(value: &Value, path: &str, out: &mut Vec<String>) {
     match value {
         Value::Array(items) => {
@@ -190,8 +200,8 @@ pub(crate) fn opaque_paths(value: &Value, path: &str, out: &mut Vec<String>) {
             }
         }
         Value::Object(map) => {
-            if is_opaque(map) {
-                out.push(path.to_owned());
+            for key in protected_keys(map) {
+                out.push(format!("{path}.{key}"));
             }
             for (key, item) in map {
                 opaque_paths(item, &format!("{path}.{key}"), out);
@@ -437,10 +447,11 @@ impl Restorer {
                 }
             }
             Value::Object(map) => {
-                let opaque = opaque || is_opaque(map);
+                let protected = protected_keys(map);
                 let in_call = in_call || declares_tool_call(map);
                 for (key, item) in map.iter_mut() {
                     at.push(Seg::Key(key.clone()));
+                    let opaque = opaque || protected.contains(&key.as_str());
                     self.walk(at, in_call || in_tool_call(key), opaque, item, reverse);
                     at.pop();
                 }
@@ -790,6 +801,22 @@ mod tests {
             out["content"][1]["input"]["command"],
             format!("curl {SECRET}")
         );
+    }
+
+    #[test]
+    fn a_singular_tool_call_keeps_credentials_masked_in_a_whole_body() {
+        let body = serde_json::json!({"items": [
+            {"type": "tool_call", "arguments": {"cmd": SECRET}},
+            {"type": "message", "text": SECRET}
+        ]})
+        .to_string();
+        let mut restorer = Restorer::new(4096, false);
+        restorer.start(Some("application/json"), false);
+        let mut chunk = Bytes::from(body);
+        restorer.feed(&mut chunk, true, &secret_reverse());
+        let out: Value = serde_json::from_slice(&chunk).unwrap();
+        assert_eq!(out["items"][0]["arguments"]["cmd"], SECRET);
+        assert_eq!(out["items"][1]["text"], "tok-123");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 ### Added
 
+- The peers health document reports `cooling_combinations` per upstream, the number of route and model combinations cooling, as a count only. Model-level throttling is no longer invisible in `reiki peers` and `reiki top`.
 - `reiki top`: a peers-by-providers model for the coming matrix view (providers a peer does not use are their own state, not a failure).
 
 ## 0.10.0

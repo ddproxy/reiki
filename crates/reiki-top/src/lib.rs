@@ -48,6 +48,10 @@ pub struct Upstream {
     pub healthy_keys: u32,
     pub cooling_keys: u32,
     pub disabled_keys: u32,
+    /// How many (route, model) combinations are cooling on this upstream's keys. A count only:
+    /// the names behind it are never published. Older publishers omit it.
+    #[serde(default)]
+    pub cooling_combinations: u32,
     /// The shortest wait among the cooling keys, or `null` when none is cooling.
     #[serde(default)]
     pub soonest_cooldown_seconds: Option<u64>,
@@ -191,6 +195,8 @@ impl Fleet {
             #[serde(default)]
             disabled_keys: Option<u32>,
             #[serde(default)]
+            cooling_combinations: Option<u32>,
+            #[serde(default)]
             soonest_cooldown_seconds: Option<u64>,
             #[serde(default)]
             last_status_class: Option<String>,
@@ -220,6 +226,9 @@ impl Fleet {
         }
         if let Some(n) = event.disabled_keys {
             upstream.disabled_keys = n;
+        }
+        if let Some(n) = event.cooling_combinations {
+            upstream.cooling_combinations = n;
         }
         if let Some(n) = event.soonest_cooldown_seconds {
             upstream.soonest_cooldown_seconds = Some(n);
@@ -315,6 +324,7 @@ mod tests {
         "age_seconds": 0,
         "upstreams": [
             {"name": "zen", "healthy_keys": 1, "cooling_keys": 1, "disabled_keys": 0,
+             "cooling_combinations": 2,
              "soonest_cooldown_seconds": 42, "last_status_class": "4xx"}
         ],
         "host": {"load_average": [0.52, 0.58, 0.59], "cores": 8,
@@ -357,6 +367,7 @@ mod tests {
                 healthy_keys: 1,
                 cooling_keys: 1,
                 disabled_keys: 0,
+                cooling_combinations: 2,
                 soonest_cooldown_seconds: Some(42),
                 last_status_class: Some("4xx".to_owned()),
                 keys: None,
@@ -364,6 +375,12 @@ mod tests {
         );
         assert!(health.host.is_some(), "host stats are kept");
         assert!(health.sessions.is_some(), "session counts are kept");
+    }
+
+    #[test]
+    fn a_document_without_cooling_combinations_parses_as_zero() {
+        let health = Health::from_json(BARE_DOC).expect("an old document parses");
+        assert_eq!(health.upstreams[0].cooling_combinations, 0);
     }
 
     #[test]
@@ -420,6 +437,7 @@ mod tests {
                 "key",
                 r#"{"observed_at":"2026-11-13T09:30:05Z","age_seconds":0,
                     "upstream":{"name":"zen","healthy_keys":0,"cooling_keys":2,"disabled_keys":0,
+                    "cooling_combinations":2,
                     "soonest_cooldown_seconds":300,"last_status_class":"4xx",
                     "keys":[{"name":"a","state":"cooling","cooldown_seconds":300,
                              "cooldown_class":"rate_limited"},
@@ -431,6 +449,7 @@ mod tests {
         let upstream = &fleet.peers["peer-a"].health.upstreams[0];
         assert_eq!(upstream.healthy_keys, 0);
         assert_eq!(upstream.cooling_keys, 2);
+        assert_eq!(upstream.cooling_combinations, 2);
         let a = &upstream.keys.as_ref().unwrap()[0];
         assert_eq!(a.state, "cooling");
         assert_eq!(a.cooldown_class.as_deref(), Some("rate_limited"));

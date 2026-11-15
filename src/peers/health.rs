@@ -49,9 +49,14 @@ pub(crate) fn upstreams(
             .map(|(key, _)| key.as_str())
             .collect();
         let (mut healthy, mut cooling, mut disabled) = (0u32, 0u32, 0u32);
+        let mut combinations = 0u32;
         let mut soonest: Option<Duration> = None;
         let mut listed = Vec::new();
         for key in &keys {
+            // A key cooling as a whole has no scoped entries left (cool_key clears them), so
+            // this counts combination cooldowns only.
+            combinations =
+                combinations.saturating_add(health.cooling_scopes(key, now).len() as u32);
             let (state, wait) = match health.status(key, now) {
                 KeyStatus::Available => {
                     healthy += 1;
@@ -82,6 +87,7 @@ pub(crate) fn upstreams(
             "healthy_keys": healthy,
             "cooling_keys": cooling,
             "disabled_keys": disabled,
+            "cooling_combinations": combinations,
             "soonest_cooldown_seconds": soonest.map(|wait| ceil_secs(wait, bucket)),
             "last_status_class": health
                 .latest_status(keys.iter().copied())
@@ -299,6 +305,80 @@ mod tests {
     }
 
     #[test]
+    fn cooling_combinations_count_scoped_cooldowns_and_no_names() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let scope = |route: &str, model: &str| crate::chain::Scope {
+            route: route.to_owned(),
+            model: model.to_owned(),
+        };
+        for (route, model) in [("/chat/completions", "model-x"), ("/responses", "model-y")] {
+            health.record_failure_scoped(
+                "a",
+                FailureClass::RateLimited(Some(Duration::from_secs(10))),
+                &policy,
+                now,
+                None,
+                Some(&scope(route, model)),
+                3,
+            );
+        }
+        // Labelled or not, the count is there and no route or model text leaves the host.
+        for labels in [false, true] {
+            let out = upstreams(&config, &mut health, now, labels, 0);
+            assert_eq!(out[1]["cooling_combinations"], 2, "labels={labels}");
+            assert_eq!(
+                out[0]["cooling_combinations"], 0,
+                "an upstream with no keys"
+            );
+            let text = serde_json::to_string(&out).unwrap();
+            for secret in [
+                "model-x",
+                "model-y",
+                "/chat",
+                "/responses",
+                "route",
+                "model",
+            ] {
+                assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_key_cooldown_counts_no_combinations() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let paid = crate::chain::Scope {
+            route: "/chat/completions".to_owned(),
+            model: "model-x".to_owned(),
+        };
+        health.record_failure_scoped(
+            "a",
+            FailureClass::RateLimited(Some(Duration::from_secs(10))),
+            &policy,
+            now,
+            None,
+            Some(&paid),
+            3,
+        );
+        // A failure with no scope cools the whole key, which clears its combinations.
+        health.record_failure(
+            "a",
+            FailureClass::RateLimited(Some(Duration::from_secs(10))),
+            &policy,
+            now,
+        );
+        let zen = &upstreams(&config, &mut health, now, false, 0)[1];
+        assert_eq!(zen["cooling_keys"], 1);
+        assert_eq!(zen["cooling_combinations"], 0, "{zen}");
+    }
+
+    #[test]
     fn labels_name_the_cooldown_class_of_a_cooling_key_only() {
         let config = config();
         let mut health = KeyState::default();
@@ -335,6 +415,7 @@ mod tests {
         assert_eq!(
             fields,
             [
+                "cooling_combinations",
                 "cooling_keys",
                 "disabled_keys",
                 "healthy_keys",

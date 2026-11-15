@@ -8,12 +8,15 @@ fn upstream_schema() -> Value {
     json!({
         "type": "object",
         "required": ["name", "healthy_keys", "cooling_keys", "disabled_keys",
+                     "cooling_combinations",
                      "soonest_cooldown_seconds", "last_status_class"],
         "properties": {
             "name": {"type": "string"},
             "healthy_keys": {"type": "integer", "minimum": 0},
             "cooling_keys": {"type": "integer", "minimum": 0},
             "disabled_keys": {"type": "integer", "minimum": 0},
+            "cooling_combinations": {"type": "integer", "minimum": 0,
+                "description": "How many (route, model) combinations are cooling on this upstream's keys; a count only, never names"},
             "soonest_cooldown_seconds": {"type": ["integer", "null"], "minimum": 1,
                 "description": "Rounded up to a multiple of cooldown_bucket_secs, unless it is 0"},
             "last_status_class": {"enum": ["2xx", "4xx", "5xx", null]},

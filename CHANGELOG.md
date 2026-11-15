@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- A response body that is not an event stream now has a 300 s default total timeout (`response_timeout_secs` overrides it), and the compressed bytes read are capped at twice the decoded cap (1 MiB minimum), so a trickling or endless-but-empty upstream cannot hold a request and its key forever.
 - A forwarder socket in a directory that group or others can write to, with no sticky bit and no `expect_uid`, is refused at config load; upstream keys under 8 bytes are refused, since the scrubber skips them.
 - The peers listener caps open connections per source address (`[peers] max_connections_per_addr`, default 4) and closes the connection after a 401 or 429.
 - Failed peer logins from loopback are locked out per address like any other, instead of a shared delay; tunnelled peers share that address. Session counts in the peers view are documented as client-reported.

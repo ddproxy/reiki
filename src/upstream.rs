@@ -25,15 +25,48 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Sen
 /// a 502 before any of a buffered response is sent.
 const BODY_LIMIT_MESSAGE: &str = "decoded response body exceeds the size limit";
 
-/// True for the error [`Capped`] produces when a decoded body is over its limit.
+/// The total timeout applied to a response body that is not an event stream when
+/// `response_timeout_secs` is unset. Event streams keep idle-only semantics so a long-lived
+/// conversation is not cut off, but a buffered body must not hold its request and key permit
+/// forever, so an unset total still bounds it.
+const DEFAULT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// True for the error [`Capped`] produces when a body is over its limit.
 pub fn is_body_limit_error(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::InvalidData && error.to_string() == BODY_LIMIT_MESSAGE
+    error.kind() == std::io::ErrorKind::InvalidData
+        && (error.to_string() == BODY_LIMIT_MESSAGE
+            || error.to_string() == COMPRESSED_LIMIT_MESSAGE)
 }
 
-/// Fails the stream once more than `left` bytes have passed through.
+/// The error a body yields when the compressed bytes read pass the cap. Distinct from
+/// [`BODY_LIMIT_MESSAGE`] so the failure is reported accurately; both map to the same 502.
+const COMPRESSED_LIMIT_MESSAGE: &str = "compressed response body exceeds the size limit";
+
+/// The total deadline a body gets: an explicit setting always wins; an unset event stream
+/// stays idle-only; any other unset body gets the default.
+fn effective_response_timeout(
+    explicit: Option<std::time::Duration>,
+    event_stream: bool,
+) -> Option<std::time::Duration> {
+    explicit.or((!event_stream).then_some(DEFAULT_RESPONSE_TIMEOUT))
+}
+
+/// True for a response the client consumes incrementally: `text/event-stream` regardless
+/// of case or parameters.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Fails the stream once more than `left` bytes have passed through. The message tells the
+/// reader which limit fired; [`is_body_limit_error`] matches both.
 struct Capped {
     inner: ByteStream,
     left: u64,
+    message: &'static str,
 }
 
 impl Stream for Capped {
@@ -52,7 +85,7 @@ impl Stream for Capped {
                     this.inner = Box::pin(OnceBody(None));
                     Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        BODY_LIMIT_MESSAGE,
+                        this.message,
                     ))))
                 }
             },
@@ -62,7 +95,15 @@ impl Stream for Capped {
 }
 
 fn capped(inner: ByteStream, max: u64) -> ByteStream {
-    Box::pin(Capped { inner, left: max })
+    capped_with_message(inner, max, BODY_LIMIT_MESSAGE)
+}
+
+fn capped_with_message(inner: ByteStream, max: u64, message: &'static str) -> ByteStream {
+    Box::pin(Capped {
+        inner,
+        left: max,
+        message,
+    })
 }
 
 /// Fails a response body when it stops producing chunks for too long, or when it takes
@@ -233,12 +274,16 @@ impl UpstreamResponse {
     }
 
     /// Bounds how long the body may take: the idle limit resets on every chunk, and the
-    /// optional total limit starts now, once the response head is in hand.
+    /// optional total limit starts now, once the response head is in hand. A body that is not
+    /// an event stream gets the default total when the config leaves it unset, because the idle
+    /// limit alone lets a trickle hold the request and its key permit forever; event streams
+    /// stay idle-only so a long conversation is not cut off.
     pub fn with_deadlines(
         mut self,
         idle: std::time::Duration,
         total: Option<std::time::Duration>,
     ) -> Self {
+        let total = effective_response_timeout(total, is_event_stream(&self.headers));
         self.body = Box::pin(DeadlineStream {
             inner: self.body,
             idle: Box::pin(tokio::time::sleep(idle)),
@@ -255,7 +300,8 @@ impl UpstreamResponse {
     pub async fn buffer(mut self) -> Result<Self, std::io::Error> {
         let mut collected = Vec::new();
         while let Some(chunk) = self.chunk().await {
-            collected.extend_from_slice(&chunk?);
+            let chunk = chunk?;
+            collected.extend_from_slice(&chunk);
         }
         Ok(Self::from_bytes(
             self.status,
@@ -336,11 +382,37 @@ fn content_encoding(headers: &HeaderMap) -> Option<Encoding> {
     }
 }
 
+/// Most compressed bytes Reiki reads from an upstream before giving up, so an endless body
+/// that decodes to nothing (zstd skippable frames, for instance) cannot be consumed without
+/// bound. A fixed floor keeps small decoded caps usable; otherwise it is a multiple of the
+/// decoded cap, so incompressible bodies under that cap stay legal.
+const MIN_COMPRESSED_BYTES: u64 = 1024 * 1024;
+
+fn compressed_cap(max_decoded: u64) -> u64 {
+    max_decoded.saturating_mul(2).max(MIN_COMPRESSED_BYTES)
+}
+
 fn decode<D, F>(source: ByteStream, max: u64, make: F) -> ByteStream
 where
     D: tokio::io::AsyncRead + Send + 'static,
     F: FnOnce(BufReader<StreamReader<ByteStream, Bytes>>) -> D,
 {
+    decode_with_limits(source, max, compressed_cap(max), make)
+}
+
+/// Caps the compressed input read and the decoded output, in that order. The input cap fails
+/// the body before the decoder can consume an unbounded stream that decodes to almost nothing.
+fn decode_with_limits<D, F>(
+    source: ByteStream,
+    max: u64,
+    max_compressed: u64,
+    make: F,
+) -> ByteStream
+where
+    D: tokio::io::AsyncRead + Send + 'static,
+    F: FnOnce(BufReader<StreamReader<ByteStream, Bytes>>) -> D,
+{
+    let source = capped_with_message(source, max_compressed, COMPRESSED_LIMIT_MESSAGE);
     capped(
         Box::pin(ReaderStream::new(make(BufReader::new(StreamReader::new(
             source,
@@ -657,6 +729,153 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unset_total_timeout_bounds_a_non_event_stream_body() {
+        assert_eq!(
+            effective_response_timeout(None, false),
+            Some(DEFAULT_RESPONSE_TIMEOUT),
+        );
+    }
+
+    #[test]
+    fn an_unset_total_timeout_leaves_an_event_stream_idle_only() {
+        assert_eq!(effective_response_timeout(None, true), None);
+    }
+
+    #[test]
+    fn an_explicit_total_timeout_applies_to_any_body() {
+        let explicit = Some(std::time::Duration::from_secs(7));
+        assert_eq!(effective_response_timeout(explicit, false), explicit);
+        assert_eq!(effective_response_timeout(explicit, true), explicit);
+    }
+
+    #[test]
+    fn event_stream_content_types_are_recognised() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(is_event_stream(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Text/Event-Stream ; charset=utf-8"),
+        );
+        assert!(is_event_stream(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!is_event_stream(&headers));
+        assert!(!is_event_stream(&HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn a_compressed_input_past_the_cap_fails_the_body() {
+        use async_compression::tokio::write::GzipEncoder;
+        use futures_util::stream;
+        use tokio::io::AsyncWriteExt;
+
+        // Incompressible bytes: the stored form is no smaller than the input.
+        let data: Vec<u8> = (0..4096u64)
+            .map(|i| {
+                let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect();
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(&data).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        let compressed = encoder.into_inner();
+        assert!(compressed.len() as u64 > 16);
+        let source: ByteStream = Box::pin(stream::iter([Ok(Bytes::from(compressed))]));
+        let mut body = decode_with_limits(source, 1024 * 1024, 16, GzipDecoder::new);
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_next(cx))
+            .await
+            .expect("the stream errors instead of hanging")
+            .expect_err("the compressed cap fails the body");
+        assert!(is_body_limit_error(&error), "{error}");
+        assert_eq!(error.to_string(), COMPRESSED_LIMIT_MESSAGE);
+        let ended = poll_fn(|cx| Pin::new(&mut body).poll_next(cx)).await;
+        assert!(ended.is_none());
+    }
+
+    #[tokio::test]
+    async fn zstd_skippable_frames_that_decode_to_nothing_are_cut() {
+        use futures_util::stream;
+
+        // A skippable frame carries arbitrary data and decodes to zero bytes; repeating it is
+        // the cheapest way to present an unbounded compressed body that stays under the
+        // decoded cap forever.
+        let mut skippable = Vec::new();
+        for _ in 0..64 {
+            skippable.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+            skippable.extend_from_slice(&64u32.to_le_bytes());
+            skippable.extend_from_slice(&[0u8; 64]);
+        }
+        let source: ByteStream = Box::pin(stream::iter([Ok(Bytes::from(skippable))]));
+        let mut body = decode_with_limits(source, 1024 * 1024, 256, ZstdDecoder::new);
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_next(cx))
+            .await
+            .expect("the stream errors instead of hanging")
+            .expect_err("the compressed cap fails the body");
+        assert!(is_body_limit_error(&error), "{error}");
+        assert_eq!(error.to_string(), COMPRESSED_LIMIT_MESSAGE);
+    }
+
+    #[test]
+    fn the_compressed_cap_is_a_double_of_the_output_cap_with_a_fixed_floor() {
+        assert_eq!(compressed_cap(1), MIN_COMPRESSED_BYTES);
+        assert_eq!(compressed_cap(64 * 1024 * 1024), 128 * 1024 * 1024);
+        assert_eq!(compressed_cap(128 * 1024 * 1024), 256 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn an_endless_gzip_member_of_empty_stored_blocks_is_cut_at_the_input_cap() {
+        use futures_util::stream;
+
+        // One gzip member of back-to-back empty stored blocks: 5 bytes in for 0 out, so the
+        // decoder stays hungry forever. The cap must fire over many small reads, not just
+        // against one big chunk.
+        let mut header = Vec::new();
+        header.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+        let blocks = [0x00, 0x00, 0x00, 0xff, 0xff].repeat(5000);
+        let mut chunks: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(header))];
+        for _ in 0..40 {
+            chunks.push(Ok(Bytes::from(blocks.clone())));
+        }
+        let source: ByteStream = Box::pin(stream::iter(chunks));
+        let mut body = decode_with_limits(source, 1024 * 1024, 64 * 1024, GzipDecoder::new);
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_next(cx))
+            .await
+            .expect("the stream errors instead of hanging")
+            .expect_err("the compressed cap fails the body");
+        assert!(is_body_limit_error(&error), "{error}");
+        assert_eq!(error.to_string(), COMPRESSED_LIMIT_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn a_mib_of_skippable_frames_still_hits_the_input_cap() {
+        use futures_util::stream;
+
+        let mut skippable = Vec::new();
+        while skippable.len() < 1024 * 1024 + 64 * 1024 {
+            skippable.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+            skippable.extend_from_slice(&64u32.to_le_bytes());
+            skippable.extend_from_slice(&[0u8; 64]);
+        }
+        let source: ByteStream = Box::pin(stream::iter([Ok(Bytes::from(skippable))]));
+        let mut body = decode_with_limits(source, 1024, compressed_cap(1024), ZstdDecoder::new);
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_next(cx))
+            .await
+            .expect("the stream errors instead of hanging")
+            .expect_err("the compressed cap fails the body");
+        assert!(is_body_limit_error(&error), "{error}");
+        assert_eq!(error.to_string(), COMPRESSED_LIMIT_MESSAGE);
+    }
+
+    #[test]
     fn standard_clients_are_built_or_fail_without_a_policy_swap() {
         assert!(Standard::try_new().is_ok());
     }
@@ -684,6 +903,7 @@ mod tests {
         let mut capped = Capped {
             inner: Box::pin(futures_util::stream::iter(parts)),
             left: 5,
+            message: BODY_LIMIT_MESSAGE,
         };
         let first = poll_fn(|cx| Pin::new(&mut capped).poll_next(cx)).await;
         assert_eq!(&first.unwrap().unwrap()[..], b"abc");

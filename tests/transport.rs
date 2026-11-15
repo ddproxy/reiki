@@ -98,6 +98,19 @@ async fn mock(State(seen): State<Arc<Seen>>, req: Request) -> Response {
 
     // Only compress when the caller offered it, as a real server does.
     let compress = encoding.contains("gzip");
+    if req.uri().path().ends_with("/skippable") {
+        // An endless gzip member of empty stored blocks: consumes input without bound
+        // while decoding to zero bytes.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+        while body.len() < 1024 * 1024 + 64 * 1024 {
+            body.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+        }
+        return Response::builder()
+            .header("content-encoding", "gzip")
+            .body(Body::from(body))
+            .unwrap();
+    }
     let reply = |status: StatusCode, text: &str| {
         let mut builder = Response::builder().status(status);
         let body = if compress {
@@ -249,6 +262,28 @@ async fn a_compressed_body_past_the_decoded_cap_becomes_a_clean_502() {
     // replaced by an error rather than streaming a 200 and failing halfway through.
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.text().await.unwrap();
+    assert!(body.contains("exceeds the size limit"), "{body}");
+    assert!(body.len() < 4096, "leaked {} bytes", body.len());
+    // One successful upstream answer, so failover did not hide the limit.
+    assert_eq!(seen.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn a_compressed_body_that_decodes_to_nothing_is_cut_at_the_input_cap() {
+    let (base, seen) = relay("forward_accept_encoding = true\nmax_decoded_bytes = 1024").await;
+    let response = client()
+        .post(format!("{base}/zen/skippable"))
+        .bearer_auth(CLIENT_TOKEN)
+        .header("accept-encoding", CLIENT_ENCODING)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    // The body decodes to nothing, so the decoded cap never fires; the compressed input is
+    // what runs out of room. The client sees one clean error status, not a truncated body.
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert!(body.contains("exceeds the size limit"), "{body}");
     assert!(body.len() < 4096, "leaked {} bytes", body.len());
     // One successful upstream answer, so failover did not hide the limit.

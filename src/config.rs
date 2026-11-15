@@ -672,13 +672,17 @@ pub struct Upstream {
     pub forward_accept_encoding: bool,
     /// Most bytes a response body may hold after decoding. An over-limit body becomes a 502
     /// before a buffered response is sent, so a small compressed body cannot expand without bound.
+    /// The compressed bytes read are also capped, at max(2x this cap, 1 MiB), so an endless
+    /// body that decodes to nothing cannot be consumed without bound.
     #[serde(default = "default_max_decoded_bytes")]
     pub max_decoded_bytes: u64,
     /// Longest gap between response body chunks before the body is abandoned. Defaults to 300.
     #[serde(default = "default_response_idle_timeout_secs")]
     pub response_idle_timeout_secs: u64,
-    /// Longest the whole response body may take after its head arrives. Unset means no total
-    /// limit; the idle timeout still applies.
+    /// Longest the whole response body may take after its head arrives. Unset means 300
+    /// seconds for a body that is not an event stream, and no total limit for an event
+    /// stream; the idle timeout still applies. At least 1 when set, and an explicit value
+    /// applies to event streams too.
     #[serde(default)]
     pub response_timeout_secs: Option<u64>,
     /// Send header names in Title-Case (`Content-Type`) on HTTP/1.1. Ignored with `http2`.

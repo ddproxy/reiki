@@ -58,7 +58,7 @@ An upstream with a `limits` table gives each key an outbound budget; without one
 [upstream.zen.limits]
 preset = "zen-free"          # or "openrouter-free"
 rpm = 20                     # requests per minute
-tpm = 100000                 # estimated tokens per minute (body bytes / 4)
+tpm = 100000                 # tokens per minute (initial estimate: body bytes / 4)
 concurrent = 2               # requests in flight
 daily_requests = 50
 daily_tokens = 250000
@@ -68,6 +68,8 @@ max_wait_secs = 20           # longest Reiki waits for a slot, 1-120
 Every field is optional; an explicit `0` means unlimited, even over a preset. A preset seeds the values and explicit fields override them; `min_rpm` sets a floor for learning.
 
 Reiki takes a slot for the chosen key before sending. A wait within `max_wait_secs` is slept off; a longer wait or a closed daily quota skips that key for this request and tries the next. If no key is usable, the client gets `429` with JSON error code `reiki_shaped`, `Retry-After` and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
+
+The first token charge is an estimate of `body bytes / 4`. When the response reports provider `usage` in JSON or an SSE event, Reiki replaces it with the prompt + completion count as the body streams, so `tpm` and the daily and monthly token counters include output. A body with no usage, or a compressed body, keeps the estimate.
 
 A response from that key's own upstream teaches the bucket: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and `remaining: 0` closes it until the reported reset. The learned cap, remaining pause or closed time and current daily and monthly counters persist in the state file across restarts; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
 

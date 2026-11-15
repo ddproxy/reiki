@@ -27,6 +27,7 @@ use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
 use crate::shaper::headers::{observe, Observed};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
+use crate::usage::Usage;
 use reiki_plugin::{Event, FailureKind};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
@@ -2291,20 +2292,59 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
 /// (including a client disconnect) releases the key's concurrency slot.
 struct Permitted<S> {
     inner: S,
-    _permit: Option<Permit>,
+    permit: Option<Permit>,
+    usage: Option<Usage>,
+}
+
+impl<S> Permitted<S> {
+    /// Replaces the estimate with the usage seen so far. Without usage the permit
+    /// is left to drop, keeping the estimate.
+    fn finish(&mut self) {
+        let Some(mut usage) = self.usage.take() else {
+            return;
+        };
+        if let Some(actual) = usage.total() {
+            if let Some(permit) = self.permit.take() {
+                permit.complete(actual);
+            }
+        }
+    }
+}
+
+impl<S> Drop for Permitted<S> {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl<S> Stream for Permitted<S>
 where
-    S: Stream + Unpin,
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
 {
-    type Item = S::Item;
+    type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(usage) = &mut this.usage {
+                    usage.feed(&chunk);
+                }
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.finish();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.finish();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }
 
@@ -2339,6 +2379,12 @@ fn stream_response(
     } else {
         crate::scrub::StreamScrubber::new(secrets)
     };
+    // A compressed body is not the upstream's bytes, so its usage cannot be read here.
+    let watch = !response.is_decoded() && !is_encoded(&response.headers);
+    let usage = permit
+        .as_ref()
+        .filter(|_| watch)
+        .map(|_| Usage::new(is_event_stream(&response.headers)));
     let stream = |response: UpstreamResponse| -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         match scrubber {
             Some(scrubber) => Box::pin(crate::scrub::ScrubbedStream::new(response.into_stream(), scrubber)),
@@ -2348,7 +2394,8 @@ fn stream_response(
     let body = if !plugin_states.needs_response_hooks() {
         Body::from_stream(Permitted {
             inner: stream(response),
-            _permit: permit,
+            permit,
+            usage,
         })
     } else {
         let mut session = plugin_states;
@@ -2368,7 +2415,8 @@ fn stream_response(
                 inner: stream(response),
                 done: false,
             },
-            _permit: permit,
+            permit,
+            usage,
         })
     };
     let mut out = Response::new(body);

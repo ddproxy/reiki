@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Outbound shaping replaces its `body / 4` token estimate with the `usage` the response reports (JSON or SSE, uncompressed bodies); without usage the estimate stands.
 - Placeholder terms match inside JSON-escaped strings (`\u00fc`, `\n`) and mask to the same placeholder as the plain spelling; object keys are not scanned.
 - `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the health scope instead of skipping it; many paths on one model now escalate to a key cooldown.
 - A response with `Content-Encoding: identity` is scrubbed for the upstream key like any plain body; before, the header switched the scrubber off.

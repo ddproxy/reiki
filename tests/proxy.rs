@@ -29,8 +29,36 @@ type PathScript = HashMap<(String, String), VecDeque<Reply>>;
 enum Reply {
     Status(u16, &'static str, Option<(&'static str, &'static str)>),
     Headers(u16, &'static str, Vec<(&'static str, &'static str)>),
+    Bytes(u16, Vec<u8>, Vec<(&'static str, &'static str)>),
     Slow(Vec<&'static str>, Duration),
     Delay(Duration),
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A valid gzip stream holding `data` in one stored (uncompressed) block.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(data.len()).unwrap();
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 1];
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&u32::from(len).to_le_bytes());
+    out
 }
 
 #[derive(Default)]
@@ -117,6 +145,13 @@ async fn mock_handler(State(mock): State<Arc<Mock>>, req: Request) -> Response {
                 b = b.header(k, v);
             }
             b.body(Body::from(text)).unwrap()
+        }
+        Some(Reply::Bytes(code, bytes, headers)) => {
+            let mut b = Response::builder().status(code);
+            for (k, v) in headers {
+                b = b.header(k, v);
+            }
+            b.body(Body::from(bytes)).unwrap()
         }
         Some(Reply::Slow(chunks, gap)) => {
             let stream = futures_util::stream::unfold(
@@ -1162,6 +1197,223 @@ async fn a_concurrent_slot_is_held_until_the_first_body_ends() {
         .expect("the slot was not released after the body ended")
         .unwrap();
     assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn json_usage_corrects_daily_tokens_down() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\ndaily_tokens = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    let response = "{\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":4}}";
+    h.mock
+        .script("up-a", vec![Reply::Headers(200, response, vec![])]);
+
+    let first = h
+        .post("tok-a", "/zen/x", &"x".repeat(400))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), response);
+
+    // The estimate was 100; the response says 10, so another 50 still fits.
+    let second = h
+        .post("tok-a", "/zen/x", &"x".repeat(200))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "usage did not correct the estimate down"
+    );
+}
+
+#[tokio::test]
+async fn json_usage_corrects_daily_tokens_up() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\ndaily_tokens = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    let response = "{\"usage\":{\"input_tokens\":300,\"output_tokens\":200}}";
+    h.mock
+        .script("up-a", vec![Reply::Headers(200, response, vec![])]);
+
+    let first = h
+        .post("tok-a", "/zen/x", &"x".repeat(40))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), response);
+
+    // The estimate was 10; usage says 500, so even one more token is over budget.
+    let second = h
+        .post("tok-a", "/zen/x", &"x".repeat(4))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        429,
+        "usage did not correct the estimate up"
+    );
+    assert!(second.text().await.unwrap().contains("reiki_shaped"));
+}
+
+#[tokio::test]
+async fn sse_usage_in_the_last_event_corrects_daily_tokens() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\ndaily_tokens = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    let chunks = vec![
+        "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+        "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    h.mock.script(
+        "up-a",
+        vec![Reply::Slow(chunks.clone(), Duration::from_millis(5))],
+    );
+
+    let first = h
+        .post("tok-a", "/zen/x", &"x".repeat(400))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), chunks.concat());
+
+    // The estimate was 100; SSE usage says 7, so another 50 still fits.
+    let second = h
+        .post("tok-a", "/zen/x", &"x".repeat(200))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "SSE usage did not correct the estimate"
+    );
+}
+
+#[tokio::test]
+async fn a_response_without_usage_keeps_the_estimate() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\ndaily_tokens = 100\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    h.mock
+        .script("up-a", vec![Reply::Headers(200, "{\"ok\":true}", vec![])]);
+
+    let first = h
+        .post("tok-a", "/zen/x", &"x".repeat(400))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), "{\"ok\":true}");
+
+    // The estimate of 100 must remain; completing with zero would let this through.
+    let second = h
+        .post("tok-a", "/zen/x", &"x".repeat(4))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429);
+    assert!(second.text().await.unwrap().contains("reiki_shaped"));
+}
+
+#[tokio::test]
+async fn a_client_disconnect_mid_sse_releases_the_slot() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\nconcurrent = 1\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    h.mock.script(
+        "up-a",
+        vec![Reply::Slow(
+            vec!["data: one\n\n", "data: two\n\n"],
+            Duration::from_millis(200),
+        )],
+    );
+
+    let mut first = h.post("tok-a", "/zen/x", "1").send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(&first.chunk().await.unwrap().unwrap()[..], b"data: one\n\n");
+    drop(first);
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        h.post("tok-a", "/zen/x", "2").send(),
+    )
+    .await
+    .expect("dropping the body did not release the concurrency slot")
+    .unwrap();
+    assert_eq!(second.status(), 200);
+}
+
+#[tokio::test]
+async fn a_compressed_response_is_not_watched_for_usage() {
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let streams: Vec<(&str, &str, &[&str])> = vec![("client-a", "tok-a", &["a"][..])];
+    let h = harness_with_shaper(
+        &streams,
+        "[upstream.zen.limits]\ndaily_tokens = 1000\nmax_wait_secs = 1\n",
+        now,
+    )
+    .await;
+    let json = b"{\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":1000}}";
+    h.mock.script(
+        "up-a",
+        vec![Reply::Bytes(
+            200,
+            gzip(json),
+            vec![("content-encoding", "gzip")],
+        )],
+    );
+
+    let first = h
+        .post("tok-a", "/zen/x", &"x".repeat(400))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.text().await.unwrap(), String::from_utf8_lossy(json));
+
+    // The compressed body was decoded and buffered, so its usage must be ignored.
+    let second = h
+        .post("tok-a", "/zen/x", &"x".repeat(40))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "a compressed body was watched for usage"
+    );
 }
 
 #[tokio::test]

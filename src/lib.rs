@@ -23,5 +23,6 @@ pub mod state;
 pub mod top;
 pub mod tunnel;
 pub mod upstream;
+pub mod usage;
 
 pub use reiki_plugin;

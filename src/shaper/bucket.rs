@@ -17,7 +17,7 @@ const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 const LOG_CAP: usize = 4_096;
 
 /// Zero in any limit means unlimited.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Window {
     pub rpm: u32,
     pub tpm: u64,

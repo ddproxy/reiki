@@ -83,6 +83,8 @@ pub struct Fleet {
     /// Data older than this is stale, and stale never reads healthy.
     max_age: Duration,
     peers: HashMap<String, Peer>,
+    /// Why a peer's last feed failed, shown until a snapshot arrives.
+    errors: HashMap<String, String>,
 }
 
 /// One upstream row of the provider summary: counts summed over every fresh peer.
@@ -109,11 +111,13 @@ impl Fleet {
         Self {
             max_age,
             peers: HashMap::new(),
+            errors: HashMap::new(),
         }
     }
 
-    /// Replaces a peer's health, received at `now`.
+    /// Replaces a peer's health, received at `now`, and clears its last feed error.
     pub fn apply_snapshot(&mut self, name: &str, health: Health, now: Instant) {
+        self.errors.remove(name);
         self.peers.insert(
             name.to_owned(),
             Peer {
@@ -121,6 +125,17 @@ impl Fleet {
                 received_at: now,
             },
         );
+    }
+
+    /// Records why a peer's feed failed. The reason stays until the next snapshot, so a peer that
+    /// is down is never mistaken for one that is merely quiet.
+    pub fn set_error(&mut self, name: &str, error: impl Into<String>) {
+        self.errors.insert(name.to_owned(), error.into());
+    }
+
+    /// The peer's last feed error, if any.
+    pub fn error(&self, name: &str) -> Option<&str> {
+        self.errors.get(name).map(String::as_str)
     }
 
     /// Applies one SSE event body. `snapshot` replaces the peer's health; `key` patches one
@@ -580,6 +595,20 @@ mod tests {
             rows.iter().map(|r| r.upstream.as_str()).collect::<Vec<_>>(),
             ["gem", "open", "zen"]
         );
+    }
+
+    #[test]
+    fn a_feed_error_stays_until_a_snapshot_arrives() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        fleet.set_error("peer-a", "stream: the stream ended; poll: cannot connect");
+        assert_eq!(
+            fleet.error("peer-a"),
+            Some("stream: the stream ended; poll: cannot connect")
+        );
+        assert_eq!(fleet.error("peer-b"), None, "errors are per peer");
+        fleet.apply_snapshot("peer-a", Health::from_json(BARE_DOC).unwrap(), now);
+        assert_eq!(fleet.error("peer-a"), None, "a snapshot clears the error");
     }
 
     #[test]

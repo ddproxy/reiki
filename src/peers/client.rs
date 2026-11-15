@@ -252,7 +252,8 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, String>
     Ok(body)
 }
 
-async fn fetch(peer: &PeerEntry) -> Result<HealthDoc, String> {
+/// The peer's `/v1/health` body, capped and still unparsed.
+pub(crate) async fn fetch_raw(peer: &PeerEntry) -> Result<String, String> {
     let token = read_token(peer)?;
     let client = client_for(peer, Some(FETCH_TIMEOUT))?;
     let response = client
@@ -265,7 +266,12 @@ async fn fetch(peer: &PeerEntry) -> Result<HealthDoc, String> {
         return Err(refusal(response.status()));
     }
     let body = read_capped(response).await?;
-    serde_json::from_slice(&body).map_err(|e| format!("not a /v1/health document: {e}"))
+    String::from_utf8(body).map_err(|e| format!("not a /v1/health document: {e}"))
+}
+
+async fn fetch(peer: &PeerEntry) -> Result<HealthDoc, String> {
+    serde_json::from_str(&fetch_raw(peer).await?)
+        .map_err(|e| format!("not a /v1/health document: {e}"))
 }
 
 /// One report per configured peer, fetched concurrently.
@@ -375,21 +381,31 @@ pub fn render_json(reports: &[PeerReport]) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The `[peers]` config a reader command needs, or the reason it cannot run. The message is
+/// shared by `reiki peers` and `reiki top`.
+pub(crate) fn ready(peers: Option<&PeersConfig>) -> Result<&PeersConfig, String> {
+    let Some(peers) = peers else {
+        return Err("the config has no [peers] table".to_owned());
+    };
+    if !peers.enabled {
+        return Err("[peers] is not enabled".to_owned());
+    }
+    if peers.peers.is_empty() {
+        return Err("[peers] lists no peers".to_owned());
+    }
+    Ok(peers)
+}
+
 /// The `reiki peers` command: 0 when a peer gave fresh data, 1 when none did, 2 on a config
 /// problem.
 pub async fn run(peers: Option<&PeersConfig>, json: bool, follow: bool) -> i32 {
-    let Some(peers) = peers else {
-        eprintln!("reiki: the config has no [peers] table");
-        return 2;
+    let peers = match ready(peers) {
+        Ok(peers) => peers,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return 2;
+        }
     };
-    if !peers.enabled {
-        eprintln!("reiki: [peers] is not enabled");
-        return 2;
-    }
-    if peers.peers.is_empty() {
-        eprintln!("reiki: [peers] lists no peers");
-        return 2;
-    }
     if follow {
         return watch(peers, json, None, |text| {
             use std::io::Write as _;
@@ -507,33 +523,22 @@ enum Watched {
     Alive,
 }
 
-/// Follows one peer's event stream, sending a report per change; returns why it stopped.
-async fn follow_stream(
-    name: &str,
-    peer: &PeerEntry,
-    poll: Duration,
-    tx: &mpsc::Sender<Watched>,
-) -> String {
-    let token = match read_token(peer) {
-        Ok(token) => token,
-        Err(e) => return e,
-    };
-    let client = match client_for(peer, None) {
-        Ok(client) => client,
-        Err(e) => return e,
-    };
+/// Opens one peer's event stream with the same pinned client, token and checks as a poll.
+pub(crate) async fn open_stream(peer: &PeerEntry) -> Result<reqwest::Response, String> {
+    let token = read_token(peer)?;
+    let client = client_for(peer, None)?;
     let request = client
         .get(endpoint(peer, "/v1/health/stream"))
         .bearer_auth(token)
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .send();
-    let mut response = match tokio::time::timeout(FETCH_TIMEOUT, request).await {
-        Err(_) => return "timed out".to_owned(),
-        Ok(Err(e)) => return describe(&e),
+    let response = match tokio::time::timeout(FETCH_TIMEOUT, request).await {
+        Err(_) => return Err("timed out".to_owned()),
+        Ok(Err(e)) => return Err(describe(&e)),
         Ok(Ok(response)) => response,
     };
     if response.status() != reqwest::StatusCode::OK {
-        return refusal(response.status());
+        return Err(refusal(response.status()));
     }
     let streams = response
         .headers()
@@ -541,16 +546,44 @@ async fn follow_stream(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"));
     if !streams {
-        return "the peer does not stream".to_owned();
+        return Err("the peer does not stream".to_owned());
     }
+    Ok(response)
+}
+
+/// One read from a live stream: data, or the end of it.
+pub(crate) enum Chunk {
+    Data(Vec<u8>),
+    Ended,
+}
+
+pub(crate) async fn next_chunk(response: &mut reqwest::Response) -> Result<Chunk, String> {
+    match tokio::time::timeout(STREAM_IDLE, response.chunk()).await {
+        Err(_) => Err("the stream went quiet".to_owned()),
+        Ok(Err(e)) => Err(describe(&e)),
+        Ok(Ok(None)) => Ok(Chunk::Ended),
+        Ok(Ok(Some(chunk))) => Ok(Chunk::Data(chunk.to_vec())),
+    }
+}
+
+/// Follows one peer's event stream, sending a report per change; returns why it stopped.
+async fn follow_stream(
+    name: &str,
+    peer: &PeerEntry,
+    poll: Duration,
+    tx: &mpsc::Sender<Watched>,
+) -> String {
+    let mut response = match open_stream(peer).await {
+        Ok(response) => response,
+        Err(e) => return e,
+    };
     let mut parser = SseParser::new(MAX_BODY);
     let mut doc: Option<HealthDoc> = None;
     loop {
-        let chunk = match tokio::time::timeout(STREAM_IDLE, response.chunk()).await {
-            Err(_) => return "the stream went quiet".to_owned(),
-            Ok(Err(e)) => return describe(&e),
-            Ok(Ok(None)) => return "the stream ended".to_owned(),
-            Ok(Ok(Some(chunk))) => chunk,
+        let chunk = match next_chunk(&mut response).await {
+            Ok(Chunk::Data(chunk)) => chunk,
+            Ok(Chunk::Ended) => return "the stream ended".to_owned(),
+            Err(e) => return e,
         };
         let items = match parser.feed(&chunk) {
             Ok(items) => items,

@@ -82,6 +82,7 @@ token_sha256 = "<sha256 of the admin token>"
 - `[upstream.X.forward]` hands each request to a Unix socket or a spawned command that speaks HTTP/1.1; `streaming = true` relays the answer as it arrives. See [docs/providers.md](docs/providers.md#forwarding).
 - `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
 - `[peers]` (off by default) publishes a read-only key-health summary to other instances, and `reiki peers` reads theirs. See [docs/peers.md](docs/peers.md).
+- `reiki top` (behind the `top` feature) is a live terminal view of the peers' key health; `--once` prints it as plain text. See [docs/top.md](docs/top.md).
 - `[hubs]`, `[hub]` and `[accounts]` (behind the `hub` feature) are parsed and validated only; nothing is served or contacted yet. See [docs/hub.md](docs/hub.md).
 - `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
 - `[reload]` with `watch = true` reloads the config when the config or key files change, so a deploy only has to write the file. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).

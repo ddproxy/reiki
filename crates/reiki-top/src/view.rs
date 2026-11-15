@@ -185,6 +185,9 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
                 ],
                 width,
             ));
+            if let Some(error) = fleet.error(name) {
+                out.push(error_line(error, width));
+            }
             continue;
         };
         let mut header = vec![
@@ -210,6 +213,9 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
             ));
         }
         out.push(line(header, width));
+        if let Some(error) = fleet.error(name) {
+            out.push(error_line(error, width));
+        }
 
         for u in &peer.health.upstreams {
             out.push(line(
@@ -230,6 +236,11 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
     }
 
     out
+}
+
+/// A peer's last feed failure, dim so it never reads as health.
+fn error_line(error: &str, width: usize) -> Line {
+    line(vec![span(format!("  error {error}"), Style::Dim)], width)
 }
 
 /// `load`, one `disk` per readable disk, from the optional `host` object. A shape we cannot
@@ -503,6 +514,20 @@ mod tests {
         let header = find(&lines, "instance");
         assert_eq!(header.plain_text(), "peer-a  instance peer-a  stale 40s");
         assert_eq!(header.spans.last().unwrap().style, Style::Dim);
+    }
+
+    #[test]
+    fn a_ct_feed_error_is_a_dim_line() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        f.set_error("peer-a", "stream: the stream ended; poll: cannot connect");
+        let lines = render(&f, &["peer-a".to_owned()], t0, 200);
+        let error = find(&lines, " error ");
+        assert_eq!(
+            error.plain_text(),
+            "  error stream: the stream ended; poll: cannot connect"
+        );
+        assert_eq!(error.spans[0].style, Style::Dim);
     }
 
     #[test]

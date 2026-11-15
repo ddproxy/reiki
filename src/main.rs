@@ -102,6 +102,20 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Show a live terminal view of every `[peers.<name>]` instance's key health.
+    ///
+    /// Follows each peer's `/v1/health/stream`, polling while a stream is down, and draws a
+    /// provider summary and one card per peer. `--once` polls once and prints plain text. Needs
+    /// the `top` build feature and an enabled `[peers]` table with at least one peer.
+    #[cfg(feature = "top")]
+    Top {
+        /// Poll every peer once, print the fleet as plain text and exit.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between redraws; the default is 1.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -350,6 +364,18 @@ fn effective_listen(flag: Option<&str>, env: Option<&str>, config: &str) -> Resu
     Ok(chosen.to_owned())
 }
 
+/// Reads and parses the config for a command that only reads `[peers]`; exits 2 when it cannot.
+#[cfg(feature = "peers")]
+fn load_peers_config(path: &std::path::Path) -> Config {
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")))
+        .unwrap_or_else(|e| {
+            eprintln!("reiki: {e}");
+            std::process::exit(2);
+        })
+}
+
 #[cfg(unix)]
 fn spawn_sighup_reload(app: Arc<App>, config: PathBuf) {
     let _handle = tokio::spawn(async move {
@@ -430,14 +456,13 @@ async fn main() {
     }
     #[cfg(feature = "peers")]
     if let Some(Command::Peers { json, watch }) = &cli.command {
-        let config = std::fs::read_to_string(&cli.config)
-            .map_err(|e| format!("cannot read {}: {e}", cli.config.display()))
-            .and_then(|text| Config::parse(&text).map_err(|e| format!("config: {e}")));
-        let config = config.unwrap_or_else(|e| {
-            eprintln!("reiki: {e}");
-            std::process::exit(2);
-        });
+        let config = load_peers_config(&cli.config);
         std::process::exit(reiki::peers::client::run(config.peers.as_ref(), *json, *watch).await);
+    }
+    #[cfg(feature = "top")]
+    if let Some(Command::Top { once, interval }) = &cli.command {
+        let config = load_peers_config(&cli.config);
+        std::process::exit(reiki::top::run(config.peers.as_ref(), *once, *interval).await);
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();

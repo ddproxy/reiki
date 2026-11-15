@@ -1588,6 +1588,7 @@ dependencies = [
  "reiki-placeholders",
  "reiki-plugin",
  "reiki-requestlog",
+ "reiki-top",
  "reqwest",
  "rustix",
  "rustls",

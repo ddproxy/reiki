@@ -19,6 +19,8 @@ pub mod scrub;
 pub mod serve;
 pub mod shaper;
 pub mod state;
+#[cfg(feature = "top")]
+pub mod top;
 pub mod tunnel;
 pub mod upstream;
 

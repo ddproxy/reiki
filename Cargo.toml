@@ -70,6 +70,7 @@ reiki-controlled = { path = "crates/reiki-controlled", optional = true }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 reiki-metrics = { path = "crates/reiki-metrics", optional = true }
+reiki-top = { path = "crates/reiki-top", optional = true, default-features = false }
 futures-core = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
@@ -102,6 +103,8 @@ plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]
 # Health sharing between instances; inert unless the config has an enabled `[peers]` table.
 peers = ["dep:rustix"]
+# `reiki top`: a live terminal fleet view of the configured peers.
+top = ["peers", "dep:reiki-top", "reiki-top/tui"]
 # Hub config: `[hubs]`, `[hub]` and `[accounts]` parse and validate; no listener or client is built.
 hub = []
 

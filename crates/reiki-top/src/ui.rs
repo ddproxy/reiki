@@ -1,6 +1,9 @@
 //! Ratatui drawing, state and key mapping for `reiki top`. Compiled only with the `tui`
 //! feature; everything here is still pure except [`draw`], which writes into a frame.
 
+pub use crossterm;
+pub use ratatui;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style as RatStyle};

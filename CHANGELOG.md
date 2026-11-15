@@ -4,6 +4,7 @@
 
 ### Added
 
+- `reiki-top` gains an optional `tui` feature (`ratatui` 0.30 and `crossterm` 0.29, off by default) with the terminal layer for the planned `reiki top`: style mapping, scroll and filter state, key bindings and drawing. The data layer and view model still depend only on serde.
 - New upstream setting `payment_required_per_request`: a 402 refuses that one request instead of cooling the key for hours. A free-tier account answers a paid model with 402 while its free models keep working. Off by default; leave it off where a 402 means no credit is left.
 - The `reiki-top` crate gains a pure view model that renders a fleet as styled plain lines (title, provider bars, per-peer cards with class-aware cooldown bars, host load, disk and sessions). It is the base of the planned `reiki top` terminal view.
 - An optional `[upstream.NAME.limits]` table (`preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs`) is parsed and validated. An explicit zero means unlimited, even over a preset value. 

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "tui")]
+pub mod ui;
 pub mod view;
 
 /// The whole `/v1/health` document. Unknown fields are ignored; missing optional fields are

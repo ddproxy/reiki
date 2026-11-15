@@ -26,22 +26,42 @@ max_response_bytes = 8388608                 # longest non-streaming body held t
 
 At least one of `terms`, `terms_file` or `builtin` must leave something to mask. At startup a bad value, an unknown key or an unreadable `terms_file` stops Reiki from starting. `reiki check` validates the table without reading the terms file.
 
-A [reload](troubleshooting.md#reload) re-reads `terms_file` when the file changed. The plugin is built again, which gives it a new random salt, so each placeholder id changes once and requests started before the reload finish with the old ids.
+A [reload](troubleshooting.md#reload) re-reads `terms_file` when the file changed. The plugin is built again, but the salt is shared by the whole process, so placeholder ids stay the same and the provider's prompt cache is not invalidated. Requests started before the reload finish with the old plugin instance; they use the same ids.
 
 ## What it does
 
-A masked value becomes `[[REIKI_TERM_9b2e41f0c3a7d652]]` (a term) or `[[REIKI_SECRET_3f9a1c07e5b08d41]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id.
+A masked value becomes `[[REIKI_TERM_9b2e41f0c3a7d652]]` (a term) or `[[REIKI_SECRET_3f9a1c07e5b08d41]]` (a credential). The id depends only on the value and a random salt that lasts as long as the process, so the same value gets the same placeholder in every request, including after a reload. A conversation that resends its history therefore masks the same way each time, and the provider's prompt cache keeps working. Restarting Reiki changes every id, so the first request after a restart misses the cached prefix.
+
+Reasoning blocks are not touched. A `thinking` block's `thinking` text and `signature`, and a `redacted_thinking` block's `data`, pass through byte for byte in both directions, including streamed `thinking_delta` and `signature_delta` events. The same is true for base64 `image` and `document` blocks: they pass through untouched and are never scanned. Treat anything inside those blocks as already sent, not as protected.
 
 Responses are restored as they stream. JSON and other bodies are held until they end, then restored. A JSON body that carries tool calls is walked as JSON so credential placeholders can stay masked in them (see `restore_tool_args`); only the string values that change are rewritten, so key order, spacing and number formatting survive byte for byte.
 
-For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41f0c3a7d652]]`, is held back from the first event and completed with the second, and a lone `[` at the end of a field is held the same way. A held fragment that is still unfinished when the stream ends, at `[DONE]` or at the last chunk, is sent as plain text. Events with no placeholder start keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
+For event streams (`text/event-stream`), each event is parsed. A placeholder a model splits across two events, such as `[[REI` then `KI_TERM_9b2e41f0c3a7d652]]`, is held back from the first event and completed with the second, and a lone `[` at the end of a field is held the same way. A held fragment that is still unfinished when the stream ends, at `[DONE]`, at `message_stop` or at the last chunk, is sent as plain text. Events with no placeholder start keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
 
 Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plugins-at-build-time)); the default build registers `placeholders` before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response and the originals are restored only afterwards.
+
+## Claude Code
+
+Point Claude Code at a Reiki upstream that proxies the Anthropic Messages API:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic
+claude
+```
+
+The path segment after the host selects the upstream, so `[upstream.anthropic] base_url = "https://api.anthropic.com"` receives `/v1/messages`. A Claude Pro/Max login uses OAuth: make that upstream `passthrough = true` and Reiki forwards the `authorization` and `x-api-key` headers untouched, without a `[streams]` entry. For an Anthropic API key managed by Reiki, configure `[keys]` and a `[streams]` entry whose token Claude Code sends as `x-api-key`; Reiki swaps in the real upstream key.
+
+The plugin masks message text, array-of-blocks text, `tool_result` content, `system` (string or array), tool descriptions, and `stop_sequences`, and restores placeholders across streamed text and tool-argument deltas. Thinking blocks, signatures and base64 images or PDFs are relayed byte for byte (see [What it does](#what-it-does)).
+
+What is guaranteed: no configured term or detected credential in the scannable request text reaches Anthropic; a resent history masks to the same placeholder ids while the Reiki process lives, including across a reload; the response is put back before Claude Code sees it.
+
+What is not: request headers, paths and query strings are not masked, OAuth headers pass through as they are, and image, PDF and thinking payloads are never scanned. Restarting Reiki changes every placeholder id and loses the provider's cached prefix. A model that paraphrases a value instead of repeating its placeholder defeats the restore, and a stream that ends mid-placeholder delivers the unfinished fragment as plain text.
 
 ## Limits
 
 - This is pattern and list matching, not a data-loss guarantee. Credential detection is heuristic, and a term only matches the exact characters you list.
 - Only the request body is masked, as raw text: header values, the path and the query string are not, and JSON object keys are masked like any other text.
+- Base64 `image` and `document` (PDF) blocks cannot be scanned and are passed through untouched. The same applies to `thinking`, `signature` and `redacted_thinking` payloads, which must stay byte-identical for the provider: a secret written into model reasoning is sent upstream.
 - A model can paraphrase or transform a value instead of repeating the placeholder. Whatever it writes back that is not a placeholder is delivered as it is.
 - A request body with a `Content-Encoding` other than `identity`, or that is not valid UTF-8 text, cannot be masked and is refused with 415 rather than sent raw. `Content-Encoding: identity` is a no-op and does not prevent masking.
 - A response with a `Content-Encoding` other than `identity` is not restored, and a stream that ends in the middle of a placeholder sends that unfinished fragment as plain text, unrestored.

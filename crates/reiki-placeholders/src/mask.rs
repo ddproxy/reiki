@@ -3,10 +3,14 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::restore::{collect_strings, opaque_paths, within};
 
 /// Every placeholder starts with this, which the response side looks for.
 pub const HEAD: &str = "[[REIKI_";
@@ -51,7 +55,7 @@ impl Masker {
                 .expect("aho-corasick builds from validated terms")
         });
         Self {
-            salt: random_salt(),
+            salt: process_salt(),
             matcher,
             builtin,
         }
@@ -83,6 +87,13 @@ impl Masker {
                 });
             }
         }
+        // Reasoning signatures and base64 payloads must reach the model byte for byte.
+        let protected = protected_spans(text);
+        found.retain(|item| {
+            !protected
+                .iter()
+                .any(|&(start, end)| item.start >= start && item.end <= end)
+        });
         self.render(text, found, reverse)
     }
 
@@ -160,6 +171,32 @@ impl Masker {
     }
 }
 
+/// String value spans that sit inside thinking blocks or base64 image/document blocks.
+fn protected_spans(text: &str) -> Vec<(usize, usize)> {
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let mut opaque = Vec::new();
+    opaque_paths(&parsed, "", &mut opaque);
+    if opaque.is_empty() {
+        return Vec::new();
+    }
+    let mut strings = Vec::new();
+    let mut at = 0;
+    if collect_strings(text, &mut at, "", &mut strings, 0).is_none() {
+        return Vec::new();
+    }
+    strings
+        .into_iter()
+        .filter(|(_, _, path)| {
+            opaque
+                .iter()
+                .any(|opaque| path == opaque || within(path, opaque))
+        })
+        .map(|(start, end, _)| (start, end))
+        .collect()
+}
+
 /// Whether `existing` is the original of the same value, which for a term is any casing of it.
 fn same_value(kind: Kind, existing: &str, original: &str) -> bool {
     match kind {
@@ -168,18 +205,22 @@ fn same_value(kind: Kind, existing: &str, original: &str) -> bool {
     }
 }
 
-fn random_salt() -> [u8; 16] {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut salt = [0u8; 16];
-    for (i, chunk) in salt.chunks_mut(8).enumerate() {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(nanos);
-        hasher.write_usize(i);
-        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
-    }
-    salt
+/// One salt per process, so a config reload keeps the placeholder ids cached upstream.
+fn process_salt() -> [u8; 16] {
+    static SALT: OnceLock<[u8; 16]> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut salt = [0u8; 16];
+        for (i, chunk) in salt.chunks_mut(8).enumerate() {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u128(nanos);
+            hasher.write_usize(i);
+            chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+        }
+        salt
+    })
 }
 
 /// Per-character lowercasing, enough to match names whatever their case.
@@ -340,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn different_maskers_use_different_salts() {
+    fn maskers_in_one_process_share_the_salt_across_reloads() {
         let a = masker(&["Falcon"], false);
         let b = masker(&["Falcon"], false);
         let (mut ra, mut rb) = (HashMap::new(), HashMap::new());
@@ -348,7 +389,7 @@ mod tests {
             a.mask("Falcon", &mut ra).unwrap(),
             b.mask("Falcon", &mut rb).unwrap(),
         );
-        assert_ne!(x, y);
+        assert_eq!(x, y, "a reload must keep the placeholder ids");
     }
 
     /// The old per-term scanner, kept as a test oracle.

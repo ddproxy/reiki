@@ -112,6 +112,23 @@ fn looks_partial(tail: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// True for the terminal event of an Anthropic stream.
+fn ends_message(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| kind == "message_stop")
+}
+
+/// True when any data line of the event is the terminal `message_stop` payload.
+fn event_ends_message(event: &str) -> bool {
+    event.lines().any(|line| {
+        line.strip_prefix("data:")
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+            .is_some_and(ends_message)
+    })
+}
+
 /// Where a held tail belongs: a JSON key or array index, or the text of a payload that is not JSON.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Seg {
@@ -147,6 +164,47 @@ fn declares_tool_call(map: &serde_json::Map<String, Value>) -> bool {
             .iter()
             .any(|m| t.contains(m))
     })
+}
+
+/// True for model reasoning and binary payloads, whose bytes must never be rewritten.
+pub(crate) fn is_opaque(map: &serde_json::Map<String, Value>) -> bool {
+    map.get("type").and_then(Value::as_str).is_some_and(|t| {
+        matches!(
+            t,
+            "thinking"
+                | "redacted_thinking"
+                | "thinking_delta"
+                | "signature_delta"
+                | "image"
+                | "document"
+        )
+    })
+}
+
+/// Paths of every object in `value` that must stay byte-identical.
+pub(crate) fn opaque_paths(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                opaque_paths(item, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            if is_opaque(map) {
+                out.push(path.to_owned());
+            }
+            for (key, item) in map {
+                opaque_paths(item, &format!("{path}.{key}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when `path` names a field below `prefix`.
+pub(crate) fn within(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with(['.', '[']))
 }
 
 /// Paths of every object in `value` that declares itself a tool call.
@@ -230,34 +288,46 @@ impl Restorer {
     /// A credential restored into a tool call would be run or echoed by the client, so a body that
     /// carries tool calls is walked as JSON and those fields keep their placeholders.
     fn restore_whole(&mut self, text: &str, reverse: &HashMap<String, String>) -> String {
-        if self.tool_args || !TOOL_CALL_MARKERS.iter().any(|m| text.contains(m)) {
-            return restore_text(text, reverse);
-        }
         let Ok(parsed) = serde_json::from_str::<Value>(text) else {
-            return restore(text, reverse, false);
+            return restore(text, reverse, self.tool_args);
         };
         let mut tool_paths = Vec::new();
         tool_call_paths(&parsed, "", &mut tool_paths);
+        let mut opaque = Vec::new();
+        opaque_paths(&parsed, "", &mut opaque);
+        // Nothing needs the structural walk, so keep every byte outside string values too.
+        if opaque.is_empty()
+            && (self.tool_args || !TOOL_CALL_MARKERS.iter().any(|m| text.contains(m)))
+        {
+            return restore_text(text, reverse);
+        }
         let in_call = |path: &str| {
             in_tool_call(path)
-                || tool_paths.iter().any(|p| {
-                    path.strip_prefix(p.as_str())
-                        .is_some_and(|rest| rest.starts_with(['.', '[']))
-                })
+                || tool_paths
+                    .iter()
+                    .any(|prefix| within(path, prefix) || path == prefix)
+        };
+        let keep = |path: &str| {
+            opaque
+                .iter()
+                .any(|prefix| within(path, prefix) || path == prefix)
         };
         let mut spans = Vec::new();
         let mut at = 0;
         if collect_strings(text, &mut at, "", &mut spans, 0).is_none() {
-            return restore(text, reverse, false);
+            return restore(text, reverse, self.tool_args);
         }
         // Only the strings that change are rewritten, so key order and layout survive.
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
         for (start, end, path) in spans {
+            if keep(&path) {
+                continue;
+            }
             let Ok(decoded) = serde_json::from_str::<String>(&text[start..end]) else {
                 continue;
             };
-            let restored = restore(&decoded, reverse, !in_call(&path));
+            let restored = restore(&decoded, reverse, self.tool_args || !in_call(&path));
             if restored != decoded {
                 out.push_str(&text[last..start]);
                 out.push_str(&serde_json::to_string(&restored).unwrap_or_default());
@@ -308,6 +378,9 @@ impl Restorer {
             return event.to_vec();
         }
         let mut out = String::with_capacity(text.len());
+        if event_ends_message(text) {
+            out.push_str(&self.flush());
+        }
         for line in text.split_inclusive('\n') {
             let body = line.trim_end_matches(['\r', '\n']);
             let eol = &line[body.len()..];
@@ -333,36 +406,42 @@ impl Restorer {
         }
         match serde_json::from_str::<Value>(payload) {
             Ok(mut value) => {
-                self.walk(&mut Vec::new(), false, &mut value, reverse);
+                self.walk(&mut Vec::new(), false, false, &mut value, reverse);
                 value.to_string()
             }
             Err(_) => self.text_at(&[Seg::Raw], false, payload, reverse),
         }
     }
 
-    /// Restores every string in `value`; `at` is where it sits and `in_call` whether that is inside a
-    /// tool call.
+    /// Restores every string in `value`; `at` is where it sits, `in_call` whether that is inside a
+    /// tool call and `opaque` whether the bytes must stay untouched.
     fn walk(
         &mut self,
         at: &mut Vec<Seg>,
         in_call: bool,
+        opaque: bool,
         value: &mut Value,
         reverse: &HashMap<String, String>,
     ) {
         match value {
-            Value::String(text) => *text = self.text_at(at, in_call, text, reverse),
+            Value::String(text) => {
+                if !opaque {
+                    *text = self.text_at(at, in_call, text, reverse);
+                }
+            }
             Value::Array(items) => {
                 for (i, item) in items.iter_mut().enumerate() {
                     at.push(Seg::Index(i));
-                    self.walk(at, in_call, item, reverse);
+                    self.walk(at, in_call, opaque, item, reverse);
                     at.pop();
                 }
             }
             Value::Object(map) => {
+                let opaque = opaque || is_opaque(map);
                 let in_call = in_call || declares_tool_call(map);
                 for (key, item) in map.iter_mut() {
                     at.push(Seg::Key(key.clone()));
-                    self.walk(at, in_call || in_tool_call(key), item, reverse);
+                    self.walk(at, in_call || in_tool_call(key), opaque, item, reverse);
                     at.pop();
                 }
             }
@@ -403,7 +482,7 @@ impl Restorer {
 }
 
 /// Byte spans (quotes included) of every string value in valid JSON, with their field path.
-fn collect_strings(
+pub(crate) fn collect_strings(
     text: &str,
     at: &mut usize,
     path: &str,

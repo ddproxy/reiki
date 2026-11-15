@@ -47,6 +47,12 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
         let Some(key) = config.keys.get(&name) else {
             continue;
         };
+        // A re-pointed key (same name and secret, different upstream) must start healthy.
+        if let Some(saved_upstream) = entry.upstream.as_deref() {
+            if saved_upstream != key.upstream {
+                continue;
+            }
+        }
         if secret_changed(&key.file, saved_at, entry.key_sha256.as_deref()) {
             continue;
         }
@@ -67,23 +73,32 @@ pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
     out
 }
 
-pub fn save(path: &Path, snapshot: &HashMap<String, SavedHealth>, keys: &HashMap<String, Secret>) {
+pub fn save(
+    path: &Path,
+    snapshot: &HashMap<String, SavedHealth>,
+    keys: &HashMap<String, Secret>,
+    config: &Config,
+) {
     let now = unix_millis(SystemTime::now());
     let entries = snapshot
         .iter()
         .map(|(name, health)| {
-            let recovery = health
-                .cooling
-                .map_or(0, |cooling| now + cooling.as_millis() as u64);
+            // Store the upstream the key targeted when saved; absent in older
+            // state files. A re-pointed key (same name and secret, different
+            // upstream) must not inherit the saved health.
+            let upstream = config.keys.get(name).map(|k| k.upstream.clone());
             (
                 name.clone(),
                 Entry {
                     disabled: health.disabled,
-                    recovery,
+                    recovery: health
+                        .cooling
+                        .map_or(0, |cooling| now + cooling.as_millis() as u64),
                     failures: health.transient_failures,
                     key_sha256: keys
                         .get(name)
                         .map(|key| crate::auth::sha256_hex(key.expose())),
+                    upstream,
                 },
             )
         })
@@ -186,6 +201,10 @@ struct Entry {
     /// SHA-256 of the key when saved; absent in state written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_sha256: Option<String>,
+    /// Upstream the key targeted when saved; absent in older state files. A re-pointed
+    /// key (same name and secret, different upstream) must not inherit the saved health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream: Option<String>,
 }
 
 #[cfg(test)]
@@ -196,10 +215,15 @@ mod tests {
     use std::time::Instant;
 
     fn config_with_keys(files: &[(&str, &str)]) -> Config {
-        let mut text = String::from("[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n");
+        config_with_keys_upstream("zen", files)
+    }
+
+    fn config_with_keys_upstream(upstream: &str, files: &[(&str, &str)]) -> Config {
+        let mut text =
+            format!("[upstream.{upstream}]\nbase_url = \"https://opencode.ai/{upstream}/v1\"\n");
         for (name, file) in files {
             text.push_str(&format!(
-                "[keys.{name}]\nupstream = \"zen\"\nfile = \"{file}\"\n"
+                "[keys.{name}]\nupstream = \"{upstream}\"\nfile = \"{file}\"\n"
             ));
         }
         Config::parse(&text).unwrap()
@@ -229,6 +253,7 @@ mod tests {
                     recovery: *recovery,
                     failures: *failures,
                     key_sha256: None,
+                    upstream: None, // no upstream in legacy write_state
                 },
             );
         }
@@ -260,6 +285,7 @@ mod tests {
             &path,
             &state.snapshot(now),
             &crate::proxy::load_keys(&config).unwrap(),
+            &config,
         );
         let loaded = load(&path, &config);
 
@@ -333,6 +359,7 @@ mod tests {
             &path,
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&config).unwrap(),
+            &config,
         );
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -402,6 +429,7 @@ mod tests {
             &path,
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&config).unwrap(),
+            &config,
         );
         assert!(load(&path, &config)["a"].disabled, "same file is restored");
 
@@ -413,6 +441,74 @@ mod tests {
         file.set_modified(SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
         assert!(load(&path, &config).is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn a_repointed_key_starts_healthy() {
+        let path = temp_path("repointed");
+        let _ = std::fs::remove_file(&path);
+        let key_file = old_key_file("repointed");
+        let zen = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
+        let mut state = KeyState::default();
+        state.record_failure(
+            "a",
+            FailureClass::Unauthorized,
+            &Policy::default(),
+            Instant::now(),
+        );
+        save(
+            &path,
+            &state.snapshot(Instant::now()),
+            &crate::proxy::load_keys(&zen).unwrap(),
+            &zen,
+        );
+        assert!(load(&path, &zen)["a"].disabled, "same upstream is restored");
+
+        // Same name, same secret, different upstream: the saved health must not follow.
+        let other = config_with_keys_upstream("other", &[("a", key_file.to_str().unwrap())]);
+        assert!(load(&path, &other).is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn the_same_upstream_restores_saved_health() {
+        let path = temp_path("same-upstream");
+        let _ = std::fs::remove_file(&path);
+        let key_file = old_key_file("same-upstream");
+        let config = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
+        let mut state = KeyState::default();
+        state.record_failure(
+            "a",
+            FailureClass::RateLimited(Some(Duration::from_secs(50))),
+            &Policy::default(),
+            Instant::now(),
+        );
+        save(
+            &path,
+            &state.snapshot(Instant::now()),
+            &crate::proxy::load_keys(&config).unwrap(),
+            &config,
+        );
+        let loaded = load(&path, &config);
+        assert!(loaded["a"].cooling.unwrap() > Duration::from_secs(40));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn older_state_without_the_upstream_field_still_restores() {
+        let path = temp_path("legacy");
+        let key_file = old_key_file("legacy");
+        let config = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
+        let now = unix_millis(SystemTime::now());
+        write_state(&path, now, &[("a", false, now + 3_600_000, 2)]);
+        let loaded = load(&path, &config);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded["a"].cooling.is_some());
+        assert_eq!(loaded["a"].transient_failures, 2);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
     }

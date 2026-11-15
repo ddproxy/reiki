@@ -8,6 +8,10 @@
 - Provider-side request and token buckets (rpm, tpm, concurrency, daily and monthly quotas) with a learned rate cap, and parsers for the rate-limit headers of OpenAI-style, Anthropic and OpenRouter responses, with `zen-free` and `openrouter-free` presets. Library code only; nothing in the proxy uses it yet.
 - An optional `[hubs]`, `[hub]` and `[accounts]` config, behind a `hub` cargo feature, is parsed and validated only; no hub is contacted or served yet. See [hub](docs/hub.md). Edge tokens must differ from each other and from the peer tokens, the hub listener from the client, admin and tunnel listeners, and a hub `timeout_secs` is 1 to 3600.
 
+### Fixed
+
+- Saved key health is not restored onto a key that was re-pointed at another upstream (same name and secret). The state file records each key's upstream; older state without it still restores.
+
 ## 0.9.1
 
 ### Added

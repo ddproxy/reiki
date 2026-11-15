@@ -444,7 +444,12 @@ impl App {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .snapshot(Instant::now());
-        crate::state::save(path, &health, &self.snapshot().keys);
+        crate::state::save(
+            path,
+            &health,
+            &self.snapshot().keys,
+            &self.snapshot().config,
+        );
     }
 
     /// Re-enables a key that was taken out of rotation and persists the change. Returns false

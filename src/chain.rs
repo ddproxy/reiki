@@ -359,8 +359,9 @@ impl KeyState {
     }
 
     /// Records a failure, on `scope` when the caller says it belongs to a combination, and
-    /// otherwise on the key. After `escalate_after` models are cooling on one key, the next
-    /// combination failure cools the key instead. Returns what was cooled, if anything.
+    /// otherwise on the key. After `escalate_after` models are cooling on one key, or the
+    /// failure brings the cooling combinations to twice that, the key cools instead. Returns
+    /// what was cooled, if anything.
     #[allow(clippy::too_many_arguments)]
     pub fn record_failure_scoped(
         &mut self,
@@ -409,15 +410,30 @@ impl KeyState {
         now: Instant,
         escalate_after: u32,
     ) -> Option<CooldownScope> {
+        // A key cooldown covers every combination, so no scoped entry outlives it.
+        if h.cooling_until.is_some_and(|deadline| deadline > now) {
+            return Self::cool_key(h, until, class);
+        }
         let Some(scope) = scope else {
-            return h.cool_until(until, class).then_some(CooldownScope::Key);
+            return Self::cool_key(h, until, class);
         };
         h.prune_scopes(now);
-        if escalate_after >= 2 && h.cooling_models(now) >= escalate_after as usize {
-            return h.cool_until(until, class).then_some(CooldownScope::Key);
+        let models = h.cooling_models(now);
+        let combinations = h.scopes.len();
+        let would_reach = combinations.saturating_add(usize::from(!h.scopes.contains_key(scope)));
+        let combination_limit = (escalate_after as usize).saturating_mul(2);
+        if escalate_after >= 2
+            && (models >= escalate_after as usize || would_reach >= combination_limit)
+        {
+            return Self::cool_key(h, until, class);
         }
         h.cool_scope(scope, until, class, now)
             .then_some(CooldownScope::Model)
+    }
+
+    fn cool_key(h: &mut KeyHealth, until: Instant, class: FailureClass) -> Option<CooldownScope> {
+        h.scopes.clear();
+        h.cool_until(until, class).then_some(CooldownScope::Key)
     }
 
     pub fn record_success(&mut self, key: &str) {
@@ -440,10 +456,16 @@ impl KeyState {
         self.health.retain(|name, _| keep(name));
     }
 
-    /// Time until the first key of the chain becomes usable again. `None` when every key
-    /// is disabled, which has no recovery time.
-    pub fn soonest_recovery(&self, chain: &[String], now: Instant) -> Option<Duration> {
-        self.soonest_recovery_for(chain, None, now)
+    /// Time until the first accepted key of the chain becomes usable again. `accept` must
+    /// match the keys the caller would pick, or a healthy key elsewhere reports no wait.
+    /// `None` when every accepted key is disabled, which has no recovery time.
+    pub fn soonest_recovery(
+        &self,
+        chain: &[String],
+        now: Instant,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<Duration> {
+        self.soonest_recovery_for(chain, None, now, accept)
     }
 
     /// Like `soonest_recovery`, but a key also waits for the request's combination cooldown.
@@ -452,10 +474,11 @@ impl KeyState {
         chain: &[String],
         scope: Option<&Scope>,
         now: Instant,
+        accept: impl Fn(&str) -> bool,
     ) -> Option<Duration> {
         chain
             .iter()
-            .filter(|k| !self.is_disabled(k))
+            .filter(|k| accept(k.as_str()) && !self.is_disabled(k))
             .map(|k| {
                 let key_wait = self.cooling_remaining(k, now).unwrap_or(Duration::ZERO);
                 let scope_wait = scope
@@ -872,10 +895,18 @@ mod tests {
         state.record_failure("a", FailureClass::RateLimited(Some(secs(40))), &policy, now);
         state.record_failure("b", FailureClass::RateLimited(Some(secs(15))), &policy, now);
         state.record_failure("c", FailureClass::Unauthorized, &policy, now);
-        assert_eq!(state.soonest_recovery(&chain, now), Some(secs(15)));
+        assert_eq!(
+            state.soonest_recovery(&chain, now, |_| true),
+            Some(secs(15))
+        );
+        assert_eq!(
+            state.soonest_recovery(&chain, now, |key| key == "a"),
+            Some(secs(40)),
+            "keys the caller would not pick do not count"
+        );
         state.disable("a");
         state.disable("b");
-        assert_eq!(state.soonest_recovery(&chain, now), None);
+        assert_eq!(state.soonest_recovery(&chain, now, |_| true), None);
     }
 
     #[test]
@@ -1092,6 +1123,53 @@ mod tests {
             "the fourth combination failure escalates"
         );
         assert!(!state.is_available("a", now));
+    }
+
+    #[test]
+    fn many_paths_on_one_model_escalate_at_the_combination_threshold() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let cooldown = secs(10);
+        for index in 0..5u64 {
+            assert_eq!(
+                state.record_failure_scoped(
+                    "a",
+                    FailureClass::RateLimited(Some(cooldown)),
+                    &policy,
+                    now,
+                    None,
+                    Some(&scope(&format!("/chat/path-{index}"), "one-model")),
+                    3,
+                ),
+                Some(CooldownScope::Model),
+                "path {index} is below the combination threshold"
+            );
+        }
+        assert!(
+            state.is_available("a", now),
+            "five combinations cool, the key is still usable"
+        );
+        assert_eq!(
+            state.record_failure_scoped(
+                "a",
+                FailureClass::RateLimited(Some(cooldown)),
+                &policy,
+                now,
+                None,
+                Some(&scope("/chat/path-5", "one-model")),
+                3,
+            ),
+            Some(CooldownScope::Key),
+            "the sixth combination reaches 2 * 3 and cools the key"
+        );
+        assert!(!state.is_available("a", now));
+        assert!(
+            state.cooling_scopes("a", now).is_empty(),
+            "the key cooldown replaces the combination entries"
+        );
+        assert!(state.cooling_scopes("a", now + cooldown).is_empty());
+        assert!(state.is_available("a", now + cooldown));
     }
 
     #[test]

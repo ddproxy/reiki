@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
+use sha2::{Digest, Sha256};
 
 /// Rewrite a JSON object body once, before any key is tried, so every replay
 /// sends the same bytes. The body is scanned at the byte level and untouched
@@ -16,16 +17,19 @@ pub fn rewrite_body(body: Bytes, aliases: &BTreeMap<String, String>, drop: &[Str
     }
 }
 
-/// Most bytes a model name may have before it is treated as unusable for scoping.
+/// Longest model name kept whole. A longer name keeps its first 100 bytes plus a digest.
 const MAX_MODEL_BYTES: usize = 128;
+const MODEL_PREFIX_BYTES: usize = 100;
+const MODEL_HASH_HEX: usize = 8;
 
 /// Members scanned before `request_model` gives up, so a body of millions of tiny members
 /// costs a bounded scan.
 const MAX_SCANNED_MEMBERS: usize = 4096;
 
-/// The top-level `model` string of a request body, decoded. `None` for a missing,
-/// non-string or over-long model, a body that is not a JSON object, a body with several
-/// `model` members (parsers disagree on which one wins) or one with too many members.
+/// The top-level `model` string of a request body, decoded. A name over the cap is shortened
+/// to a stable prefix and digest, so it still scopes. `None` for a missing or non-string
+/// model, a body that is not a JSON object, a body with several `model` members (parsers
+/// disagree on which one wins) or one with too many members.
 pub(crate) fn request_model(body: &[u8]) -> Option<String> {
     let mut found: Option<(usize, usize, usize, bool)> = None;
     let mut seen = 0usize;
@@ -59,16 +63,32 @@ pub(crate) fn request_model(body: &[u8]) -> Option<String> {
         return None;
     }
     let raw = &body[value_start + 1..value_end - 1];
-    // Every escape shrinks by at most sixfold, so this bounds the decoded allocation.
-    if raw.len() > MAX_MODEL_BYTES * 6 {
-        return None;
+    if raw.contains(&b'\\') {
+        let model = decode_json_string(&body[value_start..value_end])?;
+        return Some(scoped_model(&model));
     }
-    let model = if raw.contains(&b'\\') {
-        decode_json_string(&body[value_start..value_end])?
-    } else {
-        std::str::from_utf8(raw).ok()?.to_owned()
-    };
-    (model.len() <= MAX_MODEL_BYTES).then_some(model)
+    Some(scoped_model(std::str::from_utf8(raw).ok()?))
+}
+
+/// Keep a normal model whole; shorten a long one to a bounded prefix plus digest.
+fn scoped_model(model: &str) -> String {
+    if model.len() <= MAX_MODEL_BYTES {
+        return model.to_owned();
+    }
+    let mut end = MODEL_PREFIX_BYTES;
+    while !model.is_char_boundary(end) {
+        end -= 1;
+    }
+    let digest = Sha256::digest(model.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(end + 1 + MODEL_HASH_HEX);
+    out.push_str(&model[..end]);
+    out.push('#');
+    for byte in &digest[..MODEL_HASH_HEX / 2] {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 struct Member {
@@ -461,16 +481,48 @@ mod tests {
         ] {
             let _ = request_model(body);
         }
-        let huge = format!(r#"{{"model":"{}"}}"#, "x".repeat(4096));
-        assert_eq!(request_model(huge.as_bytes()), None, "over the cap");
+        let huge_name = "x".repeat(4096);
+        let huge = format!(r#"{{"model":"{huge_name}"}}"#);
+        assert_eq!(
+            request_model(huge.as_bytes()).as_deref(),
+            Some(&*format!(
+                "{}#{}",
+                &huge_name[..100],
+                &crate::auth::sha256_hex(&huge_name)[..8]
+            )),
+            "over the cap still scopes"
+        );
+        let escaped_name = "A".repeat(4096);
         let escaped = format!(r#"{{"model":"{}"}}"#, "\\u0041".repeat(4096));
         assert_eq!(
-            request_model(escaped.as_bytes()),
-            None,
-            "escaped input over the cap is refused before decoding"
+            request_model(escaped.as_bytes()).as_deref(),
+            Some(&*format!(
+                "{}#{}",
+                &escaped_name[..100],
+                &crate::auth::sha256_hex(&escaped_name)[..8]
+            )),
+            "escaped input over the cap scopes on its decoded name"
         );
         let at_cap = format!(r#"{{"model":"{}"}}"#, "x".repeat(128));
         assert_eq!(request_model(at_cap.as_bytes()).unwrap().len(), 128);
+    }
+
+    #[test]
+    fn a_long_model_scopes_to_a_stable_short_name() {
+        let long = "x".repeat(300);
+        let body = format!(r#"{{"model":"{long}"}}"#);
+        let scoped = request_model(body.as_bytes()).expect("an over-long model still scopes");
+        let expected = format!("{}#{}", &long[..100], &crate::auth::sha256_hex(&long)[..8]);
+        assert_eq!(scoped, expected);
+        assert_eq!(scoped.len(), 109);
+        assert_eq!(request_model(body.as_bytes()).as_deref(), Some(&*scoped));
+
+        // Two names with the same first 100 bytes still get different scopes.
+        let other = format!("{long}y");
+        let other_body = format!(r#"{{"model":"{other}"}}"#);
+        let other = request_model(other_body.as_bytes()).unwrap();
+        assert_eq!(&other[..100], &scoped[..100]);
+        assert_ne!(other, scoped);
     }
 
     #[test]

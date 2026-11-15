@@ -246,6 +246,7 @@ impl Snapshot {
         &self,
         health: &Mutex<KeyState>,
         stream: &str,
+        upstream: &str,
         scope: Option<&Scope>,
     ) -> Option<Duration> {
         let health = health.lock().unwrap_or_else(PoisonError::into_inner);
@@ -254,7 +255,10 @@ impl Snapshot {
             .get(stream)?
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        health.soonest_recovery_for(chain.keys(), scope, Instant::now())
+        let keys = &self.config.keys;
+        health.soonest_recovery_for(chain.keys(), scope, Instant::now(), |key| {
+            keys.get(key).is_some_and(|key| key.upstream == upstream)
+        })
     }
 }
 
@@ -1371,7 +1375,13 @@ async fn dispatch_body(
                 let mut session = spent.plugin_states;
                 finish_buffered(&mut session, &key, serving_upstream, status, &headers, body)
             }
-            None => exhausted(snapshot, &app.health, stream, spent.scope.as_ref()),
+            None => exhausted(
+                snapshot,
+                &app.health,
+                stream,
+                serving_upstream,
+                spent.scope.as_ref(),
+            ),
         },
     }
 }
@@ -2133,6 +2143,7 @@ fn exhausted(
     snapshot: &Snapshot,
     health: &Mutex<KeyState>,
     stream: &str,
+    upstream: &str,
     scope: Option<&Scope>,
 ) -> Response {
     let mut response = json_error(
@@ -2140,7 +2151,7 @@ fn exhausted(
         "reiki_exhausted",
         "every key in this stream's chain is unavailable",
     );
-    if let Some(wait) = snapshot.soonest_recovery(health, stream, scope) {
+    if let Some(wait) = snapshot.soonest_recovery(health, stream, upstream, scope) {
         let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
         if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
             response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -2653,6 +2664,36 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_reflects_only_the_tried_upstreams_keys() {
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://zen.example/v1\"\n\
+             [upstream.backup]\nbase_url = \"https://backup.example/v1\"\n\
+             [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused/zen-a\"\n\
+             [keys.backup-a]\nupstream = \"backup\"\nfile = \"/unused/backup-a\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"backup-a\"]\n",
+            crate::auth::sha256_hex("tok")
+        );
+        let snapshot = Snapshot::new(Config::parse(&text).unwrap(), HashMap::new());
+        let health = Mutex::new(KeyState::default());
+        {
+            let mut health = health.lock().unwrap();
+            health.record_failure(
+                "zen-a",
+                FailureClass::RateLimited(Some(Duration::from_secs(3600))),
+                &Policy::default(),
+                Instant::now(),
+            );
+        }
+
+        let response = exhausted(&snapshot, &health, "s", "zen", None);
+        assert_eq!(
+            response.headers()[header::RETRY_AFTER],
+            "3600",
+            "the healthy key of another upstream must not shorten the wait"
+        );
+    }
+
+    #[test]
     fn a_poisoned_lock_does_not_turn_every_pick_into_a_miss() {
         let text = format!(
             "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
@@ -2677,7 +2718,9 @@ mod tests {
             snapshot.pick(&health, "s", "zen", &[], None),
             Some("a".to_owned())
         );
-        assert!(snapshot.soonest_recovery(&health, "s", None).is_some());
+        assert!(snapshot
+            .soonest_recovery(&health, "s", "zen", None)
+            .is_some());
     }
 
     #[test]

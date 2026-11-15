@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- `Retry-After` on an exhausted chain counts only the tried upstream's keys; long model names are hashed into the health scope instead of skipping it; many paths on one model now escalate to a key cooldown.
 - A response with `Content-Encoding: identity` is scrubbed for the upstream key like any plain body; before, the header switched the scrubber off.
 - The labelled peers health view no longer lists per-model cooldowns (`scopes`), which exposed client-chosen model names; `reiki peers` shows control characters in peer-supplied names as `?`.
 - The `placeholders` plugin leaves Anthropic `thinking` and `redacted_thinking` blocks (and their `signature` and `data`, in requests, JSON responses and SSE deltas) and base64 `image` and `document` blocks byte-identical, so a second turn no longer fails thinking-signature validation and media is not corrupted.

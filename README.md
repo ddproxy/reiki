@@ -20,18 +20,11 @@ See [docs/security.md](docs/security.md) for what Reiki does and does not protec
 
 ## Install
 
-Download the archive for your platform from the [releases page](https://github.com/ddproxy/reiki/releases). Builds cover Linux (static musl) and macOS, on x86_64 and aarch64.
+From a checkout (Rust 1.99 or newer), `make install` builds with `reiki top` and puts `reiki` in `~/.local/bin`, or in `/usr/local/bin` as root. `PREFIX=/opt/reiki make install` picks another prefix.
 
-```bash
-VERSION=v0.7.1
-TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
-curl -fsSLO https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz
-curl -fsSL https://github.com/ddproxy/reiki/releases/download/$VERSION/reiki-$VERSION-$TARGET.tar.gz.sha256 | shasum -a 256 -c
-tar xzf reiki-$VERSION-$TARGET.tar.gz
-install -m 0755 reiki-$VERSION-$TARGET/reiki /usr/local/bin/
-```
+Or download a prebuilt archive from the [releases page](https://github.com/ddproxy/reiki/releases) (Linux static musl and macOS, x86_64 and aarch64; `reiki top` included), check it against its `.sha256` file and copy `reiki` onto your `PATH`.
 
-To build from source instead, install Rust 1.99 or newer and run `cargo install --git https://github.com/ddproxy/reiki --locked`. Plugin selection and order are build arguments; see [docs/plugins.md](docs/plugins.md#choose-and-order-plugins-at-build-time).
+Plugin selection and order are build arguments; see [docs/plugins.md](docs/plugins.md#choose-and-order-plugins-at-build-time).
 
 ## Configure
 

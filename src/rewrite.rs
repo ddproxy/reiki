@@ -18,6 +18,7 @@ pub fn rewrite_body(body: Bytes, aliases: &BTreeMap<String, String>, drop: &[Str
 
 struct Member {
     start: usize,
+    key_end: usize,
     value_start: usize,
     value_end: usize,
     key: Vec<u8>,
@@ -30,22 +31,49 @@ enum Action {
     Replace(Vec<u8>),
 }
 
+/// Decode the JSON string literal `quoted` (quotes included) into its Unicode
+/// value. Malformed input is a non-match, never a panic.
+fn decode_json_string(quoted: &[u8]) -> Option<String> {
+    std::str::from_utf8(quoted)
+        .ok()
+        .and_then(|s| serde_json::from_str::<String>(s).ok())
+}
+
 fn rewrite(body: &[u8], aliases: &BTreeMap<String, String>, drop: &[String]) -> Option<Vec<u8>> {
     let members = top_level_members(body)?;
     let mut changed = false;
     let actions: Vec<Action> = members
         .iter()
         .map(|member| {
-            if drop.iter().any(|name| name.as_bytes() == member.key) {
+            // Decode the key literal only when it holds an escape; otherwise
+            // the raw bytes are already the text to compare, so the common
+            // case stays a byte comparison.
+            let key = &body[member.start..member.key_end];
+            let key_decoded = if member.key.contains(&b'\\') {
+                decode_json_string(key)
+            } else {
+                None
+            };
+            let key_is = |name: &str| match &key_decoded {
+                Some(decoded) => decoded == name,
+                None => member.key == name.as_bytes(),
+            };
+            if drop.iter().any(|name| key_is(name)) {
                 changed = true;
                 return Action::Drop;
             }
-            if member.key == b"model" && member.is_string {
+            if key_is("model") && member.is_string {
+                let value = &body[member.value_start..member.value_end];
                 let raw = &body[member.value_start + 1..member.value_end - 1];
-                if let Some(mapped) = std::str::from_utf8(raw)
-                    .ok()
-                    .and_then(|m| aliases.get(m).or_else(|| aliases.get("*")))
-                {
+                let mapped = if raw.contains(&b'\\') {
+                    decode_json_string(value)
+                        .and_then(|m| aliases.get(m.as_str()).or_else(|| aliases.get("*")))
+                } else {
+                    std::str::from_utf8(raw)
+                        .ok()
+                        .and_then(|m| aliases.get(m).or_else(|| aliases.get("*")))
+                };
+                if let Some(mapped) = mapped {
                     changed = true;
                     return Action::Replace(json_string(mapped));
                 }
@@ -104,6 +132,7 @@ fn top_level_members(body: &[u8]) -> Option<Vec<Member>> {
         let (value_end, is_string) = scan_value(body, i)?;
         members.push(Member {
             start,
+            key_end,
             value_start: i,
             value_end,
             key,
@@ -327,9 +356,66 @@ mod tests {
     }
 
     #[test]
-    fn a_model_with_an_escape_is_not_matched() {
+    fn an_escaped_model_value_matches_its_alias() {
         let body = r#"{"model":"gpt\u002d4o"}"#;
         let out = run(body, &aliases(&[("gpt-4o", "zen")]), &[]);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            r#"{"model":"zen"}"#
+        );
+    }
+
+    #[test]
+    fn escaped_key_for_model_is_matched() {
+        let body = r#"{"mo\u0064el":"gpt-4o"}"#;
+        let out = run(body, &aliases(&[("gpt-4o", "zen")]), &[]);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            r#"{"mo\u0064el":"zen"}"#
+        );
+    }
+
+    #[test]
+    fn escaped_key_for_drop_param_is_matched() {
+        let body = r#"{"stream\u005foptions":{...}}"#;
+        let out = run(body, &BTreeMap::new(), &["stream_options"]);
+        assert_eq!(String::from_utf8(out.to_vec()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn invalid_escape_is_a_non_match_and_no_panic() {
+        let body = r#"{"model":"\u00zz"}"#;
+        let out = run(body, &aliases(&[("gpt-4o", "zen")]), &[]);
         assert_eq!(out, Bytes::copy_from_slice(body.as_bytes()));
+    }
+
+    #[test]
+    fn unescaped_input_behaves_exactly_as_before() {
+        let body = r#"{"model":"gpt-4o","messages":[]}"#;
+        let out = run(body, &aliases(&[("gpt-4o", "zen")]), &[]);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            r#"{"model":"zen","messages":[]}"#
+        );
+    }
+
+    #[test]
+    fn output_bytes_outside_rewritten_piece_unchanged() {
+        let body = r#"{"note":"caf\u00e9 \"quoted\"\nline","model":"gpt\u002d4o","big":12345678901234567890,"emoji":"😀"}"#;
+        let out = run(body, &aliases(&[("gpt-4o", "zen")]), &[]);
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            r#"{"note":"caf\u00e9 \"quoted\"\nline","model":"zen","big":12345678901234567890,"emoji":"😀"}"#
+        );
+    }
+
+    #[test]
+    fn very_long_key_or_value_no_quadratic() {
+        // Should finish in bounded time even with a large input.
+        let filler = "x".repeat(4 * 1024 * 1024);
+        let body = format!(r#"{{"model":"gpt\u002d4o","blob":"{filler}"}}"#);
+        let out = run(&body, &aliases(&[("gpt-4o", "zen")]), &[]);
+        let expected = format!(r#"{{"model":"zen","blob":"{filler}"}}"#);
+        assert_eq!(out, Bytes::from(expected));
     }
 }

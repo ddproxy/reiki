@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- The body rewrite compares the `model` value, the `model` key and `drop_params` keys after decoding JSON escapes, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o` and `stream\u005foptions` is dropped. A malformed escape is a non-match.
 - Saved key health is not restored onto a key that was re-pointed at another upstream (same name and secret). The state file records each key's upstream; older state without it still restores.
 
 ## 0.9.1

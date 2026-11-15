@@ -25,7 +25,7 @@ model_aliases = { "gpt-4o" = "opencode/gpt-4o" }
 drop_params = ["stream_options"]
 ```
 
-Reiki rewrites the body once before it picks a key, so a failover to the next key replays the same bytes. A body that is not a JSON object, a missing or non-string `model`, an unknown model, and a non-matching `drop_params` all pass through byte-for-byte unchanged. Only top-level keys are dropped; nested objects are left alone.
+Reiki rewrites the body once before it picks a key, so a failover to the next key replays the same bytes. A body that is not a JSON object, a missing or non-string `model`, an unknown model, and a non-matching `drop_params` all pass through byte-for-byte unchanged. Only top-level keys are dropped; nested objects are left alone. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise the bytes are compared exactly.
 
 ## Transport options
 

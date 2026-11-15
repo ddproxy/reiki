@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::chain::Strategy;
 use crate::proxy::PASSTHROUGH_STREAM;
 use crate::quota::Reset;
+use crate::shaper::bucket;
+use crate::shaper::headers::Preset;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -628,6 +631,10 @@ fn default_listen() -> String {
     "127.0.0.1:4097".to_owned()
 }
 
+fn default_max_wait_secs() -> u64 {
+    20
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
@@ -687,6 +694,102 @@ pub struct Upstream {
     /// The API token and outbound headers are written to the process stdin, never argv.
     #[serde(default)]
     pub forward: Option<Forward>,
+    /// Outbound shaping for this upstream; absent means no shaping.
+    #[serde(default)]
+    pub limits: Option<LimitsConfig>,
+}
+
+/// `[upstream.NAME.limits]`: outbound shaping. Every field is optional; an explicit zero means unlimited, even over a preset value.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Named free-tier preset to start from; explicit fields override it.
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// Requests per minute.
+    #[serde(default)]
+    pub rpm: Option<u32>,
+    /// Estimated tokens per minute.
+    #[serde(default)]
+    pub tpm: Option<u64>,
+    /// Requests in flight at once.
+    #[serde(default)]
+    pub concurrent: Option<u32>,
+    /// Requests per day.
+    #[serde(default)]
+    pub daily_requests: Option<u32>,
+    /// Tokens per day.
+    #[serde(default)]
+    pub daily_tokens: Option<u64>,
+    /// Floor for learned rpm; unset keeps the preset's floor, one when no preset gives one.
+    #[serde(default)]
+    pub min_rpm: Option<u32>,
+    /// Longest a request may wait for a slot before Reiki sheds it. Defaults to 20.
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            preset: None,
+            rpm: None,
+            tpm: None,
+            concurrent: None,
+            daily_requests: None,
+            daily_tokens: None,
+            min_rpm: None,
+            max_wait_secs: default_max_wait_secs(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// The window these limits describe and how long a request may wait for a slot.
+    /// The preset seeds the window; explicit fields are applied on top.
+    /// Zero fields leave the preset's value (or unlimited) in place: a zero
+    /// cannot be told apart from an unset field, and zero means unlimited.
+    pub fn to_window(&self) -> Result<(bucket::Window, Duration), String> {
+        let mut window = bucket::Window::default();
+        if let Some(name) = &self.preset {
+            let preset = Preset::parse(name)?.limits();
+            window.rpm = preset.rpm.unwrap_or(0);
+            window.tpm = u64::from(preset.tpm.unwrap_or(0));
+            window.concurrent = preset.concurrent.unwrap_or(0);
+            window.daily_requests = preset.daily_requests.unwrap_or(0);
+            window.min_rpm = preset.min_rpm.unwrap_or(1);
+        }
+        if let Some(v) = self.rpm {
+            window.rpm = v;
+        }
+        if let Some(v) = self.tpm {
+            window.tpm = v;
+        }
+        if let Some(v) = self.concurrent {
+            window.concurrent = v;
+        }
+        if let Some(v) = self.daily_requests {
+            window.daily_requests = v;
+        }
+        if let Some(v) = self.daily_tokens {
+            window.daily_tokens = v;
+        }
+        if let Some(min_rpm) = self.min_rpm {
+            window.min_rpm = min_rpm;
+        }
+        Ok((window, Duration::from_secs(self.max_wait_secs)))
+    }
+
+    /// True when nothing in the table shapes anything: no preset and no limit.
+    fn shapes_nothing(&self) -> bool {
+        self.to_window().is_ok_and(|(w, _)| {
+            w.rpm == 0
+                && w.tpm == 0
+                && w.concurrent == 0
+                && w.daily_requests == 0
+                && w.daily_tokens == 0
+        }) && self.min_rpm.is_none()
+    }
 }
 
 /// A per-request child process that performs the upstream call.
@@ -1139,6 +1242,29 @@ impl Config {
                     upstream: name.clone(),
                     reason: "response_timeout_secs must be at least 1".to_owned(),
                 });
+            }
+            if let Some(limits) = &upstream.limits {
+                if limits.shapes_nothing() {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason: "limits table sets neither a preset nor a limit".to_owned(),
+                    });
+                }
+                if !(1..=120).contains(&limits.max_wait_secs) {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason: format!(
+                            "max_wait_secs must be between 1 and 120, got {}",
+                            limits.max_wait_secs
+                        ),
+                    });
+                }
+                if let Err(reason) = limits.to_window() {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason,
+                    });
+                }
             }
             if let Some(forward) = &upstream.forward {
                 let has_command = forward.command.is_some();
@@ -3285,6 +3411,161 @@ socket = "/run/forwarder.sock"
         );
         let (_, none) = Config::parse_with_warnings(&base("")).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_limits_preset_alone_parses_into_its_window() {
+        let text = base("[upstream.zen.limits]\npreset = \"openrouter-free\"\n");
+        let config = Config::parse(&text).unwrap();
+        let (window, wait) = config.upstream["zen"]
+            .limits
+            .as_ref()
+            .unwrap()
+            .to_window()
+            .unwrap();
+        assert_eq!(
+            window,
+            bucket::Window {
+                rpm: 20,
+                daily_requests: 50,
+                min_rpm: 1,
+                ..bucket::Window::default()
+            }
+        );
+        assert_eq!(wait, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn explicit_limits_override_the_preset() {
+        let text = base(
+            "[upstream.zen.limits]\npreset = \"zen-free\"\nrpm = 42\ndaily_tokens = 8000\
+             \nmin_rpm = 4\n",
+        );
+        let config = Config::parse(&text).unwrap();
+        let (window, _) = config.upstream["zen"]
+            .limits
+            .as_ref()
+            .unwrap()
+            .to_window()
+            .unwrap();
+        assert_eq!(
+            (window.rpm, window.daily_tokens, window.min_rpm),
+            (42, 8000, 4)
+        );
+        // Preset values survive where no explicit field replaces them.
+        assert_eq!((window.concurrent, window.daily_requests), (2, 0));
+    }
+
+    #[test]
+    fn zero_limits_mean_unlimited() {
+        assert_eq!(
+            LimitsConfig::default().to_window().unwrap(),
+            (bucket::Window::default(), Duration::from_secs(20))
+        );
+        let text = base("[upstream.zen.limits]\nconcurrent = 1\n");
+        let config = Config::parse(&text).unwrap();
+        let (window, _) = config.upstream["zen"]
+            .limits
+            .as_ref()
+            .unwrap()
+            .to_window()
+            .unwrap();
+        assert_eq!((window.rpm, window.concurrent, window.tpm), (0, 1, 0));
+        // An explicit zero next to a preset clears that preset value.
+        let text =
+            base("[upstream.zen.limits]\npreset = \"zen-free\"\nrpm = 0\ndaily_tokens = 0\n");
+        let config = Config::parse(&text).unwrap();
+        let (window, _) = config.upstream["zen"]
+            .limits
+            .as_ref()
+            .unwrap()
+            .to_window()
+            .unwrap();
+        assert_eq!((window.rpm, window.concurrent), (0, 2));
+        assert_eq!((window.tpm, window.daily_tokens), (0, 0));
+    }
+
+    #[test]
+    fn a_limits_table_without_a_preset_or_a_limit_is_refused() {
+        for extra in [
+            "[upstream.zen.limits]\n",
+            "[upstream.zen.limits]\nmax_wait_secs = 5\n",
+            "[upstream.zen.limits]\nrpm = 0\ntpm = 0\nconcurrent = 0\n",
+        ] {
+            let err = Config::parse(&base(extra)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, ConfigError::BadUpstream { upstream, .. } if upstream == "zen"),
+                "{extra}: {msg}"
+            );
+            assert!(
+                msg.contains("neither a preset nor a limit"),
+                "{extra}: {msg}"
+            );
+        }
+        // A floor for learning is a limit in its own right.
+        assert!(Config::parse(&base("[upstream.zen.limits]\nmin_rpm = 2\n")).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_limits_preset_is_refused() {
+        let text = base("[upstream.zen.limits]\npreset = \"nope\"\n");
+        let err = Config::parse(&text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ConfigError::BadUpstream { upstream, .. } if upstream == "zen"),
+            "{msg}"
+        );
+        assert!(msg.contains("unknown shaper preset `nope`"), "{msg}");
+    }
+
+    #[test]
+    fn limits_max_wait_secs_must_be_between_1_and_120() {
+        for secs in [0, 121] {
+            let text = base(&format!(
+                "[upstream.zen.limits]\nrpm = 5\nmax_wait_secs = {secs}\n"
+            ));
+            let err = Config::parse(&text).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, ConfigError::BadUpstream { upstream, .. } if upstream == "zen"),
+                "{secs}: {msg}"
+            );
+            assert!(
+                msg.contains("max_wait_secs must be between 1 and 120"),
+                "{secs}: {msg}"
+            );
+        }
+        for secs in [1, 119, 120] {
+            let text = base(&format!(
+                "[upstream.zen.limits]\nrpm = 5\nmax_wait_secs = {secs}\n"
+            ));
+            let wait = Config::parse(&text).unwrap().upstream["zen"]
+                .limits
+                .as_ref()
+                .unwrap()
+                .to_window()
+                .unwrap()
+                .1;
+            assert_eq!(wait, Duration::from_secs(secs), "{secs}");
+        }
+    }
+
+    #[test]
+    fn an_upstream_without_limits_parses_as_before() {
+        let config = Config::parse(&base("")).unwrap();
+        assert!(config.upstream["zen"].limits.is_none());
+        assert_eq!(config.upstream["zen"].max_decoded_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.upstream["zen"].response_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_limits_table_is_refused() {
+        let text = base("[upstream.zen.limits]\npreset = \"zen-free\"\nrpms = 5\n");
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
     }
 
     #[test]

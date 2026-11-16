@@ -1732,8 +1732,10 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                     stream,
                     &key_name,
                     FailureClass::Transient,
-                    None,
-                    scope.as_ref(),
+                    FailureNote {
+                        scope: scope.as_ref(),
+                        ..FailureNote::default()
+                    },
                 );
                 // A POST or PATCH may already have reached the upstream, so replaying it
                 // could duplicate a side effect. Only a connect failure is unambiguously
@@ -1880,7 +1882,9 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                             bucket.note_rate_limited(now, retry_after);
                         }
                         FailureClass::QuotaExhausted if key_wide => {
-                            let cooldown = quota_cooldown(snapshot, &key_name, class, now)
+                            let hint =
+                                crate::classify::parse_retry_after(retry_after.as_deref(), now);
+                            let cooldown = quota_cooldown(snapshot, &key_name, class, now, hint)
                                 .unwrap_or(app.policy.quota_exhausted);
                             if let Some(until) = now.checked_add(cooldown) {
                                 bucket.note_window_closed(now, until);
@@ -1942,14 +1946,33 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             Outcome::KeyFailure(class) => {
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream error");
                 disabled_one |= matches!(class, FailureClass::Unauthorized);
+                let quota_hint = if class == FailureClass::QuotaExhausted {
+                    crate::classify::parse_retry_after(retry_after.as_deref(), app.wall_now())
+                } else {
+                    None
+                };
+                if class == FailureClass::QuotaExhausted {
+                    // What the provider says about its reset, so the cooldown can follow it.
+                    tracing::warn!(
+                        stream = %stream,
+                        key = %key_name,
+                        status = status.as_u16(),
+                        retry_after = ?retry_after,
+                        body = %printable_snippet(&text, 200),
+                        "quota failure detail"
+                    );
+                }
                 record(
                     app,
                     snapshot,
                     stream,
                     &key_name,
                     class,
-                    Some(status.as_u16()),
-                    scope.as_ref(),
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        scope: scope.as_ref(),
+                        quota_hint,
+                    },
                 );
                 // A first transient 5xx does not cool the key; skip it so the walk moves on.
                 if matches!(class, FailureClass::Transient) {
@@ -2107,8 +2130,10 @@ fn release_held(app: &App, snapshot: &Snapshot, stream: &str, held: Option<(Stri
             stream,
             &key,
             FailureClass::Unauthorized,
-            Some(status),
-            None,
+            FailureNote {
+                status: Some(status),
+                ..FailureNote::default()
+            },
         );
     }
 }
@@ -2143,16 +2168,29 @@ fn is_encoded(headers: &HeaderMap) -> bool {
         })
 }
 
+/// What an attempt reported about its failure.
+#[derive(Clone, Copy, Default)]
+struct FailureNote<'a> {
+    status: Option<u16>,
+    scope: Option<&'a Scope>,
+    /// The provider's own wait for a quota failure, from `Retry-After`.
+    quota_hint: Option<Duration>,
+}
+
 fn record(
     app: &App,
     snapshot: &Snapshot,
     stream: &str,
     key: &str,
     class: FailureClass,
-    status: Option<u16>,
-    scope: Option<&Scope>,
+    note: FailureNote<'_>,
 ) {
-    let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now());
+    let FailureNote {
+        status,
+        scope,
+        quota_hint,
+    } = note;
+    let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now(), quota_hint);
     let scoped = failure_scope(class, status, scope);
     let escalate_after = snapshot
         .config
@@ -2204,18 +2242,38 @@ fn record(
     app.persist_state();
 }
 
-/// The cooldown for a quota failure when the key names a reset schedule; `None`
-/// otherwise, so the fixed policy window applies.
+/// The cooldown for a quota failure when the key names a reset schedule or the provider sent a
+/// `Retry-After`; `None` otherwise, so the fixed policy window applies.
 fn quota_cooldown(
     snapshot: &Snapshot,
     key: &str,
     class: FailureClass,
     now: SystemTime,
+    hint: Option<Duration>,
 ) -> Option<Duration> {
     if class != FailureClass::QuotaExhausted {
         return None;
     }
-    snapshot.config.quota_reset(key)?.next_after(now)
+    quota_window(
+        snapshot
+            .config
+            .quota_reset(key)
+            .and_then(|reset| reset.next_after(now)),
+        hint,
+    )
+}
+
+/// A configured reset schedule wins over the provider's hint, which wins over the policy window.
+fn quota_window(schedule: Option<Duration>, hint: Option<Duration>) -> Option<Duration> {
+    schedule.or(hint.filter(|wait| !wait.is_zero()))
+}
+
+/// Printable, bounded text from an upstream body for a log line.
+fn printable_snippet(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn exhausted(
@@ -3231,5 +3289,23 @@ mod tests {
         let config = Config::parse(&text).unwrap();
         assert!(load_keys(&config).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quota_window_prefers_the_schedule_then_the_providers_hint() {
+        let schedule = Some(Duration::from_secs(600));
+        let hint = Some(Duration::from_secs(90));
+        assert_eq!(quota_window(schedule, hint), schedule);
+        assert_eq!(quota_window(None, hint), hint);
+        assert_eq!(quota_window(None, Some(Duration::ZERO)), None);
+        assert_eq!(quota_window(None, None), None);
+    }
+
+    #[test]
+    fn a_logged_snippet_is_bounded_and_has_no_control_characters() {
+        let text = "a\u{1b}[31mb\nc".repeat(100);
+        let out = printable_snippet(&text, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.chars().all(|c| !c.is_control()));
     }
 }

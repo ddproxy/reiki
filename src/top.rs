@@ -375,6 +375,7 @@ async fn live_loop(
             // come from the redraw tick, not from feed events, so a chatty peer gets no more.
             _ = frame_tick.tick() => {
                 if frozen.is_none() {
+                    fleet.advance(Instant::now());
                     sample_fleet(&mut history, &fleet, &all, Instant::now(), &mut last_sample, redraw);
                 }
                 draw_now = true;
@@ -1248,7 +1249,11 @@ mod tests {
         apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
         apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, false);
         state.scroll = 4;
-        assert_eq!(state.detail, Some(true));
+        assert_eq!(
+            state.detail,
+            Some(false),
+            "Enter closed the pane that followed"
+        );
         apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
         assert_eq!(state.detail, None, "the new peer decides for itself");
         assert_eq!(state.scroll, 0);

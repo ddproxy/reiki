@@ -78,9 +78,11 @@ fn max_scroll(total_lines: usize, viewport: usize) -> usize {
 }
 
 impl UiState {
-    /// Whether the detail pane is open, given whether the selected peer needs attention.
+    /// Whether the detail pane is open. Unless Enter chose, it opens for a peer that needs
+    /// attention and for any peer the user has moved to.
     pub fn detail_open(&self, problem_selected: bool) -> bool {
-        self.detail.unwrap_or(problem_selected)
+        self.detail
+            .unwrap_or(problem_selected || self.selected.is_some())
     }
 
     /// Flips the detail pane from what is showing now, so the first Enter on a problem peer
@@ -657,6 +659,16 @@ mod tests {
         assert_eq!(state.mode, Mode::Matrix);
         assert!(state.detail_open(true), "a problem peer opens it");
         assert!(!state.detail_open(false));
+    }
+
+    #[test]
+    fn moving_the_selection_opens_the_detail_of_a_healthy_peer() {
+        let mut state = UiState::default();
+        assert!(!state.detail_open(false), "nothing chosen yet");
+        state.selected = Some(1);
+        assert!(state.detail_open(false), "following the selection");
+        state.toggle_detail(false);
+        assert!(!state.detail_open(false), "Enter closes it");
     }
 
     #[test]

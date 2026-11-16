@@ -80,6 +80,8 @@ pub struct KeyView {
 struct Peer {
     health: Health,
     received_at: Instant,
+    /// Cooldowns are counted down to this instant by [`Fleet::advance`].
+    advanced_at: Instant,
 }
 
 /// Health from every peer (the label the caller gives each peer), for a TUI to render.
@@ -128,6 +130,7 @@ impl Fleet {
             Peer {
                 health,
                 received_at: now,
+                advanced_at: now,
             },
         );
     }
@@ -167,6 +170,29 @@ impl Fleet {
             _ => {
                 self.touch(name, now);
                 Ok(())
+            }
+        }
+    }
+
+    /// Counts every cooldown down by the time since the last call. A peer republishes only when a
+    /// key changes, so without this a cooldown would sit at its published value until then.
+    pub fn advance(&mut self, now: Instant) {
+        for peer in self.peers.values_mut() {
+            let secs = now.saturating_duration_since(peer.advanced_at).as_secs();
+            if secs == 0 {
+                continue;
+            }
+            // Only whole seconds are consumed, so the remainder carries to the next call.
+            peer.advanced_at += Duration::from_secs(secs);
+            for upstream in &mut peer.health.upstreams {
+                if let Some(left) = upstream.soonest_cooldown_seconds.as_mut() {
+                    *left = left.saturating_sub(secs);
+                }
+                for key in upstream.keys.iter_mut().flatten() {
+                    if let Some(left) = key.cooldown_seconds.as_mut() {
+                        *left = left.saturating_sub(secs);
+                    }
+                }
             }
         }
     }
@@ -658,5 +684,28 @@ mod tests {
             now + Duration::from_secs(91),
             Duration::from_secs(90)
         ));
+    }
+
+    #[test]
+    fn cooldowns_count_down_between_snapshots_and_never_below_zero() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(Duration::from_secs(30));
+        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":90,
+             "keys":[{"name":"k","state":"cooling","cooldown_seconds":90}]}]}"#;
+        fleet.apply_snapshot("peer-a", Health::from_json(doc).unwrap(), t0);
+        fleet.advance(t0 + Duration::from_millis(1500));
+        let left = |f: &Fleet, at| f.peer("peer-a", at).unwrap().health.upstreams[0].clone();
+        let at = t0 + Duration::from_millis(1500);
+        assert_eq!(left(&fleet, at).soonest_cooldown_seconds, Some(89));
+        assert_eq!(left(&fleet, at).keys.unwrap()[0].cooldown_seconds, Some(89));
+        // The half second left over is not lost.
+        fleet.advance(t0 + Duration::from_millis(2100));
+        let at = t0 + Duration::from_millis(2100);
+        assert_eq!(left(&fleet, at).soonest_cooldown_seconds, Some(88));
+        fleet.advance(t0 + Duration::from_secs(10_000));
+        let at = t0 + Duration::from_secs(10_000);
+        assert_eq!(left(&fleet, at).soonest_cooldown_seconds, Some(0));
     }
 }

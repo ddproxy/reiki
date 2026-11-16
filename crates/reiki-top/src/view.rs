@@ -278,6 +278,15 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
         if let Some(class) = crate::matrix::cooldown_class(u) {
             spans.push(span(format!("  class {class}"), Style::Warn));
         }
+        if u.cooling_combinations > 0 {
+            spans.push(span(
+                format!("  {} model cooling", u.cooling_combinations),
+                Style::Warn,
+            ));
+        }
+        if let Some(class) = u.last_status_class.as_deref().filter(|c| *c != "2xx") {
+            spans.push(span(format!("  last {class}"), Style::Warn));
+        }
         out.push(line(spans, width));
         if let Some(keys) = &u.keys {
             for k in keys {
@@ -776,6 +785,8 @@ fn cell_text(cell: &Cell, combos: u32) -> (String, Style) {
     let (glyph, soonest, style) = match cell {
         Cell::Absent => return ("·".to_owned(), Style::Dim),
         Cell::Stale => return ("?".to_owned(), Style::Dim),
+        // A healthy key with a model cooling is rate limited for that model: not green.
+        Cell::Healthy if combos > 0 => ("◐", None, Style::Warn),
         Cell::Healthy => ("■", None, Style::Good),
         Cell::Partial { soonest, .. } => ("◐", *soonest, Style::Warn),
         Cell::Cooling { soonest, .. } => ("■", *soonest, Style::Bad),
@@ -1001,9 +1012,9 @@ mod tests {
         assert_eq!(positions(&rows[0], "■"), vec![gemini]);
         assert_eq!(positions(&rows[0], "·"), vec![zen]);
         assert_eq!(positions(&rows[0], "◐"), vec![openrouter]);
-        assert_eq!(positions(&rows[1], "■"), vec![gemini, zen]);
+        assert_eq!(positions(&rows[1], "■"), vec![zen]);
         assert_eq!(
-            positions(&rows[1], "■+2"),
+            positions(&rows[1], "◐+2"),
             vec![gemini],
             "combinations suffix"
         );
@@ -1016,7 +1027,7 @@ mod tests {
     fn every_cell_state_has_its_glyph_text_and_colour() {
         let cells = [
             (Cell::Healthy, 0, "■", Style::Good),
-            (Cell::Healthy, 2, "■+2", Style::Good),
+            (Cell::Healthy, 2, "◐+2", Style::Warn),
             (
                 Cell::Partial {
                     cooling: 1,
@@ -1319,7 +1330,8 @@ mod tests {
         assert!(
             texts(&card)
                 .iter()
-                .any(|l| l == "  zen: 0 healthy  1 cooling  0 disabled  class quota_exhausted"),
+                .any(|l| l
+                    .starts_with("  zen: 0 healthy  1 cooling  0 disabled  class quota_exhausted")),
             "{:?}",
             texts(&card)
         );
@@ -1363,9 +1375,9 @@ mod tests {
             rows: vec![row],
         };
         let lines = render_matrix(&m, &History::new(0), None, 100, None);
-        assert!(lines[2].plain_text().contains("■+3"));
+        assert!(lines[2].plain_text().contains("◐+3"));
         let narrow = render_matrix(&m, &History::new(0), None, 25, None);
-        assert!(narrow[1].plain_text().contains("zen ■+3"), "{narrow:?}");
+        assert!(narrow[1].plain_text().contains("zen ◐+3"), "{narrow:?}");
     }
 
     #[test]
@@ -1875,6 +1887,35 @@ mod tests {
             past.last().unwrap(),
             "L21",
             "a stale selection clamps to the last row"
+        );
+    }
+
+    #[test]
+    fn a_healthy_key_with_a_model_cooling_is_a_warning_not_green() {
+        let (text, style) = cell_text(&Cell::Healthy, 2);
+        assert_eq!(text, "◐+2");
+        assert_eq!(style, Style::Warn);
+        let (text, style) = cell_text(&Cell::Healthy, 0);
+        assert_eq!((text.as_str(), style), ("■", Style::Good));
+    }
+
+    #[test]
+    fn the_card_says_when_models_are_cooling_and_the_last_status_was_not_ok() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "cooling_combinations":1,"last_status_class":"4xx"}]}"#,
+            t0,
+        );
+        let card = texts(&peer_detail(&f, "peer-a", t0, 100));
+        assert!(
+            card.iter().any(|l| l
+                == "  openrouter: 1 healthy  0 cooling  0 disabled  1 model cooling  last 4xx"),
+            "{card:?}"
         );
     }
 }

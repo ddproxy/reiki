@@ -4241,15 +4241,22 @@ socket = "/run/forwarder.sock"
 
     #[test]
     fn token_counts_are_read_only_when_something_consumes_them() {
-        let base = "[upstream.api]\nbase_url = \"https://api.example.net/v1\"\n\
-                    [keys.k]\nupstream = \"api\"\nfile = \"/unused/k\"\n\
-                    [streams.s]\ntoken_sha256 = \"00\"\nchain = [\"k\"]\n";
-        let plain = Config::parse(base).unwrap();
+        let hash = crate::auth::sha256_hex("tok");
+        let base = format!(
+            "[upstream.api]\nbase_url = \"https://api.example.net/v1\"\n\
+             [keys.k]\nupstream = \"api\"\nfile = \"/unused/k\"\n\
+             [streams.s]\ntoken_sha256 = \"{hash}\"\nchain = [\"k\"]\n"
+        );
+        let plain = Config::parse(&base).unwrap();
         assert!(plain.exposes_usage());
         assert!(!plain.tracks_usage(), "nobody reads the figures");
-        let with_peers = Config::parse(&format!("{base}[peers]\nenabled = true\n"));
-        if let Ok(config) = with_peers {
-            assert!(config.tracks_usage());
-        }
+
+        let peers = Config::parse(&format!("{base}[peers]\nenabled = true\n")).unwrap();
+        assert!(peers.tracks_usage());
+        let off = Config::parse(&format!(
+            "{base}[peers]\nenabled = true\nexpose_usage = false\n"
+        ))
+        .unwrap();
+        assert!(!off.tracks_usage());
     }
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `[server]` sets the `max_connections` (default 1024) and `max_connections_per_addr` (default 256) caps on the client listener and `admin_max_connections` (default 64) with `admin_max_connections_per_addr` (default 16) on the admin listener; loopback is exempt from the per-address caps, and `reiki check` prints the caps.
+
 ## 0.10.1
 
 ### Added

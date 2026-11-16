@@ -231,3 +231,40 @@ fn sighup_reloads_the_running_instance() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn check_prints_the_connection_caps_and_names_unserved_hub_tables() {
+    let dir = std::env::temp_dir().join(format!("reiki-check-caps-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    let config = dir.join("reiki.toml");
+    let text = format!(
+        "[server]\nmax_connections = 32\nmax_connections_per_addr = 8\n\
+         [upstream.api]\nbase_url = \"https://example.net/v1\"\n\
+         [keys.k1]\nupstream = \"api\"\nfile = \"{}/key\"\n",
+        dir.display()
+    );
+    #[cfg(feature = "hub")]
+    let text = format!("{text}[accounts.acct-a]\nupstream = \"api\"\nkeys = [\"k1\"]\n");
+    std::fs::write(&config, text).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_reiki"))
+        .arg("--config")
+        .arg(&config)
+        .arg("check")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("caps: client 32 (8 per address), admin 64 (16 per address)"),
+        "{stdout}"
+    );
+    #[cfg(feature = "hub")]
+    assert!(
+        stdout.contains("hub: configured but not served in this version"),
+        "{stdout}"
+    );
+}

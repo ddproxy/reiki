@@ -471,6 +471,31 @@ async fn turning_publishing_off_on_reload_closes_the_route_and_asks_for_a_restar
 }
 
 #[tokio::test]
+async fn a_changed_server_or_service_table_on_reload_asks_for_a_restart() {
+    let rig = Rig::new("").await;
+    let dir = std::env::temp_dir().join(format!("reiki-server-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["zen-a", "zen-b"] {
+        std::fs::write(dir.join(name), format!("upstream-{name}\n")).unwrap();
+    }
+    let text = config_text(&rig.upstream, rig.peer_addr, "")
+        .replace("/unused/", &format!("{}/", dir.display()));
+    let text =
+        format!("{text}\n[server]\nmax_connections = 500\n[service]\nshutdown_timeout_secs = 40\n");
+    let path = dir.join("reiki.toml");
+    std::fs::write(&path, text).unwrap();
+    let report = rig.app.reload_from_file(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    for wanted in ["server.max_connections", "service.shutdown_timeout_secs"] {
+        assert!(
+            report.restart_needed.iter().any(|r| r == wanted),
+            "{wanted} missing from {:?}",
+            report.restart_needed
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_peer_token_hash_shared_with_another_credential_is_refused() {
     let upstream = "http://127.0.0.1:9";
     let addr: SocketAddr = "127.0.0.1:4999".parse().unwrap();

@@ -67,21 +67,35 @@ impl DropWarning {
     }
 }
 
-/// Open connections from one remote address, so one source cannot hold every global slot.
+/// Open connections from one remote address, so one source cannot hold every global slot. A
+/// listener whose clients share one address, such as loopback, can exempt it.
 struct AddrLimit {
     limit: usize,
+    exempt_loopback: bool,
     active: Mutex<HashMap<IpAddr, usize>>,
 }
 
 impl AddrLimit {
     fn new(limit: usize) -> Self {
+        Self::with_loopback_exemption(limit, false)
+    }
+
+    fn new_exempting_loopback(limit: usize) -> Self {
+        Self::with_loopback_exemption(limit, true)
+    }
+
+    fn with_loopback_exemption(limit: usize, exempt_loopback: bool) -> Self {
         Self {
             limit,
+            exempt_loopback,
             active: Mutex::new(HashMap::new()),
         }
     }
 
     fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<AddrSlot> {
+        if self.exempt_loopback && ip.to_canonical().is_loopback() {
+            return Some(AddrSlot { limit: None, ip });
+        }
         let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         let count = active.entry(ip).or_insert(0);
         if *count >= self.limit {
@@ -89,7 +103,7 @@ impl AddrLimit {
         }
         *count += 1;
         Some(AddrSlot {
-            limit: Arc::clone(self),
+            limit: Some(Arc::clone(self)),
             ip,
         })
     }
@@ -105,16 +119,28 @@ impl AddrLimit {
     }
 }
 
-/// Holds one address slot until the connection ends.
+/// Holds one address slot until the connection ends; an exempt connection holds none.
 struct AddrSlot {
-    limit: Arc<AddrLimit>,
+    limit: Option<Arc<AddrLimit>>,
     ip: IpAddr,
 }
 
 impl Drop for AddrSlot {
     fn drop(&mut self) {
-        self.limit.release(self.ip);
+        if let Some(limit) = &self.limit {
+            limit.release(self.ip);
+        }
     }
+}
+
+/// Open connections allowed on one listener, in total and from each remote address.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionLimits {
+    pub max_connections: usize,
+    pub max_connections_per_addr: usize,
+    /// Leave connections from a loopback address out of the per-address count, because every
+    /// local process shares `127.0.0.1`.
+    pub exempt_loopback: bool,
 }
 
 /// Serves `router` until `shutdown` completes, refusing connections beyond `max_connections`.
@@ -136,6 +162,30 @@ pub async fn serve(
     .await;
 }
 
+/// [`serve`] with [`ConnectionLimits`], such as a per-address cap that exempts loopback.
+pub async fn serve_with_limits(
+    listener: TcpListener,
+    router: Router,
+    limits: ConnectionLimits,
+    shutdown: impl Future<Output = ()>,
+) {
+    let addr_limit = if limits.exempt_loopback {
+        AddrLimit::new_exempting_loopback(limits.max_connections_per_addr)
+    } else {
+        AddrLimit::new(limits.max_connections_per_addr)
+    };
+    run(
+        listener,
+        router,
+        limits.max_connections,
+        Some(Arc::new(addr_limit)),
+        HEADER_READ_TIMEOUT,
+        None,
+        shutdown,
+    )
+    .await;
+}
+
 /// [`serve`] with a cap on open connections from each remote address.
 pub async fn serve_per_addr(
     listener: TcpListener,
@@ -148,7 +198,7 @@ pub async fn serve_per_addr(
         listener,
         router,
         max_connections,
-        Some(max_connections_per_addr),
+        Some(Arc::new(AddrLimit::new(max_connections_per_addr))),
         HEADER_READ_TIMEOUT,
         None,
         shutdown,
@@ -193,7 +243,7 @@ pub async fn serve_tls_per_addr(
         listener,
         router,
         max_connections,
-        Some(max_connections_per_addr),
+        Some(Arc::new(AddrLimit::new(max_connections_per_addr))),
         HEADER_READ_TIMEOUT,
         Some(tls),
         shutdown,
@@ -225,13 +275,12 @@ async fn run(
     listener: TcpListener,
     router: Router,
     max_connections: usize,
-    max_connections_per_addr: Option<usize>,
+    addr_limit: Option<Arc<AddrLimit>>,
     header_read_timeout: Duration,
     tls: Option<TlsSource>,
     shutdown: impl Future<Output = ()>,
 ) {
     let slots = Arc::new(Semaphore::new(max_connections));
-    let addr_limit = max_connections_per_addr.map(|limit| Arc::new(AddrLimit::new(limit)));
     tokio::pin!(shutdown);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut drops = DropWarning::new();
@@ -357,6 +406,31 @@ mod tests {
         drop((first, again, other));
         assert!(limit.acquire(a).is_some(), "every slot returned");
         assert!(limit.acquire(b).is_some(), "and the other address too");
+    }
+
+    #[test]
+    fn the_per_address_limit_can_exempt_loopback() {
+        let limit = Arc::new(AddrLimit::new_exempting_loopback(1));
+        let local = "127.0.0.1".parse().unwrap();
+        let remote = "192.0.2.1".parse().unwrap();
+        let mapped = "::ffff:127.0.0.1".parse().unwrap();
+        let _mapped = limit
+            .acquire(mapped)
+            .expect("an IPv4-mapped loopback address is exempt too");
+        let one = limit.acquire(local).expect("loopback is allowed");
+        let two = limit.acquire(local).expect("loopback holds no slot");
+        let three = limit
+            .acquire(remote)
+            .expect("a remote address gets its slot");
+        assert!(
+            limit.acquire(remote).is_none(),
+            "the remote address is still capped"
+        );
+        drop((one, two, three));
+        assert!(
+            limit.acquire(remote).is_some(),
+            "a closed connection frees it"
+        );
     }
 
     #[test]

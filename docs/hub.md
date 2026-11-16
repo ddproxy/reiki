@@ -1,6 +1,6 @@
 # Hub
 
-Status: configuration only. Behind the `hub` cargo feature (not in the default set), Reiki parses and validates the tables below but opens no listener, builds no client and contacts no hub. A binary without the feature refuses such a config; without these tables nothing changes.
+Status: configuration only. Behind the `hub` cargo feature (not in the default set), Reiki parses and validates the tables below but opens no listener, builds no client and contacts no hub. A binary built without the feature refuses a config containing `[hubs]`, `[hub]` or `[accounts]` with an error; with the feature on, `reiki check` accepts them but nothing serves them. Without these tables nothing changes.
 
 ## Tables
 

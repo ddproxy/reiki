@@ -64,6 +64,7 @@ pub enum ConfigError {
     BadService(String),
     BadAuth(String),
     BadPeers(String),
+    BadServer(String),
     /// The config has a `[hubs]`, `[hub]` or `[accounts]` table, but this binary was built without
     /// the `hub` feature.
     HubFeatureOff,
@@ -171,6 +172,7 @@ impl fmt::Display for ConfigError {
             Self::BadService(reason) => write!(f, "invalid [service]: {reason}"),
             Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
             Self::BadPeers(reason) => write!(f, "invalid [peers]: {reason}"),
+            Self::BadServer(reason) => write!(f, "invalid [server]: {reason}"),
             Self::HubFeatureOff => {
                 write!(
                     f,
@@ -238,6 +240,9 @@ pub struct Config {
     /// Failed token checks on the client and admin listeners.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Open connection caps for the client and admin listeners, read at startup.
+    #[serde(default)]
+    pub server: ServerConfig,
     #[serde(skip)]
     quota_resets: BTreeMap<String, Reset>,
     #[serde(default)]
@@ -932,6 +937,89 @@ pub struct AdminConfig {
     pub token_sha256: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Open connections allowed on the client listener in total.
+    #[serde(default = "default_server_max_connections")]
+    pub max_connections: u32,
+    /// Open connections allowed on the client listener from one remote address.
+    #[serde(default = "default_server_max_connections_per_addr")]
+    pub max_connections_per_addr: u32,
+    /// Open connections allowed on the admin listener in total.
+    #[serde(default = "default_server_admin_max_connections")]
+    pub admin_max_connections: u32,
+    /// Open connections allowed on the admin listener from one remote address.
+    #[serde(default = "default_server_admin_max_connections_per_addr")]
+    pub admin_max_connections_per_addr: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_server_max_connections(),
+            max_connections_per_addr: default_server_max_connections_per_addr(),
+            admin_max_connections: default_server_admin_max_connections(),
+            admin_max_connections_per_addr: default_server_admin_max_connections_per_addr(),
+        }
+    }
+}
+
+fn default_server_max_connections() -> u32 {
+    1024
+}
+
+fn default_server_max_connections_per_addr() -> u32 {
+    256
+}
+
+fn default_server_admin_max_connections() -> u32 {
+    64
+}
+
+fn default_server_admin_max_connections_per_addr() -> u32 {
+    16
+}
+
+impl ServerConfig {
+    /// The `caps:` line `reiki check` prints.
+    pub fn check_line(&self) -> String {
+        format!(
+            "caps: client {} ({} per address), admin {} ({} per address); loopback exempt from the per-address caps",
+            self.max_connections,
+            self.max_connections_per_addr,
+            self.admin_max_connections,
+            self.admin_max_connections_per_addr
+        )
+    }
+
+    /// The startup-only settings that differ in `new`, for a reload report.
+    pub fn restart_needed(&self, new: &Self) -> Vec<String> {
+        [
+            (
+                "server.max_connections",
+                self.max_connections != new.max_connections,
+            ),
+            (
+                "server.max_connections_per_addr",
+                self.max_connections_per_addr != new.max_connections_per_addr,
+            ),
+            (
+                "server.admin_max_connections",
+                self.admin_max_connections != new.admin_max_connections,
+            ),
+            (
+                "server.admin_max_connections_per_addr",
+                self.admin_max_connections_per_addr != new.admin_max_connections_per_addr,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, differs)| *differs)
+        .map(|(name, _)| name.to_owned())
+        .collect()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
@@ -1575,6 +1663,9 @@ impl Config {
                 self.auth.window_secs
             )));
         }
+        if let Some(reason) = self.server_problem() {
+            return Err(ConfigError::BadServer(reason));
+        }
         if let Some(peers) = &self.peers {
             if let Some(reason) = self.peers_problem(peers) {
                 return Err(ConfigError::BadPeers(reason));
@@ -1586,6 +1677,42 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// What is wrong with the `[server]` table, if anything.
+    fn server_problem(&self) -> Option<String> {
+        let server = &self.server;
+        if !(1..=100_000).contains(&server.max_connections) {
+            return Some(format!(
+                "max_connections must be between 1 and 100000, got {}",
+                server.max_connections
+            ));
+        }
+        if !(1..=server.max_connections).contains(&server.max_connections_per_addr) {
+            return Some(format!(
+                "max_connections_per_addr must be between 1 and max_connections ({}), got {}",
+                server.max_connections, server.max_connections_per_addr
+            ));
+        }
+        if !(1..=10_000).contains(&server.admin_max_connections) {
+            return Some(format!(
+                "admin_max_connections must be between 1 and 10000, got {}",
+                server.admin_max_connections
+            ));
+        }
+        if !(1..=server.admin_max_connections).contains(&server.admin_max_connections_per_addr) {
+            return Some(format!(
+                "admin_max_connections_per_addr must be between 1 and admin_max_connections ({}), got {}",
+                server.admin_max_connections, server.admin_max_connections_per_addr
+            ));
+        }
+        None
+    }
+
+    /// The `reiki check` line for hub tables that nothing serves yet.
+    pub fn hub_check_line(&self) -> Option<&'static str> {
+        (self.hubs.is_some() || self.hub.is_some() || self.accounts.is_some())
+            .then_some("hub: configured but not served in this version")
     }
 
     /// What is wrong with a `[peers]` table, if anything.
@@ -3192,6 +3319,85 @@ socket = "/run/forwarder.sock"
         }
     }
 
+    #[test]
+    fn the_server_caps_default_and_are_checked() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.server.max_connections, 1024);
+        assert_eq!(config.server.max_connections_per_addr, 256);
+        assert_eq!(config.server.admin_max_connections, 64);
+        assert_eq!(config.server.admin_max_connections_per_addr, 16);
+
+        let config = Config::parse(
+            "[server]\nmax_connections = 100\nmax_connections_per_addr = 10\n\
+             admin_max_connections = 20\nadmin_max_connections_per_addr = 5\n",
+        )
+        .unwrap();
+        assert_eq!(config.server.max_connections, 100);
+        assert_eq!(config.server.admin_max_connections_per_addr, 5);
+
+        for (text, key) in [
+            ("[server]\nmax_connections = 0\n", "max_connections"),
+            ("[server]\nmax_connections = 100001\n", "max_connections"),
+            (
+                "[server]\nmax_connections = 10\n",
+                "max_connections_per_addr",
+            ),
+            (
+                "[server]\nmax_connections_per_addr = 0\n",
+                "max_connections_per_addr",
+            ),
+            (
+                "[server]\nadmin_max_connections = 0\n",
+                "admin_max_connections",
+            ),
+            (
+                "[server]\nadmin_max_connections = 10001\n",
+                "admin_max_connections",
+            ),
+            (
+                "[server]\nadmin_max_connections = 10\n",
+                "admin_max_connections_per_addr",
+            ),
+            (
+                "[server]\nadmin_max_connections_per_addr = 0\n",
+                "admin_max_connections_per_addr",
+            ),
+        ] {
+            let error = Config::parse(text).unwrap_err().to_string();
+            assert!(
+                error.contains("[server]") && error.contains(key),
+                "{text}: {error}"
+            );
+        }
+        assert!(matches!(
+            Config::parse("[server]\nbogus = 1\n"),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn the_server_caps_are_printed_and_a_change_needs_a_restart() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(
+            config.server.check_line(),
+            "caps: client 1024 (256 per address), admin 64 (16 per address); loopback exempt from the per-address caps"
+        );
+        let started = ServerConfig::default();
+        assert!(started.restart_needed(&started).is_empty());
+        let next = ServerConfig {
+            max_connections: 2048,
+            admin_max_connections_per_addr: 32,
+            ..started
+        };
+        assert_eq!(
+            started.restart_needed(&next),
+            [
+                "server.max_connections",
+                "server.admin_max_connections_per_addr"
+            ]
+        );
+    }
+
     #[cfg(feature = "peers")]
     const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
@@ -3786,6 +3992,16 @@ socket = "/run/forwarder.sock"
             assert_eq!((edge.max_concurrent, edge.max_tokens_per_day), (0, 0));
             let account = &config.accounts.as_ref().unwrap()["acct-a"];
             assert!(account.limits.is_none() && !account.shared);
+        }
+
+        #[test]
+        fn check_says_the_hub_tables_are_not_served() {
+            let config = Config::parse(&hub_text()).unwrap();
+            assert_eq!(
+                config.hub_check_line(),
+                Some("hub: configured but not served in this version")
+            );
+            assert!(Config::parse(&base("")).unwrap().hub_check_line().is_none());
         }
 
         #[test]

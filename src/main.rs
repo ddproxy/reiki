@@ -593,10 +593,15 @@ async fn main() {
         } else {
             format!(", {} plugin(s)[{}]", names.len(), names.join(", "))
         };
+        println!("{}", config.server.check_line());
         println!(
             "{}",
             reiki::config::PeersConfig::check_line(config.peers.as_ref())
         );
+        #[cfg(feature = "hub")]
+        if let Some(line) = config.hub_check_line() {
+            println!("{line}");
+        }
         println!(
             "ok: {} upstream(s), {} key(s), {} stream(s){plugin_part}, listening on {listen}{admin}",
             config.upstream.len(),
@@ -607,6 +612,7 @@ async fn main() {
     }
 
     let tunnel_config = config.tunnel.clone();
+    let caps = config.server;
     for text in reiki::forward::socket_warnings(&config) {
         tracing::warn!("{text}");
     }
@@ -636,11 +642,16 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("cannot bind admin {addr}: {e}")));
         tracing::info!(%addr, "reiki admin listening");
         let admin_router = reiki::admin::router(Arc::clone(&app));
+        let limits = reiki::serve::ConnectionLimits {
+            max_connections: caps.admin_max_connections as usize,
+            max_connections_per_addr: caps.admin_max_connections_per_addr as usize,
+            exempt_loopback: true,
+        };
         listeners.push(tokio::spawn(async move {
-            reiki::serve::serve(
+            reiki::serve::serve_with_limits(
                 admin_listener,
                 admin_router,
-                64,
+                limits,
                 reiki::lifecycle::stopped(),
             )
             .await;
@@ -682,7 +693,17 @@ async fn main() {
     tracing::info!(%listen, "reiki listening");
     reiki::notify::ready(&format!("listening on {listen}"));
     let flush = Arc::clone(&app);
-    reiki::serve::serve(listener, router(app), 1024, reiki::lifecycle::stopped()).await;
+    reiki::serve::serve_with_limits(
+        listener,
+        router(app),
+        reiki::serve::ConnectionLimits {
+            max_connections: caps.max_connections as usize,
+            max_connections_per_addr: caps.max_connections_per_addr as usize,
+            exempt_loopback: true,
+        },
+        reiki::lifecycle::stopped(),
+    )
+    .await;
     // The client listener has drained; the others started draining at the same moment.
     let grace = reiki::serve::drain_timeout() + std::time::Duration::from_secs(2);
     for task in listeners {

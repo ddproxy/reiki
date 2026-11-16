@@ -7,6 +7,7 @@
 - Reiki stops cleanly on SIGTERM and SIGINT: listeners (client, admin, peers, tunnel) stop accepting at once, idle keep-alive connections close, requests in flight get `[service] shutdown_timeout_secs` (default 25), then the request log and state file are written and it exits 0. A second signal exits at once. See [service](docs/service.md).
 - systemd integration with no new dependency: `Type=notify` readiness (`READY=1`, `STOPPING=1`) and `WatchdogSec=` pings that stop when the async runtime is wedged. A warning at start when the open-file limit is below 4096.
 - Plugins get an `on_shutdown` hook; the request log writes out its queue there.
+- `[server]` sets the `max_connections` (default 1024) and `max_connections_per_addr` (default 256) caps on the client listener and `admin_max_connections` (default 64) with `admin_max_connections_per_addr` (default 16) on the admin listener; loopback is exempt from the per-address caps, and `reiki check` prints the caps.
 
 ### Fixed
 

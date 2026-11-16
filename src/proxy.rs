@@ -813,6 +813,10 @@ impl App {
         if admin_listen(&current.config) != admin_listen(&config) {
             restart_needed.push("admin.listen".to_owned());
         }
+        restart_needed.extend(current.config.server.restart_needed(&config.server));
+        if current.config.service != config.service {
+            restart_needed.push("service.shutdown_timeout_secs".to_owned());
+        }
         let peer_listen = |c: &Config| {
             c.peers
                 .as_ref()

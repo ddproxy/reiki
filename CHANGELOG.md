@@ -1,13 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.10.4
 
 ### Added
 
 - `reiki top` frame: a header panel with version, UTC clock, live or paused state and key hints; a provider tab row that follows `f`; a titled Peers panel; a Cooling panel shown only while something cools; a footer of toggle chips (detail, gauge, chart, filter, paused).
 - `reiki top` chart row at 28 rows or more: a line chart of the selected peer's load, disk, sessions or requests (or the fleet's when none is selected), and a key-count chart by state. `m` cycles the chart metric.
 - `reiki top`: `?` lists every key; any key closes the list.
-- Docs: an overview, a configuration reference for every key, a command-line reference, and pages for failover and traffic shaping. The docs site gets a menu.
+- Docs: an overview, a configuration reference for every key, a command-line reference, and pages for failover and traffic shaping. The docs site gets a menu, and diagrams are drawn with mermaid.
 
 ### Changed
 

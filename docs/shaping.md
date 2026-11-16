@@ -120,6 +120,8 @@ These apply only to the key that sent the attempt. They use the bucket for that 
 
 The quota cooldown is the same one that cools the key. See [failover](failover.md#cooldowns).
 
+The limit is scoped to the route and model on purpose: a provider can rate-limit each model and route independently, so one model hitting its limit must not stop the key's traffic to the others.
+
 Rate headers do not lower the learned cap. They only close the bucket when `remaining` is 0.
 
 ## Persisting across restarts

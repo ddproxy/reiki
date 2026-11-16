@@ -21,13 +21,18 @@ strategy = "sticky"          # or "round_robin"
 
 Each key is in one of three states:
 
-```
-available --429 (quota), second transient in a row--> cooling (whole key)
-available --429 (rate limit), 402--> cooling for one (route, model)
-cooling   --deadline passes-----------------------> available
-available --401, or invalid key in a 400 or 403----> disabled
-cooling   --401 or invalid key--------------------> disabled (cooldown kept, shown as disabled)
-disabled  --reiki keys --enable, or changed key file + reload--> available
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "cooling (whole key)" as cooling_key
+    state "cooling (one route and model)" as cooling_scope
+    available --> cooling_key: quota 429, or a second transient in a row
+    available --> cooling_scope: rate-limit 429, or 402
+    cooling_key --> available: deadline passes
+    cooling_scope --> available: deadline passes
+    available --> disabled: 401, or an invalid key in a 400 or 403
+    cooling_key --> disabled: 401 or invalid key, cooldown kept
+    disabled --> available: enable with reiki keys, or change the key file and reload
 ```
 
 A combination cooldown is a fourth, narrower state. The key stays available for every other model and route. Only the `(route, model)` pair that failed is held back.

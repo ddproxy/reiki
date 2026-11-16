@@ -10,31 +10,26 @@ Reiki is one binary. It runs in the foreground, reads one TOML file and logs to 
 
 ## The model
 
+```mermaid
+flowchart TD
+    client["client<br/>Authorization: Bearer stream token"] --> listener["client listener<br/>listen"]
+    listener -->|"token picks the stream<br/>path /upstream/... picks the upstream"| stream["stream<br/>[streams.NAME]<br/>plugins run request hooks once"]
+    stream -->|first usable key| chain["chain<br/>chain = key, key, ..."]
+    chain --> key["key<br/>[keys.NAME] file = path<br/>credential header set from the key"]
+    key --> upstream["upstream<br/>[upstream.NAME] base_url = https://..."]
+    upstream --> provider["provider"]
+    upstream -.->|"no usable key: fallback upstream, one hop"| fallback["fallback upstream"]
+    fallback --> provider
 ```
-client  --Authorization: Bearer <stream token>-->  client listener (listen)
-                                                       |  token picks the stream
-                                                       |  path /<upstream>/... picks the upstream
-                                                       v
-                                                  stream  [streams.NAME]
-                                                       |  plugins: request hooks, once
-                                                       v
-                                                  chain   chain = [key, key, ...]
-                                                       |  first usable key
-                                                       v
-                                                  key     [keys.NAME] file = <path>
-                                                       |  credential header set from the key
-                                                       v
-                                                  upstream  [upstream.NAME] base_url = https://...
-                                                       |  no usable key: fallback upstream, one hop
-                                                       v
-                                                  provider
 
-other listeners, each optional and on its own socket:
-  admin   [admin]    GET /status, POST /reload, GET /metrics
-  peers   [peers]    GET /v1/health (read-only peer token)
-  tunnel  [tunnel]   CONNECT proxy with a destination allow-list; intercept for chosen hosts
-  hub     [hub]      parsed and validated only in this release
-```
+Other listeners, each optional and on its own socket:
+
+| Listener | Table | Serves |
+| --- | --- | --- |
+| admin | `[admin]` | `GET /status`, `POST /reload`, `GET /metrics` |
+| peers | `[peers]` | `GET /v1/health` with a read-only peer token |
+| tunnel | `[tunnel]` | CONNECT proxy with a destination allow-list; intercept for chosen hosts |
+| hub | `[hub]` | parsed and validated only in this release |
 
 - **Client listener.** Serves the API. A request needs a stream token, except on a `passthrough` upstream. The path prefix chooses the upstream, so `/example/chat/completions` goes to the `example` upstream.
 - **Stream.** One client with its own token and key chain. The token is stored as a SHA-256 hash. Streams share cooldown state only for keys they both list.

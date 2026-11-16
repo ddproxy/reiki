@@ -11,7 +11,7 @@ use reiki::proxy::{load_keys, router, App};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Security proxy that isolates LLM harnesses from keys and secrets"
+    about = "Security proxy for agent and LLM traffic: isolates keys, filters what leaves, keeps access reliable"
 )]
 struct Cli {
     /// Path to the configuration file.

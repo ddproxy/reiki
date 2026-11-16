@@ -8,6 +8,10 @@ Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when
 
 `GET /v1/health` and `GET /v1/health/stream`, the coarse summary other instances read, are never served here: they live on the separate `[peers]` listener with its own read-only token (see [peers](peers.md)). While publishing, `/v1/openapi.json` lists them with that listener as their server.
 
+## Health probe
+
+`GET /__reiki/healthz` on the client listener returns `200` and `ok` while Reiki is up. It needs no token and does not check upstreams or keys.
+
 ## Configure
 
 ```toml

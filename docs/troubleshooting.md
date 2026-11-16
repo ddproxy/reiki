@@ -105,8 +105,8 @@ Key health is saved next to the config as `<config>.state` and restored at start
 
 **404 from the upstream.** The client base URL and `base_url` disagree. The client must use `http://127.0.0.1:4097/<name>`, and `base_url` must be the root the provider's SDK uses. See [providers](providers.md).
 
-**A key stays cooling for hours.** A quota-exhausted key cools for 5 h by default. Set `quota_resets` on the key to end its cooldown at the provider's next reset instead; see the config section of the README.
+**A key stays cooling for hours.** A quota failure cools the key until its `quota_resets` instant, when the key sets one. Otherwise it cools until the `Retry-After` the provider sent, when there is one, and otherwise for 5 h. Set `quota_resets` on the key to end the cooldown at the provider's next reset. See [failover](failover.md) and [configuration](configuration.md).
 
-**A request fails after two minutes.** Reiki waits 120 s for upstream response headers, then counts a transient failure and tries again.
+**A request fails after two minutes.** Reiki waits 120 s for upstream response headers and counts a transient failure. A GET, HEAD, PUT, DELETE, OPTIONS or TRACE is tried again. A POST or PATCH is not replayed, because the first attempt may have reached the provider; it gets 504 for a timeout or 502 for a broken connection. See [failover](failover.md).
 
 **429 from Reiki.** Either the stream hit its `rate_limit_per_minute`, or the client address sent 10 wrong tokens in a minute (look for `failed login` in the log). Wait for `Retry-After`, or raise the limit. Reloading config resets the counter.

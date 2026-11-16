@@ -67,11 +67,11 @@ max_wait_secs = 20           # longest Reiki waits for a slot, 1-120
 
 Every field is optional; an explicit `0` means unlimited, even over a preset. A preset seeds the values and explicit fields override them; `min_rpm` sets a floor for learning.
 
-Reiki takes a slot for the chosen key before sending. A wait within `max_wait_secs` is slept off; a longer wait or a closed daily quota skips that key for this request and tries the next. If no key is usable, the client gets `429` with JSON error code `reiki_shaped`, `Retry-After` and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
+Reiki takes a slot for the chosen key before sending. A wait within `max_wait_secs` is slept off, at most twice per key; a longer wait or a closed daily quota skips that key for this request and tries the next. If no key is usable, the client gets `429` with JSON error code `reiki_shaped`, `Retry-After` and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
 
 The first token charge is an estimate of `body bytes / 4`. When the response reports provider `usage` in JSON or an SSE event, Reiki replaces it with the prompt + completion count as the body streams, so `tpm` and the daily and monthly token counters include output. A body with no usage, or a compressed body, keeps the estimate.
 
-A response from that key's own upstream teaches the bucket: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and `remaining: 0` closes it until the reported reset. The learned cap, remaining pause or closed time and current daily and monthly counters persist in the state file across restarts; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
+A response from that key's own upstream teaches the bucket: `Retry-After` on a rate-limit `429` pauses it, `402`/quota exhaustion closes it for the key cooldown, and `remaining: 0` closes it until the reported reset. A rate-limit or quota failure on a request that names a `model` only cools that route and model, so it does not pause or close the bucket; see [shaping](shaping.md). The learned cap, remaining pause or closed time and current daily and monthly counters persist in the state file across restarts; the sliding minute log is not saved, and a key whose file or upstream changed starts with a fresh bucket.
 
 ## Forwarding
 
@@ -180,7 +180,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 `insufficient_quota` body cools the key for the quota period; other 429s cool it for `Retry-After`. Both are unit-tested but not exercised with a real exhausted key.
+Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, cools the key until its `quota_resets` instant when one is set, else for the `Retry-After` the response carries, else for 5 h. Other 429s cool it for `Retry-After`, or 60 s without one. These rules are unit-tested but not exercised with a real exhausted key.
 
 ## OpenCode Zen
 

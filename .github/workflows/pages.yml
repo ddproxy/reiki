@@ -7,6 +7,7 @@ on:
       - README.md
       - docs/**
       - .github/workflows/pages.yml
+      - .github/pages/**
   workflow_dispatch:
 
 permissions:
@@ -33,6 +34,8 @@ jobs:
         run: |
           mkdir -p site
           cp -r docs site/docs
+          # The menu: layout, includes and the page list live in .github/pages.
+          cp -r .github/pages/. site/
           {
             printf -- '---\ntitle: Reiki\n---\n\n'
             sed -e '/<picture>/,/<\/picture>/c\  <img src="docs/assets/logo.png" alt="Reiki logo" width="200">' -e '/^# Reiki$/d' README.md
@@ -44,7 +47,7 @@ jobs:
           done
           cat > site/_config.yml <<CONFIG
           title: Reiki
-          description: Key-failover relay for LLM APIs
+          description: "Security proxy for agent and LLM traffic: isolates keys, filters what leaves, keeps access reliable"
           theme: jekyll-theme-minimal
           baseurl: ${{ steps.pages.outputs.base_path }}
           plugins:

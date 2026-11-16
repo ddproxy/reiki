@@ -7,16 +7,23 @@
 
 # Reiki
 
-Reiki is a security proxy between a client and the LLM providers it calls. The client can be an agent such as opencode or Claude Code, or an application that would otherwise hold provider API keys. Reiki keeps upstream keys away from the client and credentials and sensitive terms in prompts away from the provider.
+Security proxy for agent and LLM traffic: isolates keys, filters what leaves, keeps access reliable.
 
-- **Key isolation.** Upstream keys live in files only Reiki reads; the client authenticates with a revocable stream token and never sees a key. Reiki redacts a key an upstream echoes back in an error; [security](docs/security.md#clients-and-keys) lists the exception.
-- **Secret and term masking.** The `placeholders` plugin swaps credentials and listed sensitive terms in a request for stable placeholders before the provider sees them, and restores them in the response. Private keys are removed outright, and credentials stay masked inside tool-call arguments by default.
-- **Controlled egress.** Upstreams come only from the config, and the optional CONNECT tunnel allows only listed destinations. Interception brings chosen hosts under the same rules with a name-constrained CA.
-- **Outbound data checks.** The `phi` plugin blocks or reports PHI and NPPI identifiers in a request before it reaches the provider. See [docs/phi.md](docs/phi.md).
-- **Auditable traffic.** The `requestlog` plugin records what the client sent and received, with credentials masked, to a file and a live socket. Failed logins are logged and throttled.
-- **Key failover.** A stream's chain of keys, and optionally a fallback upstream, takes over on a rate limit, exhausted quota or disabled key, so the client sees one stable endpoint.
+Reiki sits between a client and the LLM providers it calls. The client can be an agent such as opencode or Claude Code, or an application that would otherwise hold provider API keys. The client gets a stream token. Reiki keeps the keys.
 
-See [docs/security.md](docs/security.md) for what Reiki does and does not protect against.
+Start with the [overview](docs/overview.md) for how the parts fit together.
+
+## Isolation
+
+Upstream keys and secrets stay out of the client. Keys live in files that only Reiki reads. The client authenticates with a revocable stream token. See [security](docs/security.md#clients-and-keys) for what this does and does not cover, and [configuration](docs/configuration.md) for the key and stream tables.
+
+## Control
+
+Reiki filters what leaves. The `placeholders` plugin masks credentials and listed terms. The `phi`, `finance` and `controlled` plugins block or report identifiers. Upstreams come only from the config, and the optional tunnel allows only listed destinations. Read [placeholders](docs/placeholders.md), [phi](docs/phi.md), [finance](docs/finance.md), [controlled](docs/controlled.md) and [tunnel](docs/tunnel.md).
+
+## Reliability and visibility
+
+Access stays up and you can see it. A stream's chain of keys, and an optional fallback upstream, takes over on a rate limit, an exhausted quota or a disabled key ([failover](docs/failover.md)). Traffic shaping ([shaping](docs/shaping.md)) keeps each key inside its budget. The request log ([requestlog](docs/requestlog.md)), `reiki top` ([top](docs/top.md)), peers ([peers](docs/peers.md)) and `/metrics` ([monitoring](docs/monitoring.md)) show what happened.
 
 ## Install
 
@@ -26,103 +33,92 @@ Or download a prebuilt archive from the [releases page](https://github.com/ddpro
 
 Plugin selection and order are build arguments; see [docs/plugins.md](docs/plugins.md#choose-and-order-plugins-at-build-time).
 
-## Configure
+## Quick start
 
-Reiki reads a TOML file, `/etc/reiki/reiki.toml` by default (`--config` to change it). Override the `listen` address with `--listen <addr>` or `REIKI_LISTEN`; the flag wins over the variable, and both win over the file. `reiki check` prints the address Reiki will use.
+This takes one upstream, one key and one stream. Replace each placeholder.
 
-```toml
-listen = "127.0.0.1:4097"
+1. Write the provider key to a file that only Reiki's user can read.
 
-[upstream.example]
-base_url = "https://api.example.com/v1"   # must be https
-# auth_header = "authorization"           # defaults
-# auth_format = "Bearer {key}"
-# model_aliases = { "small" = "vendor/small-v2" }  # rewrite the top-level `model`
-# drop_params = ["stream_options"]        # remove these top-level keys
-# http2 = true                            # negotiate HTTP/2 (default: HTTP/1.1)
-# forward_accept_encoding = true          # send the client's Accept-Encoding (default: identity)
-# title_case_headers = true               # send Content-Type rather than content-type (HTTP/1.1)
-# send_keep_alive = true                  # add Connection: keep-alive
-# [upstream.example.forward]              # optional: hand requests to a listener or command
-# socket = "/run/forwarder.sock"          # or `command` with optional `args` and `pass_env`
-# # expect_uid = 1000                     # socket only
+   ```bash
+   umask 077
+   printf '%s' "$PROVIDER_KEY" > /path/to/keys/example-a
+   ```
 
-[keys.example-a]
-upstream = "example"
-file = "/etc/reiki/keys/example-a"            # file holding the key
-# quota_resets = "daily 00:00 UTC"        # end a quota cooldown at the next reset
+2. Choose a client token of at least 16 characters and hash it.
 
-[keys.example-b]
-upstream = "example"
-file = "/etc/reiki/keys/example-b"
+   ```bash
+   printf '%s' "$CLIENT_TOKEN" | reiki hash-token
+   ```
 
-[streams.client-a]
-token_sha256 = "<sha256 of the client token>"
-chain = ["example-a", "example-b"]                # tried in order
-strategy = "sticky"                       # or "round_robin"
-# rate_limit_per_minute = 60              # optional; off unless set
+3. Save `reiki.toml`, with the hash from step 2 in `token_sha256`.
 
-[admin]                                    # optional; off unless set
-listen = "127.0.0.1:4098"                  # must differ from `listen`
-token_sha256 = "<sha256 of the admin token>"
-```
+   ```toml
+   [upstream.example]
+   base_url = "https://api.example.com/v1"
 
-- A **stream** is one client with its own token and key chain; streams share cooldown state only when they list the same key.
-- `rate_limit_per_minute` caps a stream's upstream attempts per minute. Every selected-key attempt counts, including retries and a fallback upstream. Reiki answers an over-limit attempt with 429 and `Retry-After` before sending it, so the upstream and key state are untouched. The counter is in memory and resets on reload.
-- `[admin]` opens a separate listener for `GET /status` (JSON) and, with the `metrics` plugin configured, `GET /metrics` (Prometheus text), both behind `Authorization: Bearer <admin token>`. See [docs/monitoring.md](docs/monitoring.md).
-- `model_aliases` rewrites the top-level `model` of a JSON body and `drop_params` removes top-level keys, once before the first attempt so every key replay sends the same body. See [docs/providers.md](docs/providers.md#rewriting-the-request-body).
-- `http2`, `forward_accept_encoding`, `title_case_headers` and `send_keep_alive` tune the transport per upstream, while `max_decoded_bytes`, `response_idle_timeout_secs` and `response_timeout_secs` bound response bodies. See [docs/providers.md](docs/providers.md#transport-options).
-- `[upstream.X.forward]` hands each request to a Unix socket or a spawned command that speaks HTTP/1.1; `streaming = true` relays the answer as it arrives. See [docs/providers.md](docs/providers.md#forwarding).
-- `[upstream.X.fallback]` sends a request to another upstream when none of X's keys is usable, and `passthrough = true` makes X a plain reverse proxy that forwards the client's own credentials. See [docs/providers.md](docs/providers.md).
-- `[peers]` (off by default) publishes a read-only key-health summary to other instances, and `reiki peers` reads theirs. See [docs/peers.md](docs/peers.md).
-- `reiki top` (behind the `top` feature) is a live terminal view of the peers' key health; `--once` prints it as plain text. See [docs/top.md](docs/top.md).
-- `[hubs]`, `[hub]` and `[accounts]` (behind the `hub` feature) are parsed and validated only; nothing is served or contacted yet. See [docs/hub.md](docs/hub.md).
-- `[tunnel]` adds a CONNECT proxy with a destination allowlist; `[tunnel.intercept]` terminates TLS for chosen hosts so plugins and key handling apply to that traffic. See [docs/tunnel.md](docs/tunnel.md).
-- `[reload]` with `watch = true` reloads the config when the config or key files change, so a deploy only has to write the file. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).
-- `[service]` sets how long a clean stop (SIGTERM, SIGINT) lets requests in flight finish. Reiki also speaks the systemd readiness and watchdog protocol. See [docs/service.md](docs/service.md).
-- `[log]` sends Reiki's own log to a rotating file as well as stderr and sets the level, which SIGHUP reloads. See [docs/troubleshooting.md](docs/troubleshooting.md#logs).
-- `[plugins.placeholders]` masks credentials and listed terms before a request leaves and restores them in the response; `[plugins.requestlog]` logs traffic. See [docs/plugins.md](docs/plugins.md).
-- `quota_resets` (optional, per key) ends a quota cooldown at the provider's next reset instead of the fixed 5 h. Use `daily HH:MM <zone>` or `monthly D HH:MM <zone>`, where `D` is 1–28 and `<zone>` is `UTC` or a fixed `+HH:MM`/`-HH:MM` offset. It applies only to quota-exhausted failures, and a wait longer than 31 days falls back to the fixed 5 h.
-- Keys live in files, never in the config. Keep them mode 0600.
-- Generate a token hash with `printf '%s' "$TOKEN" | reiki hash-token`. Tokens shorter than 16 characters are refused by `hash-token`.
-- Validate the setup with `reiki check`, then start Reiki with `reiki`.
+   [keys.example-a]
+   upstream = "example"
+   file = "/path/to/keys/example-a"
 
-## Use
+   [streams.client-a]
+   token_sha256 = "<64 hex characters from hash-token>"
+   chain = ["example-a"]
+   ```
 
-Point the client's base URL at `http://127.0.0.1:4097/<upstream>` and send the stream token where the client would normally put its API key. The path prefix picks the upstream, so `/example/chat/completions` goes to `https://api.example.com/v1/chat/completions`. Only the credential header is replaced; every other header passes through.
+4. Check the setup, then run Reiki. It listens on `127.0.0.1:4097` unless `listen` says otherwise.
 
-Clients send the stream token as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, in that order of preference. Provider-specific setup is in [docs/providers.md](docs/providers.md).
+   ```bash
+   reiki --config reiki.toml check
+   reiki --config reiki.toml
+   ```
 
-`GET /__reiki/healthz` returns 200 and `ok` when Reiki is up. It needs no token.
+5. From another terminal, send a request through Reiki. Only the stream token goes to Reiki.
 
-`reiki keys` prints each key's state, cooldown and last status from the admin listener, and `reiki keys --check` checks the key files offline. See [docs/monitoring.md](docs/monitoring.md#check-key-health).
+   ```bash
+   curl -s http://127.0.0.1:4097/example/chat/completions \
+     -H "Authorization: Bearer $CLIENT_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"model": "example-model", "messages": [{"role": "user", "content": "ping"}]}'
+   ```
 
-## Failover
+To point a client at Reiki, set its base URL to `http://127.0.0.1:4097/<upstream>` and send the stream token where it would send its API key. Clients may send the token as `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or a `?key=` query parameter, in that order of preference. Provider setup is in [providers](docs/providers.md).
 
-| Upstream response | Action |
-| --- | --- |
-| 429 | Cool the key for `Retry-After`, or 60 s |
-| 402, or 429 with a quota phrase in the body (`quota`, `usage exceeded`, `insufficient`) | Cool the key for 5 h, or until the key's `quota_resets` instant |
-| 400 with an empty-balance body | Cool the key for 5 h, or until the key's `quota_resets` instant |
-| 403 or 5xx saying access is disabled | Try the next key for that request only; the key stays in rotation |
-| 5xx saying rate limit | Cool the key for `Retry-After`, or 60 s |
-| 401, other 403, or 400 with an invalid-key body | Take the key out of rotation until you rotate the key file and reload |
-| Other 5xx | Retry once on the same key, then cool it for 30 s after the second failure in a row |
-| Connection failure before anything was sent | Retry once on the same key, whichever the method |
-| Timeout or broken connection on GET, HEAD, PUT, DELETE, OPTIONS or TRACE | Retry once on the same key |
-| Timeout or broken connection on POST or PATCH | Do not replay; answer 502, or 504 for a timeout |
-| 403 that is a CDN block page | Pass through unchanged |
-| Other 4xx | Pass through unchanged (a body over 64 KiB is cut and the response carries `x-reiki-truncated: 1`) |
+## Documentation
 
-An upstream response such as a 429 or 5xx moves the request to the next key as long as no response bytes have reached the client. A transport failure is different: only an idempotent method, or any method when the connection could not be established, is replayed, so an uncertain POST or PATCH is not sent twice. If every key is out, Reiki returns 503 `reiki_exhausted`, with `Retry-After` when a key will recover.
+**Start**
 
-`Retry-After` is read as delta-seconds or as an HTTP-date (IMF-fixdate, such as `Sun, 06 Nov 1994 08:49:37 GMT`); a cooldown taken from it is capped at 24 h.
+- [Overview](docs/overview.md): the model, the three jobs and a glossary.
+- [Configuration](docs/configuration.md): every table and field.
+- [CLI](docs/cli.md): every subcommand.
 
-Key health persists across restarts in `<config>.state`. See [docs/troubleshooting.md](docs/troubleshooting.md#key-health).
+**Keys and providers**
 
-Limits: request bodies up to 8 MiB, 120 s to receive upstream response headers. Send `kill -HUP <pid>` or `POST /reload` after changing the config or a key file to apply it without a restart. Plugin settings, the tunnel allowlist, the intercept hosts and the interception CA reload too; listen addresses need a restart. See [docs/troubleshooting.md](docs/troubleshooting.md#reload).
+- [Providers](docs/providers.md): upstreams, transport, forwarding, fallback and passthrough.
+- [Failover](docs/failover.md): chains, cooldown classes, `Retry-After` and `quota_resets`.
+- [Shaping](docs/shaping.md): outbound budgets and limits.
 
-See [docs/troubleshooting.md](docs/troubleshooting.md) for status codes and logs, [docs/security.md](docs/security.md) for the security model, and [docs/monitoring.md](docs/monitoring.md) for the optional admin listener.
+**Plugins**
+
+- [Plugins](docs/plugins.md): the plugin model and the bundled set.
+- [Placeholders](docs/placeholders.md), [PHI and NPPI](docs/phi.md), [Finance](docs/finance.md), [Controlled information](docs/controlled.md).
+- [Request log](docs/requestlog.md).
+
+**Egress**
+
+- [Tunnel](docs/tunnel.md): CONNECT proxy, destination allow-list and interception.
+
+**Operations**
+
+- [Monitoring](docs/monitoring.md): the admin listener, `/status`, `/metrics` and key checks.
+- [Peers](docs/peers.md): read-only key health shared between instances.
+- [Top](docs/top.md): the live fleet view.
+- [Hub](docs/hub.md): hub configuration, parsed only in this release.
+- [Service](docs/service.md): signals, systemd and an example unit.
+- [Troubleshooting](docs/troubleshooting.md): status codes, logs, reload and common problems.
+
+**Security**
+
+- [Security](docs/security.md): what Reiki protects and what it does not.
 
 ## Develop
 

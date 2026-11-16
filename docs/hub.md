@@ -1,6 +1,8 @@
 # Hub
 
-Status: configuration only. Behind the `hub` cargo feature (not in the default set), Reiki parses and validates the tables below but opens no listener, builds no client and contacts no hub. A binary built without the feature refuses a config containing `[hubs]`, `[hub]` or `[accounts]` with an error; with the feature on, `reiki check` accepts them but nothing serves them. Without these tables nothing changes.
+The hub is configuration-only in this release. Nothing here opens a listener, builds a client or contacts a hub.
+
+The tables below are parsed and validated only, and only behind the `hub` cargo feature (not in the default set). A binary built without the feature refuses a config that contains `[hubs]`, `[hub]` or `[accounts]`. With the feature on, `reiki check` accepts them, but nothing serves or uses them. Without these tables nothing changes.
 
 ## Tables
 
@@ -10,7 +12,7 @@ url = "https://hub.example.net:4443"             # https, or http on a loopback 
 token_file = "/etc/reiki/hub/edge.token" # raw token the hub issued; mode 0400
 ca_file = "/etc/reiki/hub/ca.pem"        # optional PEM CA certificates for this hub
 accounts = ["acct-a"]                   # account labels routed through this hub
-timeout_secs = 300                       # default 300, at least 1
+timeout_secs = 300                       # default 300, 1 to 3600
 
 [hub]                                    # this instance serves edges
 listen = "127.0.0.1:4443"                # loopback only: no TLS yet

@@ -26,7 +26,7 @@ Each client connection and each upstream connection uses a file descriptor, and 
 
 ```ini
 [Unit]
-Description=Reiki API key failover proxy
+Description=Reiki security proxy for agent and LLM traffic
 After=network-online.target
 Wants=network-online.target
 
@@ -44,6 +44,7 @@ LimitNOFILE=65536
 StateDirectory=reiki
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=/etc/reiki
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -59,4 +60,4 @@ UMask=0077
 WantedBy=multi-user.target
 ```
 
-Add `ReadWritePaths=` for a log or request-log directory outside `StateDirectory`. A forwarder command (see [providers](providers.md)) inherits these limits; check `systemd-analyze security reiki` after adding `SystemCallFilter=` or `MemoryDenyWriteExecute=`, which a JavaScript runtime used as a forwarder may not tolerate.
+`ReadWritePaths=/etc/reiki` lets Reiki write `<config>.state` beside the config, which key health needs to survive a restart. Without it Reiki logs a warning and runs without that persistence. The same line also makes the key files writable, so keep keys elsewhere if that matters to you. Add `ReadWritePaths=` for a log or request-log directory outside `StateDirectory`. A forwarder command (see [providers](providers.md)) inherits these limits; check `systemd-analyze security reiki` after adding `SystemCallFilter=` or `MemoryDenyWriteExecute=`, which a JavaScript runtime used as a forwarder may not tolerate.

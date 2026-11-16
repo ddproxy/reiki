@@ -145,7 +145,7 @@ expose_host_stats = true
 - A successful login does not clear a failure count on the peer listener, so valid requests between guesses do not reset it; counts expire with the `[auth]` window. The client and admin listeners are unchanged.
 - The peer listener keeps its own counts, so failed peer logins never lock an address out of the admin or client listener.
 - The matching token's name stays with the request: it counts towards `max_subscribers_per_token` and may appear in Reiki's log lines. The token itself is never logged and the name is never published.
-- The listener caps open connections at 32 and closes a connection that does not finish its headers within 30 s.
+- The listener caps open connections at `max_subscribers` plus 16 (32 with the default of 16), and closes a connection that does not finish its headers within 30 s.
 
 ### What a peer token holder learns
 

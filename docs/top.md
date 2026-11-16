@@ -54,11 +54,11 @@ reiki top --interval 2    # redraw every two seconds instead of every second
                        [□ detail] [req 1h] [chart: load]
 ```
 
-- The header panel has the version, the UTC clock, the live or paused state with the fresh count, and the key hints. Below 28 rows it folds to one line with the title, state and clock.
+- The header panel has the version, the UTC clock, the live or paused state with the fresh count, and the key hints. When the matrix does not fit beside it, the header folds to one line with the title, state and clock (see [narrow terminals](#narrow-terminals)).
 - The tab row lists `All` and every provider column. The selected tab follows the `f` filter.
 - The Peers panel holds the matrix. Its first line is the fleet line described below.
 - The Cooling panel appears only while some fresh peer has a cooling key. It lists the same lines `--once` prints, without its title.
-- The chart row appears at 28 rows or more, and only while no peer detail is open. The left chart plots the selected peer's history, or the fleet's when no peer is selected: `m` cycles load, disk, sessions and requests. The right panel counts keys by state across the fleet: healthy, cooling and disabled. Fresh peers only; every provider counts.
+- The chart row appears at 28 rows or more, and only while no peer detail is open. Its rows are 10, borders included. The left chart plots the selected peer's history, or the fleet's when no peer is selected: `m` cycles load, disk, sessions and requests. The right panel counts keys by state across the fleet: healthy, cooling and disabled. Fresh peers only; every provider counts.
 - The footer shows chips: `[■ detail]` or `[□ detail]` for the peer card, `[req 1h]` for the gauge, `[chart: <metric>]`, `[filter: <provider>]` when a filter is set, and `[paused]`.
 - `?` opens the key list over the screen. The next key closes it; Ctrl-C still quits.
 

@@ -1,0 +1,10 @@
+<nav class="menu" aria-label="Documentation">
+{% for group in site.data.nav %}
+  <h2>{{ group.title }}</h2>
+  <ul>
+  {% for item in group.items %}
+    <li{% if page.url == item.url %} class="current"{% endif %}><a href="{{ item.url | relative_url }}">{{ item.title }}</a></li>
+  {% endfor %}
+  </ul>
+{% endfor %}
+</nav>

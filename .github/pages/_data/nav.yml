@@ -1,0 +1,29 @@
+- title: Start
+  items:
+    - { title: Home, url: / }
+    - { title: Overview, url: /docs/overview.html }
+    - { title: Command line, url: /docs/cli.html }
+    - { title: Configuration, url: /docs/configuration.html }
+- title: Reliability
+  items:
+    - { title: Failover, url: /docs/failover.html }
+    - { title: Traffic shaping, url: /docs/shaping.html }
+    - { title: Providers, url: /docs/providers.html }
+- title: Security and data
+  items:
+    - { title: Security, url: /docs/security.html }
+    - { title: Plugins, url: /docs/plugins.html }
+    - { title: Placeholders, url: /docs/placeholders.html }
+    - { title: PHI and NPPI, url: /docs/phi.html }
+    - { title: Finance, url: /docs/finance.html }
+    - { title: Controlled information, url: /docs/controlled.html }
+    - { title: Tunnel, url: /docs/tunnel.html }
+    - { title: Request log, url: /docs/requestlog.html }
+- title: Operate
+  items:
+    - { title: Running as a service, url: /docs/service.html }
+    - { title: Monitoring, url: /docs/monitoring.html }
+    - { title: Peers, url: /docs/peers.html }
+    - { title: reiki top, url: /docs/top.html }
+    - { title: Troubleshooting, url: /docs/troubleshooting.html }
+    - { title: Hub, url: /docs/hub.html }

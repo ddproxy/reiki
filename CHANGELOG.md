@@ -1,21 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.10.2
 
 ### Added
 
-- Reiki stops cleanly on SIGTERM and SIGINT: listeners (client, admin, peers, tunnel) stop accepting at once, idle keep-alive connections close, requests in flight get `[service] shutdown_timeout_secs` (default 25), then the request log and state file are written and it exits 0. A second signal exits at once. See [service](docs/service.md).
+- Clean stop on SIGTERM and SIGINT, as a Linux service should. Listeners (client, admin, peers, tunnel) stop accepting at once, idle keep-alive connections close, requests in flight get `[service] shutdown_timeout_secs` (default 25), then the request log and state file are written and Reiki exits 0. A second signal exits at once. See [service](docs/service.md).
 - systemd integration with no new dependency: `Type=notify` readiness (`READY=1`, `STOPPING=1`) and `WatchdogSec=` pings that stop when the async runtime is wedged. A warning at start when the open-file limit is below 4096.
+- `[server]` sets the connection caps of the client listener (`max_connections`, default 1024; `max_connections_per_addr`, default 256) and the admin listener (`admin_max_connections`, default 64; `admin_max_connections_per_addr`, default 16). Loopback is exempt from the per-address cap. `reiki check` prints them, and a changed value on reload asks for a restart.
+- `reiki top`: `f` cycles a provider filter, `--provider NAME` starts (or, with `--once`, prints) filtered to one provider, and the fleet line shows `ALERT <provider> all cooling, soonest <time>` when every peer that has a provider has it cooling or disabled.
 - Plugins get an `on_shutdown` hook; the request log writes out its queue there.
-- `reiki top`: `f` cycles a provider filter (all, then each provider) and `--provider NAME` starts, or prints with `--once`, filtered to one provider; the fleet line shows `ALERT <provider> all cooling, soonest <time>` when every peer that has a provider has it cooling or disabled.
-- `[server]` sets the `max_connections` (default 1024) and `max_connections_per_addr` (default 256) caps on the client listener and `admin_max_connections` (default 64) with `admin_max_connections_per_addr` (default 16) on the admin listener; loopback is exempt from the per-address caps, and `reiki check` prints the caps.
+- `reiki check` says when `[hubs]`, `[hub]` or `[accounts]` are configured but nothing serves them yet.
+
+### Changed
+
+- The client and admin listeners now cap connections per remote address (256 and 16 by default, loopback exempt). A busy agent host that opens more than 256 connections from one address needs a higher `max_connections_per_addr`.
+- The key-health state file is written by a background thread, not inline on the request that records a failure. Writes that arrive meanwhile coalesce, and a stop flushes the last one.
+- A relayed error body over 64 KiB is cut with `x-reiki-truncated: 1` instead of silently.
+- In `reiki top`, a peer that went stale shows `Absent` for providers it never published instead of `?`.
 
 ### Fixed
 
-- SIGTERM, which is what systemd sends, no longer kills Reiki on the spot with no drain and no flush; it was only Ctrl-C that stopped cleanly.
-- A listener now closes when it is told to stop, so connections during the drain are refused instead of left waiting, and idle keep-alive connections no longer hold the drain for its whole length.
-- The key-health state file is written by a background thread instead of inline on the request that records a failure, so a burst of failures on a slow disk no longer queues requests behind an fsync; writes that arrive meanwhile coalesce, and shutdown on Ctrl-C flushes the last one.
-- An upstream error body is scrubbed of the key before it is cut to 64 KiB, so a key echoed across the cut no longer leaks its head. A relayed error body over the cap is cut with `x-reiki-truncated: 1` instead of silently.
+- SIGTERM, which is what systemd sends, no longer kills Reiki on the spot with no drain and no flush; only Ctrl-C stopped cleanly before.
+- A listener closes when told to stop, so connections during the drain are refused instead of left waiting, and idle keep-alive connections no longer hold the drain for its whole length.
+- An upstream error body is scrubbed of the key before it is cut to 64 KiB, so a key echoed across the cut no longer leaks its head.
+- Documentation: the forwarder environment line, the plugin-timeout summary and the listener caps now match the code.
 
 ## 0.10.1
 

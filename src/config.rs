@@ -283,6 +283,8 @@ pub struct PeersConfig {
     pub expose_key_labels: bool,
     /// Publish load, memory, disk use and active sessions.
     pub expose_host_stats: bool,
+    /// Publish per-upstream attempt counts for the last hour, without key or route names.
+    pub expose_usage: bool,
     /// Client header whose distinct values count as active sessions.
     pub session_header: String,
     /// How long a session id counts as active after its last request.
@@ -339,6 +341,8 @@ struct PeersSettings {
     expose_key_labels: bool,
     #[serde(default)]
     expose_host_stats: bool,
+    #[serde(default = "default_expose_usage")]
+    expose_usage: bool,
     #[serde(default = "default_session_header")]
     session_header: String,
     #[serde(default = "default_session_window_secs")]
@@ -367,6 +371,10 @@ struct PeersSettings {
 
 fn default_cooldown_bucket_secs() -> u64 {
     300
+}
+
+fn default_expose_usage() -> bool {
+    true
 }
 
 fn default_max_subscribers_per_token() -> u32 {
@@ -455,6 +463,7 @@ impl TryFrom<toml::Table> for PeersConfig {
             poll_interval_secs: settings.poll_interval_secs,
             expose_key_labels: settings.expose_key_labels,
             expose_host_stats: settings.expose_host_stats,
+            expose_usage: settings.expose_usage,
             session_header: settings.session_header,
             session_window_secs: settings.session_window_secs,
             stream_interval_secs: settings.stream_interval_secs,
@@ -3428,6 +3437,7 @@ socket = "/run/forwarder.sock"
         assert_eq!(peers.poll_interval_secs, 30);
         assert!(peers.peers.is_empty() && peers.listen.is_none());
         assert!(!peers.expose_host_stats);
+        assert!(peers.expose_usage);
         assert_eq!(peers.session_header, "x-opencode-session");
         assert_eq!(peers.session_window_secs, 300);
         assert_eq!(peers.stream_interval_secs, 5);

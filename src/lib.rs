@@ -12,6 +12,7 @@ pub mod notify;
 #[cfg(feature = "peers")]
 pub mod peers;
 pub mod plugins;
+pub mod pressure;
 pub mod proxy;
 pub mod quota;
 pub mod reload;

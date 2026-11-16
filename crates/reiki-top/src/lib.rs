@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 pub mod matrix;
@@ -61,6 +61,60 @@ pub struct Upstream {
     /// Labelled keys, only when the peer sets `expose_key_labels`.
     #[serde(default)]
     pub keys: Option<Vec<KeyView>>,
+    /// Attempts in the last hour; absent from an older publisher or with `expose_usage = false`.
+    #[serde(default, deserialize_with = "usage_u64")]
+    pub requests_1h: Option<u64>,
+    /// Attempts that were rate-limited or began a cooldown in the last hour.
+    #[serde(default, deserialize_with = "usage_u32")]
+    pub limited_1h: Option<u32>,
+    /// Twelve five-minute attempt counts, oldest first; extra buckets are dropped.
+    #[serde(default, deserialize_with = "usage_buckets")]
+    pub request_buckets: Option<[u32; 12]>,
+}
+
+/// A JSON number as a clamped count: other types read as absent, never as a parse error.
+fn usage_number(value: &Value) -> Option<u64> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    if let Some(n) = number.as_u64() {
+        return Some(n);
+    }
+    if let Some(n) = number.as_i64() {
+        return Some(u64::try_from(n).unwrap_or(0));
+    }
+    let f = number.as_f64()?;
+    if !f.is_finite() || f <= 0.0 {
+        Some(0)
+    } else if f >= u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(f as u64)
+    }
+}
+
+fn usage_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(usage_number))
+}
+
+fn usage_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    Ok(usage_u64(deserializer)?.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
+}
+
+fn usage_buckets<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u32; 12]>, D::Error> {
+    let Some(Value::Array(items)) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mut buckets = [0u32; 12];
+    let start = items.len().saturating_sub(buckets.len());
+    for (bucket, item) in buckets.iter_mut().zip(&items[start..]) {
+        *bucket = usage_number(item).map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    }
+    Ok(Some(buckets))
 }
 
 /// One labelled key. `cooldown_class` is set only for a cooling key whose class is known.
@@ -228,6 +282,12 @@ impl Fleet {
             last_status_class: Option<String>,
             #[serde(default)]
             keys: Option<Vec<KeyView>>,
+            #[serde(default, deserialize_with = "usage_u64")]
+            requests_1h: Option<u64>,
+            #[serde(default, deserialize_with = "usage_u32")]
+            limited_1h: Option<u32>,
+            #[serde(default, deserialize_with = "usage_buckets")]
+            request_buckets: Option<[u32; 12]>,
         }
         let event: Event = serde_json::from_str(data).map_err(|e| e.to_string())?;
         let Some(event) = event.upstream else {
@@ -266,6 +326,15 @@ impl Fleet {
         // removed key does not linger until the next snapshot.
         if let Some(incoming) = event.keys {
             upstream.keys = Some(incoming);
+        }
+        if let Some(n) = event.requests_1h {
+            upstream.requests_1h = Some(n);
+        }
+        if let Some(n) = event.limited_1h {
+            upstream.limited_1h = Some(n);
+        }
+        if let Some(buckets) = event.request_buckets {
+            upstream.request_buckets = Some(buckets);
         }
         Ok(())
     }
@@ -366,6 +435,13 @@ mod tests {
         {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
          "soonest_cooldown_seconds":42,"last_status_class":"4xx"}]}"#;
 
+    /// A document carrying the last hour of attempts.
+    const USAGE_DOC: &str = r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z",
+        "upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+        "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+        "requests_1h":120,"limited_1h":3,
+        "request_buckets":[1,2,3,4,5,6,7,8,9,10,11,12]}]}"#;
+
     /// A labelled view whose cooling key carries the quota class.
     const LABELLED_DOC: &str = r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z",
         "upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
@@ -397,10 +473,100 @@ mod tests {
                 soonest_cooldown_seconds: Some(42),
                 last_status_class: Some("4xx".to_owned()),
                 keys: None,
+                requests_1h: None,
+                limited_1h: None,
+                request_buckets: None,
             }
         );
         assert!(health.host.is_some(), "host stats are kept");
         assert!(health.sessions.is_some(), "session counts are kept");
+    }
+
+    #[test]
+    fn usage_fields_parse_and_an_older_document_has_none() {
+        let health = Health::from_json(USAGE_DOC).expect("a usage document parses");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.requests_1h, Some(120));
+        assert_eq!(upstream.limited_1h, Some(3));
+        assert_eq!(
+            upstream.request_buckets,
+            Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        );
+        let old = Health::from_json(BARE_DOC).expect("an old document parses");
+        assert_eq!(old.upstreams[0].requests_1h, None);
+        assert_eq!(old.upstreams[0].limited_1h, None);
+        assert_eq!(old.upstreams[0].request_buckets, None);
+    }
+
+    #[test]
+    fn hostile_usage_numbers_are_clamped_not_rejected() {
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":18446744073709551615,
+                 "limited_1h":18446744073709551615,
+                 "request_buckets":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}]}"#,
+        )
+        .expect("large numbers parse");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.requests_1h, Some(u64::MAX));
+        assert_eq!(upstream.limited_1h, Some(u32::MAX));
+        assert_eq!(
+            upstream.request_buckets,
+            Some([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            "only the newest twelve buckets are kept"
+        );
+
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":-5,"limited_1h":1.9,
+                 "request_buckets":[-1,1.9,"x",3,4,5,6,7,8,9,10,11]}]}"#,
+        )
+        .expect("negative, float and string numbers parse");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.requests_1h, Some(0), "negative clamps to zero");
+        assert_eq!(upstream.limited_1h, Some(1), "a float truncates");
+        assert_eq!(
+            upstream.request_buckets,
+            Some([0, 1, 0, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            "bad bucket entries read as zero"
+        );
+
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":"many","limited_1h":{},"request_buckets":"not an array"}]}"#,
+        )
+        .expect("wrong types do not reject the document");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.requests_1h, None);
+        assert_eq!(upstream.limited_1h, None);
+        assert_eq!(upstream.request_buckets, None);
+    }
+
+    #[test]
+    fn a_key_event_carries_usage_fields() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        fleet.apply_snapshot("peer-a", Health::from_json(USAGE_DOC).unwrap(), now);
+        fleet
+            .apply_event(
+                "peer-a",
+                "key",
+                r#"{"upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,
+                    "disabled_keys":0,"requests_1h":7,"limited_1h":1,
+                    "request_buckets":[0,0,0,0,0,0,0,0,0,0,1,6]}}"#,
+                now,
+            )
+            .expect("a key event applies");
+        let upstream = &fleet.peers["peer-a"].health.upstreams[0];
+        assert_eq!(upstream.requests_1h, Some(7));
+        assert_eq!(upstream.limited_1h, Some(1));
+        assert_eq!(
+            upstream.request_buckets,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 6])
+        );
     }
 
     #[test]

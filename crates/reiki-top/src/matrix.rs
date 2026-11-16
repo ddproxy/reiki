@@ -91,6 +91,15 @@ impl HostSummary {
     }
 }
 
+/// One upstream's attempts in the last hour, from a publisher that exposes usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pressure {
+    pub requests_1h: u64,
+    pub limited_1h: u32,
+    /// Twelve five-minute counts, oldest first, newest last.
+    pub buckets: [u32; 12],
+}
+
 /// One peer row: a cell per column, in column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -99,6 +108,9 @@ pub struct Row {
     /// Cooling combinations per column, in column order; 0 where the peer has no such upstream
     /// or its data is stale.
     pub combos: Vec<u32>,
+    /// Attempt counts per column, in column order; `None` without them, for an older publisher
+    /// or a stale or absent upstream.
+    pub pressure: Vec<Option<Pressure>>,
     pub host: HostSummary,
     pub error: Option<String>,
     pub stale: bool,
@@ -180,6 +192,10 @@ impl Matrix {
                     .iter()
                     .map(|col| upstream(col).map_or(0, |u| u.cooling_combinations))
                     .collect(),
+                pressure: columns
+                    .iter()
+                    .map(|col| upstream(col).and_then(pressure_of))
+                    .collect(),
                 host,
                 error: fleet.error(name).map(str::to_owned),
                 stale: fresh.is_none(),
@@ -211,6 +227,7 @@ impl Matrix {
                 peer: r.peer.clone(),
                 cells: vec![r.cells[idx].clone()],
                 combos: vec![r.combos.get(idx).copied().unwrap_or(0)],
+                pressure: vec![r.pressure.get(idx).copied().flatten()],
                 host: r.host.clone(),
                 error: r.error.clone(),
                 stale: r.stale,
@@ -376,6 +393,15 @@ impl History {
     }
 }
 
+/// `requests_1h` is what marks a new publisher; the other two default rather than drop it.
+fn pressure_of(upstream: &Upstream) -> Option<Pressure> {
+    upstream.requests_1h.map(|requests_1h| Pressure {
+        requests_1h,
+        limited_1h: upstream.limited_1h.unwrap_or(0),
+        buckets: upstream.request_buckets.unwrap_or([0; 12]),
+    })
+}
+
 fn cell_of(upstream: &Upstream) -> Cell {
     let total = upstream
         .healthy_keys
@@ -445,6 +471,15 @@ mod tests {
     fn upstream(name: &str, healthy: u32, cooling: u32, disabled: u32) -> String {
         format!(
             r#"{{"name":"{name}","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":{disabled},"soonest_cooldown_seconds":null,"last_status_class":null}}"#
+        )
+    }
+
+    fn usage_upstream(name: &str, requests: u64, limited: u32, buckets: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                "requests_1h":{requests},"limited_1h":{limited},
+                "request_buckets":{buckets}}}"#
         )
     }
 
@@ -669,6 +704,77 @@ mod tests {
         let gem = m.columns.iter().find(|c| c.upstream == "gem").unwrap();
         assert_eq!((gem.peers_with, gem.healthy_peers), (1, 0));
         assert_eq!(gem.total_label(), "0/1");
+    }
+
+    #[test]
+    fn pressure_is_carried_per_column_and_none_when_absent_or_stale() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(&usage_upstream(
+                "zen",
+                120,
+                3,
+                "[1,2,3,4,5,6,7,8,9,10,11,12]",
+            )),
+            t0,
+        );
+        add(&mut f, "peer-b", &doc(&upstream("zen", 1, 0, 0)), t0);
+        add(
+            &mut f,
+            "peer-c",
+            &doc(&usage_upstream("zen", 9, 0, "[1,2,3,4,5,6,7,8,9,10,11,9]")),
+            t0 - Duration::from_secs(91),
+        );
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0);
+        assert_eq!(
+            m.rows[0].pressure,
+            vec![Some(Pressure {
+                requests_1h: 120,
+                limited_1h: 3,
+                buckets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            })],
+            "a new publisher's figures reach the row"
+        );
+        assert_eq!(
+            m.rows[1].pressure,
+            vec![None],
+            "an older publisher has none"
+        );
+        assert_eq!(m.rows[2].pressure, vec![None], "stale data counts nothing");
+
+        let filtered = m.filter_provider("zen").expect("zen exists");
+        assert_eq!(
+            filtered.rows[0].pressure, m.rows[0].pressure,
+            "filtering keeps the column's pressure"
+        );
+        assert_eq!(filtered.rows[1].pressure, vec![None]);
+    }
+
+    #[test]
+    fn pressure_treats_a_missing_limited_or_bucket_array_as_zero() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(
+                r#"{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    "requests_1h":5}"#,
+            ),
+            t0,
+        );
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        assert_eq!(
+            m.rows[0].pressure,
+            vec![Some(Pressure {
+                requests_1h: 5,
+                limited_1h: 0,
+                buckets: [0; 12],
+            })]
+        );
     }
 
     #[test]

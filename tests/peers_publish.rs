@@ -302,6 +302,41 @@ async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
 }
 
 #[tokio::test]
+async fn usage_counts_are_published_by_default_and_can_be_hidden() {
+    let rig = Rig::new("cooldown_bucket_secs = 0\n").await;
+    let zen = &rig.health().await["upstreams"][0];
+    assert_eq!(zen["requests_1h"], 0);
+    assert_eq!(zen["limited_1h"], 0);
+    assert_eq!(
+        zen["request_buckets"],
+        serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    );
+
+    // Both keys answer 429, so both attempts are counted and limited.
+    let res = rig
+        .client
+        .post(format!("{}/zen/chat/completions", rig.relay))
+        .bearer_auth(STREAM_TOKEN)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    let zen = &rig.health().await["upstreams"][0];
+    assert_eq!(zen["requests_1h"], 2);
+    assert_eq!(zen["limited_1h"], 2);
+    let buckets = zen["request_buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 12);
+    assert_eq!(buckets[11], 2, "the newest bucket holds the two attempts");
+
+    let hidden = Rig::new("expose_usage = false\n").await;
+    let zen = &hidden.health().await["upstreams"][0];
+    for field in ["requests_1h", "limited_1h", "request_buckets"] {
+        assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
+    }
+}
+
+#[tokio::test]
 async fn key_labels_appear_only_when_exposed() {
     let rig = Rig::new("expose_key_labels = true\n").await;
     let doc = rig.health().await;
@@ -444,6 +479,22 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
         health["get"]["security"][0]["peerAuth"],
         serde_json::json!([])
     );
+    let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        ["properties"]["upstreams"]["items"];
+    for field in ["requests_1h", "limited_1h", "request_buckets"] {
+        assert!(
+            upstream["properties"].get(field).is_some(),
+            "{field} is described"
+        );
+        assert!(
+            !upstream["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == field),
+            "{field} stays optional"
+        );
+    }
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@ use crate::classify::{classify, FailureClass, Outcome};
 use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
+use crate::pressure::PressureCounter;
 use crate::rewrite::{request_model, rewrite_body};
 use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
 use crate::shaper::headers::{observe, Observed};
@@ -281,6 +282,8 @@ const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
+    /// Per-upstream attempts for the last hour, in memory only.
+    pressure: PressureCounter,
     /// Per-key outbound buckets, kept across reloads for an unchanged window.
     shaper: Shaper,
     /// The shaper snapshot last written and when, so natural expiry of a pause or
@@ -355,6 +358,7 @@ impl App {
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
+            pressure: PressureCounter::new(),
             shaper,
             shaper_saved: Mutex::new((BTreeMap::new(), None)),
             policy,
@@ -417,6 +421,10 @@ impl App {
 
     pub(crate) fn health(&self) -> &Mutex<KeyState> {
         &self.health
+    }
+
+    pub(crate) fn pressure(&self) -> &PressureCounter {
+        &self.pressure
     }
 
     /// Failed admin token checks, kept apart from the client listener's counts.
@@ -1795,6 +1803,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             } else {
                 false
             };
+            app.pressure.record(upstream_name, false, Instant::now());
             // Only write when this success changed what is on disk.
             if had_failures {
                 app.persist_state();
@@ -2192,6 +2201,11 @@ fn record(
     } = note;
     let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now(), quota_hint);
     let scoped = failure_scope(class, status, scope);
+    let upstream = snapshot
+        .config
+        .keys
+        .get(key)
+        .map(|key| key.upstream.clone());
     let escalate_after = snapshot
         .config
         .keys
@@ -2200,6 +2214,9 @@ fn record(
         .map_or(DEFAULT_SCOPE_ESCALATE_AFTER, |upstream| {
             upstream.scope_escalate_after
         });
+    let now = Instant::now();
+    let mut counted = false;
+    let mut limited = false;
     if let Ok(mut health) = app.health.lock() {
         // A reload that rotated this key's secret already reset its health; the old
         // secret's failure must not disable the new one.
@@ -2213,12 +2230,14 @@ fn record(
             key,
             class,
             &app.policy,
-            Instant::now(),
+            now,
             quota_cooldown,
             scoped,
             escalate_after,
         );
         health.record_status(key, status);
+        limited = status == Some(429) || cooled.is_some();
+        counted = true;
         if let Some(cooled_scope) = cooled {
             app.plugins().on_event(&Event::Cooldown {
                 key,
@@ -2226,9 +2245,7 @@ fn record(
                 scope: cooled_scope,
             });
         }
-        let cooling_secs = health
-            .cooling_remaining(key, Instant::now())
-            .map(|d| d.as_secs());
+        let cooling_secs = health.cooling_remaining(key, now).map(|d| d.as_secs());
         tracing::warn!(
             stream,
             key,
@@ -2238,6 +2255,11 @@ fn record(
             ?cooling_secs,
             "upstream key failed"
         );
+    }
+    if counted {
+        if let Some(upstream) = upstream {
+            app.pressure.record(&upstream, limited, now);
+        }
     }
     app.persist_state();
 }

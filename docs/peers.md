@@ -23,6 +23,7 @@ peer_token_sha256 = "<sha256 of the peer token>"   # a token named `default`; th
 poll_interval_secs = 30            # reader poll period; data older than 3 periods is unknown
 expose_key_labels = false          # publish per-key names and states, not only counts
 expose_host_stats = false          # publish load, memory, disk use and active sessions
+expose_usage = true                # publish per-upstream attempt counts for the last hour
 cooldown_bucket_secs = 300         # published cooldowns round up to a multiple of this; 0 is exact
 # stream_interval_secs = 5         # period of `host` events on /v1/health/stream
 # max_subscribers = 16             # open streams in total
@@ -90,7 +91,9 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192
 {"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z","upstreams":[
   {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
    "cooling_combinations":2,
-   "soonest_cooldown_seconds":42,"last_status_class":"4xx"}]}
+   "soonest_cooldown_seconds":42,"last_status_class":"4xx",
+   "requests_1h":120,"limited_1h":3,
+   "request_buckets":[0,0,0,0,0,0,0,4,9,18,31,58]}]}
 ```
 
 - One entry per upstream that uses Reiki's keys; a `passthrough` upstream is left out.
@@ -99,8 +102,9 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192
 - `cooling_combinations` counts the (route, model) combinations currently cooling on that upstream's keys, always an integer, `0` when none. It is a count only: no route or model name is ever published, and a key cooling as a whole adds nothing, since its combinations are cleared.
 - `observed_at` is this host's UTC clock when the answer was built, for people and logs.
 - `age_seconds` is how old the figures were when the answer was sent. Everything is read as the answer is built, so it is `0`; a reader judges freshness by its own receive time plus this age, with no clock agreement needed. `key` events also carry it.
+- With `expose_usage = true` (the default), each upstream also carries the last hour of attempts: `requests_1h` (total attempts), `limited_1h` (attempts that were rate-limited or began a cooldown) and `request_buckets` (12 five-minute counts, oldest first, newest last). They are counts only, with no key, route or model names, and are kept in memory, so they restart at zero. `expose_usage = false` omits all three; an older peer that lacks them is read as having no figures.
 - With `expose_key_labels = true`, each upstream also carries `keys`: `name`, `state` (`available`, `cooling`, `out_of_rotation`) and `cooldown_seconds`, bucketed the same way. A cooling key also carries `cooldown_class` (`rate_limited`, `quota_exhausted` or `transient`, as in `/status`) when known.
-- The answer never holds key values, token hashes, key file paths, stream names or request counts, and is sent with `Cache-Control: no-store`.
+- The answer never holds key values, token hashes, key file paths or stream names; attempt counts are per upstream only, and it is sent with `Cache-Control: no-store`.
 
 ### Host stats and sessions
 

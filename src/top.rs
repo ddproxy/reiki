@@ -1122,6 +1122,44 @@ mod tests {
         assert!(!out.contains("Providers"), "{out}");
     }
 
+    #[tokio::test]
+    async fn run_once_draws_a_gauge_for_each_peer_from_its_own_traffic() {
+        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "requests_1h":42,"limited_1h":0,
+             "request_buckets":[1,1,2,2,3,3,4,4,5,5,6,6]}]}"#;
+        let doc_b = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "requests_1h":0,"limited_1h":0,
+             "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,0]}]}"#;
+        let doc_c = r#"{"instance":"peer-c","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "requests_1h":12,"limited_1h":2,
+             "request_buckets":[6,6,0,0,0,0,0,0,0,0,0,0]}]}"#;
+        let url_a = health_server_with(doc_a).await;
+        let url_b = health_server_with(doc_b).await;
+        let url_c = health_server_with(doc_c).await;
+        let token = token_file("once-gauges");
+        let text = format!(
+            "[peers]\nenabled = true\n\
+             [peers.peer-a]\nurl = \"{url_a}\"\ntoken_file = \"{}\"\n\
+             [peers.peer-b]\nurl = \"{url_b}\"\ntoken_file = \"{}\"\n\
+             [peers.peer-c]\nurl = \"{url_c}\"\ntoken_file = \"{}\"\n",
+            token.display(),
+            token.display(),
+            token.display()
+        );
+        let peers = Config::parse(&text).unwrap().peers.unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_once_to(&peers, false, None, &mut out, &mut err).await;
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("■ ▁▃▄▅▇█"), "peer-a: {out}");
+        assert!(out.contains("■ ······"), "peer-b: {out}");
+        assert!(out.contains("■ █·····"), "peer-c: {out}");
+    }
+
     #[derive(Clone, Default)]
     struct FakeWriter {
         text: Rc<RefCell<String>>,

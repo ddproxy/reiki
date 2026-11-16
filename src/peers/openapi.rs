@@ -20,6 +20,13 @@ fn upstream_schema() -> Value {
             "soonest_cooldown_seconds": {"type": ["integer", "null"], "minimum": 1,
                 "description": "Rounded up to a multiple of cooldown_bucket_secs, unless it is 0"},
             "last_status_class": {"enum": ["2xx", "4xx", "5xx", null]},
+            "requests_1h": {"type": "integer", "minimum": 0,
+                "description": "Attempts in the last 60 minutes; only with expose_usage, a count only"},
+            "limited_1h": {"type": "integer", "minimum": 0,
+                "description": "Attempts that were rate-limited or began a cooldown in the last 60 minutes; only with expose_usage"},
+            "request_buckets": {"type": "array", "items": {"type": "integer", "minimum": 0},
+                "minItems": 12, "maxItems": 12,
+                "description": "Twelve five-minute attempt counts, oldest first, newest last; only with expose_usage"},
             "keys": {
                 "description": "Only with expose_key_labels",
                 "type": "array",

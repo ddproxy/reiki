@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::{Config, PeersConfig};
+use crate::pressure::PressureCounter;
 use crate::proxy::App;
 
 /// Whole seconds, rounded up so a short wait never reads as zero, then up to a multiple of
@@ -36,6 +37,7 @@ pub(crate) fn upstreams(
     now: Instant,
     labels: bool,
     bucket: u64,
+    pressure: Option<&PressureCounter>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for (name, upstream) in &config.upstream {
@@ -93,6 +95,12 @@ pub(crate) fn upstreams(
                 .latest_status(keys.iter().copied())
                 .map_or(Value::Null, status_class),
         });
+        if let Some(pressure) = pressure {
+            let (requests, limited) = pressure.totals(name, now);
+            entry["requests_1h"] = json!(requests);
+            entry["limited_1h"] = json!(limited);
+            entry["request_buckets"] = json!(pressure.buckets(name, now));
+        }
         if labels {
             entry["keys"] = Value::Array(listed);
         }
@@ -126,6 +134,7 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
             Instant::now(),
             peers.expose_key_labels,
             peers.cooldown_bucket_secs,
+            peers.expose_usage.then(|| app.pressure()),
         )
     };
     let mut doc = json!({
@@ -227,7 +236,7 @@ mod tests {
         );
         health.record_status("a", Some(429));
         health.disable("b");
-        let out = upstreams(&config, &mut health, now, false, 0);
+        let out = upstreams(&config, &mut health, now, false, 0, None);
         assert_eq!(
             out.len(),
             2,
@@ -252,7 +261,7 @@ mod tests {
         let config = config();
         let mut health = KeyState::default();
         health.disable("c");
-        let out = upstreams(&config, &mut health, Instant::now(), true, 0);
+        let out = upstreams(&config, &mut health, Instant::now(), true, 0, None);
         let keys = out[1]["keys"].as_array().unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(
@@ -295,11 +304,11 @@ mod tests {
                 now,
             );
         }
-        let zen = &upstreams(&config, &mut health, now, true, 300)[1];
+        let zen = &upstreams(&config, &mut health, now, true, 300, None)[1];
         assert_eq!(zen["soonest_cooldown_seconds"], 300);
         assert_eq!(zen["keys"][0]["cooldown_seconds"], 300);
         assert_eq!(zen["keys"][1]["cooldown_seconds"], 600);
-        let exact = &upstreams(&config, &mut health, now, true, 0)[1];
+        let exact = &upstreams(&config, &mut health, now, true, 0, None)[1];
         assert_eq!(exact["soonest_cooldown_seconds"], 10);
         assert_eq!(exact["keys"][1]["cooldown_seconds"], 301);
     }
@@ -327,7 +336,7 @@ mod tests {
         }
         // Labelled or not, the count is there and no route or model text leaves the host.
         for labels in [false, true] {
-            let out = upstreams(&config, &mut health, now, labels, 0);
+            let out = upstreams(&config, &mut health, now, labels, 0, None);
             assert_eq!(out[1]["cooling_combinations"], 2, "labels={labels}");
             assert_eq!(
                 out[0]["cooling_combinations"], 0,
@@ -373,7 +382,7 @@ mod tests {
             &policy,
             now,
         );
-        let zen = &upstreams(&config, &mut health, now, false, 0)[1];
+        let zen = &upstreams(&config, &mut health, now, false, 0, None)[1];
         assert_eq!(zen["cooling_keys"], 1);
         assert_eq!(zen["cooling_combinations"], 0, "{zen}");
     }
@@ -386,7 +395,7 @@ mod tests {
         let policy = Policy::default();
         health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
         health.disable("c");
-        let zen = &upstreams(&config, &mut health, now, true, 0)[1];
+        let zen = &upstreams(&config, &mut health, now, true, 0, None)[1];
         assert_eq!(zen["keys"][0]["cooldown_class"], "quota_exhausted");
         assert!(
             zen["keys"][1].get("cooldown_class").is_none(),
@@ -399,13 +408,39 @@ mod tests {
     }
 
     #[test]
+    fn usage_fields_appear_only_when_exposed() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let pressure = PressureCounter::new();
+        pressure.record("zen", false, now);
+        pressure.record("zen", true, now);
+        pressure.record("spare", false, now);
+        let exposed = upstreams(&config, &mut health, now, false, 0, Some(&pressure));
+        let zen = &exposed[1];
+        assert_eq!(zen["requests_1h"], 2);
+        assert_eq!(zen["limited_1h"], 1);
+        let buckets = zen["request_buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 12);
+        assert_eq!(buckets[11], 2, "the newest bucket holds both attempts");
+        assert_eq!(exposed[0]["requests_1h"], 1, "per upstream, not pooled");
+
+        let hidden = upstreams(&config, &mut health, now, false, 0, None);
+        for entry in &hidden {
+            for field in ["requests_1h", "limited_1h", "request_buckets"] {
+                assert!(entry.get(field).is_none(), "{field} is hidden: {entry}");
+            }
+        }
+    }
+
+    #[test]
     fn the_unlabelled_view_never_carries_a_cooldown_class() {
         let config = config();
         let mut health = KeyState::default();
         let now = Instant::now();
         let policy = Policy::default();
         health.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
-        let zen = &upstreams(&config, &mut health, now, false, 0)[1];
+        let zen = &upstreams(&config, &mut health, now, false, 0, None)[1];
         let fields: Vec<&str> = zen
             .as_object()
             .unwrap()

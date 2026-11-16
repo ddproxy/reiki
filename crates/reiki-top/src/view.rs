@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::matrix::{order_peers, resolve, Cell, History, Matrix, Metric, Row};
+use crate::matrix::{order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row};
 use crate::Fleet;
 
 /// How a span should read on the terminal. `Plain` is the caller's default.
@@ -121,6 +121,66 @@ fn fmt_duration(d: Duration) -> String {
 fn bar(filled: usize, total: usize) -> String {
     let filled = filled.min(total);
     "█".repeat(filled) + &"░".repeat(total - filled)
+}
+
+/// One sparkline character for `value` against `scale`, or `None` for zero. A busy bucket never
+/// rounds down to nothing.
+fn level(value: u64, scale: u64) -> Option<char> {
+    if value == 0 {
+        return None;
+    }
+    if scale == 0 {
+        return Some(SPARK[SPARK.len() - 1]);
+    }
+    let n = (value.saturating_mul(8).saturating_add(scale / 2) / scale).clamp(1, 8) as usize;
+    Some(SPARK[n - 1])
+}
+
+/// Six paired five-minute buckets, oldest first.
+fn bucket_pairs(buckets: &[u32; 12]) -> [u64; GAUGE_CELLS] {
+    let mut out = [0u64; GAUGE_CELLS];
+    for (slot, pair) in out.iter_mut().zip(buckets.as_chunks::<2>().0) {
+        *slot = u64::from(pair[0]).saturating_add(u64::from(pair[1]));
+    }
+    out
+}
+
+/// The busiest paired bucket in one column, the fleet-wide gauge scale.
+fn column_peak(matrix: &Matrix, column: usize) -> u64 {
+    matrix
+        .rows
+        .iter()
+        .filter_map(|row| row.pressure.get(column).and_then(Option::as_ref))
+        .map(|p| bucket_pairs(&p.buckets).into_iter().max().unwrap_or(0))
+        .max()
+        .unwrap_or(0)
+}
+
+/// `" ▁▂▃▄▅▆"` after the state glyph: `·` for a zero bucket and a dim run when the publisher
+/// sent no figures. Six cells cover the last hour in ten-minute steps.
+fn gauge(pressure: Option<&Pressure>, scale: u64) -> (String, Style) {
+    let Some(pressure) = pressure else {
+        return (format!(" {}", "·".repeat(GAUGE_CELLS)), Style::Dim);
+    };
+    let mut text = String::from(" ");
+    for pair in bucket_pairs(&pressure.buckets) {
+        text.push(level(pair, scale).unwrap_or('·'));
+    }
+    let style = if pressure.limited_1h > 0 {
+        Style::Warn
+    } else {
+        Style::Plain
+    };
+    (text, style)
+}
+
+/// Twelve five-minute cells for the detail pane, scaled to this upstream alone.
+fn trend(buckets: &[u32; 12]) -> String {
+    let peak = buckets.iter().copied().max().map(u64::from).unwrap_or(0);
+    buckets
+        .iter()
+        .map(|&n| level(u64::from(n), peak).unwrap_or('·'))
+        .collect()
 }
 
 /// The full scale a cooldown bar is drawn against. `None` for the class means the remaining
@@ -288,6 +348,22 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
             spans.push(span(format!("  last {class}"), Style::Warn));
         }
         out.push(line(spans, width));
+        if let Some(requests) = u.requests_1h {
+            let limited = u.limited_1h.unwrap_or(0);
+            let style = if limited > 0 {
+                Style::Warn
+            } else {
+                Style::Plain
+            };
+            let mut spans = vec![span(
+                format!("    last hour: {requests} requests, {limited} limited"),
+                style,
+            )];
+            if let Some(buckets) = u.request_buckets {
+                spans.push(span(format!("  {}", trend(&buckets)), style));
+            }
+            out.push(line(spans, width));
+        }
         if let Some(keys) = &u.keys {
             for k in keys {
                 out.push(key_line(k, width));
@@ -363,6 +439,10 @@ fn key_line(k: &crate::KeyView, width: usize) -> Line {
 
 /// Sparkline levels, lowest to highest.
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Cells in the last-hour gauge, one per pair of five-minute buckets.
+const GAUGE_CELLS: usize = 6;
+/// Narrowest provider column that can hold the glyph, a space and the gauge.
+const GAUGE_WIDTH: usize = 1 + 1 + GAUGE_CELLS;
 /// Longest peer name drawn; longer names are clipped.
 const NAME_MAX: usize = 16;
 /// Longest provider header drawn at full width.
@@ -377,8 +457,15 @@ const GAP_TEXT: &str = "  ";
 /// Header labels for the host columns, in the order `host_figures` returns them.
 const HOST_LABELS: [&str; 3] = ["load", "disk", "sess"];
 
-/// Header label widths tried in order; the sparkline is dropped after the third.
-const FITS: [(usize, bool); 4] = [(LABEL_MAX, true), (6, true), (3, true), (3, false)];
+/// Layouts tried in order: the gauge goes before provider names are shortened, and the
+/// sparkline goes last.
+const FITS: [(usize, bool, bool); 5] = [
+    (LABEL_MAX, true, true),
+    (LABEL_MAX, true, false),
+    (6, true, false),
+    (3, true, false),
+    (3, false, false),
+];
 
 /// The peers-by-providers matrix: a fleet line with one tally per provider, a header, then one
 /// row per peer in [`order_peers`] order. `selected` is a display position, wrapped to the row
@@ -493,8 +580,8 @@ pub fn render_matrix(
         return out;
     }
 
-    for (label_max, spark) in FITS {
-        let grid = Grid::new(matrix, &order, history, label_max, spark);
+    for (label_max, spark, gauge) in FITS {
+        let grid = Grid::new(matrix, &order, history, label_max, spark, gauge);
         if grid.width() <= width {
             return grid.lines(title, selected, width);
         }
@@ -583,8 +670,8 @@ struct Grid<'a> {
     widths: Vec<usize>,
     /// Peer names clipped to `NAME_MAX`, padded to the widest.
     name_w: usize,
-    /// Text of each row's cells, padded per column later.
-    cells: Vec<Vec<(String, Style)>>,
+    /// Spans of each row's cells, padded per column later.
+    cells: Vec<Vec<Vec<(String, Style)>>>,
     host: Vec<HostArea>,
     host_w: [usize; 3],
 }
@@ -596,30 +683,47 @@ impl<'a> Grid<'a> {
         history: &History,
         label_max: usize,
         spark: bool,
+        gauge: bool,
     ) -> Self {
         let labels: Vec<String> = matrix
             .columns
             .iter()
             .map(|c| clip(&c.upstream, label_max))
             .collect();
-        let cells: Vec<Vec<(String, Style)>> = order
+        let peaks: Vec<u64> = (0..labels.len()).map(|c| column_peak(matrix, c)).collect();
+        let cells: Vec<Vec<Vec<(String, Style)>>> = order
             .iter()
             .map(|&i| {
                 let row = &matrix.rows[i];
                 row.cells
                     .iter()
                     .zip(&row.combos)
-                    .map(|(cell, &n)| cell_text(cell, n))
+                    .enumerate()
+                    .map(|(c, (cell, &n))| {
+                        cell_spans(
+                            cell,
+                            n,
+                            row.pressure.get(c).and_then(Option::as_ref),
+                            peaks.get(c).copied().unwrap_or(0),
+                            gauge,
+                        )
+                    })
                     .collect()
             })
             .collect();
         let widths = (0..labels.len())
             .map(|c| {
-                cells
+                let content = cells
                     .iter()
                     .filter_map(|row| row.get(c))
-                    .map(|(text, _)| text_width(text))
-                    .fold(text_width(&labels[c]), usize::max)
+                    .map(|spans| spans.iter().map(|(text, _)| text_width(text)).sum())
+                    .fold(0, usize::max);
+                let width = content.max(text_width(&labels[c]));
+                if gauge {
+                    width.max(GAUGE_WIDTH)
+                } else {
+                    width
+                }
             })
             .collect();
         let name_w = order
@@ -686,9 +790,19 @@ impl<'a> Grid<'a> {
                     name_style(is_selected),
                 ),
             ];
-            for ((text, style), w) in cells.iter().zip(&self.widths) {
+            for (parts, w) in cells.iter().zip(&self.widths) {
                 spans.push(span(GAP_TEXT, Style::Plain));
-                spans.push(span(pad(text, *w), *style));
+                let mut used = 0;
+                for (text, style) in parts {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    used += text_width(text);
+                    spans.push(span(text.clone(), *style));
+                }
+                if used < *w {
+                    spans.push(span(" ".repeat(*w - used), Style::Plain));
+                }
             }
             match host {
                 HostArea::Stale(text, style) => {
@@ -801,6 +915,30 @@ fn cell_text(cell: &Cell, combos: u32) -> (String, Style) {
         text.push_str(&format!("+{combos}"));
     }
     (text, style)
+}
+
+/// One cell split so the gauge can carry its own style after the state glyph. Absent and stale
+/// cells stay a single mark: there is no traffic to draw.
+fn cell_spans(
+    cell: &Cell,
+    combos: u32,
+    pressure: Option<&Pressure>,
+    scale: u64,
+    with_gauge: bool,
+) -> Vec<(String, Style)> {
+    let (text, style) = cell_text(cell, combos);
+    if !with_gauge || matches!(cell, Cell::Absent | Cell::Stale) {
+        return vec![(text, style)];
+    }
+    let mut chars = text.chars();
+    let glyph = chars.next().map(String::from).unwrap_or_default();
+    let rest: String = chars.collect();
+    let (gauge, gauge_style) = gauge(pressure, scale);
+    let mut spans = vec![(glyph, style), (gauge, gauge_style)];
+    if !rest.is_empty() {
+        spans.push((rest, style));
+    }
+    spans
 }
 
 /// Drops the padding after the last column, so a line ends with its text.
@@ -1010,17 +1148,179 @@ mod tests {
         let openrouter = first(&header, "openrouter");
         // Columns are left aligned, so every glyph sits under its provider's header.
         assert_eq!(positions(&rows[0], "■"), vec![gemini]);
-        assert_eq!(positions(&rows[0], "·"), vec![zen]);
         assert_eq!(positions(&rows[0], "◐"), vec![openrouter]);
         assert_eq!(positions(&rows[1], "■"), vec![zen]);
         assert_eq!(
-            positions(&rows[1], "◐+2"),
-            vec![gemini],
-            "combinations suffix"
+            positions(&rows[1], "······+2"),
+            vec![gemini + 2],
+            "combinations suffix after the gauge"
         );
-        assert_eq!(positions(&rows[1], "■ 45s"), vec![zen]);
-        assert_eq!(positions(&rows[2], "·"), vec![gemini, openrouter]);
-        assert!(rows[0].contains("◐ 4m00s"), "{:?}", rows[0]);
+        assert_eq!(positions(&rows[1], "······ 45s"), vec![zen + 2]);
+        let absent = |row: &str, at: usize| {
+            row.chars().nth(at) == Some('·') && row.chars().nth(at + 1) != Some('·')
+        };
+        assert!(absent(&rows[0], zen), "absent zen: {:?}", rows[0]);
+        for at in [gemini, openrouter] {
+            assert!(absent(&rows[2], at), "absent at {at}: {:?}", rows[2]);
+        }
+        assert!(rows[0].contains("◐ ······ 4m00s"), "{:?}", rows[0]);
+    }
+
+    fn usage_doc(peer: &str, buckets: &str) -> String {
+        let total: u64 = buckets
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|n| n.trim().parse().unwrap_or(0))
+            .sum();
+        format!(
+            r#"{{"instance":"{peer}","observed_at":"t","upstreams":[
+            {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+             "requests_1h":{total},"limited_1h":0,"request_buckets":{buckets}}}]}}"#
+        )
+    }
+
+    fn row_text(lines: &[Line], peer: &str) -> String {
+        find(lines, &format!("  {peer} ")).plain_text()
+    }
+
+    #[test]
+    fn gauges_are_six_cells_scaled_across_the_whole_fleet() {
+        let t0 = Instant::now();
+        let mut alone = fleet();
+        add(
+            &mut alone,
+            "peer-q",
+            &usage_doc("peer-q", "[30,30,30,30,30,30,30,30,30,30,30,30]"),
+            t0,
+        );
+        let lines = matrix_lines(&alone, &names(&["peer-q"]), t0, 100);
+        assert!(
+            row_text(&lines, "peer-q").contains("■ ██████"),
+            "alone, the busiest peer fills the gauge: {lines:?}"
+        );
+
+        let mut busy = fleet();
+        add(
+            &mut busy,
+            "peer-q",
+            &usage_doc("peer-q", "[30,30,30,30,30,30,30,30,30,30,30,30]"),
+            t0,
+        );
+        add(
+            &mut busy,
+            "peer-b",
+            &usage_doc("peer-b", "[60,60,60,60,60,60,60,60,60,60,60,60]"),
+            t0,
+        );
+        let lines = matrix_lines(&busy, &names(&["peer-q", "peer-b"]), t0, 100);
+        assert!(
+            row_text(&lines, "peer-q").contains("■ ▄▄▄▄▄▄"),
+            "the same count reads smaller beside a busier peer: {lines:?}"
+        );
+        assert!(
+            row_text(&lines, "peer-b").contains("■ ██████"),
+            "the busiest peer fills the gauge: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn zero_buckets_and_missing_usage_draw_dots() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &usage_doc("peer-a", "[0,0,0,0,0,0,0,0,0,0,0,6]"),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &usage_doc("peer-b", "[0,0,0,0,0,0,0,0,0,0,0,0]"),
+            t0,
+        );
+        add(&mut f, "peer-c", BARE_DOC, t0);
+        let lines = matrix_lines(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0, 100);
+        assert!(row_text(&lines, "peer-a").contains("■ ·····█"), "{lines:?}");
+        assert!(
+            row_text(&lines, "peer-b").contains("■ ······"),
+            "zero traffic stays blank: {lines:?}"
+        );
+        assert!(
+            row_text(&lines, "peer-c").contains("■ ······"),
+            "an older publisher reads as no figures, not an error: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_limited_gauge_is_drawn_in_the_warning_style() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":8,"limited_1h":2,
+                 "request_buckets":[1,1,1,1,1,1,1,1,1,1,1,1]}]}"#,
+            t0,
+        );
+        let lines = matrix_lines(&f, &names(&["peer-a"]), t0, 100);
+        let line = find(&lines, "  peer-a ");
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.style == Style::Warn && s.text.trim() == "██████"),
+            "limited traffic warns: {line:?}"
+        );
+    }
+
+    #[test]
+    fn the_detail_card_lists_the_last_hour_with_a_twelve_cell_trend() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":120,"limited_1h":3,
+                 "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,3]}]}"#,
+            t0,
+        );
+        let card = peer_detail(&f, "peer-a", t0, 100);
+        let line = find(&card, "last hour:");
+        let text = line.plain_text();
+        assert!(
+            text.contains("last hour: 120 requests, 3 limited"),
+            "{text}"
+        );
+        assert!(text.contains("···········█"), "twelve cells: {text}");
+    }
+
+    #[test]
+    fn the_gauge_is_dropped_before_provider_headers_are_shortened() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let wide = matrix_lines(&f, &peers, t0, 100);
+        assert!(wide[1].plain_text().contains("openrouter"));
+        assert!(
+            wide[2..].iter().any(|l| l.plain_text().contains("······")),
+            "a wide matrix draws gauges: {wide:?}"
+        );
+
+        let medium = matrix_lines(&f, &peers, t0, 64);
+        assert!(
+            medium[1].plain_text().contains("openrouter"),
+            "headers keep their full names when the gauge goes: {medium:?}"
+        );
+        assert!(
+            !medium[2..]
+                .iter()
+                .any(|l| l.plain_text().contains("······")),
+            "the gauge is gone: {medium:?}"
+        );
     }
 
     #[test]
@@ -1060,35 +1360,12 @@ mod tests {
             (Cell::Absent, 3, "·", Style::Dim),
             (Cell::Stale, 4, "?", Style::Dim),
         ];
-        let rows = cells
-            .iter()
-            .enumerate()
-            .map(|(i, (cell, combos, _, _))| Row {
-                peer: format!("peer-{i}"),
-                cells: vec![cell.clone()],
-                combos: vec![*combos],
-                host: HostSummary::default(),
-                error: None,
-                stale: matches!(cell, Cell::Stale),
-                age: None,
-            })
-            .collect();
-        let m = Matrix {
-            hidden_columns: 0,
-            columns: vec![Column {
-                upstream: "zen".to_owned(),
-                peers_with: cells.len(),
-                healthy_peers: 1,
-            }],
-            rows,
-        };
-        let lines = render_matrix(&m, &History::new(0), None, 100, None);
-        for (_, _, text, style) in cells {
-            let found = lines
-                .iter()
-                .flat_map(|l| &l.spans)
-                .any(|s| s.text.trim_end() == text && s.style == style);
-            assert!(found, "{text:?} as {style:?} in {lines:?}");
+        for (cell, combos, text, style) in cells {
+            assert_eq!(
+                cell_text(&cell, combos),
+                (text.to_owned(), style),
+                "{cell:?}"
+            );
         }
     }
 
@@ -1098,6 +1375,7 @@ mod tests {
             peer: peer.to_owned(),
             cells: vec![Cell::Stale],
             combos: vec![0],
+            pressure: vec![None],
             host: HostSummary::default(),
             error: Some("poll: cannot connect".to_owned()),
             stale: true,
@@ -1196,6 +1474,7 @@ mod tests {
             peer: "peer-a".to_owned(),
             cells: vec![],
             combos: vec![],
+            pressure: vec![],
             host: HostSummary {
                 load1: None,
                 disk_percent: Some(pct),
@@ -1276,6 +1555,7 @@ mod tests {
             peer: "peer-a".to_owned(),
             cells: vec![],
             combos: vec![],
+            pressure: vec![],
             host: HostSummary {
                 load1: Some(load),
                 disk_percent: Some(100.0),
@@ -1353,6 +1633,7 @@ mod tests {
             peer: "peer-a".to_owned(),
             cells: vec![Cell::Healthy, Cell::Healthy],
             combos: vec![3],
+            pressure: vec![None],
             host: HostSummary::default(),
             error: None,
             stale: false,
@@ -1375,7 +1656,7 @@ mod tests {
             rows: vec![row],
         };
         let lines = render_matrix(&m, &History::new(0), None, 100, None);
-        assert!(lines[2].plain_text().contains("◐+3"));
+        assert!(lines[2].plain_text().contains("◐ ······+3"));
         let narrow = render_matrix(&m, &History::new(0), None, 25, None);
         assert!(narrow[1].plain_text().contains("zen ◐+3"), "{narrow:?}");
     }

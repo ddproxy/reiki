@@ -16,7 +16,8 @@ use crate::view::{self, Span, Style};
 /// The key hints on the footer's right side, full view.
 const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix";
 /// The key hints on the footer's right side, matrix view.
-const HINTS_MATRIX: &str = "q quit  j/k peer  Enter detail  PgUp/PgDn scroll  p pause  v full view";
+const HINTS_MATRIX: &str =
+    "q quit  j/k peer  Enter detail  PgUp/PgDn scroll  f provider  p pause  v full view";
 
 /// The filter the caller applies before rendering; this layer only stores it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -43,6 +44,8 @@ pub enum Action {
     ToggleDetail,
     /// Switches between the matrix and the full text view.
     ToggleMode,
+    /// Cycles the matrix provider filter: all, then each column, then all.
+    CycleProvider,
 }
 
 /// Which screen the live view shows. The matrix is the default.
@@ -95,6 +98,22 @@ impl UiState {
         self.scroll = 0;
     }
 
+    /// Cycles the matrix provider filter over `providers` in column order. A selected provider
+    /// that is not in the list falls back to all on the next cycle.
+    pub fn cycle_provider(&mut self, providers: &[String]) {
+        let next = match self.filter.provider.as_deref() {
+            None => providers.first().cloned(),
+            Some(current) => match providers.iter().position(|p| p == current) {
+                Some(i) if i + 1 < providers.len() => Some(providers[i + 1].clone()),
+                _ => None,
+            },
+        };
+        self.filter.provider = next;
+        self.selected = None;
+        self.detail = None;
+        self.scroll = 0;
+    }
+
     /// Applies one key action. Returns false only for [`Action::Quit`]; a false return leaves
     /// the state untouched. Scroll is clamped to the last line, so any view size is safe.
     pub fn apply(&mut self, action: Action, total_lines: usize, viewport: usize) -> bool {
@@ -119,6 +138,8 @@ impl UiState {
             Action::ToggleMode => self.toggle_mode(),
             // Needs the selected peer's problem flag, so the caller calls `toggle_detail`.
             Action::ToggleDetail => {}
+            // Needs the current provider columns; the caller cycles the filter.
+            Action::CycleProvider => {}
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
         true
@@ -147,6 +168,7 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Char('c') => Action::ClearFilter,
         KeyCode::Enter | KeyCode::Char('e') => Action::ToggleDetail,
         KeyCode::Char('v') | KeyCode::Char('E') => Action::ToggleMode,
+        KeyCode::Char('f') => Action::CycleProvider,
         _ => return None,
     };
     Some(action)
@@ -498,6 +520,48 @@ mod tests {
     }
 
     #[test]
+    fn cycling_the_provider_filter_wraps_and_resets_selection() {
+        let providers = vec![
+            "gemini".to_owned(),
+            "zen".to_owned(),
+            "openrouter".to_owned(),
+        ];
+        let mut state = UiState {
+            selected: Some(2),
+            detail: Some(true),
+            scroll: 4,
+            ..UiState::default()
+        };
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider.as_deref(), Some("gemini"));
+        assert_eq!(state.selected, None);
+        assert_eq!(state.detail, None);
+        assert_eq!(state.scroll, 0);
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider.as_deref(), Some("zen"));
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider.as_deref(), Some("openrouter"));
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider, None, "wraps back to all");
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn cycling_a_missing_provider_falls_back_to_all() {
+        let providers = vec!["gemini".to_owned(), "zen".to_owned()];
+        let mut state = UiState {
+            filter: Filter {
+                peer: None,
+                provider: Some("gone".to_owned()),
+            },
+            ..UiState::default()
+        };
+        state.cycle_provider(&providers);
+        assert_eq!(state.filter.provider, None);
+    }
+
+    #[test]
     fn the_key_map_covers_every_binding() {
         let cases = [
             (KeyCode::Char('q'), KeyModifiers::NONE, Some(Action::Quit)),
@@ -561,6 +625,11 @@ mod tests {
                 KeyCode::Char('E'),
                 KeyModifiers::NONE,
                 Some(Action::ToggleMode),
+            ),
+            (
+                KeyCode::Char('f'),
+                KeyModifiers::NONE,
+                Some(Action::CycleProvider),
             ),
         ];
         for (code, modifiers, expected) in cases {

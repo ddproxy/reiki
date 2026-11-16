@@ -37,6 +37,7 @@ pub async fn run(
     once: bool,
     interval: Option<u64>,
     full: bool,
+    provider: Option<&str>,
 ) -> i32 {
     let peers = match client::ready(peers) {
         Ok(peers) => peers,
@@ -46,22 +47,23 @@ pub async fn run(
         }
     };
     if once {
-        run_once(peers, full).await
+        run_once(peers, full, provider).await
     } else {
-        run_live(peers, interval, full).await
+        run_live(peers, interval, full, provider).await
     }
 }
 
 /// Polls every peer once, prints the fleet as plain text and returns 0 when at least one peer
 /// answered, 1 when none did.
-pub async fn run_once(peers: &PeersConfig, full: bool) -> i32 {
-    run_once_to(peers, full, &mut io::stdout(), &mut io::stderr()).await
+pub async fn run_once(peers: &PeersConfig, full: bool, provider: Option<&str>) -> i32 {
+    run_once_to(peers, full, provider, &mut io::stdout(), &mut io::stderr()).await
 }
 
 /// [`run_once`] with the output handles passed in, so tests need no terminal.
 async fn run_once_to(
     peers: &PeersConfig,
     full: bool,
+    provider: Option<&str>,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> i32 {
@@ -106,7 +108,17 @@ async fn run_once_to(
         view::render(&fleet, &names, now, 100)
     } else {
         let matrix = Matrix::build(&fleet, &names, now);
-        view::render_matrix(&matrix, &History::new(0), None, 100)
+        let (matrix, filter_name): (Matrix, Option<&str>) = match provider {
+            Some(p) if matrix.filter_provider(p).is_some() => {
+                (matrix.filter_provider(p).unwrap(), Some(p))
+            }
+            Some(p) => {
+                let _ = writeln!(err, "unknown provider: {p}");
+                (matrix, None)
+            }
+            None => (matrix, None),
+        };
+        view::render_matrix(&matrix, &History::new(0), None, 100, filter_name)
     };
     for line in lines {
         let _ = writeln!(out, "{}", line.plain_text());
@@ -248,7 +260,12 @@ impl<C: ScreenControl> Drop for Guard<C> {
 type Screen = ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>;
 
 /// Follows the feeds and draws the fleet until the user quits.
-pub async fn run_live(peers: &PeersConfig, interval: Option<u64>, full: bool) -> i32 {
+pub async fn run_live(
+    peers: &PeersConfig,
+    interval: Option<u64>,
+    full: bool,
+    provider: Option<&str>,
+) -> i32 {
     if !io::stdout().is_terminal() {
         eprintln!("reiki: stdout is not a terminal; use `reiki top --once`");
         return 2;
@@ -279,7 +296,7 @@ pub async fn run_live(peers: &PeersConfig, interval: Option<u64>, full: bool) ->
         }
     };
     let redraw = Duration::from_secs(interval.unwrap_or(1).max(1));
-    let code = live_loop(&mut terminal, peers, rx, redraw, full).await;
+    let code = live_loop(&mut terminal, peers, rx, redraw, full, provider).await;
     for task in tasks {
         task.abort();
     }
@@ -308,6 +325,7 @@ async fn live_loop(
     mut rx: mpsc::Receiver<(String, FeedEvent)>,
     redraw: Duration,
     full: bool,
+    provider: Option<&str>,
 ) -> i32 {
     let poll = Duration::from_secs(peers.poll_interval_secs);
     let all: Vec<String> = peers.peers.keys().cloned().collect();
@@ -319,6 +337,10 @@ async fn live_loop(
             ui::Mode::Full
         } else {
             ui::Mode::Matrix
+        },
+        filter: ui::Filter {
+            peer: None,
+            provider: provider.map(str::to_owned),
         },
         ..ui::UiState::default()
     };
@@ -391,9 +413,16 @@ async fn live_loop(
                             return 1;
                         }
                     };
-                let problem = selected_peer(shown, &all, shown_at, state.selected)
+                let problem = selected_peer(shown, &all, shown_at, &state)
                     .is_some_and(|(_, problem)| problem);
-                if !apply_action(&mut state, action, &all, total, viewport, problem) {
+                if action == ui::Action::CycleProvider {
+                    if state.mode == ui::Mode::Matrix {
+                        let matrix = Matrix::build(shown, &all, shown_at);
+                        let providers: Vec<String> =
+                            matrix.columns.iter().map(|c| c.upstream.clone()).collect();
+                        state.cycle_provider(&providers);
+                    }
+                } else if !apply_action(&mut state, action, &all, total, viewport, problem) {
                     return 0;
                 }
                 match (state.paused, frozen.is_some()) {
@@ -500,11 +529,19 @@ fn selected_peer(
     fleet: &Fleet,
     all: &[String],
     now: Instant,
-    selected: Option<usize>,
+    state: &ui::UiState,
 ) -> Option<(String, bool)> {
     let matrix = Matrix::build(fleet, all, now);
+    let matrix = if state.mode == ui::Mode::Matrix {
+        match state.filter.provider.as_deref() {
+            Some(p) => matrix.filter_provider(p).unwrap_or(matrix),
+            None => matrix,
+        }
+    } else {
+        matrix
+    };
     let order = order_peers(&matrix);
-    let row = &matrix.rows[order[resolve(selected, order.len())?]];
+    let row = &matrix.rows[order[resolve(state.selected, order.len())?]];
     Some((row.peer.clone(), is_problem(row)))
 }
 
@@ -530,6 +567,14 @@ fn build_parts(
         },
         ui::Mode::Matrix => {
             let matrix = Matrix::build(fleet, all, now);
+            let (matrix, filter_name): (Matrix, Option<&str>) =
+                match state.filter.provider.as_deref() {
+                    Some(p) => match matrix.filter_provider(p) {
+                        Some(fm) => (fm, Some(p)),
+                        None => (matrix, None),
+                    },
+                    None => (matrix, None),
+                };
             let order = order_peers(&matrix);
             let pos = resolve(state.selected, order.len());
             let detail = pos.and_then(|pos| {
@@ -547,7 +592,7 @@ fn build_parts(
                 None => body,
             };
             let lines = view::window_matrix(
-                view::render_matrix(&matrix, history, pos, width),
+                view::render_matrix(&matrix, history, pos, width, filter_name),
                 matrix.rows.len(),
                 pos,
                 top,
@@ -1066,7 +1111,10 @@ mod tests {
         let peers = reader(&url, &token);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        assert_eq!(run_once_to(&peers, false, &mut out, &mut err).await, 0);
+        assert_eq!(
+            run_once_to(&peers, false, None, &mut out, &mut err).await,
+            0
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("Fleet 1/1 fresh"), "{out}");
         assert!(out.contains("zen"), "{out}");
@@ -1160,7 +1208,7 @@ mod tests {
         let peers = reader(&url, &token);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_once_to(&peers, true, &mut out, &mut err).await;
+        let code = run_once_to(&peers, true, None, &mut out, &mut err).await;
         let out = String::from_utf8(out).unwrap();
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
         assert!(out.contains("Providers"), "{out}");
@@ -1180,7 +1228,7 @@ mod tests {
         let peers = reader(&format!("http://127.0.0.1:{port}"), &token);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_once_to(&peers, true, &mut out, &mut err).await;
+        let code = run_once_to(&peers, true, None, &mut out, &mut err).await;
         let out = String::from_utf8(out).unwrap();
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, 1);
@@ -1204,5 +1252,59 @@ mod tests {
         apply_action(&mut state, ui::Action::NextPeer, &all, 10, 3, false);
         assert_eq!(state.detail, None, "the new peer decides for itself");
         assert_eq!(state.scroll, 0);
+    }
+
+    async fn health_server_with(doc: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .fallback(move || async move { ([("content-type", "application/json")], doc) });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn run_once_filters_to_one_provider_and_hides_absent_peers() {
+        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx"},
+            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#;
+        let doc_b = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+            {"name":"openrouter","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#;
+        let url_a = health_server_with(doc_a).await;
+        let url_b = health_server_with(doc_b).await;
+        let token = token_file("once-provider-filter");
+        let text = format!(
+            "[peers]\nenabled = true\n\
+             [peers.peer-a]\nurl = \"{url_a}\"\ntoken_file = \"{}\"\n\
+             [peers.peer-b]\nurl = \"{url_b}\"\ntoken_file = \"{}\"\n",
+            token.display(),
+            token.display()
+        );
+        let peers = Config::parse(&text).unwrap().peers.unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_once_to(&peers, false, Some("zen"), &mut out, &mut err).await;
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("filter: zen"), "{out}");
+        assert!(out.contains("peer-a"), "{out}");
+        assert!(!out.contains("peer-b"), "absent peer hidden: {out}");
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+
+    #[tokio::test]
+    async fn run_once_unknown_provider_prints_stderr_and_shows_all() {
+        let url = health_server().await;
+        let token = token_file("once-provider-unknown");
+        let peers = reader(&url, &token);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_once_to(&peers, false, Some("gone"), &mut out, &mut err).await;
+        assert_eq!(code, 0);
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(!out.contains("filter: gone"), "{out}");
+        assert!(out.contains("zen"), "{out}");
+        assert_eq!(err.trim(), "unknown provider: gone");
     }
 }

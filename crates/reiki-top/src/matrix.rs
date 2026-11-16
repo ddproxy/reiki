@@ -159,6 +159,10 @@ impl Matrix {
             let upstream = |col: &Column| {
                 fresh.and_then(|v| v.health.upstreams.iter().find(|u| u.name == col.upstream))
             };
+            let has_upstream = |col: &Column| {
+                view.as_ref()
+                    .is_some_and(|v| v.health.upstreams.iter().any(|u| u.name == col.upstream))
+            };
             let host = fresh
                 .map(|v| HostSummary::from_health(v.health))
                 .unwrap_or_default();
@@ -167,8 +171,9 @@ impl Matrix {
                 cells: columns
                     .iter()
                     .map(|col| match fresh {
-                        None => Cell::Stale,
                         Some(_) => upstream(col).map_or(Cell::Absent, cell_of),
+                        None if view.is_some() && !has_upstream(col) => Cell::Absent,
+                        None => Cell::Stale,
                     })
                     .collect(),
                 combos: columns
@@ -192,6 +197,41 @@ impl Matrix {
             rows,
             hidden_columns,
         }
+    }
+
+    /// Returns a view with only `provider` and only peers whose cell for it is not `Absent`.
+    /// `None` when no such provider column exists.
+    pub fn filter_provider(&self, provider: &str) -> Option<Matrix> {
+        let idx = self.columns.iter().position(|c| c.upstream == provider)?;
+        let rows: Vec<Row> = self
+            .rows
+            .iter()
+            .filter(|r| r.cells.get(idx) != Some(&Cell::Absent))
+            .map(|r| Row {
+                peer: r.peer.clone(),
+                cells: vec![r.cells[idx].clone()],
+                combos: vec![r.combos.get(idx).copied().unwrap_or(0)],
+                host: r.host.clone(),
+                error: r.error.clone(),
+                stale: r.stale,
+                age: r.age,
+            })
+            .collect();
+        // keep original order (same as build input order) which is fine; display order applied later
+        let healthy_peers = rows
+            .iter()
+            .filter(|r| r.cells.first() == Some(&Cell::Healthy))
+            .count();
+        let column = Column {
+            upstream: self.columns[idx].upstream.clone(),
+            peers_with: rows.len(),
+            healthy_peers,
+        };
+        Some(Matrix {
+            columns: vec![column],
+            rows,
+            hidden_columns: 0,
+        })
     }
 }
 
@@ -930,5 +970,55 @@ mod tests {
         assert_eq!(m.hidden_columns, 40 - MAX_COLUMNS);
         assert_eq!(m.rows[0].cells.len(), MAX_COLUMNS);
         assert_eq!(m.rows[0].combos.len(), MAX_COLUMNS);
+    }
+
+    #[test]
+    fn filter_keeps_one_provider_and_hides_absent_peers() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &doc(&upstream("zen", 2, 0, 0)), t0);
+        add(
+            &mut f,
+            "peer-b",
+            &doc(&format!(
+                "{},{}",
+                upstream("openrouter", 1, 0, 0),
+                upstream("gemini", 0, 2, 0)
+            )),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-c",
+            &doc(&format!(
+                "{},{}",
+                upstream("zen", 1, 0, 0),
+                upstream("gemini", 3, 0, 0)
+            )),
+            t0,
+        );
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0);
+        let fz = m.filter_provider("zen").expect("zen exists");
+        assert_eq!(fz.columns.len(), 1);
+        assert_eq!(fz.columns[0].upstream, "zen");
+        assert_eq!(fz.hidden_columns, 0);
+        assert_eq!(
+            fz.rows.iter().map(|r| r.peer.as_str()).collect::<Vec<_>>(),
+            ["peer-a", "peer-c"],
+            "peer-b is absent for zen"
+        );
+        assert_eq!(fz.rows[0].cells, vec![Cell::Healthy]);
+        assert_eq!(fz.rows[1].cells, vec![Cell::Healthy]);
+        assert_eq!(fz.columns[0].peers_with, 2);
+        assert_eq!(fz.columns[0].healthy_peers, 2);
+    }
+
+    #[test]
+    fn filter_falls_back_when_the_provider_vanishes() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &doc(&upstream("zen", 1, 0, 0)), t0);
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        assert!(m.filter_provider("gone").is_none());
     }
 }

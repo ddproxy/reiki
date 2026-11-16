@@ -27,6 +27,7 @@ reiki top                 # live matrix; q quits
 reiki top --full          # live per-peer text view instead
 reiki top --once          # poll every peer once, print the matrix as text and exit
 reiki top --once --full   # poll once, print the per-peer text view
+reiki top --provider zen  # show only the zen column and peers that have it
 reiki top --interval 2    # redraw every two seconds instead of every second
 ```
 
@@ -40,7 +41,7 @@ Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
   peer-a  ·       ■      ·           0.4 ▁▅█▄   30% ██░░░░░░  1
 ```
 
-- The first line counts fresh peers, then one `provider healthy/with` tally per provider. Only peers that publish a provider count towards it.
+- The first line counts fresh peers, then one `provider healthy/with` tally per provider. Only peers that publish a provider count towards it. When every peer that has a provider is cooling or disabled (a stale peer counts as unknown), it adds `ALERT <provider> all cooling[, soonest <time>]` (up to three, then `+N more`). With `--provider` or the `f` filter it shows `filter: <provider>` and omits alerts.
 - Cells: `■` healthy (green); `◐` partly healthy, with the soonest cooldown (yellow); `■` with a cooldown, no healthy key (red); `⊘` every key out of rotation (red); `·` the peer does not use this provider (dim); `?` the peer is stale (dim).
 - A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it.
 - `load` is the one-minute load with a sparkline of recent samples. `disk` is the fullest disk: green under 75%, yellow to 89%, red from 90%. `sess` is active sessions. A `-` means the peer does not publish that figure.
@@ -53,6 +54,7 @@ Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
 In the matrix:
 
 - `j`/`k`, the arrows, `Tab`/`Shift-Tab`: move the selection to the next or previous peer. With more peers than rows the list scrolls with the selection and the header stays in place.
+- `f`: cycle the provider filter (all, then each provider, then all). The filtered view shows only that column and peers that have it, and falls back to all if the provider disappears.
 - `Enter` or `e`: open or close the detail pane. A problem peer's pane opens by itself; Enter flips it.
 - `PgUp`/`PgDn`, `g`/`Home`, `G`/`End`: scroll the detail pane.
 - `v` or `E`: switch to the full view.

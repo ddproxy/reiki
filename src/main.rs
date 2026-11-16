@@ -119,6 +119,9 @@ enum Command {
         /// Show the per-peer text view instead of the matrix.
         #[arg(long)]
         full: bool,
+        /// Filter the matrix to one provider.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
@@ -468,10 +471,20 @@ async fn main() {
         once,
         interval,
         full,
+        provider,
     }) = &cli.command
     {
         let config = load_peers_config(&cli.config);
-        std::process::exit(reiki::top::run(config.peers.as_ref(), *once, *interval, *full).await);
+        std::process::exit(
+            reiki::top::run(
+                config.peers.as_ref(),
+                *once,
+                *interval,
+                *full,
+                provider.as_deref(),
+            )
+            .await,
+        );
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();

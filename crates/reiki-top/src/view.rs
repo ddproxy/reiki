@@ -374,12 +374,14 @@ const FITS: [(usize, bool); 4] = [(LABEL_MAX, true), (6, true), (3, true), (3, f
 /// The peers-by-providers matrix: a fleet line with one tally per provider, a header, then one
 /// row per peer in [`order_peers`] order. `selected` is a display position, wrapped to the row
 /// count; `None` draws no marker. Sparklines come from `history`, so an empty history draws
-/// none. Too narrow for the columns, it falls back to one chip line per peer.
+/// none. `filter` names the active provider filter shown in the fleet line. Too narrow for the
+/// columns, it falls back to one chip line per peer.
 pub fn render_matrix(
     matrix: &Matrix,
     history: &History,
     selected: Option<usize>,
     width: usize,
+    filter: Option<&str>,
 ) -> Vec<Line> {
     let order = order_peers(matrix);
     let selected = selected.and_then(|s| resolve(Some(s), order.len()));
@@ -388,6 +390,9 @@ pub fn render_matrix(
         format!("Fleet {fresh}/{} fresh", matrix.rows.len()),
         Style::Title,
     )];
+    if let Some(name) = filter {
+        title.push(span(format!("   filter: {name}"), Style::Title));
+    }
     for col in &matrix.columns {
         let style = if col.healthy_peers == col.peers_with {
             Style::Good
@@ -411,6 +416,54 @@ pub fn render_matrix(
             format!("   +{} more", matrix.hidden_columns),
             Style::Dim,
         ));
+    }
+    if filter.is_none() {
+        let mut alerts = Vec::new();
+        for (c, col) in matrix.columns.iter().enumerate() {
+            if col.peers_with == 0 {
+                continue;
+            }
+            let mut all_down = true;
+            let mut soonest: Option<Duration> = None;
+            let mut has_peer = false;
+            for row in &matrix.rows {
+                let Some(cell) = row.cells.get(c) else {
+                    continue;
+                };
+                if *cell == Cell::Absent {
+                    continue;
+                }
+                has_peer = true;
+                match cell {
+                    Cell::Cooling { soonest: s, .. } => {
+                        if let Some(s) = s {
+                            soonest = Some(match soonest {
+                                Some(cur) => cur.min(*s),
+                                None => *s,
+                            });
+                        }
+                    }
+                    Cell::Disabled => {}
+                    _ => {
+                        all_down = false;
+                        break;
+                    }
+                }
+            }
+            if has_peer && all_down {
+                let mut text = format!("ALERT {} all cooling", col.upstream);
+                if let Some(d) = soonest {
+                    text.push_str(&format!(", soonest {}", fmt_duration(d)));
+                }
+                alerts.push(text);
+            }
+        }
+        for text in alerts.iter().take(3) {
+            title.push(span(format!("   {text}"), Style::Bad));
+        }
+        if alerts.len() > 3 {
+            title.push(span(format!("   +{} more", alerts.len() - 3), Style::Bad));
+        }
     }
 
     if order.is_empty() {
@@ -899,7 +952,7 @@ mod tests {
 
     fn matrix_lines(f: &Fleet, peers: &[String], t0: Instant, width: usize) -> Vec<Line> {
         let m = Matrix::build(f, peers, t0);
-        render_matrix(&m, &History::new(0), None, width)
+        render_matrix(&m, &History::new(0), None, width, None)
     }
 
     /// Char index of each occurrence of `needle` in `text`.
@@ -1018,7 +1071,7 @@ mod tests {
             }],
             rows,
         };
-        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
         for (_, _, text, style) in cells {
             let found = lines
                 .iter()
@@ -1051,7 +1104,7 @@ mod tests {
                 row("edge-1", None),
             ],
         };
-        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
         let host_1 = lines[3].plain_text();
         assert!(host_1.contains("stale 2m00s"), "{host_1}");
         assert!(!host_1.contains("poll"), "errors stay in the detail pane");
@@ -1119,7 +1172,7 @@ mod tests {
                 },
             );
         }
-        let lines = render_matrix(&m, &history, None, 100);
+        let lines = render_matrix(&m, &history, None, 100, None);
         let a = lines[4].plain_text();
         assert!(a.contains("0.4 ▁▅█"), "{a}");
         assert!(a.contains(" 30% ██░░░░░░"), "{a}");
@@ -1146,7 +1199,7 @@ mod tests {
             columns: vec![],
             rows: vec![disk(53.0), disk(80.0), disk(95.0), disk(100.0)],
         };
-        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
         for (line, (text, style)) in lines[2..].iter().zip([
             ("53% ████░░░░", Style::Good),
             ("80% ██████░░", Style::Warn),
@@ -1226,7 +1279,7 @@ mod tests {
             columns: vec![],
             rows: vec![row(1e308, u64::MAX), row(f64::NAN, 3)],
         };
-        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
         let first_row = lines[2].plain_text();
         assert!(first_row.contains("999+"), "{first_row}");
         assert!(first_row.contains("9999+"), "{first_row}");
@@ -1240,7 +1293,7 @@ mod tests {
         let t0 = Instant::now();
         let (f, peers) = three_peers(t0);
         let m = Matrix::build(&f, &peers, t0);
-        let lines = render_matrix(&m, &History::new(0), Some(4), 100);
+        let lines = render_matrix(&m, &History::new(0), Some(4), 100, None);
         let marked: Vec<&Line> = lines
             .iter()
             .filter(|l| l.plain_text().starts_with("> "))
@@ -1309,9 +1362,9 @@ mod tests {
             ],
             rows: vec![row],
         };
-        let lines = render_matrix(&m, &History::new(0), None, 100);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
         assert!(lines[2].plain_text().contains("■+3"));
-        let narrow = render_matrix(&m, &History::new(0), None, 25);
+        let narrow = render_matrix(&m, &History::new(0), None, 25, None);
         assert!(narrow[1].plain_text().contains("zen ■+3"), "{narrow:?}");
     }
 
@@ -1322,8 +1375,153 @@ mod tests {
             columns: vec![],
             rows: vec![],
         };
-        let lines = render_matrix(&m, &History::new(0), Some(5), 100);
+        let lines = render_matrix(&m, &History::new(0), Some(5), 100, None);
         assert_eq!(texts(&lines), ["Fleet 0/0 fresh"]);
+    }
+
+    #[test]
+    fn a_filtered_matrix_says_filter_and_hides_absent_peers() {
+        let t0 = Instant::now();
+        let (f, peers) = three_peers(t0);
+        let m = Matrix::build(&f, &peers, t0)
+            .filter_provider("zen")
+            .unwrap();
+        let lines = render_matrix(&m, &History::new(0), None, 100, Some("zen"));
+        assert!(
+            lines[0].plain_text().contains("filter: zen"),
+            "{:?}",
+            lines[0]
+        );
+        let rows: Vec<String> = lines[2..].iter().map(Line::plain_text).collect();
+        assert_eq!(rows.len(), 2, "peer-b has no zen: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("peer-a")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("peer-c")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("peer-b")), "{rows:?}");
+    }
+
+    #[test]
+    fn fleet_line_alerts_when_every_peer_with_a_provider_is_cooling_or_disabled() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":4800,"last_status_class":"4xx"}]}"#,
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":1,
+             "soonest_cooldown_seconds":null,"last_status_class":"4xx"}]}"#,
+            t0,
+        );
+        let peers = names(&["peer-a", "peer-b"]);
+        let m = Matrix::build(&f, &peers, t0);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
+        let title = lines[0].plain_text();
+        assert!(
+            title.contains("ALERT zen all cooling, soonest 1h20m"),
+            "{title}"
+        );
+        let alert = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.text.contains("ALERT zen"))
+            .expect("alert span");
+        assert_eq!(alert.style, Style::Bad);
+    }
+
+    #[test]
+    fn fleet_line_has_no_alert_for_mixed_or_stale_providers() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"mix","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":60,"last_status_class":"4xx"},
+            {"name":"stale","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#,
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+            {"name":"stale","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":30,"last_status_class":"4xx"}]}"#,
+            t0 - Duration::from_secs(120),
+        );
+        let peers = names(&["peer-a", "peer-b"]);
+        let m = Matrix::build(&f, &peers, t0);
+        let lines = render_matrix(&m, &History::new(0), None, 100, None);
+        let title = lines[0].plain_text();
+        assert!(!title.contains("ALERT mix"), "{title}");
+        assert!(
+            !title.contains("ALERT stale"),
+            "stale peer counts as unknown: {title}"
+        );
+    }
+
+    #[test]
+    fn fleet_line_caps_alerts_at_three_and_hides_them_when_filtered() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            add(
+                &mut f,
+                &format!("peer-{name}"),
+                &format!(
+                    r#"{{"instance":"peer-{name}","observed_at":"t","upstreams":[
+                    {{"name":"p0","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p1","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p2","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p3","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}}]}}"#,
+                ),
+                t0,
+            );
+            let _ = i;
+        }
+        let peers = names(&["peer-a", "peer-b", "peer-c", "peer-d"]);
+        let m = Matrix::build(&f, &peers, t0);
+        let lines = render_matrix(&m, &History::new(0), None, 200, None);
+        let title = lines[0].plain_text();
+        assert_eq!(title.matches("ALERT ").count(), 3, "{title}");
+        assert!(title.contains("+1 more"), "{title}");
+        let fm = m.filter_provider("p0").unwrap();
+        let filtered = render_matrix(&fm, &History::new(0), None, 200, Some("p0"));
+        assert!(
+            !filtered[0].plain_text().contains("ALERT"),
+            "hidden by filter: {:?}",
+            filtered[0]
+        );
+    }
+
+    #[test]
+    fn fleet_line_alerts_survive_narrow_widths() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":4800,"last_status_class":"4xx"}]}"#,
+            t0,
+        );
+        let peers = names(&["peer-a"]);
+        let m = Matrix::build(&f, &peers, t0);
+        for width in [0, 1, 19, 30, 60, 100] {
+            let lines = render_matrix(&m, &History::new(0), None, width, None);
+            for l in &lines {
+                assert!(text_width(&l.plain_text()) <= width, "width {width}: {l:?}");
+            }
+        }
     }
 
     #[test]

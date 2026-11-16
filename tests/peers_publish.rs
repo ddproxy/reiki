@@ -358,10 +358,19 @@ async fn usage_counts_are_published_by_default_and_can_be_hidden() {
     let buckets = zen["request_buckets"].as_array().unwrap();
     assert_eq!(buckets.len(), 12);
     assert_eq!(buckets[11], 2, "the newest bucket holds the two attempts");
+    let minutes = zen["request_minutes"].as_array().unwrap();
+    assert_eq!(minutes.len(), 10);
+    assert_eq!(minutes[9], 2, "the newest minute holds the two attempts");
 
     let hidden = Rig::new("expose_usage = false\n").await;
     let zen = &hidden.health().await["upstreams"][0];
-    for field in ["requests_1h", "limited_1h", "request_buckets"] {
+    for field in [
+        "requests_1h",
+        "limited_1h",
+        "request_buckets",
+        "request_minutes",
+        "token_minutes",
+    ] {
         assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
     }
 }
@@ -380,6 +389,9 @@ async fn tokens_are_counted_from_each_response_per_upstream() {
     let buckets = zen["token_buckets"].as_array().unwrap();
     assert_eq!(buckets.len(), 12);
     assert_eq!(buckets[11], 20);
+    let minutes = zen["token_minutes"].as_array().unwrap();
+    assert_eq!(minutes.len(), 10);
+    assert_eq!(minutes[9], 20);
 
     let hidden = Rig::with_upstream("expose_usage = false\n", usage_upstream().await).await;
     assert_eq!(hidden.send(None).await, 200);
@@ -574,7 +586,13 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
     );
     let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]
         ["properties"]["upstreams"]["items"];
-    for field in ["requests_1h", "limited_1h", "request_buckets"] {
+    for field in [
+        "requests_1h",
+        "limited_1h",
+        "request_buckets",
+        "request_minutes",
+        "token_minutes",
+    ] {
         assert!(
             upstream["properties"].get(field).is_some(),
             "{field} is described"

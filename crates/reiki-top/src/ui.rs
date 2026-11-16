@@ -11,13 +11,13 @@ use ratatui::text::{Line as RatLine, Span as RatSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::view::{self, Span, Style};
+use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
 const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix";
 /// The key hints on the footer's right side, matrix view.
 const HINTS_MATRIX: &str =
-    "q quit  j/k peer  Enter detail  PgUp/PgDn scroll  f provider  p pause  v full view";
+    "q quit  j/k peer  Enter detail  PgUp/PgDn  f provider  u metric  w window  p pause  v full view";
 
 /// The filter the caller applies before rendering; this layer only stores it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,6 +46,10 @@ pub enum Action {
     ToggleMode,
     /// Cycles the matrix provider filter: all, then each column, then all.
     CycleProvider,
+    /// Switches the matrix gauge between requests and tokens.
+    ToggleMetric,
+    /// Switches the matrix gauge between the last hour and the last five minutes.
+    ToggleWindow,
 }
 
 /// Which screen the live view shows. The matrix is the default.
@@ -69,6 +73,8 @@ pub struct UiState {
     /// `None` opens the detail pane only while the selected peer is a problem; `Some` is an
     /// explicit choice made with Enter.
     pub detail: Option<bool>,
+    /// What the matrix gauges draw; requests over the hour by default.
+    pub gauge: GaugeMode,
 }
 
 /// The last top line that still fills the viewport, or the last line when the viewport is
@@ -142,6 +148,18 @@ impl UiState {
             Action::ToggleDetail => {}
             // Needs the current provider columns; the caller cycles the filter.
             Action::CycleProvider => {}
+            Action::ToggleMetric => {
+                self.gauge.metric = match self.gauge.metric {
+                    GaugeMetric::Requests => GaugeMetric::Tokens,
+                    GaugeMetric::Tokens => GaugeMetric::Requests,
+                };
+            }
+            Action::ToggleWindow => {
+                self.gauge.window = match self.gauge.window {
+                    GaugeWindow::Hour => GaugeWindow::Minutes,
+                    GaugeWindow::Minutes => GaugeWindow::Hour,
+                };
+            }
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
         true
@@ -171,6 +189,8 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Enter | KeyCode::Char('e') => Action::ToggleDetail,
         KeyCode::Char('v') | KeyCode::Char('E') => Action::ToggleMode,
         KeyCode::Char('f') => Action::CycleProvider,
+        KeyCode::Char('u') => Action::ToggleMetric,
+        KeyCode::Char('w') => Action::ToggleWindow,
         _ => return None,
     };
     Some(action)
@@ -479,6 +499,7 @@ mod tests {
             },
             mode: Mode::Full,
             detail: Some(true),
+            gauge: GaugeMode::default(),
         };
         let before = state.clone();
         assert!(!state.apply(Action::Quit, 10, 3));
@@ -633,11 +654,43 @@ mod tests {
                 KeyModifiers::NONE,
                 Some(Action::CycleProvider),
             ),
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleMetric),
+            ),
+            (
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleWindow),
+            ),
         ];
         for (code, modifiers, expected) in cases {
             let event = KeyEvent::new(code, modifiers);
             assert_eq!(map_key(event), expected, "{code:?} with {modifiers:?}");
         }
+    }
+
+    #[test]
+    fn u_and_w_flip_the_gauge_metric_and_window_and_keep_the_rest() {
+        let mut state = UiState::default();
+        assert_eq!(state.gauge, GaugeMode::default());
+        state.apply(Action::ToggleMetric, 0, 1);
+        assert_eq!(state.gauge.metric, GaugeMetric::Tokens);
+        assert_eq!(state.gauge.window, GaugeWindow::Hour);
+        state.apply(Action::ToggleWindow, 0, 1);
+        assert_eq!(state.gauge.window, GaugeWindow::Minutes);
+        state.apply(Action::ToggleMetric, 0, 1);
+        assert_eq!(state.gauge.metric, GaugeMetric::Requests);
+        state.apply(Action::ToggleWindow, 0, 1);
+        assert_eq!(state.gauge, GaugeMode::default());
+    }
+
+    #[test]
+    fn the_matrix_footer_names_the_gauge_keys_on_one_line() {
+        assert!(!HINTS_MATRIX.contains('\n'));
+        assert!(HINTS_MATRIX.contains("u metric"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("w window"), "{HINTS_MATRIX:?}");
     }
 
     #[test]

@@ -34,7 +34,7 @@ reiki top --interval 2    # redraw every two seconds instead of every second
 ### The matrix
 
 ```
-Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
+Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1   [req 1h]
           gemini        zen           openrouter  load      disk           sess
   peer-b  ■ ······      ·             ◐ ▁▂▃▄▅▆      -         -              -
 > peer-c  ■ ······+2    ■ ▂▃▄▅▆▇ 45s  ·             -         -              -
@@ -43,7 +43,9 @@ Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
 
 - The first line counts fresh peers, then one `provider healthy/with` tally per provider. Only peers that publish a provider count towards it. When every peer that has a provider is cooling or disabled (a stale peer counts as unknown), it adds `ALERT <provider> all cooling[, soonest <time>]` (up to three, then `+N more`). With `--provider` or the `f` filter it shows `filter: <provider>` and omits alerts.
 - Cells: `■` healthy (green); `◐` partly healthy, with the soonest cooldown (yellow); `■` with a cooldown, no healthy key (red); `⊘` every key out of rotation (red); `·` the peer does not use this provider (dim); `?` the peer is stale (dim).
-- After the state glyph, six cells show the last hour of attempts in ten-minute steps, from `▁` to `█`. They scale to the busiest bucket across the whole fleet for that provider, so rows compare at a glance; `·` is a zero bucket. A gauge turns yellow when any attempt in the hour was rate-limited or began a cooldown. A peer that publishes no figures, or an older publisher, draws `·` cells rather than an error.
+- After the state glyph, six cells show the last hour of attempts in ten-minute steps, from `▁` to `█`. They scale to the busiest cell across the whole fleet for that provider, so rows compare at a glance; `·` is a zero cell. A gauge turns yellow when any attempt in the hour was rate-limited or began a cooldown. A peer that publishes no figures for the chosen metric and window, or an older publisher, draws `·` cells rather than an error.
+- `u` switches the gauge between requests and tokens; `w` switches the window between the last hour and the last five minutes, drawn as five cells, one per minute. The fleet line ends with the mode, such as `[req 1h]` or `[tok 5m]`. Both modes take the same column width.
+- Under the matrix, a cooling panel lists each (peer, provider) with cooling keys: its drain bar, time left and last status class, soonest first, six lines then `+N more`. It appears only while some fresh peer has a cooling key, and it is the first thing dropped when the terminal is short, so the matrix is never cut off for it. `--once` prints it too.
 - A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it; the request total is never in the matrix.
 - The detail pane adds `last hour: N requests, M limited` and a twelve-cell five-minute trend for each upstream.
 - `Ver` is the version each peer publishes (`reiki_version`), after the provider columns and before the host figures, clipped to twelve characters. `?` means the peer does not publish one. The detail card shows it after the instance name, as `v0.10.3`.
@@ -58,6 +60,7 @@ In the matrix:
 
 - `j`/`k`, the arrows, `Tab`/`Shift-Tab`: move the selection to the next or previous peer. With more peers than rows the list scrolls with the selection and the header stays in place.
 - `f`: cycle the provider filter (all, then each provider, then all). The filtered view shows only that column and peers that have it, and falls back to all if the provider disappears.
+- `u`: switch the gauge between requests and tokens. `w`: switch the gauge window between the last hour and the last five minutes.
 - `Enter` or `e`: open or close the detail pane. A problem peer's pane opens by itself; Enter flips it.
 - `PgUp`/`PgDn`, `g`/`Home`, `G`/`End`: scroll the detail pane.
 - `v` or `E`: switch to the full view.

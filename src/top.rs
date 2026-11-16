@@ -118,7 +118,9 @@ async fn run_once_to(
             }
             None => (matrix, None),
         };
-        view::render_matrix(&matrix, &History::new(0), None, 100, filter_name)
+        let mut lines = view::render_matrix(&matrix, &History::new(0), None, 100, filter_name);
+        lines.extend(view::cooling_panel(&fleet, &names, filter_name, now, 100));
+        lines
     };
     for line in lines {
         let _ = writeln!(out, "{}", line.plain_text());
@@ -489,6 +491,13 @@ fn apply_action(
         }
         return true;
     }
+    // The gauge only exists in the matrix, so the full view ignores its keys.
+    if matches!(action, ui::Action::ToggleMetric | ui::Action::ToggleWindow) {
+        if state.mode == ui::Mode::Matrix {
+            state.apply(action, total, viewport);
+        }
+        return true;
+    }
     // The first press has to move off the row that is selected by default.
     if state.mode == ui::Mode::Matrix
         && state.selected.is_none()
@@ -592,15 +601,33 @@ fn build_parts(
                 ))),
                 None => body,
             };
-            let lines = view::window_matrix(
-                view::render_matrix(&matrix, history, pos, width, filter_name),
+            let lines = matrix_with_panel(
+                view::render_matrix_mode(&matrix, history, pos, width, filter_name, state.gauge),
                 matrix.rows.len(),
                 pos,
                 top,
+                view::cooling_panel(fleet, all, filter_name, now, width),
             );
             Parts { lines, detail }
         }
     }
+}
+
+/// The cooling panel fills only the rows the matrix leaves spare, so the matrix is never cut for it.
+fn matrix_with_panel(
+    matrix: Vec<view::Line>,
+    rows: usize,
+    selected: Option<usize>,
+    height: usize,
+    panel: Vec<view::Line>,
+) -> Vec<view::Line> {
+    let spare = height.saturating_sub(matrix.len());
+    if !panel.is_empty() && matrix.len() <= height && spare >= 2 {
+        let mut out = matrix;
+        out.extend(panel.into_iter().take(spare));
+        return out;
+    }
+    view::window_matrix(matrix, rows, selected, height)
 }
 
 /// Pushes one host sample for each fresh peer, at most once per `every`. Called from the redraw
@@ -951,6 +978,37 @@ mod tests {
         let before = state.clone();
         apply_action(&mut state, ui::Action::ToggleDetail, &all, 10, 3, true);
         assert_eq!(state, before, "Enter does nothing in the full view");
+    }
+
+    #[test]
+    fn u_and_w_change_the_gauge_only_in_matrix_view_and_the_title_says_so() {
+        let all = vec!["peer-a".to_owned()];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::ToggleMetric, &all, 10, 3, false);
+        apply_action(&mut state, ui::Action::ToggleWindow, &all, 10, 3, false);
+        assert_eq!(state.gauge.metric, view::GaugeMetric::Tokens);
+        assert_eq!(state.gauge.window, view::GaugeWindow::Minutes);
+
+        let now = Instant::now();
+        let mut fleet = fleet();
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(DOC.to_owned()),
+            now,
+        );
+        let history = History::new(0);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, 40);
+        assert!(
+            parts.lines[0].plain_text().ends_with("[tok 5m]"),
+            "{:?}",
+            parts.lines[0]
+        );
+
+        state.toggle_mode();
+        let before = state.clone();
+        apply_action(&mut state, ui::Action::ToggleMetric, &all, 10, 3, false);
+        assert_eq!(state, before, "u does nothing in the full view");
     }
 
     #[test]
@@ -1349,5 +1407,88 @@ mod tests {
         assert!(!out.contains("filter: gone"), "{out}");
         assert!(out.contains("zen"), "{out}");
         assert_eq!(err.trim(), "unknown provider: gone");
+    }
+    const COOLING_DOC: &str = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
+        {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+         "soonest_cooldown_seconds":90,"last_status_class":"4xx"}]}"#;
+
+    fn plain(lines: &[view::Line]) -> Vec<String> {
+        lines.iter().map(view::Line::plain_text).collect()
+    }
+
+    #[test]
+    fn the_cooling_panel_sits_under_the_matrix_and_gives_way_to_it() {
+        let now = Instant::now();
+        let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
+        let mut f = fleet();
+        apply_feed(&mut f, "peer-a", FeedEvent::Snapshot(DOC.to_owned()), now);
+        apply_feed(
+            &mut f,
+            "peer-b",
+            FeedEvent::Snapshot(COOLING_DOC.to_owned()),
+            now,
+        );
+        let state = ui::UiState {
+            detail: Some(false),
+            ..ui::UiState::default()
+        };
+        let history = History::new(0);
+
+        let matrix = plain(&view::render_matrix_mode(
+            &Matrix::build(&f, &all, now),
+            &history,
+            Some(0),
+            100,
+            None,
+            state.gauge,
+        ));
+        let rows = matrix.len();
+
+        let full = plain(&build_parts(&f, &history, &all, now, &state, 100, 100).lines);
+        assert_eq!(full[..rows], matrix[..], "the matrix comes first, whole");
+        assert_eq!(full[rows], "Cooling", "{full:?}");
+        assert!(full[rows + 1].contains("peer-b"), "{full:?}");
+        assert_eq!(full.len(), rows + 2, "{full:?}");
+
+        let one_short = plain(&build_parts(&f, &history, &all, now, &state, 100, rows + 1).lines);
+        assert_eq!(one_short, matrix, "no spare row, no panel");
+
+        let one_spare = plain(&build_parts(&f, &history, &all, now, &state, 100, rows + 3).lines);
+        assert_eq!(one_spare.len(), rows + 2, "{one_spare:?}");
+        assert_eq!(one_spare[rows], "Cooling");
+
+        let tiny = plain(&build_parts(&f, &history, &all, now, &state, 100, 2).lines);
+        assert!(tiny.len() <= 1, "the matrix window wins: {tiny:?}");
+        assert!(!tiny.iter().any(|l| l == "Cooling"), "{tiny:?}");
+        for (w, h) in [(0, 0), (0, 1), (1, 1), (1, 5)] {
+            build_parts(&f, &history, &all, now, &state, w, h);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_prints_the_cooling_panel_after_the_matrix() {
+        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        let url_a = health_server_with(doc_a).await;
+        let url_b = health_server_with(COOLING_DOC).await;
+        let token = token_file("once-cooling");
+        let text = format!(
+            "[peers]\nenabled = true\n\
+             [peers.peer-a]\nurl = \"{url_a}\"\ntoken_file = \"{}\"\n\
+             [peers.peer-b]\nurl = \"{url_b}\"\ntoken_file = \"{}\"\n",
+            token.display(),
+            token.display()
+        );
+        let peers = Config::parse(&text).unwrap().peers.unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_once_to(&peers, false, None, &mut out, &mut err).await;
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        let cooling = out
+            .find("Cooling")
+            .unwrap_or_else(|| panic!("panel: {out}"));
+        assert!(out.find("Fleet").unwrap() < cooling, "{out}");
+        assert!(out[cooling..].contains("peer-b"), "{out}");
     }
 }

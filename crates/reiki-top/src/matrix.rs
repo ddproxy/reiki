@@ -91,13 +91,22 @@ impl HostSummary {
     }
 }
 
-/// One upstream's attempts in the last hour, from a publisher that exposes usage.
+/// Minutes a publisher lists per upstream, the ten ending at its current minute.
+pub const MINUTE_SLOTS: usize = 10;
+
+/// One upstream's attempts and tokens in the last hour, from a publisher that exposes usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pressure {
     pub requests_1h: u64,
     pub limited_1h: u32,
-    /// Twelve five-minute counts, oldest first, newest last.
+    /// Twelve five-minute request counts, oldest first, newest last.
     pub buckets: [u32; 12],
+    /// Ten one-minute request counts, oldest first; `None` from an older publisher.
+    pub minutes: Option<[u32; MINUTE_SLOTS]>,
+    /// Twelve five-minute token counts, oldest first; `None` from an older publisher.
+    pub token_buckets: Option<[u64; 12]>,
+    /// Ten one-minute token counts, oldest first; `None` from an older publisher.
+    pub token_minutes: Option<[u32; MINUTE_SLOTS]>,
 }
 
 /// One peer row: a cell per column, in column order.
@@ -404,6 +413,9 @@ fn pressure_of(upstream: &Upstream) -> Option<Pressure> {
         requests_1h,
         limited_1h: upstream.limited_1h.unwrap_or(0),
         buckets: upstream.request_buckets.unwrap_or([0; 12]),
+        minutes: upstream.request_minutes,
+        token_buckets: upstream.token_buckets,
+        token_minutes: upstream.token_minutes,
     })
 }
 
@@ -740,6 +752,9 @@ mod tests {
                 requests_1h: 120,
                 limited_1h: 3,
                 buckets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                minutes: None,
+                token_buckets: None,
+                token_minutes: None,
             })],
             "a new publisher's figures reach the row"
         );
@@ -778,6 +793,9 @@ mod tests {
                 requests_1h: 5,
                 limited_1h: 0,
                 buckets: [0; 12],
+                minutes: None,
+                token_buckets: None,
+                token_minutes: None,
             })]
         );
     }

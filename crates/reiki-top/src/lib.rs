@@ -94,6 +94,12 @@ pub struct Upstream {
     /// Twelve five-minute token counts, oldest first; extra buckets are dropped.
     #[serde(default, deserialize_with = "token_buckets")]
     pub token_buckets: Option<[u64; 12]>,
+    /// Ten one-minute attempt counts, oldest first and newest last; extra minutes are dropped.
+    #[serde(default, deserialize_with = "request_minutes")]
+    pub request_minutes: Option<[u32; 10]>,
+    /// Ten one-minute token counts, oldest first and newest last; extra minutes are dropped.
+    #[serde(default, deserialize_with = "token_minutes")]
+    pub token_minutes: Option<[u32; 10]>,
 }
 
 /// A JSON number as a clamped count: other types read as absent, never as a parse error.
@@ -127,32 +133,48 @@ fn usage_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, 
     Ok(usage_u64(deserializer)?.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
 }
 
-/// The newest twelve entries of a bucket array, each clamped; other shapes read as absent.
-fn bucket_counts<'de, D: Deserializer<'de>>(
+/// The newest `N` entries of a count array, each clamped; other shapes read as absent.
+fn counts<'de, D: Deserializer<'de>, const N: usize>(
     deserializer: D,
-) -> Result<Option<[u64; 12]>, D::Error> {
+) -> Result<Option<[u64; N]>, D::Error> {
     let Some(Value::Array(items)) = Option::<Value>::deserialize(deserializer)? else {
         return Ok(None);
     };
-    let mut buckets = [0u64; 12];
-    let start = items.len().saturating_sub(buckets.len());
-    for (bucket, item) in buckets.iter_mut().zip(&items[start..]) {
-        *bucket = usage_number(item).unwrap_or(0);
+    let mut out = [0u64; N];
+    let start = items.len().saturating_sub(N);
+    for (slot, item) in out.iter_mut().zip(&items[start..]) {
+        *slot = usage_number(item).unwrap_or(0);
     }
-    Ok(Some(buckets))
+    Ok(Some(out))
+}
+
+/// `u64` counts narrowed to `u32`, saturating.
+fn narrow<const N: usize>(counts: [u64; N]) -> [u32; N] {
+    counts.map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 fn usage_buckets<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<[u32; 12]>, D::Error> {
-    Ok(bucket_counts(deserializer)?
-        .map(|buckets| buckets.map(|n| u32::try_from(n).unwrap_or(u32::MAX))))
+    Ok(counts::<D, 12>(deserializer)?.map(narrow))
 }
 
 fn token_buckets<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<[u64; 12]>, D::Error> {
-    bucket_counts(deserializer)
+    counts::<D, 12>(deserializer)
+}
+
+fn request_minutes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u32; 10]>, D::Error> {
+    Ok(counts::<D, 10>(deserializer)?.map(narrow))
+}
+
+fn token_minutes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u32; 10]>, D::Error> {
+    Ok(counts::<D, 10>(deserializer)?.map(narrow))
 }
 
 /// One labelled key. `cooldown_class` is set only for a cooling key whose class is known.
@@ -330,6 +352,10 @@ impl Fleet {
             tokens_1h: Option<u64>,
             #[serde(default, deserialize_with = "token_buckets")]
             token_buckets: Option<[u64; 12]>,
+            #[serde(default, deserialize_with = "request_minutes")]
+            request_minutes: Option<[u32; 10]>,
+            #[serde(default, deserialize_with = "token_minutes")]
+            token_minutes: Option<[u32; 10]>,
         }
         let event: Event = serde_json::from_str(data).map_err(|e| e.to_string())?;
         let Some(event) = event.upstream else {
@@ -383,6 +409,12 @@ impl Fleet {
         }
         if let Some(buckets) = event.token_buckets {
             upstream.token_buckets = Some(buckets);
+        }
+        if let Some(minutes) = event.request_minutes {
+            upstream.request_minutes = Some(minutes);
+        }
+        if let Some(minutes) = event.token_minutes {
+            upstream.token_minutes = Some(minutes);
         }
         Ok(())
     }
@@ -526,6 +558,8 @@ mod tests {
                 request_buckets: None,
                 tokens_1h: None,
                 token_buckets: None,
+                request_minutes: None,
+                token_minutes: None,
             }
         );
         assert!(health.host.is_some(), "host stats are kept");
@@ -640,6 +674,41 @@ mod tests {
     }
 
     #[test]
+    fn minute_fields_parse_clamp_and_stay_absent_from_older_documents() {
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "request_minutes":[1,2,3,4,5,6,7,8,9,10,11,12],
+                 "token_minutes":[1,"x",-1,1.9,4,5,6,7,8,18446744073709551615]}]}"#,
+        )
+        .expect("minute arrays parse");
+        let upstream = &health.upstreams[0];
+        assert_eq!(
+            upstream.request_minutes,
+            Some([3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            "only the newest ten minutes are kept"
+        );
+        assert_eq!(
+            upstream.token_minutes,
+            Some([1, 0, 0, 1, 4, 5, 6, 7, 8, u32::MAX]),
+            "hostile values clamp, a huge one saturates at u32"
+        );
+
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "request_minutes":"many","token_minutes":{"a":1}}]}"#,
+        )
+        .expect("wrong types do not reject the document");
+        assert_eq!(health.upstreams[0].request_minutes, None);
+        assert_eq!(health.upstreams[0].token_minutes, None);
+
+        let old = Health::from_json(BARE_DOC).expect("an old document parses");
+        assert_eq!(old.upstreams[0].request_minutes, None);
+        assert_eq!(old.upstreams[0].token_minutes, None);
+    }
+
+    #[test]
     fn a_key_event_carries_usage_fields() {
         let now = Instant::now();
         let mut fleet = fleet();
@@ -651,7 +720,9 @@ mod tests {
                 r#"{"upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,
                     "disabled_keys":0,"requests_1h":7,"limited_1h":1,
                     "request_buckets":[0,0,0,0,0,0,0,0,0,0,1,6],
-                    "tokens_1h":99,"token_buckets":[0,0,0,0,0,0,0,0,0,0,9,90]}}"#,
+                    "tokens_1h":99,"token_buckets":[0,0,0,0,0,0,0,0,0,0,9,90],
+                    "request_minutes":[0,0,0,0,0,0,0,0,0,4],
+                    "token_minutes":[0,0,0,0,0,0,0,0,0,90]}}"#,
                 now,
             )
             .expect("a key event applies");
@@ -666,6 +737,14 @@ mod tests {
         assert_eq!(
             upstream.token_buckets,
             Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 90])
+        );
+        assert_eq!(
+            upstream.request_minutes,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 4])
+        );
+        assert_eq!(
+            upstream.token_minutes,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 90])
         );
     }
 

@@ -12,6 +12,8 @@ use crate::config::Config;
 const MINUTES: usize = 60;
 /// Five-minute buckets published to a reader.
 pub(crate) const BUCKETS: usize = 12;
+/// One-minute counts published to a reader, the ten minutes ending at the current one.
+pub(crate) const MINUTE_SLOTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Slot {
@@ -147,6 +149,47 @@ impl PressureCounter {
         for slot in series.slots.iter().filter(|slot| in_hour(slot, minute)) {
             let bucket = bucket_of(slot, minute);
             out[bucket] = out[bucket].saturating_add(slot.requests);
+        }
+        out
+    }
+
+    /// The last ten one-minute request counts, oldest first and newest last, saturating at u32.
+    pub(crate) fn minutes(&self, upstream: &str, now: Instant) -> [u32; MINUTE_SLOTS] {
+        self.recent(upstream, now, |slot| slot.requests)
+    }
+
+    /// The last ten one-minute token counts, oldest first and newest last, saturating at u32.
+    pub(crate) fn token_minutes(&self, upstream: &str, now: Instant) -> [u32; MINUTE_SLOTS] {
+        self.recent(upstream, now, |slot| {
+            u32::try_from(slot.tokens).unwrap_or(u32::MAX)
+        })
+    }
+
+    fn recent(
+        &self,
+        upstream: &str,
+        now: Instant,
+        figure: impl Fn(&Slot) -> u32,
+    ) -> [u32; MINUTE_SLOTS] {
+        let minute = self.minute(now);
+        let map = self
+            .upstreams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(series) = map.get(upstream) else {
+            return [0; MINUTE_SLOTS];
+        };
+        // Looked up by minute: an empty slot still carries minute 0, so scanning the slots would
+        // let an unused one overwrite a real minute 0.
+        let mut out = [0u32; MINUTE_SLOTS];
+        for (position, value) in out.iter_mut().enumerate() {
+            let Some(wanted) = minute.checked_sub((MINUTE_SLOTS - 1 - position) as u64) else {
+                continue;
+            };
+            let slot = &series.slots[(wanted % MINUTES as u64) as usize];
+            if slot.minute == wanted {
+                *value = figure(slot);
+            }
         }
         out
     }
@@ -346,5 +389,50 @@ mod tests {
         let later = t0 + std::time::Duration::from_secs(60 * 60);
         counter.record_tokens("zen", 3, later);
         assert_eq!(counter.token_totals("zen", later), 3);
+    }
+
+    #[test]
+    fn minutes_are_the_last_ten_one_minute_counts_oldest_first() {
+        let counter = PressureCounter::new();
+        let t0 = Instant::now();
+        let at = |minute: u64| t0 + std::time::Duration::from_secs(minute * 60);
+        counter.record("zen", false, at(2));
+        counter.record("zen", false, at(3));
+        counter.record("zen", true, at(3));
+        counter.record("zen", false, at(12));
+        counter.record("zen", false, at(12));
+        counter.record("zen", false, at(12));
+        counter.record_tokens("zen", 5, at(3));
+        counter.record_tokens("zen", u64::from(u32::MAX) + 9, at(12));
+        assert_eq!(
+            counter.minutes("zen", at(12)),
+            [2, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+            "minute 2 is outside the ten minutes ending at minute 12"
+        );
+        assert_eq!(
+            counter.token_minutes("zen", at(12))[9],
+            u32::MAX,
+            "tokens saturate to u32"
+        );
+        assert_eq!(counter.token_minutes("zen", at(12))[0], 5);
+        assert_eq!(counter.minutes("zen", at(70)), [0; MINUTE_SLOTS]);
+        assert_eq!(counter.minutes("never-seen", at(12)), [0; MINUTE_SLOTS]);
+        assert_eq!(
+            counter.token_minutes("never-seen", at(12)),
+            [0; MINUTE_SLOTS]
+        );
+    }
+
+    #[test]
+    fn an_unused_slot_never_hides_minute_zero() {
+        let counter = PressureCounter::new();
+        let t0 = Instant::now();
+        counter.record("zen", false, t0);
+        let at_nine = t0 + std::time::Duration::from_secs(9 * 60);
+        assert_eq!(
+            counter.minutes("zen", at_nine),
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "minute 0 is the oldest of the ten, and empty slots draw nothing"
+        );
     }
 }

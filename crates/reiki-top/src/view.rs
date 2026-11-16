@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::matrix::{order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row};
+use crate::matrix::{
+    order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row, MINUTE_SLOTS,
+};
 use crate::Fleet;
 
 /// How a span should read on the terminal. `Plain` is the caller's default.
@@ -136,41 +138,124 @@ fn level(value: u64, scale: u64) -> Option<char> {
     Some(SPARK[n - 1])
 }
 
+/// The gauge's metric and window: what the matrix's gauge cells count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GaugeMode {
+    pub metric: GaugeMetric,
+    pub window: GaugeWindow,
+}
+
+/// Requests attempted, or tokens the provider reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GaugeMetric {
+    #[default]
+    Requests,
+    Tokens,
+}
+
+/// The last hour in six ten-minute cells, or the last five minutes in one cell per minute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GaugeWindow {
+    #[default]
+    Hour,
+    Minutes,
+}
+
+impl GaugeMode {
+    /// The fleet line's tag, such as `[req 1h]`.
+    pub fn tag(self) -> String {
+        let metric = match self.metric {
+            GaugeMetric::Requests => "req",
+            GaugeMetric::Tokens => "tok",
+        };
+        let window = match self.window {
+            GaugeWindow::Hour => "1h",
+            GaugeWindow::Minutes => "5m",
+        };
+        format!("[{metric} {window}]")
+    }
+
+    /// Cells the window draws; the gauge is padded to [`GAUGE_CELLS`] either way.
+    fn cells(self) -> usize {
+        match self.window {
+            GaugeWindow::Hour => GAUGE_CELLS,
+            GaugeWindow::Minutes => MINUTE_CELLS,
+        }
+    }
+}
+
 /// Six paired five-minute buckets, oldest first.
-fn bucket_pairs(buckets: &[u32; 12]) -> [u64; GAUGE_CELLS] {
+fn bucket_pairs(buckets: &[u64; 12]) -> [u64; GAUGE_CELLS] {
     let mut out = [0u64; GAUGE_CELLS];
     for (slot, pair) in out.iter_mut().zip(buckets.as_chunks::<2>().0) {
-        *slot = u64::from(pair[0]).saturating_add(u64::from(pair[1]));
+        *slot = pair[0].saturating_add(pair[1]);
     }
     out
 }
 
-/// The busiest paired bucket in one column, the fleet-wide gauge scale.
-fn column_peak(matrix: &Matrix, column: usize) -> u64 {
+/// The newest [`MINUTE_CELLS`] of a row's ten published minutes, oldest first.
+fn newest_minutes(minutes: &[u32; MINUTE_SLOTS]) -> Vec<u64> {
+    minutes[MINUTE_SLOTS - MINUTE_CELLS..]
+        .iter()
+        .map(|&n| u64::from(n))
+        .collect()
+}
+
+/// The values the gauge draws for one upstream, oldest first, or `None` when the publisher sent
+/// no figures for this metric and window.
+fn gauge_values(pressure: &Pressure, mode: GaugeMode) -> Option<Vec<u64>> {
+    match (mode.metric, mode.window) {
+        (GaugeMetric::Requests, GaugeWindow::Hour) => {
+            Some(bucket_pairs(&pressure.buckets.map(u64::from)).to_vec())
+        }
+        (GaugeMetric::Tokens, GaugeWindow::Hour) => pressure
+            .token_buckets
+            .as_ref()
+            .map(|buckets| bucket_pairs(buckets).to_vec()),
+        (GaugeMetric::Requests, GaugeWindow::Minutes) => {
+            pressure.minutes.as_ref().map(newest_minutes)
+        }
+        (GaugeMetric::Tokens, GaugeWindow::Minutes) => {
+            pressure.token_minutes.as_ref().map(newest_minutes)
+        }
+    }
+}
+
+/// The busiest cell in one column across the fleet: the gauge scale.
+fn column_peak(matrix: &Matrix, column: usize, mode: GaugeMode) -> u64 {
     matrix
         .rows
         .iter()
         .filter_map(|row| row.pressure.get(column).and_then(Option::as_ref))
-        .map(|p| bucket_pairs(&p.buckets).into_iter().max().unwrap_or(0))
+        .filter_map(|pressure| gauge_values(pressure, mode))
+        .flatten()
         .max()
         .unwrap_or(0)
 }
 
-/// `" ▁▂▃▄▅▆"` after the state glyph: `·` for a zero bucket and a dim run when the publisher
-/// sent no figures. Six cells cover the last hour in ten-minute steps.
-fn gauge(pressure: Option<&Pressure>, scale: u64) -> (String, Style) {
-    let Some(pressure) = pressure else {
-        return (format!(" {}", "·".repeat(GAUGE_CELLS)), Style::Dim);
-    };
+/// `" ▁▂▃▄▅▆"` after the state glyph: `·` for a zero cell and a dim run when the publisher
+/// sent no figures. The minute window has five cells and a trailing space, so both windows fill
+/// the same width.
+fn gauge(pressure: Option<&Pressure>, scale: u64, mode: GaugeMode) -> (String, Style) {
+    let cells = mode.cells();
     let mut text = String::from(" ");
-    for pair in bucket_pairs(&pressure.buckets) {
-        text.push(level(pair, scale).unwrap_or('·'));
-    }
-    let style = if pressure.limited_1h > 0 {
-        Style::Warn
-    } else {
-        Style::Plain
+    let style = match pressure.and_then(|p| gauge_values(p, mode)) {
+        None => {
+            text.push_str(&"·".repeat(cells));
+            Style::Dim
+        }
+        Some(values) => {
+            for value in values {
+                text.push(level(value, scale).unwrap_or('·'));
+            }
+            if pressure.is_some_and(|p| p.limited_1h > 0) {
+                Style::Warn
+            } else {
+                Style::Plain
+            }
+        }
     };
+    text.push_str(&" ".repeat(GAUGE_CELLS - cells));
     (text, style)
 }
 
@@ -444,6 +529,12 @@ fn key_line(k: &crate::KeyView, width: usize) -> Line {
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Cells in the last-hour gauge, one per pair of five-minute buckets.
 const GAUGE_CELLS: usize = 6;
+/// Cells in the last-five-minutes gauge, one per minute.
+const MINUTE_CELLS: usize = 5;
+/// Cooling panel lines before the `+N more` count.
+const COOLING_LINES: usize = 6;
+/// Cells in a cooling panel drain bar.
+const COOLING_BAR: usize = 20;
 /// Narrowest provider column that can hold the glyph, a space and the gauge.
 const GAUGE_WIDTH: usize = 1 + 1 + GAUGE_CELLS;
 /// Longest peer name drawn; longer names are clipped.
@@ -487,6 +578,26 @@ pub fn render_matrix(
     selected: Option<usize>,
     width: usize,
     filter: Option<&str>,
+) -> Vec<Line> {
+    render_matrix_mode(
+        matrix,
+        history,
+        selected,
+        width,
+        filter,
+        GaugeMode::default(),
+    )
+}
+
+/// [`render_matrix`] with the gauge's metric and window chosen by the caller. The fleet line ends
+/// with the mode's tag.
+pub fn render_matrix_mode(
+    matrix: &Matrix,
+    history: &History,
+    selected: Option<usize>,
+    width: usize,
+    filter: Option<&str>,
+    mode: GaugeMode,
 ) -> Vec<Line> {
     let order = order_peers(matrix);
     let selected = selected.and_then(|s| resolve(Some(s), order.len()));
@@ -570,6 +681,7 @@ pub fn render_matrix(
             title.push(span(format!("   +{} more", alerts.len() - 3), Style::Bad));
         }
     }
+    title.push(span(format!("   {}", mode.tag()), Style::Title));
 
     if order.is_empty() {
         return vec![line(title, width)];
@@ -590,7 +702,15 @@ pub fn render_matrix(
     }
 
     for (ver, label_max, spark, gauge) in FITS {
-        let grid = Grid::new(matrix, &order, history, label_max, spark, gauge, ver);
+        let grid = Grid::new(
+            matrix,
+            &order,
+            history,
+            label_max,
+            spark,
+            gauge.then_some(mode),
+            ver,
+        );
         if grid.width() <= width {
             return grid.lines(title, selected, width);
         }
@@ -620,6 +740,129 @@ pub fn window_matrix(
     let start = (pos + 1).saturating_sub(visible);
     let mut out: Vec<Line> = lines.drain(..pinned).collect();
     out.extend(lines.into_iter().skip(start).take(visible));
+    out
+}
+
+/// One (peer, provider) pair with cooling keys, as the cooling panel lists it.
+struct Cooling {
+    peer: String,
+    provider: String,
+    /// `None` when the publisher sent no cooldown time for the cooling keys.
+    remaining: Option<Duration>,
+    class: Option<String>,
+    last: Option<String>,
+}
+
+fn cooling_of(peer: &str, upstream: &crate::Upstream) -> Option<Cooling> {
+    let keyed = || {
+        upstream
+            .keys
+            .iter()
+            .flatten()
+            .filter(|k| k.state == "cooling")
+    };
+    if upstream.cooling_keys == 0 && keyed().next().is_none() {
+        return None;
+    }
+    let secs = keyed()
+        .filter_map(|k| k.cooldown_seconds)
+        .min()
+        .or(upstream.soonest_cooldown_seconds);
+    Some(Cooling {
+        peer: peer.to_owned(),
+        provider: upstream.name.clone(),
+        remaining: secs.map(Duration::from_secs),
+        class: crate::matrix::cooldown_class(upstream),
+        last: upstream.last_status_class.clone(),
+    })
+}
+
+/// Cooling lines under the matrix, one per fresh (peer, provider) with cooling keys, soonest first.
+pub fn cooling_panel(
+    fleet: &Fleet,
+    names: &[String],
+    provider: Option<&str>,
+    now: Instant,
+    width: usize,
+) -> Vec<Line> {
+    let mut entries: Vec<Cooling> = Vec::new();
+    for name in names {
+        let Some(peer) = fleet.peer(name, now).filter(|p| !p.stale) else {
+            continue;
+        };
+        for upstream in &peer.health.upstreams {
+            if provider.is_some_and(|p| p != upstream.name) {
+                continue;
+            }
+            entries.extend(cooling_of(name, upstream));
+        }
+    }
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    entries.sort_by(|a, b| {
+        (a.remaining.is_none(), a.remaining, &a.peer, &a.provider).cmp(&(
+            b.remaining.is_none(),
+            b.remaining,
+            &b.peer,
+            &b.provider,
+        ))
+    });
+
+    let shown = entries.len().min(COOLING_LINES);
+    let name_w = entries[..shown]
+        .iter()
+        .map(|e| text_width(&clip(&e.peer, NAME_MAX)))
+        .max()
+        .unwrap_or(0);
+    let provider_w = entries[..shown]
+        .iter()
+        .map(|e| text_width(&clip(&e.provider, LABEL_MAX)))
+        .max()
+        .unwrap_or(0);
+
+    let mut out = vec![line(vec![span("Cooling", Style::Title)], width)];
+    for e in &entries[..shown] {
+        let (filled, left) = match e.remaining {
+            Some(remaining) => {
+                let scale = cooldown_scale(e.class.as_deref(), remaining);
+                (
+                    bar_cells(remaining, scale, COOLING_BAR),
+                    fmt_duration(remaining),
+                )
+            }
+            None => (COOLING_BAR, "?".to_owned()),
+        };
+        out.push(line(
+            vec![
+                span(
+                    format!("  {}  ", pad(&clip(&e.peer, NAME_MAX), name_w)),
+                    Style::Plain,
+                ),
+                span(
+                    format!("{}  ", pad(&clip(&e.provider, LABEL_MAX), provider_w)),
+                    Style::Plain,
+                ),
+                span("◐ cooling", Style::Warn),
+                span(format!("  [{}]", bar(filled, COOLING_BAR)), Style::Warn),
+                span(format!("  {left}"), Style::Plain),
+                span(
+                    format!("  last {}", e.last.as_deref().unwrap_or("-")),
+                    Style::Plain,
+                ),
+            ],
+            width,
+        ));
+    }
+    if entries.len() > shown {
+        out.push(line(
+            vec![span(
+                format!("  +{} more", entries.len() - shown),
+                Style::Dim,
+            )],
+            width,
+        ));
+    }
     out
 }
 
@@ -696,7 +939,7 @@ impl<'a> Grid<'a> {
         history: &History,
         label_max: usize,
         spark: bool,
-        gauge: bool,
+        gauge: Option<GaugeMode>,
         ver: bool,
     ) -> Self {
         let labels: Vec<String> = matrix
@@ -704,7 +947,10 @@ impl<'a> Grid<'a> {
             .iter()
             .map(|c| clip(&c.upstream, label_max))
             .collect();
-        let peaks: Vec<u64> = (0..labels.len()).map(|c| column_peak(matrix, c)).collect();
+        let mode = gauge.unwrap_or_default();
+        let peaks: Vec<u64> = (0..labels.len())
+            .map(|c| column_peak(matrix, c, mode))
+            .collect();
         let cells: Vec<Vec<Vec<(String, Style)>>> = order
             .iter()
             .map(|&i| {
@@ -733,7 +979,7 @@ impl<'a> Grid<'a> {
                     .map(|spans| spans.iter().map(|(text, _)| text_width(text)).sum())
                     .fold(0, usize::max);
                 let width = content.max(text_width(&labels[c]));
-                if gauge {
+                if gauge.is_some() {
                     width.max(GAUGE_WIDTH)
                 } else {
                     width
@@ -968,16 +1214,19 @@ fn cell_spans(
     combos: u32,
     pressure: Option<&Pressure>,
     scale: u64,
-    with_gauge: bool,
+    mode: Option<GaugeMode>,
 ) -> Vec<(String, Style)> {
     let (text, style) = cell_text(cell, combos);
-    if !with_gauge || matches!(cell, Cell::Absent | Cell::Stale) {
+    let Some(mode) = mode else {
+        return vec![(text, style)];
+    };
+    if matches!(cell, Cell::Absent | Cell::Stale) {
         return vec![(text, style)];
     }
     let mut chars = text.chars();
     let glyph = chars.next().map(String::from).unwrap_or_default();
     let rest: String = chars.collect();
-    let (gauge, gauge_style) = gauge(pressure, scale);
+    let (gauge, gauge_style) = gauge(pressure, scale, mode);
     let mut spans = vec![(glyph, style), (gauge, gauge_style)];
     if !rest.is_empty() {
         spans.push((rest, style));
@@ -1243,7 +1492,7 @@ mod tests {
         let lines = matrix_lines(&f, &peers, t0, 100);
         assert_eq!(
             lines[0].plain_text(),
-            "Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1"
+            "Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1   [req 1h]"
         );
     }
 
@@ -1789,7 +2038,7 @@ mod tests {
             rows: vec![],
         };
         let lines = render_matrix(&m, &History::new(0), Some(5), 100, None);
-        assert_eq!(texts(&lines), ["Fleet 0/0 fresh"]);
+        assert_eq!(texts(&lines), ["Fleet 0/0 fresh   [req 1h]"]);
     }
 
     #[test]
@@ -2318,5 +2567,312 @@ mod tests {
                 == "  openrouter: 1 healthy  0 cooling  0 disabled  1 model cooling  last 4xx"),
             "{card:?}"
         );
+    }
+
+    /// One peer with every figure, so each metric and window draws its own gauge.
+    fn gauge_doc() -> String {
+        r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "requests_1h":6,"limited_1h":0,
+             "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,6],
+             "request_minutes":[9,9,9,9,9,0,1,2,4,8],
+             "tokens_1h":10,"token_buckets":[10,0,0,0,0,0,0,0,0,0,0,0],
+             "token_minutes":[4,4,4,4,4,4,4,4,4,4]}]}"#
+            .to_owned()
+    }
+
+    fn gauge_row(mode: GaugeMode) -> (String, String) {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &gauge_doc(), t0);
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode);
+        (lines[0].plain_text(), row_text(&lines, "peer-a"))
+    }
+
+    #[test]
+    fn the_gauge_metric_and_window_choose_which_figures_are_drawn() {
+        let (title, row) = gauge_row(GaugeMode::default());
+        assert!(row.contains("■ ·····█"), "requests over the hour: {row:?}");
+        assert!(title.ends_with("[req 1h]"), "{title:?}");
+
+        let tokens = GaugeMode {
+            metric: GaugeMetric::Tokens,
+            window: GaugeWindow::Hour,
+        };
+        let (title, row) = gauge_row(tokens);
+        assert!(row.contains("■ █·····"), "tokens over the hour: {row:?}");
+        assert!(title.ends_with("[tok 1h]"), "{title:?}");
+
+        let minutes = GaugeMode {
+            metric: GaugeMetric::Requests,
+            window: GaugeWindow::Minutes,
+        };
+        let (title, row) = gauge_row(minutes);
+        assert!(
+            row.contains("■ ·▁▂▄█"),
+            "the newest five minutes, one cell each: {row:?}"
+        );
+        assert!(title.ends_with("[req 5m]"), "{title:?}");
+
+        let tokens_minutes = GaugeMode {
+            metric: GaugeMetric::Tokens,
+            window: GaugeWindow::Minutes,
+        };
+        let (title, row) = gauge_row(tokens_minutes);
+        assert!(row.contains("■ █████"), "{row:?}");
+        assert!(title.ends_with("[tok 5m]"), "{title:?}");
+    }
+
+    #[test]
+    fn the_minute_gauge_is_padded_to_the_hour_gauge_width() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &gauge_doc(), t0);
+        add(
+            &mut f,
+            "peer-b",
+            &usage_doc("peer-b", "[1,1,1,1,1,1,1,1,1,1,1,1]"),
+            t0,
+        );
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b"]), t0);
+        let layout = |mode: GaugeMode| {
+            let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode);
+            let header = lines[1].plain_text();
+            let row = row_text(&lines, "peer-a");
+            (first(&header, "load"), row.chars().count())
+        };
+        let hour = layout(GaugeMode::default());
+        let minutes = layout(GaugeMode {
+            metric: GaugeMetric::Requests,
+            window: GaugeWindow::Minutes,
+        });
+        assert_eq!(
+            hour, minutes,
+            "the host columns sit where the hour gauge put them"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_the_needed_array_draws_dots_not_an_error() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &usage_doc("peer-a", "[0,0,0,0,0,0,0,0,0,0,0,6]"),
+            t0,
+        );
+        let minutes = GaugeMode {
+            metric: GaugeMetric::Requests,
+            window: GaugeWindow::Minutes,
+        };
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, minutes);
+        assert!(row_text(&lines, "peer-a").contains("■ ·····"), "{lines:?}");
+        let tokens = GaugeMode {
+            metric: GaugeMetric::Tokens,
+            window: GaugeWindow::Hour,
+        };
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, tokens);
+        assert!(row_text(&lines, "peer-a").contains("■ ······"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_fleet_scale_follows_the_chosen_window() {
+        let t0 = Instant::now();
+        let minute_doc = |minutes: &str| {
+            format!(
+                r#"{{"instance":"x","observed_at":"t","upstreams":[
+                {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "requests_1h":1,"limited_1h":0,"request_minutes":{minutes}}}]}}"#
+            )
+        };
+        let mut f = fleet();
+        add(&mut f, "peer-q", &minute_doc("[0,0,0,0,0,3,3,3,3,3]"), t0);
+        add(&mut f, "peer-b", &minute_doc("[0,0,0,0,0,6,6,6,6,6]"), t0);
+        let minutes = GaugeMode {
+            metric: GaugeMetric::Requests,
+            window: GaugeWindow::Minutes,
+        };
+        let m = Matrix::build(&f, &names(&["peer-q", "peer-b"]), t0);
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, minutes);
+        assert!(row_text(&lines, "peer-q").contains("■ ▄▄▄▄▄"), "{lines:?}");
+        assert!(row_text(&lines, "peer-b").contains("■ █████"), "{lines:?}");
+    }
+
+    /// One peer with one provider and one cooling key.
+    fn cooling_doc(
+        peer: &str,
+        provider: &str,
+        cooldown: Option<u64>,
+        class: Option<&str>,
+        last: &str,
+    ) -> String {
+        let class = class
+            .map(|c| format!(r#","cooldown_class":"{c}""#))
+            .unwrap_or_default();
+        let secs = cooldown.map_or("null".to_owned(), |s| s.to_string());
+        format!(
+            r#"{{"instance":"{peer}","observed_at":"t","upstreams":[
+            {{"name":"{provider}","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
+             "soonest_cooldown_seconds":{secs},"last_status_class":"{last}",
+             "keys":[{{"name":"k","state":"cooling","cooldown_seconds":{secs}{class}}}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn no_cooling_keys_draw_no_cooling_panel() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", BARE_DOC, t0);
+        assert!(cooling_panel(&f, &names(&["peer-a"]), None, t0, 100).is_empty());
+    }
+
+    #[test]
+    fn a_stale_peer_with_cooling_keys_draws_no_cooling_panel() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = cooling_doc("peer-a", "zen", Some(60), Some("rate_limited"), "4xx");
+        add(&mut f, "peer-a", &doc, t0);
+        let later = t0 + Duration::from_secs(200);
+        assert!(cooling_panel(&f, &names(&["peer-a"]), None, later, 100).is_empty());
+    }
+
+    #[test]
+    fn the_cooling_panel_lists_soonest_first_with_drain_time_and_last_class() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &cooling_doc("peer-a", "zen", Some(3600), Some("quota_exhausted"), "4xx"),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &cooling_doc("peer-b", "gem", Some(45), Some("rate_limited"), "5xx"),
+            t0,
+        );
+        let lines = texts(&cooling_panel(
+            &f,
+            &names(&["peer-a", "peer-b"]),
+            None,
+            t0,
+            120,
+        ));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "Cooling");
+        assert!(
+            lines[1].contains("peer-b")
+                && lines[1].contains("gem")
+                && lines[1].contains("◐ cooling")
+                && lines[1].contains(&format!("[{}{}]", "█".repeat(15), "░".repeat(5)))
+                && lines[1].contains("45s")
+                && lines[1].contains("last 5xx"),
+            "rate limited 45s of 60s: {lines:?}"
+        );
+        assert!(
+            lines[2].contains("peer-a")
+                && lines[2].contains("zen")
+                && lines[2].contains(&format!("[{}{}]", "█".repeat(4), "░".repeat(16)))
+                && lines[2].contains("1h00m")
+                && lines[2].contains("last 4xx"),
+            "quota 1h of 5h: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_cooling_panel_caps_at_six_lines_then_counts_the_rest() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let peers: Vec<String> = (0..8).map(|i| format!("peer-{i}")).collect();
+        for (i, p) in peers.iter().enumerate() {
+            let doc = cooling_doc(p, "zen", Some(10 + i as u64), None, "4xx");
+            add(&mut f, p, &doc, t0);
+        }
+        let lines = texts(&cooling_panel(&f, &peers, None, t0, 100));
+        assert_eq!(lines.len(), 1 + 6 + 1, "{lines:?}");
+        assert!(lines[1].contains("peer-0"), "{lines:?}");
+        assert!(lines[6].contains("peer-5"), "{lines:?}");
+        assert_eq!(lines[7].trim(), "+2 more");
+    }
+
+    #[test]
+    fn the_cooling_panel_follows_the_provider_filter() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &cooling_doc("peer-a", "zen", Some(30), None, "4xx"),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &cooling_doc("peer-b", "gem", Some(40), None, "4xx"),
+            t0,
+        );
+        let peers = names(&["peer-a", "peer-b"]);
+        let lines = texts(&cooling_panel(&f, &peers, Some("gem"), t0, 100));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("peer-b"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("zen")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_cooling_key_without_a_known_time_draws_a_full_bar_and_a_question_mark() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = cooling_doc("peer-a", "zen", None, None, "4xx");
+        add(&mut f, "peer-a", &doc, t0);
+        let lines = texts(&cooling_panel(&f, &names(&["peer-a"]), None, t0, 100));
+        assert!(
+            lines[1].contains(&format!("[{}]", "█".repeat(20)))
+                && lines[1].contains("  ?  last 4xx"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_cooling_panel_clips_to_narrow_widths_without_panicking() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = cooling_doc("peer-a", "zen", Some(90), Some("transient"), "5xx");
+        add(&mut f, "peer-a", &doc, t0);
+        let peers = names(&["peer-a"]);
+        for width in [0, 1, 2, 5, 20, 40] {
+            for line in cooling_panel(&f, &peers, None, t0, width) {
+                assert!(
+                    line.plain_text().chars().count() <= width,
+                    "width {width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_gauge_mode_stays_inside_tiny_widths() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(&mut f, "peer-a", &gauge_doc(), t0);
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        for metric in [GaugeMetric::Requests, GaugeMetric::Tokens] {
+            for window in [GaugeWindow::Hour, GaugeWindow::Minutes] {
+                let mode = GaugeMode { metric, window };
+                for width in 0..=24 {
+                    let lines =
+                        render_matrix_mode(&m, &History::new(0), Some(0), width, None, mode);
+                    for line in lines {
+                        assert!(
+                            line.plain_text().chars().count() <= width,
+                            "{mode:?} width {width}: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

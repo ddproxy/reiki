@@ -102,6 +102,8 @@ pub(crate) fn upstreams(
             entry["request_buckets"] = json!(pressure.buckets(name, now));
             entry["tokens_1h"] = json!(pressure.token_totals(name, now));
             entry["token_buckets"] = json!(pressure.token_buckets(name, now));
+            entry["request_minutes"] = json!(pressure.minutes(name, now));
+            entry["token_minutes"] = json!(pressure.token_minutes(name, now));
         }
         if labels {
             entry["keys"] = Value::Array(listed);

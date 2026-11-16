@@ -32,6 +32,12 @@ fn upstream_schema() -> Value {
             "token_buckets": {"type": "array", "items": {"type": "integer", "minimum": 0},
                 "minItems": 12, "maxItems": 12,
                 "description": "Twelve five-minute token counts, oldest first, newest last; only with expose_usage"},
+            "request_minutes": {"type": "array", "items": {"type": "integer", "minimum": 0},
+                "minItems": 10, "maxItems": 10,
+                "description": "Ten one-minute attempt counts ending at the current minute, oldest first, newest last; only with expose_usage"},
+            "token_minutes": {"type": "array", "items": {"type": "integer", "minimum": 0},
+                "minItems": 10, "maxItems": 10,
+                "description": "Ten one-minute token counts ending at the current minute, oldest first, newest last; only with expose_usage"},
             "keys": {
                 "description": "Only with expose_key_labels",
                 "type": "array",

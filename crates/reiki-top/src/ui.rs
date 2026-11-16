@@ -5,6 +5,13 @@ pub use crossterm;
 pub use ratatui;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use fw_tui::sanitize::printable;
+use fw_tui::text::{display_width, pad_width, truncate_width};
+use fw_tui::theme::Theme;
+use fw_tui::widgets::{
+    render_footer_bar, render_frequency_chart, render_header_bar, render_line_chart,
+    render_overlay, render_tabs, FrequencyBar, LineChartConfig, Panel, Series, ToggleChip,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style as RatStyle};
 use ratatui::text::{Line as RatLine, Span as RatSpan};
@@ -14,10 +21,44 @@ use ratatui::Frame;
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
-const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix";
-/// The key hints on the footer's right side, matrix view.
+const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix  ? keys";
+/// The key hints under the matrix header. Kept within 100 columns so the header's status fits.
 const HINTS_MATRIX: &str =
-    "q quit  j/k peer  Enter detail  PgUp/PgDn  f provider  u metric  w window  p pause  v full view";
+    "q quit  j/k peer  Enter detail  f filter  u metric  w window  m chart  p pause  v full  ? keys";
+
+/// Rows of the matrix header panel: a border, the status line, the hints and a border.
+const HEADER_ROWS: u16 = 4;
+/// Height from which the chart row appears.
+pub const CHARTS_MIN_HEIGHT: u16 = 28;
+/// Rows of the chart row, borders included.
+pub const CHART_ROWS: u16 = 10;
+
+/// The keys the matrix overlay lists.
+const MATRIX_KEYS: &[&str] = &[
+    "j/k, arrows, Tab, Shift-Tab   move the peer selection",
+    "Enter, e   open or close the peer detail",
+    "PgUp/PgDn, g/Home, G/End   scroll the detail",
+    "f   cycle the provider filter",
+    "c   clear the filter and the selection",
+    "u   gauge: requests or tokens",
+    "w   gauge: last hour or last five minutes",
+    "m   chart: load, disk, sessions, requests",
+    "p   freeze the screen; again to resume",
+    "v or E   full text view",
+    "?   this list; any key closes it, Ctrl-C quits",
+    "q or Esc   quit",
+];
+
+/// The keys the full view's overlay lists.
+const FULL_KEYS: &[&str] = &[
+    "j/k, arrows, PgUp/PgDn, g/Home, G/End   scroll",
+    "Tab, Shift-Tab   filter to the next or previous peer",
+    "c   clear the filter",
+    "p   freeze the screen; again to resume",
+    "v or E   back to the matrix",
+    "?   this list; any key closes it, Ctrl-C quits",
+    "q or Esc   quit",
+];
 
 /// The filter the caller applies before rendering; this layer only stores it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -50,6 +91,52 @@ pub enum Action {
     ToggleMetric,
     /// Switches the matrix gauge between the last hour and the last five minutes.
     ToggleWindow,
+    /// Cycles the chart's metric: load, disk, sessions, requests.
+    CycleChart,
+    /// Opens or closes the key list.
+    ToggleHelp,
+}
+
+/// What the matrix chart plots. Load is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChartMetric {
+    #[default]
+    Load,
+    Disk,
+    Sessions,
+    Requests,
+}
+
+impl ChartMetric {
+    /// The next metric in the `m` cycle.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Load => Self::Disk,
+            Self::Disk => Self::Sessions,
+            Self::Sessions => Self::Requests,
+            Self::Requests => Self::Load,
+        }
+    }
+
+    /// The lower-case name the footer chip shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Disk => "disk",
+            Self::Sessions => "sessions",
+            Self::Requests => "requests",
+        }
+    }
+
+    /// The capitalised name the chart title shows.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Load => "Load",
+            Self::Disk => "Disk",
+            Self::Sessions => "Sessions",
+            Self::Requests => "Requests",
+        }
+    }
 }
 
 /// Which screen the live view shows. The matrix is the default.
@@ -75,6 +162,10 @@ pub struct UiState {
     pub detail: Option<bool>,
     /// What the matrix gauges draw; requests over the hour by default.
     pub gauge: GaugeMode,
+    /// What the matrix chart plots.
+    pub chart: ChartMetric,
+    /// Whether the key list is open over the frame.
+    pub help: bool,
 }
 
 /// The last top line that still fills the viewport, or the last line when the viewport is
@@ -160,6 +251,8 @@ impl UiState {
                     GaugeWindow::Minutes => GaugeWindow::Hour,
                 };
             }
+            Action::CycleChart => self.chart = self.chart.next(),
+            Action::ToggleHelp => self.help = !self.help,
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
         true
@@ -191,9 +284,24 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Char('f') => Action::CycleProvider,
         KeyCode::Char('u') => Action::ToggleMetric,
         KeyCode::Char('w') => Action::ToggleWindow,
+        KeyCode::Char('m') => Action::CycleChart,
+        KeyCode::Char('?') => Action::ToggleHelp,
         _ => return None,
     };
     Some(action)
+}
+
+/// While the key list is open, the next key press closes it and does nothing else. Ctrl-C is
+/// not swallowed, so it still quits. Returns true when the key was used up here.
+pub fn dismiss_help(state: &mut UiState, event: KeyEvent) -> bool {
+    if !state.help || event.kind == KeyEventKind::Release {
+        return false;
+    }
+    if event.code == KeyCode::Char('c') && event.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    state.help = false;
+    true
 }
 
 fn rat_style(style: Style) -> RatStyle {
@@ -251,6 +359,14 @@ pub fn draw(frame: &mut Frame, lines: &[view::Line], state: &UiState, status: &s
         Paragraph::new(footer_text(state, status, HINTS)),
         footer_area,
     );
+    if state.help {
+        draw_help(frame, area, FULL_KEYS);
+    }
+}
+
+fn draw_help(frame: &mut Frame, area: Rect, keys: &[&str]) {
+    let lines: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+    render_overlay(area, frame.buffer_mut(), " Keys ", &lines, &Theme::auto());
 }
 
 /// The detail pane's total height for a terminal of `screen_height` rows: a third of the body
@@ -264,52 +380,331 @@ pub fn detail_height(screen_height: u16) -> u16 {
     }
 }
 
-/// Draws the matrix over the body, then the selected peer's detail card in a bordered pane
-/// when `detail` is given. `state.scroll` scrolls the detail pane; the matrix is not scrolled.
-pub fn draw_matrix(
+/// Rows of each band of the matrix frame, top to bottom. Zero means the band is not drawn.
+/// `charts` and `detail` never both have rows: the open peer card takes the chart row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Bands {
+    pub header: u16,
+    pub tabs: u16,
+    pub peers: u16,
+    pub cooling: u16,
+    pub charts: u16,
+    pub detail: u16,
+    pub footer: u16,
+}
+
+/// Splits a terminal height into the matrix frame's bands. Short terminals lose the chart row,
+/// then the cooling panel, then the tab row, and the header folds to one line, so a panel goes
+/// before the matrix loses a row. The Peers panel takes what is left, clipped only when even the
+/// bare matrix does not fit. `matrix_lines` and `cooling_lines` count content, not borders.
+pub fn bands(height: u16, matrix_lines: usize, cooling_lines: usize, detail_open: bool) -> Bands {
+    let footer = u16::from(height > 0);
+    let body = height - footer;
+    let detail = if detail_open {
+        detail_height(height)
+    } else {
+        0
+    };
+    let charts = if detail == 0 && height >= CHARTS_MIN_HEIGHT {
+        CHART_ROWS
+    } else {
+        0
+    };
+    let cooling = if cooling_lines == 0 {
+        0
+    } else {
+        u16::try_from(cooling_lines).unwrap_or(u16::MAX - 2) + 2
+    };
+    let mut b = Bands {
+        header: HEADER_ROWS,
+        tabs: 1,
+        peers: 0,
+        cooling,
+        charts,
+        detail,
+        footer,
+    };
+    let peers_want = u32::try_from(matrix_lines).unwrap_or(u32::MAX - 2) + 2;
+    let fits = |b: &Bands| {
+        u32::from(b.header)
+            + u32::from(b.tabs)
+            + u32::from(b.cooling)
+            + u32::from(b.charts)
+            + u32::from(b.detail)
+            + peers_want
+            <= u32::from(body)
+    };
+    if !fits(&b) {
+        b.charts = 0;
+    }
+    if !fits(&b) {
+        b.cooling = 0;
+    }
+    if !fits(&b) {
+        b.tabs = 0;
+    }
+    if !fits(&b) {
+        b.header = if body > 0 { 1 } else { 0 };
+    }
+    let used = u32::from(b.header)
+        + u32::from(b.tabs)
+        + u32::from(b.cooling)
+        + u32::from(b.charts)
+        + u32::from(b.detail);
+    b.peers = u16::try_from(u32::from(body).saturating_sub(used)).unwrap_or(0);
+    b
+}
+
+/// What one matrix frame draws, built by the caller from the fleet and its history.
+pub struct MatrixFrame<'a> {
+    pub version: &'a str,
+    /// The UTC time of this frame, `HH:MM:SSZ`.
+    pub clock: &'a str,
+    /// `N of M peers fresh`, with the age of a paused snapshot.
+    pub status: &'a str,
+    /// Every provider column in order, unfiltered: the tabs.
+    pub providers: &'a [String],
+    /// The matrix lines: the fleet line, the grid header, then one line per peer.
+    pub matrix: &'a [view::Line],
+    /// How many of `matrix` are peer rows, and the selected row's display position.
+    pub rows: usize,
+    pub selected: Option<usize>,
+    /// The cooling panel's lines, without its title. Empty hides the panel.
+    pub cooling: &'a [view::Line],
+    /// The selected peer's detail card, when open.
+    pub detail: Option<&'a [view::Line]>,
+    pub chart_title: &'a str,
+    /// The series' name in the chart's legend.
+    pub chart_name: &'a str,
+    pub chart: &'a [Option<f64>],
+    /// Healthy, cooling and disabled keys across the fleet.
+    pub keys: [u64; 3],
+}
+
+/// Takes `rows` off the top of `rest`, or whatever is left of it.
+fn carve(rest: &mut Rect, rows: u16) -> Rect {
+    let rows = rows.min(rest.height);
+    let top = Rect::new(rest.x, rest.y, rest.width, rows);
+    rest.y = rest.y.saturating_add(rows);
+    rest.height -= rows;
+    top
+}
+
+/// A line with `left` at the start and `right` at the end, cut to `width` columns.
+fn split_line(width: u16, left: &str, right: &str, theme: &Theme) -> RatLine<'static> {
+    let width = usize::from(width);
+    let right = truncate_width(right, width);
+    let right_w = display_width(&right);
+    let left_w = width.saturating_sub(right_w);
+    let left = pad_width(&truncate_width(left, left_w), left_w);
+    RatLine::from(vec![
+        RatSpan::raw(left),
+        RatSpan::styled(right, theme.label),
+    ])
+}
+
+fn paint(frame: &mut Frame, area: Rect, lines: &[view::Line]) {
+    frame.render_widget(Paragraph::new(to_ratatui(lines)), area);
+}
+
+fn draw_header(
     frame: &mut Frame,
-    lines: &[view::Line],
-    detail: Option<&[view::Line]>,
+    area: Rect,
+    view: &MatrixFrame<'_>,
     state: &UiState,
-    status: &str,
+    theme: &Theme,
 ) {
+    let title = format!("reiki top v{}", view.version);
+    let live = if state.paused { "paused" } else { "live" };
+    if area.height < HEADER_ROWS {
+        let left = format!("{title}  {live} · {}", view.status);
+        render_header_bar(
+            area,
+            frame.buffer_mut(),
+            &[left],
+            &[view.clock.to_owned()],
+            theme,
+        );
+        return;
+    }
+    frame.render_widget(
+        Panel::new(&title)
+            .block(theme)
+            .title_top(RatLine::from(view.clock).right_aligned()),
+        area,
+    );
+    let inner = Panel::inner(area);
+    let status = format!("{live} · {}", view.status);
+    let status_row = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(split_line(inner.width, &status, "", theme)),
+        status_row,
+    );
+    let hints_row = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(split_line(inner.width, HINTS_MATRIX, "", theme)),
+        hints_row,
+    );
+}
+
+fn draw_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    view: &MatrixFrame<'_>,
+    state: &UiState,
+    theme: &Theme,
+) {
+    let mut labels: Vec<&str> = vec!["All"];
+    labels.extend(view.providers.iter().map(String::as_str));
+    let selected = state
+        .filter
+        .provider
+        .as_deref()
+        .and_then(|p| view.providers.iter().position(|c| c == p))
+        .map_or(0, |i| i + 1);
+    render_tabs(area, frame.buffer_mut(), &labels, selected, theme);
+}
+
+fn draw_charts(frame: &mut Frame, area: Rect, view: &MatrixFrame<'_>, theme: &Theme) {
+    let left_w = u16::try_from(u32::from(area.width) * 2 / 3).unwrap_or(area.width);
+    let left = Rect::new(area.x, area.y, left_w, area.height);
+    let right = Rect::new(
+        area.x.saturating_add(left_w),
+        area.y,
+        area.width - left_w,
+        area.height,
+    );
+    let title = printable(view.chart_title);
+    frame.render_widget(Panel::new(&title).block(theme), left);
+    let series = [Series::new(view.chart_name, view.chart.to_vec())];
+    render_line_chart(
+        Panel::inner(left),
+        frame.buffer_mut(),
+        &series,
+        &LineChartConfig::default(),
+        theme,
+    );
+
+    frame.render_widget(Panel::new("Keys").block(theme), right);
+    let [healthy, cooling, disabled] = view.keys;
+    let bars = [
+        FrequencyBar {
+            label: "healthy".to_owned(),
+            count: healthy,
+        },
+        FrequencyBar {
+            label: "cooling".to_owned(),
+            count: cooling,
+        },
+        FrequencyBar {
+            label: "disabled".to_owned(),
+            count: disabled,
+        },
+    ];
+    render_frequency_chart(Panel::inner(right), frame.buffer_mut(), &bars, theme);
+}
+
+/// Draws the matrix frame: a header panel, the provider tabs, the Peers panel, the cooling panel,
+/// then either the selected peer's detail card or the chart row, and the footer chips. The bands
+/// come from [`bands`]; nothing here is clipped except what a short terminal cannot fit.
+pub fn draw_matrix(frame: &mut Frame, view: &MatrixFrame<'_>, state: &UiState) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let body_height = area.height.saturating_sub(1);
-    let footer_y = area.y.saturating_add(body_height);
-    let detail_rows = detail.map_or(0, |_| detail_height(area.height));
+    let theme = Theme::auto();
+    let b = bands(
+        area.height,
+        view.matrix.len(),
+        view.cooling.len(),
+        view.detail.is_some(),
+    );
 
-    if body_height > 0 {
-        let top_rows = body_height.saturating_sub(detail_rows);
-        if top_rows > 0 {
-            let top = Rect::new(area.x, area.y, area.width, top_rows);
-            frame.render_widget(Paragraph::new(to_ratatui(lines)), top);
+    let mut rest = area;
+    let header = carve(&mut rest, b.header);
+    let tabs = carve(&mut rest, b.tabs);
+    let peers = carve(&mut rest, b.peers);
+    let cooling = carve(&mut rest, b.cooling);
+    let bottom = carve(&mut rest, b.charts.max(b.detail));
+    let footer = carve(&mut rest, b.footer);
+
+    if header.height > 0 {
+        draw_header(frame, header, view, state, &theme);
+    }
+    if tabs.height > 0 {
+        draw_tabs(frame, tabs, view, state, &theme);
+    }
+    if peers.height > 0 {
+        frame.render_widget(Panel::new("Peers").block(&theme), peers);
+        let inner = Panel::inner(peers);
+        let visible = view::window_matrix(
+            view.matrix.to_vec(),
+            view.rows,
+            view.selected,
+            usize::from(inner.height),
+        );
+        paint(frame, inner, &visible);
+    }
+    if cooling.height > 0 {
+        frame.render_widget(Panel::new("Cooling").block(&theme), cooling);
+        paint(frame, Panel::inner(cooling), view.cooling);
+    }
+    if b.detail > 0 {
+        if let Some(card) = view.detail {
+            frame.render_widget(Panel::new("Detail").block(&theme), bottom);
+            let inner = Panel::inner(bottom);
+            let viewport = usize::from(inner.height);
+            let start = state.scroll.min(max_scroll(card.len(), viewport));
+            let end = start.saturating_add(viewport).min(card.len());
+            paint(frame, inner, &card[start..end]);
         }
-        if let (Some(card), true) = (detail, detail_rows > 0) {
-            let pane = Rect::new(
-                area.x,
-                area.y.saturating_add(top_rows),
-                area.width,
-                detail_rows,
-            );
-            let block = Block::default().borders(Borders::ALL);
-            let inner = block.inner(pane);
-            frame.render_widget(block, pane);
-            if inner.width > 0 && inner.height > 0 {
-                let viewport = usize::from(inner.height);
-                let start = state.scroll.min(max_scroll(card.len(), viewport));
-                let end = start.saturating_add(viewport).min(card.len());
-                frame.render_widget(Paragraph::new(to_ratatui(&card[start..end])), inner);
-            }
-        }
+    } else if b.charts > 0 {
+        draw_charts(frame, bottom, view, &theme);
     }
 
-    frame.render_widget(
-        Paragraph::new(footer_text(state, status, HINTS_MATRIX)),
-        Rect::new(area.x, footer_y, area.width, 1),
-    );
+    if footer.height > 0 {
+        let gauge = state
+            .gauge
+            .tag()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let mut chips = vec![
+            ToggleChip::toggle("detail", view.detail.is_some()),
+            ToggleChip {
+                label: gauge,
+                on: None,
+                value: None,
+            },
+            ToggleChip::value("chart", state.chart.label()),
+        ];
+        if let Some(provider) = &state.filter.provider {
+            chips.push(ToggleChip::value("filter", provider));
+        }
+        if state.paused {
+            chips.push(ToggleChip {
+                label: "paused".to_owned(),
+                on: None,
+                value: None,
+            });
+        }
+        render_footer_bar(footer, frame.buffer_mut(), "", &chips, &theme);
+    }
+
+    if state.help {
+        draw_help(frame, area, MATRIX_KEYS);
+    }
+}
+
+/// `HH:MM:SSZ` for a Unix time in seconds, in UTC.
+pub fn utc_clock(unix_secs: u64) -> String {
+    let day_secs = unix_secs % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        day_secs / 3600,
+        (day_secs / 60) % 60,
+        day_secs % 60
+    )
 }
 
 fn footer_text(state: &UiState, status: &str, hints: &str) -> String {
@@ -500,6 +895,8 @@ mod tests {
             mode: Mode::Full,
             detail: Some(true),
             gauge: GaugeMode::default(),
+            chart: ChartMetric::Disk,
+            help: true,
         };
         let before = state.clone();
         assert!(!state.apply(Action::Quit, 10, 3));
@@ -687,10 +1084,17 @@ mod tests {
     }
 
     #[test]
-    fn the_matrix_footer_names_the_gauge_keys_on_one_line() {
+    fn the_matrix_hints_name_the_new_keys_on_one_line_within_100_columns() {
         assert!(!HINTS_MATRIX.contains('\n'));
         assert!(HINTS_MATRIX.contains("u metric"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("w window"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("m chart"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("? keys"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("v full"), "{HINTS_MATRIX:?}");
+        assert!(
+            fw_tui::text::display_width(HINTS_MATRIX) <= 98,
+            "fits the panel"
+        );
     }
 
     #[test]
@@ -750,61 +1154,184 @@ mod tests {
         assert_eq!(state.mode, Mode::Matrix);
     }
 
-    fn rendered_matrix(
-        lines: &[view::Line],
-        detail: Option<&[view::Line]>,
-        state: &UiState,
-        status: &str,
-        width: u16,
-        height: u16,
-    ) -> Buffer {
+    /// The data one matrix frame is drawn from, owned so tests can lend it out.
+    struct Fixture {
+        providers: Vec<String>,
+        matrix: Vec<view::Line>,
+        rows: usize,
+        cooling: Vec<view::Line>,
+        detail: Option<Vec<view::Line>>,
+        chart: Vec<Option<f64>>,
+    }
+
+    impl Fixture {
+        fn sample() -> Self {
+            Self {
+                providers: vec!["gemini".to_owned(), "zen".to_owned()],
+                matrix: vec![
+                    line("Fleet 2/2 fresh   gemini 2/2   zen 1/2"),
+                    line("  peer-a  ■ ······"),
+                    line("  peer-b  · ◐ ▁▂▃"),
+                ],
+                rows: 2,
+                cooling: Vec::new(),
+                detail: None,
+                chart: vec![Some(1.0), Some(2.0), Some(3.0)],
+            }
+        }
+
+        fn frame(&self) -> MatrixFrame<'_> {
+            MatrixFrame {
+                version: "9.8.7",
+                clock: "12:34:56Z",
+                status: "2 of 2 peers fresh",
+                providers: &self.providers,
+                matrix: &self.matrix,
+                rows: self.rows,
+                selected: None,
+                cooling: &self.cooling,
+                detail: self.detail.as_deref(),
+                chart_title: "Load · fleet",
+                chart_name: "load",
+                chart: &self.chart,
+                keys: [5, 2, 1],
+            }
+        }
+    }
+
+    fn rendered_matrix(fixture: &Fixture, state: &UiState, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("a test terminal");
         terminal
-            .draw(|frame| draw_matrix(frame, lines, detail, state, status))
+            .draw(|frame| draw_matrix(frame, &fixture.frame(), state))
             .expect("drawing succeeds");
         terminal.backend().buffer().clone()
     }
 
-    #[test]
-    fn the_matrix_footer_hints_the_matrix_keys() {
-        let buffer = rendered_matrix(&numbered(1), None, &UiState::default(), "ok", 100, 8);
-        let footer = row_text(&buffer, 7);
-        assert!(footer.contains("Enter detail"), "{footer:?}");
-        assert!(footer.contains("v full view"), "{footer:?}");
+    fn all_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|r| row_text(buffer, r))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn the_detail_pane_is_a_bordered_third_under_the_matrix() {
-        let rows = numbered(3);
-        let card = vec![line("peer-b  instance peer-b"), line("    b  cooling")];
-        let buffer = rendered_matrix(&rows, Some(&card), &UiState::default(), "ok", 40, 20);
-        // Body is 19 rows; the pane takes 19 / 3 = 6, so its top border is row 13.
-        assert_eq!(row_text(&buffer, 13), format!("┌{}┐", "─".repeat(38)));
+    fn the_matrix_frame_draws_header_tabs_peers_and_footer_at_100x30() {
+        let buffer = rendered_matrix(&Fixture::sample(), &UiState::default(), 100, 30);
+        let title = row_text(&buffer, 0);
+        assert!(title.contains("reiki top v9.8.7"), "{title:?}");
+        assert!(title.contains("12:34:56Z"), "{title:?}");
+        assert!(row_text(&buffer, 1).contains("live · 2 of 2 peers fresh"));
+        assert!(row_text(&buffer, 2).contains("v full"), "hints");
+        let tabs = row_text(&buffer, 4);
+        assert!(
+            tabs.contains("All") && tabs.contains("gemini") && tabs.contains("zen"),
+            "{tabs:?}"
+        );
+        let text = all_text(&buffer);
+        assert!(text.contains("Peers"), "{text}");
+        assert!(text.contains("Keys"), "charts at 30 rows: {text}");
+        assert!(text.contains("Load · fleet"), "{text}");
+        let footer = row_text(&buffer, 29);
+        assert!(footer.contains("[□ detail]"), "{footer:?}");
+        assert!(footer.contains("[req 1h]"), "{footer:?}");
+        assert!(footer.contains("[chart: load]"), "{footer:?}");
+        assert!(
+            !footer.contains("paused") && !footer.contains("filter"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn the_tab_and_footer_follow_the_provider_filter_and_pause() {
+        let state = UiState {
+            paused: true,
+            filter: Filter {
+                peer: None,
+                provider: Some("zen".to_owned()),
+            },
+            detail: Some(true),
+            ..UiState::default()
+        };
+        let mut fixture = Fixture::sample();
+        fixture.detail = Some(vec![line("peer-a card")]);
+        let buffer = rendered_matrix(&fixture, &state, 100, 30);
+        let tabs = row_text(&buffer, 4);
+        let zen_at = tabs.find("zen").expect("zen tab");
+        assert!(tabs.contains("All"));
+        assert!(tabs[zen_at..].starts_with("zen"));
+        let footer = row_text(&buffer, 29);
+        assert!(footer.contains("[■ detail]"), "{footer:?}");
+        assert!(footer.contains("[filter: zen]"), "{footer:?}");
+        assert!(footer.contains("[paused]"), "{footer:?}");
+    }
+
+    #[test]
+    fn the_cooling_panel_appears_only_with_a_cooling_key() {
+        let closed = rendered_matrix(&Fixture::sample(), &UiState::default(), 100, 30);
+        assert!(!all_text(&closed).contains("Cooling"));
+        let mut cooling = Fixture::sample();
+        cooling.cooling = vec![line("  peer-b  zen  ◐ cooling  [▁▂]  45s")];
+        let open = rendered_matrix(&cooling, &UiState::default(), 100, 30);
+        let text = all_text(&open);
+        assert!(text.contains("Cooling"), "{text}");
+        assert!(text.contains("peer-b  zen  ◐ cooling"), "{text}");
+    }
+
+    #[test]
+    fn the_chart_row_needs_twenty_eight_rows() {
+        let fixture = Fixture::sample();
+        let short = all_text(&rendered_matrix(&fixture, &UiState::default(), 100, 27));
+        assert!(!short.contains("Keys"), "no chart row at 27 rows");
+        assert!(!short.contains("Load · fleet"));
+        let tall = all_text(&rendered_matrix(&fixture, &UiState::default(), 100, 28));
+        assert!(tall.contains("Keys") && tall.contains("Load · fleet"));
+    }
+
+    #[test]
+    fn an_open_peer_card_takes_the_chart_row_and_keeps_its_place() {
+        let mut fixture = Fixture::sample();
+        fixture.detail = Some(vec![
+            line("peer-b  instance peer-b"),
+            line("    b  cooling"),
+        ]);
+        let state = UiState::default();
+        let buffer = rendered_matrix(&fixture, &state, 40, 20);
+        // Body is 19 rows: header 4, tabs 1, the card's third (6) at the bottom.
+        assert!(
+            row_text(&buffer, 13).starts_with('╭'),
+            "{:?}",
+            row_text(&buffer, 13)
+        );
+        assert!(row_text(&buffer, 13).contains("Detail"));
         assert_eq!(
             row_text(&buffer, 14),
             format!("│{:<38}│", "peer-b  instance peer-b")
         );
-        assert_eq!(row_text(&buffer, 0), format!("{:<40}", "line 0"));
-        let closed = rendered_matrix(&rows, None, &UiState::default(), "ok", 40, 20);
-        assert!(!(0..20).any(|r| row_text(&closed, r).starts_with('┌')));
+        assert!(
+            !all_text(&buffer).contains("Keys"),
+            "the card replaces the charts"
+        );
+        fixture.detail = None;
+        let closed = rendered_matrix(&fixture, &state, 40, 20);
+        assert!(!(0..20).any(|r| row_text(&closed, r).contains("Detail")));
     }
 
     #[test]
     fn the_detail_scroll_shows_its_own_window() {
-        let rows = numbered(2);
-        let card = numbered(12);
+        let mut fixture = Fixture::sample();
+        fixture.detail = Some(numbered(12));
         let state = UiState {
             scroll: 4,
             ..UiState::default()
         };
-        let buffer = rendered_matrix(&rows, Some(&card), &state, "ok", 40, 20);
+        let buffer = rendered_matrix(&fixture, &state, 40, 20);
         assert_eq!(row_text(&buffer, 14), format!("│{:<38}│", "line 4"));
         let far = UiState {
             scroll: 99,
             ..UiState::default()
         };
-        let buffer = rendered_matrix(&rows, Some(&card), &far, "ok", 40, 20);
+        let buffer = rendered_matrix(&fixture, &far, 40, 20);
         // The pane has four inner rows, from row 14; the last page starts at 12 - 4.
         assert_eq!(
             row_text(&buffer, 17),
@@ -814,17 +1341,160 @@ mod tests {
     }
 
     #[test]
+    fn the_help_overlay_lists_the_keys_and_any_key_closes_it() {
+        let state = UiState {
+            help: true,
+            ..UiState::default()
+        };
+        let text = all_text(&rendered_matrix(&Fixture::sample(), &state, 100, 30));
+        assert!(text.contains(" Keys "), "{text}");
+        assert!(text.contains("any key closes it"), "{text}");
+        let full = all_text(&rendered(&numbered(3), &state, "ok", 100, 30));
+        assert!(full.contains(" Keys "), "{full}");
+
+        let mut open = state.clone();
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(dismiss_help(&mut open, x));
+        assert!(!open.help);
+        let mut open = state.clone();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!dismiss_help(&mut open, ctrl_c), "Ctrl-C still quits");
+        assert!(open.help);
+        let mut closed = UiState::default();
+        assert!(!dismiss_help(&mut closed, x));
+    }
+
+    #[test]
+    fn question_mark_and_m_map_to_the_overlay_and_the_chart() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(map_key(q), Some(Action::ToggleHelp));
+        let m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(map_key(m), Some(Action::CycleChart));
+        let mut state = UiState::default();
+        state.apply(Action::ToggleHelp, 0, 1);
+        assert!(state.help);
+        state.apply(Action::ToggleHelp, 0, 1);
+        assert!(!state.help);
+        let order: Vec<ChartMetric> = (0..5)
+            .map(|_| {
+                let before = state.chart;
+                state.apply(Action::CycleChart, 0, 1);
+                before
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ChartMetric::Load,
+                ChartMetric::Disk,
+                ChartMetric::Sessions,
+                ChartMetric::Requests,
+                ChartMetric::Load,
+            ]
+        );
+    }
+
+    #[test]
+    fn bands_drop_charts_then_cooling_then_tabs_then_fold_the_header() {
+        // Three peers, so the bare matrix is five rows with its border.
+        for height in 0..=60 {
+            let b = bands(height, 3, 3, false);
+            let total = u32::from(b.header)
+                + u32::from(b.tabs)
+                + u32::from(b.peers)
+                + u32::from(b.cooling)
+                + u32::from(b.charts)
+                + u32::from(b.footer);
+            assert!(total <= u32::from(height), "{height}: {b:?}");
+            if height >= CHARTS_MIN_HEIGHT {
+                assert_eq!(b.charts, CHART_ROWS, "{height}");
+            } else {
+                assert_eq!(b.charts, 0, "{height}");
+            }
+            if b.tabs == 0 {
+                assert_eq!(
+                    (b.cooling, b.charts),
+                    (0, 0),
+                    "tabs go after the panels: {height}"
+                );
+            }
+            if b.header == 1 {
+                assert_eq!(b.tabs, 0, "the header folds after the tabs: {height}");
+            }
+            if b.header == HEADER_ROWS && height >= 12 {
+                assert!(b.peers >= 5, "the whole matrix shows at {height}: {b:?}");
+            }
+        }
+        assert_eq!(
+            bands(27, 3, 3, false).cooling,
+            5,
+            "the cooling panel stays at 27 rows"
+        );
+        assert_eq!(
+            bands(12, 3, 3, false).cooling,
+            0,
+            "and goes before the matrix is cut"
+        );
+        assert_eq!(bands(12, 3, 3, false).peers, 6);
+        assert_eq!(bands(0, 0, 0, true), Bands::default());
+    }
+
+    #[test]
+    fn a_fleet_too_tall_for_the_panels_loses_them_and_clips_the_matrix_last() {
+        let b = bands(30, 40, 3, false);
+        assert_eq!((b.charts, b.cooling, b.tabs, b.header), (0, 0, 0, 1));
+        assert_eq!(b.peers, 28, "the Peers panel takes the rest");
+    }
+
+    #[test]
+    fn utc_clock_formats_the_time_of_day() {
+        assert_eq!(utc_clock(0), "00:00:00Z");
+        assert_eq!(utc_clock(3661), "01:01:01Z");
+        assert_eq!(utc_clock(86_400 + 5), "00:00:05Z");
+        assert_eq!(utc_clock(u64::MAX).len(), "00:00:00Z".len());
+    }
+
+    #[test]
+    fn every_matrix_size_draws_without_panicking() {
+        let mut fixture = Fixture::sample();
+        fixture.cooling = numbered(9);
+        let card = numbered(12);
+        let states = [
+            UiState::default(),
+            UiState {
+                paused: true,
+                help: true,
+                detail: Some(true),
+                ..UiState::default()
+            },
+        ];
+        for (width, height) in [
+            (0, 0),
+            (1, 1),
+            (20, 5),
+            (60, 12),
+            (100, 30),
+            (200, 60),
+            (1, 40),
+            (40, 1),
+        ] {
+            for state in &states {
+                rendered_matrix(&fixture, state, width, height);
+                fixture.detail = Some(card.clone());
+                rendered_matrix(&fixture, state, width, height);
+                fixture.detail = None;
+                let buffer = rendered(&numbered(3), state, "ok", width, height);
+                assert_eq!(buffer.area.height, height);
+            }
+        }
+    }
+
+    #[test]
     fn tiny_matrix_screens_do_not_panic() {
-        let card = numbered(4);
+        let mut fixture = Fixture::sample();
+        fixture.detail = Some(numbered(4));
         for (width, height) in [(0, 0), (1, 1), (3, 2), (2, 1), (40, 1), (40, 4), (40, 9)] {
-            let buffer = rendered_matrix(
-                &numbered(3),
-                Some(&card),
-                &UiState::default(),
-                "ok",
-                width,
-                height,
-            );
+            let buffer = rendered_matrix(&fixture, &UiState::default(), width, height);
             assert_eq!(buffer.area.width, width);
             assert_eq!(buffer.area.height, height);
         }

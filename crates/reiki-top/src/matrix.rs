@@ -377,17 +377,21 @@ impl History {
         );
     }
 
+    /// The raw values of one metric over the retained window, oldest first. Samples missing the
+    /// metric are skipped.
+    pub fn values(&self, peer: &str, metric: Metric) -> Vec<f64> {
+        self.peers.get(peer).map_or_else(Vec::new, |ring| {
+            ring.samples
+                .iter()
+                .filter_map(|s| value(s, metric))
+                .collect()
+        })
+    }
+
     /// Levels 0..=8 over the retained window. Samples missing the metric are skipped, so the
     /// series can be shorter than the window. Scaling is stated on [`Metric`].
     pub fn series(&self, peer: &str, metric: Metric) -> Vec<u64> {
-        let Some(ring) = self.peers.get(peer) else {
-            return Vec::new();
-        };
-        let values: Vec<f64> = ring
-            .samples
-            .iter()
-            .filter_map(|s| value(s, metric))
-            .collect();
+        let values = self.values(peer, metric);
         if values.is_empty() {
             return Vec::new();
         }
@@ -460,6 +464,61 @@ pub fn cooldown_class(upstream: &Upstream) -> Option<String> {
         .and_then(|k| k.cooldown_class.clone())
 }
 
+/// The peers' values of one metric summed by sample age, so the newest samples line up at the
+/// right edge. Disk takes the fullest peer instead of a sum.
+pub fn fleet_series(history: &History, peers: &[String], metric: Metric) -> Vec<Option<f64>> {
+    let series: Vec<Vec<f64>> = peers
+        .iter()
+        .map(|peer| history.values(peer, metric))
+        .collect();
+    let len = series.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out: Vec<Option<f64>> = vec![None; len];
+    for values in &series {
+        for (age, v) in values.iter().rev().enumerate() {
+            let slot = &mut out[len - 1 - age];
+            *slot = Some(match (*slot, metric) {
+                (None, _) => *v,
+                (Some(acc), Metric::DiskPercent) => acc.max(*v),
+                (Some(acc), _) => acc + v,
+            });
+        }
+    }
+    out
+}
+
+/// Requests per five-minute bucket, summed over the rows' providers. `None` for every bucket
+/// when no row publishes request figures.
+pub fn request_series(rows: &[Row]) -> Vec<Option<f64>> {
+    let mut sums = [0u64; 12];
+    let mut published = false;
+    for pressure in rows.iter().flat_map(|row| row.pressure.iter().flatten()) {
+        published = true;
+        for (sum, bucket) in sums.iter_mut().zip(pressure.buckets) {
+            *sum += u64::from(bucket);
+        }
+    }
+    if !published {
+        return vec![None; sums.len()];
+    }
+    sums.iter().map(|&n| Some(n as f64)).collect()
+}
+
+/// Keys by state, summed over the fresh peers and every provider: healthy, cooling, disabled.
+pub fn key_counts(fleet: &Fleet, peers: &[String], now: Instant) -> [u64; 3] {
+    let mut counts = [0u64; 3];
+    for name in peers {
+        let Some(peer) = fleet.peer(name, now).filter(|p| !p.stale) else {
+            continue;
+        };
+        for upstream in &peer.health.upstreams {
+            counts[0] += u64::from(upstream.healthy_keys);
+            counts[1] += u64::from(upstream.cooling_keys);
+            counts[2] += u64::from(upstream.disabled_keys);
+        }
+    }
+    counts
+}
+
 fn value(sample: &Sample, metric: Metric) -> Option<f64> {
     match metric {
         Metric::Load1 => sample.load1.filter(|v| v.is_finite() && *v >= 0.0),
@@ -506,6 +565,12 @@ mod tests {
 
     fn names(peers: &[&str]) -> Vec<String> {
         peers.iter().map(|p| p.to_string()).collect()
+    }
+
+    macro_rules! doc {
+        ($name:literal) => {
+            doc(&upstream($name, 0, 0, 0))
+        };
     }
 
     #[test]
@@ -1149,5 +1214,92 @@ mod tests {
         add(&mut f, "peer-a", &doc(&upstream("zen", 1, 0, 0)), t0);
         let m = Matrix::build(&f, &names(&["peer-a"]), t0);
         assert!(m.filter_provider("gone").is_none());
+    }
+
+    fn sample(load: f64, disk: f64, sessions: u64) -> Sample {
+        Sample {
+            load1: Some(load),
+            disk_percent: Some(disk),
+            sessions: Some(sessions),
+        }
+    }
+
+    #[test]
+    fn raw_values_are_the_unscaled_samples_oldest_first() {
+        let mut h = History::new(60);
+        h.push("peer-a", sample(0.5, 40.0, 3));
+        h.push("peer-a", Sample::default());
+        h.push("peer-a", sample(2.5, 60.0, 7));
+        assert_eq!(h.values("peer-a", Metric::Load1), vec![0.5, 2.5]);
+        assert_eq!(h.values("peer-a", Metric::Sessions), vec![3.0, 7.0]);
+        assert!(h.values("nobody", Metric::Load1).is_empty());
+    }
+
+    #[test]
+    fn fleet_load_sums_by_age_and_disk_takes_the_fullest_peer() {
+        let mut h = History::new(60);
+        h.push("peer-a", sample(1.0, 30.0, 1));
+        h.push("peer-a", sample(2.0, 40.0, 1));
+        h.push("peer-b", sample(4.0, 90.0, 1));
+        let peers = names(&["peer-a", "peer-b"]);
+        assert_eq!(
+            fleet_series(&h, &peers, Metric::Load1),
+            vec![Some(1.0), Some(2.0 + 4.0)],
+            "the newest samples line up at the right edge"
+        );
+        assert_eq!(
+            fleet_series(&h, &peers, Metric::DiskPercent),
+            vec![Some(30.0), Some(90.0)],
+            "the fullest peer at each age"
+        );
+        assert!(fleet_series(&h, &names(&["nobody"]), Metric::Load1).is_empty());
+    }
+
+    #[test]
+    fn request_buckets_sum_over_providers_and_stay_gaps_without_figures() {
+        let doc = doc(&format!(
+            "{},{}",
+            usage_upstream("zen", 3, 0, "[1,0,0,0,0,0,0,0,0,0,0,2]"),
+            usage_upstream("gemini", 1, 0, "[0,0,0,0,0,0,0,0,0,0,0,5]")
+        ));
+        let mut f = fleet();
+        let t0 = Instant::now();
+        add(&mut f, "peer-a", &doc, t0);
+        add(&mut f, "peer-b", &doc!("zen"), t0);
+        let m = Matrix::build(&f, &names(&["peer-a", "peer-b"]), t0);
+        let a = m.rows.iter().find(|r| r.peer == "peer-a").unwrap();
+        let series = request_series(std::slice::from_ref(a));
+        assert_eq!(series.len(), 12);
+        assert_eq!(series[0], Some(1.0));
+        assert_eq!(series[11], Some(7.0));
+        assert_eq!(series[5], Some(0.0));
+        let fleet_total = request_series(&m.rows);
+        assert_eq!(fleet_total[11], Some(7.0));
+        let none = request_series(&[]);
+        assert_eq!(none, vec![None; 12]);
+    }
+
+    #[test]
+    fn key_counts_cover_fresh_peers_and_every_provider() {
+        let mut f = fleet();
+        let t0 = Instant::now();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(&format!(
+                "{},{}",
+                upstream("zen", 2, 1, 0),
+                upstream("gemini", 1, 0, 1)
+            )),
+            t0,
+        );
+        add(&mut f, "peer-b", &doc(&upstream("zen", 0, 3, 0)), t0);
+        assert_eq!(key_counts(&f, &names(&["peer-a", "peer-b"]), t0), [3, 4, 1]);
+        let later = t0 + Duration::from_secs(600);
+        assert_eq!(
+            key_counts(&f, &names(&["peer-a", "peer-b"]), later),
+            [0, 0, 0],
+            "stale peers count for nothing"
+        );
     }
 }

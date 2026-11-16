@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `reiki top` frame: a header panel with version, UTC clock, live or paused state and key hints; a provider tab row that follows `f`; a titled Peers panel; a Cooling panel shown only while something cools; a footer of toggle chips (detail, gauge, chart, filter, paused).
+- `reiki top` chart row at 28 rows or more: a line chart of the selected peer's load, disk, sessions or requests (or the fleet's when none is selected), and a key-count chart by state. `m` cycles the chart metric.
+- `reiki top`: `?` lists every key; any key closes the list.
+
+### Changed
+
+- The interactive `reiki top` screen is drawn with the `fw-tui` widgets. Short terminals drop the chart row, then the cooling panel, then the tabs, and fold the header before the matrix is cut. `--once` output is unchanged.
+
 ## 0.10.3
 
 ### Added

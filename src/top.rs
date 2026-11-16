@@ -9,8 +9,11 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use reiki_top::matrix::{is_problem, order_peers, resolve, History, HostSummary, Matrix, Sample};
-use reiki_top::ui::{self, crossterm, ratatui};
+use reiki_top::matrix::{
+    fleet_series, is_problem, key_counts, order_peers, request_series, resolve, History,
+    HostSummary, Matrix, Metric, Sample,
+};
+use reiki_top::ui::{self, crossterm, ratatui, ChartMetric};
 use reiki_top::{view, Fleet, Health};
 use tokio::sync::mpsc;
 
@@ -401,6 +404,10 @@ async fn live_loop(
                 let crossterm::event::Event::Key(key) = event else {
                     continue;
                 };
+                if ui::dismiss_help(&mut state, key) {
+                    draw_now = true;
+                    continue;
+                }
                 let Some(action) = ui::map_key(key) else {
                     continue;
                 };
@@ -491,8 +498,11 @@ fn apply_action(
         }
         return true;
     }
-    // The gauge only exists in the matrix, so the full view ignores its keys.
-    if matches!(action, ui::Action::ToggleMetric | ui::Action::ToggleWindow) {
+    // The gauge and the chart only exist in the matrix, so the full view ignores their keys.
+    if matches!(
+        action,
+        ui::Action::ToggleMetric | ui::Action::ToggleWindow | ui::Action::CycleChart
+    ) {
         if state.mode == ui::Mode::Matrix {
             state.apply(action, total, viewport);
         }
@@ -555,10 +565,20 @@ fn selected_peer(
     Some((row.peer.clone(), is_problem(row)))
 }
 
-/// What one frame draws: the top area, and the selected peer's detail card when it is open.
+/// What one frame draws: the matrix lines and the panels' contents, or the full view's text.
+#[derive(Default)]
 struct Parts {
     lines: Vec<view::Line>,
+    /// Peer rows in `lines`, and the selected row's display position.
+    rows: usize,
+    selected: Option<usize>,
+    cooling: Vec<view::Line>,
     detail: Option<Vec<view::Line>>,
+    providers: Vec<String>,
+    chart_title: String,
+    chart_name: &'static str,
+    chart: Vec<Option<f64>>,
+    keys: [u64; 3],
 }
 
 fn build_parts(
@@ -568,66 +588,100 @@ fn build_parts(
     now: Instant,
     state: &ui::UiState,
     width: usize,
-    height: usize,
 ) -> Parts {
     match state.mode {
         ui::Mode::Full => Parts {
             lines: view::render(fleet, &visible_cts(all, state), now, width),
-            detail: None,
+            ..Parts::default()
         },
         ui::Mode::Matrix => {
-            let matrix = Matrix::build(fleet, all, now);
+            // The panels draw inside a border.
+            let inner = width.saturating_sub(2);
+            let full = Matrix::build(fleet, all, now);
+            let providers = full.columns.iter().map(|c| c.upstream.clone()).collect();
             let (matrix, filter_name): (Matrix, Option<&str>) =
                 match state.filter.provider.as_deref() {
-                    Some(p) => match matrix.filter_provider(p) {
+                    Some(p) => match full.filter_provider(p) {
                         Some(fm) => (fm, Some(p)),
-                        None => (matrix, None),
+                        None => (full, None),
                     },
-                    None => (matrix, None),
+                    None => (full, None),
                 };
             let order = order_peers(&matrix);
             let pos = resolve(state.selected, order.len());
-            let detail = pos.and_then(|pos| {
-                let row = &matrix.rows[order[pos]];
+            let row = pos.map(|pos| &matrix.rows[order[pos]]);
+            let detail = row.and_then(|row| {
                 state
                     .detail_open(is_problem(row))
-                    .then(|| view::peer_detail(fleet, &row.peer, now, width))
+                    .then(|| view::peer_detail(fleet, &row.peer, now, inner))
             });
-            // Rows above the footer, minus the detail pane when it is open.
-            let body = height.saturating_sub(1);
-            let top = match detail {
-                Some(_) => body.saturating_sub(usize::from(ui::detail_height(
-                    u16::try_from(height).unwrap_or(u16::MAX),
-                ))),
-                None => body,
+            // The chart follows the user's own selection; the fleet until they move it.
+            let chart_row = state.selected.and(row);
+            let (chart_name, chart) = chart_series(state.chart, history, &matrix, chart_row);
+            let chart_title = match (state.chart, chart_row) {
+                (ChartMetric::Disk, None) => format!("{} · fleet max", state.chart.title()),
+                (_, None) => format!("{} · fleet", state.chart.title()),
+                (_, Some(row)) => format!("{} · {}", state.chart.title(), row.peer),
             };
-            let lines = matrix_with_panel(
-                view::render_matrix_mode(&matrix, history, pos, width, filter_name, state.gauge),
-                matrix.rows.len(),
-                pos,
-                top,
-                view::cooling_panel(fleet, all, filter_name, now, width),
-            );
-            Parts { lines, detail }
+            Parts {
+                lines: view::render_matrix_mode(
+                    &matrix,
+                    history,
+                    pos,
+                    inner,
+                    filter_name,
+                    state.gauge,
+                ),
+                rows: matrix.rows.len(),
+                selected: pos,
+                // The panel's own title is drawn by the frame, so its first line is dropped.
+                cooling: view::cooling_panel(fleet, all, filter_name, now, inner)
+                    .into_iter()
+                    .skip(1)
+                    .collect(),
+                detail,
+                providers,
+                chart_title,
+                chart_name,
+                chart,
+                keys: key_counts(fleet, all, now),
+            }
         }
     }
 }
 
-/// The cooling panel fills only the rows the matrix leaves spare, so the matrix is never cut for it.
-fn matrix_with_panel(
-    matrix: Vec<view::Line>,
-    rows: usize,
-    selected: Option<usize>,
-    height: usize,
-    panel: Vec<view::Line>,
-) -> Vec<view::Line> {
-    let spare = height.saturating_sub(matrix.len());
-    if !panel.is_empty() && matrix.len() <= height && spare >= 2 {
-        let mut out = matrix;
-        out.extend(panel.into_iter().take(spare));
-        return out;
+/// The chart's legend name and points: the selected peer's history, or the fleet's when no
+/// peer is selected. Requests come from the matrix rows, so a provider filter narrows them.
+fn chart_series(
+    metric: ChartMetric,
+    history: &History,
+    matrix: &Matrix,
+    row: Option<&reiki_top::matrix::Row>,
+) -> (&'static str, Vec<Option<f64>>) {
+    let name = metric.label();
+    let metric = match metric {
+        ChartMetric::Requests => {
+            let rows = row.map_or(&matrix.rows[..], std::slice::from_ref);
+            return (name, request_series(rows));
+        }
+        ChartMetric::Load => Metric::Load1,
+        ChartMetric::Disk => Metric::DiskPercent,
+        ChartMetric::Sessions => Metric::Sessions,
+    };
+    match row {
+        Some(row) => (
+            name,
+            history
+                .values(&row.peer, metric)
+                .into_iter()
+                .map(Some)
+                .collect(),
+        ),
+        None => {
+            let peers: Vec<String> = matrix.rows.iter().map(|r| r.peer.clone()).collect();
+            (name, fleet_series(history, &peers, metric))
+        }
     }
-    view::window_matrix(matrix, rows, selected, height)
 }
 
 /// Pushes one host sample for each fresh peer, at most once per `every`. Called from the redraw
@@ -680,15 +734,7 @@ fn measure(
     state: &ui::UiState,
 ) -> io::Result<(usize, usize)> {
     let size = terminal.size()?;
-    let parts = build_parts(
-        fleet,
-        history,
-        all,
-        now,
-        state,
-        usize::from(size.width),
-        usize::from(size.height),
-    );
+    let parts = build_parts(fleet, history, all, now, state, usize::from(size.width));
     Ok(match (state.mode, parts.detail) {
         (ui::Mode::Full, _) => (
             parts.lines.len(),
@@ -739,6 +785,11 @@ fn render_screen(
         })
         .count();
     let status = status_line(fresh, visible.len(), shown.paused_for);
+    let clock = ui::utc_clock(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    );
     terminal.draw(|frame| {
         let parts = build_parts(
             shown.fleet,
@@ -747,13 +798,28 @@ fn render_screen(
             shown.now,
             state,
             usize::from(frame.area().width),
-            usize::from(frame.area().height),
         );
         match state.mode {
             ui::Mode::Full => ui::draw(frame, &parts.lines, state, &status),
-            ui::Mode::Matrix => {
-                ui::draw_matrix(frame, &parts.lines, parts.detail.as_deref(), state, &status);
-            }
+            ui::Mode::Matrix => ui::draw_matrix(
+                frame,
+                &ui::MatrixFrame {
+                    version: env!("CARGO_PKG_VERSION"),
+                    clock: &clock,
+                    status: &status,
+                    providers: &parts.providers,
+                    matrix: &parts.lines,
+                    rows: parts.rows,
+                    selected: parts.selected,
+                    cooling: &parts.cooling,
+                    detail: parts.detail.as_deref(),
+                    chart_title: &parts.chart_title,
+                    chart_name: parts.chart_name,
+                    chart: &parts.chart,
+                    keys: parts.keys,
+                },
+                state,
+            ),
         }
     })?;
     Ok(())
@@ -981,6 +1047,52 @@ mod tests {
     }
 
     #[test]
+    fn m_cycles_the_chart_only_in_matrix_view_and_the_chart_follows_the_selection() {
+        let all = vec!["peer-a".to_owned()];
+        let mut state = ui::UiState::default();
+        apply_action(&mut state, ui::Action::CycleChart, &all, 10, 3, false);
+        assert_eq!(state.chart, ui::ChartMetric::Disk);
+        state.toggle_mode();
+        let before = state.clone();
+        apply_action(&mut state, ui::Action::CycleChart, &all, 10, 3, false);
+        assert_eq!(state, before, "the full view ignores m");
+        state.toggle_mode();
+
+        let now = Instant::now();
+        let mut fleet = fleet();
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(DOC.to_owned()),
+            now,
+        );
+        let mut history = History::new(10);
+        history.push(
+            "peer-a",
+            Sample {
+                load1: Some(1.5),
+                disk_percent: Some(40.0),
+                sessions: Some(2),
+            },
+        );
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        assert_eq!(
+            parts.chart_title, "Disk · fleet max",
+            "no selection, so the fleet"
+        );
+        assert_eq!(parts.chart, vec![Some(40.0)]);
+        assert!(parts.keys.iter().sum::<u64>() > 0, "{:?}", parts.keys);
+        assert_eq!(parts.providers, vec!["zen".to_owned()]);
+
+        state.chart = ui::ChartMetric::Load;
+        state.selected = Some(0);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        assert_eq!(parts.chart_title, "Load · peer-a");
+        assert_eq!(parts.chart, vec![Some(1.5)]);
+        assert_eq!(parts.chart_name, "load");
+    }
+
+    #[test]
     fn u_and_w_change_the_gauge_only_in_matrix_view_and_the_title_says_so() {
         let all = vec!["peer-a".to_owned()];
         let mut state = ui::UiState::default();
@@ -998,7 +1110,7 @@ mod tests {
             now,
         );
         let history = History::new(0);
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100, 40);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
         assert!(
             parts.lines[0].plain_text().ends_with("[tok 5m]"),
             "{:?}",
@@ -1035,7 +1147,7 @@ mod tests {
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let history = History::new(0);
         let state = ui::UiState::default();
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100, 40);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
         let card = parts
             .detail
             .expect("peer-b is a problem, so the pane opens");
@@ -1046,12 +1158,12 @@ mod tests {
 
         let mut closed = state.clone();
         closed.detail = Some(false);
-        assert!(build_parts(&fleet, &history, &all, now, &closed, 100, 40)
+        assert!(build_parts(&fleet, &history, &all, now, &closed, 100)
             .detail
             .is_none());
         let mut full = state.clone();
         full.toggle_mode();
-        assert!(build_parts(&fleet, &history, &all, now, &full, 100, 40)
+        assert!(build_parts(&fleet, &history, &all, now, &full, 100)
             .detail
             .is_none());
     }
@@ -1417,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cooling_panel_sits_under_the_matrix_and_gives_way_to_it() {
+    fn the_cooling_panel_is_separate_from_the_matrix_lines() {
         let now = Instant::now();
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let mut f = fleet();
@@ -1438,31 +1550,23 @@ mod tests {
             &Matrix::build(&f, &all, now),
             &history,
             Some(0),
-            100,
+            98,
             None,
             state.gauge,
         ));
-        let rows = matrix.len();
+        let parts = build_parts(&f, &history, &all, now, &state, 100);
+        assert_eq!(
+            plain(&parts.lines),
+            matrix,
+            "the matrix lines are unchanged"
+        );
+        assert_eq!(parts.rows, 2);
+        assert_eq!(parts.cooling.len(), 1, "{:?}", plain(&parts.cooling));
+        assert!(plain(&parts.cooling)[0].contains("peer-b"));
+        assert!(!plain(&parts.cooling).iter().any(|l| l == "Cooling"));
 
-        let full = plain(&build_parts(&f, &history, &all, now, &state, 100, 100).lines);
-        assert_eq!(full[..rows], matrix[..], "the matrix comes first, whole");
-        assert_eq!(full[rows], "Cooling", "{full:?}");
-        assert!(full[rows + 1].contains("peer-b"), "{full:?}");
-        assert_eq!(full.len(), rows + 2, "{full:?}");
-
-        let one_short = plain(&build_parts(&f, &history, &all, now, &state, 100, rows + 1).lines);
-        assert_eq!(one_short, matrix, "no spare row, no panel");
-
-        let one_spare = plain(&build_parts(&f, &history, &all, now, &state, 100, rows + 3).lines);
-        assert_eq!(one_spare.len(), rows + 2, "{one_spare:?}");
-        assert_eq!(one_spare[rows], "Cooling");
-
-        let tiny = plain(&build_parts(&f, &history, &all, now, &state, 100, 2).lines);
-        assert!(tiny.len() <= 1, "the matrix window wins: {tiny:?}");
-        assert!(!tiny.iter().any(|l| l == "Cooling"), "{tiny:?}");
-        for (w, h) in [(0, 0), (0, 1), (1, 1), (1, 5)] {
-            build_parts(&f, &history, &all, now, &state, w, h);
-        }
+        let healthy_only = build_parts(&f, &history, &all[..1], now, &state, 100);
+        assert!(healthy_only.cooling.is_empty());
     }
 
     #[tokio::test]

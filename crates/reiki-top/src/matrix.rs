@@ -112,6 +112,9 @@ pub struct Row {
     /// or a stale or absent upstream.
     pub pressure: Vec<Option<Pressure>>,
     pub host: HostSummary,
+    /// The peer's published version from its last data, stale or not; `None` for an older peer
+    /// or a peer never seen.
+    pub version: Option<String>,
     pub error: Option<String>,
     pub stale: bool,
     /// How long ago this host received the peer's data; `None` when it never did.
@@ -197,6 +200,7 @@ impl Matrix {
                     .map(|col| upstream(col).and_then(pressure_of))
                     .collect(),
                 host,
+                version: view.as_ref().and_then(|v| v.health.reiki_version.clone()),
                 error: fleet.error(name).map(str::to_owned),
                 stale: fresh.is_none(),
                 age: view.as_ref().map(|v| v.age),
@@ -229,6 +233,7 @@ impl Matrix {
                 combos: vec![r.combos.get(idx).copied().unwrap_or(0)],
                 pressure: vec![r.pressure.get(idx).copied().flatten()],
                 host: r.host.clone(),
+                version: r.version.clone(),
                 error: r.error.clone(),
                 stale: r.stale,
                 age: r.age,

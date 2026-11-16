@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
     AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, KeyCounts, Plugin,
-    RequestCtx, ResponseHeadCtx, HOST_KEYS,
+    RequestCtx, ResponseHeadCtx, UpstreamUsage, HOST_KEYS,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
@@ -121,7 +121,7 @@ impl Plugin for MetricsPlugin {
         if ctx.path == "/metrics" {
             Some(AdminReply {
                 content_type: "text/plain; version=0.0.4; charset=utf-8",
-                body: self.metrics.render(ctx.keys),
+                body: self.metrics.render(ctx.keys, ctx.usage.as_deref()),
             })
         } else if ctx.path == "/usage" {
             Some(AdminReply {
@@ -437,9 +437,10 @@ impl Metrics {
         });
     }
 
-    /// Render the Prometheus text exposition. `keys` is the current gauge,
-    /// sampled by the caller so it reflects the same instant as the scrape.
-    pub fn render(&self, keys: KeyCounts) -> String {
+    /// Render the Prometheus text exposition. `keys` and `usage` are the current gauges,
+    /// sampled by the caller so they reflect the same instant as the scrape. `usage` is `None`
+    /// when the operator hides it, and then its families are left out.
+    pub fn render(&self, keys: KeyCounts, usage: Option<&[UpstreamUsage]>) -> String {
         let inner = self
             .inner
             .lock()
@@ -553,6 +554,39 @@ impl Metrics {
             keys.out_of_rotation
         );
 
+        if let Some(usage) = usage {
+            type Field = fn(&UpstreamUsage) -> u64;
+            let families: [(&str, &str, Field); 3] = [
+                (
+                    "reiki_upstream_requests_1h",
+                    "Attempts in the last hour, by upstream.",
+                    |u| u.requests_1h,
+                ),
+                (
+                    "reiki_upstream_limited_1h",
+                    "Attempts in the last hour that were rate-limited or began a cooldown, by upstream.",
+                    |u| u.limited_1h,
+                ),
+                (
+                    "reiki_upstream_tokens_1h",
+                    "Input plus output tokens in the last hour, by upstream.",
+                    |u| u.tokens_1h,
+                ),
+            ];
+            for (family, help, value) in families {
+                let _ = writeln!(out, "# HELP {family} {help}");
+                let _ = writeln!(out, "# TYPE {family} gauge");
+                for entry in usage {
+                    let _ = writeln!(
+                        out,
+                        "{family}{{upstream=\"{}\"}} {}",
+                        escape_label(&entry.upstream),
+                        value(entry)
+                    );
+                }
+            }
+        }
+
         out
     }
 
@@ -641,11 +675,14 @@ mod tests {
         metrics.record_cooldown("zen-a", FailureKind::QuotaExhausted, CooldownScope::Key);
         metrics.record_rate_limit_rejection("client");
 
-        let text = metrics.render(KeyCounts {
-            available: 1,
-            cooling: 2,
-            out_of_rotation: 0,
-        });
+        let text = metrics.render(
+            KeyCounts {
+                available: 1,
+                cooling: 2,
+                out_of_rotation: 0,
+            },
+            None,
+        );
 
         assert!(text.contains("# TYPE reiki_requests_total counter"));
         assert!(text.contains(
@@ -664,8 +701,30 @@ mod tests {
     }
 
     #[test]
+    fn usage_gauges_are_per_upstream_and_absent_when_hidden() {
+        let usage = [UpstreamUsage {
+            upstream: "zen".to_owned(),
+            requests_1h: 3,
+            limited_1h: 1,
+            tokens_1h: 40,
+        }];
+        let shown = Metrics::new().render(KeyCounts::default(), Some(&usage));
+        assert!(shown.contains("# TYPE reiki_upstream_requests_1h gauge"));
+        assert!(shown.contains("reiki_upstream_requests_1h{upstream=\"zen\"} 3"));
+        assert!(shown.contains("reiki_upstream_limited_1h{upstream=\"zen\"} 1"));
+        assert!(shown.contains("reiki_upstream_tokens_1h{upstream=\"zen\"} 40"));
+
+        let exposed_but_empty = Metrics::new().render(KeyCounts::default(), Some(&[]));
+        assert!(exposed_but_empty.contains("# TYPE reiki_upstream_tokens_1h gauge"));
+        assert!(!exposed_but_empty.contains("reiki_upstream_tokens_1h{"));
+
+        let hidden = Metrics::new().render(KeyCounts::default(), None);
+        assert!(!hidden.contains("reiki_upstream_"), "{hidden}");
+    }
+
+    #[test]
     fn render_always_emits_type_lines_and_the_full_gauge() {
-        let text = Metrics::new().render(KeyCounts::default());
+        let text = Metrics::new().render(KeyCounts::default(), None);
         for family in [
             "reiki_requests_total",
             "reiki_failovers_total",
@@ -689,7 +748,7 @@ mod tests {
         }
         let usage: serde_json::Value = serde_json::from_str(&metrics.render_usage()).unwrap();
         assert_eq!(usage["s"]["u"]["input"], u64::MAX);
-        let text = metrics.render(KeyCounts::default());
+        let text = metrics.render(KeyCounts::default(), None);
         assert!(
             text.contains(&format!(
                 "reiki_findings_total{{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"}} {}",
@@ -718,7 +777,7 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_finding("s", "phi", "ssn", 2, false);
         metrics.record_finding("s", "phi", "ssn", 3, true);
-        let text = metrics.render(KeyCounts::default());
+        let text = metrics.render(KeyCounts::default(), None);
         assert!(text.contains(
             "reiki_findings_total{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"} 2"
         ));
@@ -749,7 +808,7 @@ mod tests {
         assert!(
             text.contains("reiki_plugin_rejections_total{plugin=\"placeholders\",stream=\"t\"} 1")
         );
-        let empty = Metrics::new().render(KeyCounts::default());
+        let empty = Metrics::new().render(KeyCounts::default(), None);
         assert!(empty.contains("# TYPE reiki_plugin_rejections_total counter"));
         assert!(!empty.contains("reiki_plugin_rejections_total{"));
     }
@@ -758,7 +817,7 @@ mod tests {
     fn labels_are_escaped_in_the_exposition() {
         let metrics = Metrics::new();
         metrics.record_request("a\"b", "c\\d", StatusClass::ServerError);
-        let text = metrics.render(KeyCounts::default());
+        let text = metrics.render(KeyCounts::default(), None);
         assert!(text.contains(
             "reiki_requests_total{stream=\"a\\\"b\",upstream=\"c\\\\d\",status=\"server_error\"} 1"
         ));
@@ -943,7 +1002,7 @@ mod tests {
         let mut s = state(&metrics, false);
         s.feed(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
         s.finish();
-        let text = metrics.render(KeyCounts::default());
+        let text = metrics.render(KeyCounts::default(), None);
         assert!(
             text.contains(
                 "reiki_tokens_total{stream=\"s\",upstream=\"zen\",direction=\"input\"} 2"

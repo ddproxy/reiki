@@ -19,6 +19,9 @@ pub mod view;
 pub struct Health {
     /// The published instance name, or the fixed `reiki`.
     pub instance: String,
+    /// The publisher's version, cleaned by [`version_field`]; older publishers omit it.
+    #[serde(default, deserialize_with = "version_field")]
+    pub reiki_version: Option<String>,
     /// The publisher's UTC clock when the answer was built; for people and logs.
     pub observed_at: String,
     /// How old the figures were when the peer sent them; older publishers omit it.
@@ -39,6 +42,21 @@ impl Health {
     pub fn from_json(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|e| e.to_string())
     }
+}
+
+/// Printable ASCII, at most 32 characters, so a peer's version cannot spoof a terminal line.
+fn version_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(text)) => {
+            let clean: String = text
+                .chars()
+                .filter(|c| (' '..='~').contains(c))
+                .take(32)
+                .collect();
+            (!clean.is_empty()).then_some(clean)
+        }
+        _ => None,
+    })
 }
 
 /// One upstream entry: counts by key state, never key material.
@@ -70,6 +88,12 @@ pub struct Upstream {
     /// Twelve five-minute attempt counts, oldest first; extra buckets are dropped.
     #[serde(default, deserialize_with = "usage_buckets")]
     pub request_buckets: Option<[u32; 12]>,
+    /// Input plus output tokens in the last hour; absent from an older publisher.
+    #[serde(default, deserialize_with = "usage_u64")]
+    pub tokens_1h: Option<u64>,
+    /// Twelve five-minute token counts, oldest first; extra buckets are dropped.
+    #[serde(default, deserialize_with = "token_buckets")]
+    pub token_buckets: Option<[u64; 12]>,
 }
 
 /// A JSON number as a clamped count: other types read as absent, never as a parse error.
@@ -103,18 +127,32 @@ fn usage_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, 
     Ok(usage_u64(deserializer)?.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
 }
 
-fn usage_buckets<'de, D: Deserializer<'de>>(
+/// The newest twelve entries of a bucket array, each clamped; other shapes read as absent.
+fn bucket_counts<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<[u32; 12]>, D::Error> {
+) -> Result<Option<[u64; 12]>, D::Error> {
     let Some(Value::Array(items)) = Option::<Value>::deserialize(deserializer)? else {
         return Ok(None);
     };
-    let mut buckets = [0u32; 12];
+    let mut buckets = [0u64; 12];
     let start = items.len().saturating_sub(buckets.len());
     for (bucket, item) in buckets.iter_mut().zip(&items[start..]) {
-        *bucket = usage_number(item).map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        *bucket = usage_number(item).unwrap_or(0);
     }
     Ok(Some(buckets))
+}
+
+fn usage_buckets<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u32; 12]>, D::Error> {
+    Ok(bucket_counts(deserializer)?
+        .map(|buckets| buckets.map(|n| u32::try_from(n).unwrap_or(u32::MAX))))
+}
+
+fn token_buckets<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u64; 12]>, D::Error> {
+    bucket_counts(deserializer)
 }
 
 /// One labelled key. `cooldown_class` is set only for a cooling key whose class is known.
@@ -288,6 +326,10 @@ impl Fleet {
             limited_1h: Option<u32>,
             #[serde(default, deserialize_with = "usage_buckets")]
             request_buckets: Option<[u32; 12]>,
+            #[serde(default, deserialize_with = "usage_u64")]
+            tokens_1h: Option<u64>,
+            #[serde(default, deserialize_with = "token_buckets")]
+            token_buckets: Option<[u64; 12]>,
         }
         let event: Event = serde_json::from_str(data).map_err(|e| e.to_string())?;
         let Some(event) = event.upstream else {
@@ -335,6 +377,12 @@ impl Fleet {
         }
         if let Some(buckets) = event.request_buckets {
             upstream.request_buckets = Some(buckets);
+        }
+        if let Some(n) = event.tokens_1h {
+            upstream.tokens_1h = Some(n);
+        }
+        if let Some(buckets) = event.token_buckets {
+            upstream.token_buckets = Some(buckets);
         }
         Ok(())
     }
@@ -476,6 +524,8 @@ mod tests {
                 requests_1h: None,
                 limited_1h: None,
                 request_buckets: None,
+                tokens_1h: None,
+                token_buckets: None,
             }
         );
         assert!(health.host.is_some(), "host stats are kept");
@@ -546,6 +596,50 @@ mod tests {
     }
 
     #[test]
+    fn token_fields_parse_clamp_and_stay_absent_from_older_documents() {
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "tokens_1h":18446744073709551615,
+                 "token_buckets":[1,2,3,4,5,6,7,8,9,10,11,12,13]}]}"#,
+        )
+        .expect("a document with tokens parses");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.tokens_1h, Some(u64::MAX));
+        assert_eq!(
+            upstream.token_buckets,
+            Some([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+            "only the newest twelve buckets are kept"
+        );
+
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "tokens_1h":-5,"token_buckets":[-1,1.9,"x",3,4,5,6,7,8,9,10,11]}]}"#,
+        )
+        .expect("negative, float and string numbers parse");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.tokens_1h, Some(0));
+        assert_eq!(
+            upstream.token_buckets,
+            Some([0, 1, 0, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        );
+
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
+                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                 "tokens_1h":"many","token_buckets":"not an array"}]}"#,
+        )
+        .expect("wrong types do not reject the document");
+        assert_eq!(health.upstreams[0].tokens_1h, None);
+        assert_eq!(health.upstreams[0].token_buckets, None);
+
+        let old = Health::from_json(BARE_DOC).expect("an old document parses");
+        assert_eq!(old.upstreams[0].tokens_1h, None);
+        assert_eq!(old.upstreams[0].token_buckets, None);
+    }
+
+    #[test]
     fn a_key_event_carries_usage_fields() {
         let now = Instant::now();
         let mut fleet = fleet();
@@ -556,7 +650,8 @@ mod tests {
                 "key",
                 r#"{"upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,
                     "disabled_keys":0,"requests_1h":7,"limited_1h":1,
-                    "request_buckets":[0,0,0,0,0,0,0,0,0,0,1,6]}}"#,
+                    "request_buckets":[0,0,0,0,0,0,0,0,0,0,1,6],
+                    "tokens_1h":99,"token_buckets":[0,0,0,0,0,0,0,0,0,0,9,90]}}"#,
                 now,
             )
             .expect("a key event applies");
@@ -566,6 +661,11 @@ mod tests {
         assert_eq!(
             upstream.request_buckets,
             Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 6])
+        );
+        assert_eq!(upstream.tokens_1h, Some(99));
+        assert_eq!(
+            upstream.token_buckets,
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 90])
         );
     }
 
@@ -873,5 +973,48 @@ mod tests {
         fleet.advance(t0 + Duration::from_secs(10_000));
         let at = t0 + Duration::from_secs(10_000);
         assert_eq!(left(&fleet, at).soonest_cooldown_seconds, Some(0));
+    }
+
+    #[test]
+    fn the_version_is_read_when_present_and_none_when_an_older_peer_omits_it() {
+        let with =
+            r#"{"instance":"peer-a","observed_at":"t","reiki_version":"0.10.3","upstreams":[]}"#;
+        assert_eq!(
+            Health::from_json(with).unwrap().reiki_version.as_deref(),
+            Some("0.10.3")
+        );
+        assert_eq!(
+            Health::from_json(BARE_DOC).unwrap().reiki_version,
+            None,
+            "an older peer"
+        );
+    }
+
+    #[test]
+    fn a_hostile_version_keeps_printable_ascii_and_at_most_32_chars() {
+        let doc = |value: &str| {
+            format!(
+                r#"{{"instance":"p","observed_at":"t","reiki_version":{value},"upstreams":[]}}"#
+            )
+        };
+        let long = format!("\"{}\"", "9".repeat(40));
+        let cases = [
+            (
+                r#""0.10.3\u0007\u202e""#.to_owned(),
+                Some("0.10.3".to_owned()),
+            ),
+            (r#""héllo-1""#.to_owned(), Some("hllo-1".to_owned())),
+            (long, Some("9".repeat(32))),
+            (r#""\u0001\n""#.to_owned(), None),
+            (r#""""#.to_owned(), None),
+            ("42".to_owned(), None),
+            ("null".to_owned(), None),
+            (r#"["0.10.3"]"#.to_owned(), None),
+        ];
+        for (value, expected) in cases {
+            let health = Health::from_json(&doc(&value))
+                .unwrap_or_else(|e| panic!("{value} is not an error: {e}"));
+            assert_eq!(health.reiki_version, expected, "{value}");
+        }
     }
 }

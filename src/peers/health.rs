@@ -100,6 +100,8 @@ pub(crate) fn upstreams(
             entry["requests_1h"] = json!(requests);
             entry["limited_1h"] = json!(limited);
             entry["request_buckets"] = json!(pressure.buckets(name, now));
+            entry["tokens_1h"] = json!(pressure.token_totals(name, now));
+            entry["token_buckets"] = json!(pressure.token_buckets(name, now));
         }
         if labels {
             entry["keys"] = Value::Array(listed);
@@ -139,6 +141,7 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
     };
     let mut doc = json!({
         "instance": instance_name(peers),
+        "reiki_version": env!("CARGO_PKG_VERSION"),
         "observed_at": crate::reload::rfc3339(app.wall_now()),
         // Every figure is read as the answer is built; a reader adds its own time since receipt.
         "age_seconds": 0,
@@ -416,18 +419,30 @@ mod tests {
         pressure.record("zen", false, now);
         pressure.record("zen", true, now);
         pressure.record("spare", false, now);
+        pressure.record_tokens("zen", 30, now);
         let exposed = upstreams(&config, &mut health, now, false, 0, Some(&pressure));
         let zen = &exposed[1];
         assert_eq!(zen["requests_1h"], 2);
         assert_eq!(zen["limited_1h"], 1);
+        assert_eq!(zen["tokens_1h"], 30);
         let buckets = zen["request_buckets"].as_array().unwrap();
         assert_eq!(buckets.len(), 12);
         assert_eq!(buckets[11], 2, "the newest bucket holds both attempts");
+        let token_buckets = zen["token_buckets"].as_array().unwrap();
+        assert_eq!(token_buckets.len(), 12);
+        assert_eq!(token_buckets[11], 30);
         assert_eq!(exposed[0]["requests_1h"], 1, "per upstream, not pooled");
+        assert_eq!(exposed[0]["tokens_1h"], 0);
 
         let hidden = upstreams(&config, &mut health, now, false, 0, None);
         for entry in &hidden {
-            for field in ["requests_1h", "limited_1h", "request_buckets"] {
+            for field in [
+                "requests_1h",
+                "limited_1h",
+                "request_buckets",
+                "tokens_1h",
+                "token_buckets",
+            ] {
                 assert!(entry.get(field).is_none(), "{field} is hidden: {entry}");
             }
         }

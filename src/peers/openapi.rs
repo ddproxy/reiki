@@ -27,6 +27,11 @@ fn upstream_schema() -> Value {
             "request_buckets": {"type": "array", "items": {"type": "integer", "minimum": 0},
                 "minItems": 12, "maxItems": 12,
                 "description": "Twelve five-minute attempt counts, oldest first, newest last; only with expose_usage"},
+            "tokens_1h": {"type": "integer", "minimum": 0,
+                "description": "Input plus output tokens of the responses served by this upstream in the last 60 minutes; only with expose_usage"},
+            "token_buckets": {"type": "array", "items": {"type": "integer", "minimum": 0},
+                "minItems": 12, "maxItems": 12,
+                "description": "Twelve five-minute token counts, oldest first, newest last; only with expose_usage"},
             "keys": {
                 "description": "Only with expose_key_labels",
                 "type": "array",
@@ -49,6 +54,8 @@ fn health_schema() -> Value {
         "required": ["instance", "observed_at", "upstreams"],
         "properties": {
             "instance": {"type": "string"},
+            "reiki_version": {"type": "string", "maxLength": 32,
+                "description": "The publisher's version; older publishers omit it"},
             "observed_at": {"type": "string", "format": "date-time"},
             "age_seconds": {"type": "integer", "minimum": 0,
                 "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},

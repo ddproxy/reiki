@@ -391,7 +391,11 @@ async fn plugin_route(
         .strip_prefix(V1)
         .filter(|rest| rest.starts_with('/'))
         .unwrap_or(path);
-    match app.plugins().on_admin(path, keys) {
+    let usage = snapshot
+        .config
+        .exposes_usage()
+        .then(|| crate::pressure::upstream_usage(&snapshot.config, app.pressure(), now));
+    match app.plugins().on_admin(path, keys, usage) {
         Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
         None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
     }

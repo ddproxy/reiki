@@ -17,7 +17,7 @@ use toml::Value;
 
 use reiki_plugin::{
     AdminCtx, AdminReply, AttemptCtx, ChunkCtx, Event, KeyCounts, Plugin, PluginError, RequestCtx,
-    ResponseHeadCtx,
+    ResponseHeadCtx, UpstreamUsage,
 };
 
 use crate::config::ConfigError;
@@ -415,12 +415,17 @@ impl PluginChain {
     }
 
     /// Answers an admin GET from the plugin that claimed `path`.
-    pub fn on_admin(&self, path: &str, keys: KeyCounts) -> Option<AdminReply> {
+    pub fn on_admin(
+        &self,
+        path: &str,
+        keys: KeyCounts,
+        usage: Option<Vec<UpstreamUsage>>,
+    ) -> Option<AdminReply> {
         let entry = self
             .entries
             .iter()
             .find(|e| e.plugin.admin_paths().contains(&path))?;
-        let ctx = AdminCtx::new(path, keys);
+        let ctx = AdminCtx::new(path, keys).with_usage(usage);
         guard(entry.plugin.name(), "on_admin", || {
             entry.plugin.on_admin(&ctx)
         })
@@ -1074,7 +1079,7 @@ mod tests {
         assert!(same_instance(&first, &next.chain, "metrics"));
         let text = next
             .chain
-            .on_admin("/metrics", KeyCounts::default())
+            .on_admin("/metrics", KeyCounts::default(), None)
             .unwrap()
             .body;
         assert!(text.contains(
@@ -1561,7 +1566,9 @@ mod tests {
             Bytes::from_static(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
         session.on_response_chunk(&mut body, true);
 
-        let reply = chain.on_admin("/usage", KeyCounts::default()).unwrap();
+        let reply = chain
+            .on_admin("/usage", KeyCounts::default(), None)
+            .unwrap();
         let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(usage["s"]["u"]["input"], 2);
         assert_eq!(usage["s"]["u"]["output"], 3);
@@ -1595,7 +1602,9 @@ mod tests {
             Bytes::from_static(br#"{"usage":{"prompt_tokens":5,"completion_tokens":6}}"#);
         session.on_response_chunk(&mut body, true);
 
-        let reply = chain.on_admin("/usage", KeyCounts::default()).unwrap();
+        let reply = chain
+            .on_admin("/usage", KeyCounts::default(), None)
+            .unwrap();
         let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(usage["s"]["fallback"]["input"], 5);
         assert_eq!(usage["s"]["fallback"]["output"], 6);
@@ -1679,8 +1688,8 @@ mod tests {
             available: 3,
             ..KeyCounts::default()
         };
-        assert_eq!(chain.on_admin("/b", keys).unwrap().body, "second:3");
-        assert!(chain.on_admin("/missing", keys).is_none());
+        assert_eq!(chain.on_admin("/b", keys, None).unwrap().body, "second:3");
+        assert!(chain.on_admin("/missing", keys, None).is_none());
     }
 
     #[test]
@@ -1817,7 +1826,7 @@ mod tests {
         assert_eq!(count(), 1);
         let keys = KeyCounts::default();
         assert!(
-            chain.on_admin("/scoped", keys).is_some(),
+            chain.on_admin("/scoped", keys, None).is_some(),
             "admin paths ignore streams"
         );
     }

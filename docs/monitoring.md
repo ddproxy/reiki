@@ -111,10 +111,15 @@ Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts 
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` |
 | `reiki_tokens_total` | counter | `stream`, `upstream`, `direction` |
 | `reiki_keys` | gauge | `state` |
+| `reiki_upstream_requests_1h` | gauge | `upstream` |
+| `reiki_upstream_limited_1h` | gauge | `upstream` |
+| `reiki_upstream_tokens_1h` | gauge | `upstream` |
 
 `reiki_findings_total` counts the identifiers a detection plugin (`phi`, `finance`, `controlled`) found in request bodies. `kind` is the identifier kind (`ssn`, `iban`); `action` is `blocked` when the request was rejected for it and `reported` when it went through. Label values are fixed by the plugins and configured streams, and the counter never holds a matched value. A plugin's `detail` label is ignored so series do not grow with reported names; use the request log for per-name counts.
 
 `reiki_plugin_rejections_total` counts requests a plugin stopped: a rejection (the `phi`, `finance` and `controlled` plugins do when they block), or a skip or panic under `on_error = "reject"`, which answers 503. `plugin` is its name and `stream` the incoming stream, so series are bounded by built-in plugins times configured streams. A stream-rate-limited request counts under `reiki_rate_limit_rejections_total` instead.
+
+`reiki_upstream_*_1h` are the last hour per upstream, read at scrape time from the counters behind `GET /v1/health`, so the two agree: `requests` is every attempt, `limited` the rate-limited or cooldown-starting ones, `tokens` the input plus output tokens the provider reported. Unlike `reiki_tokens_total` they fall as attempts age out and restart at zero with the process. Upstreams follow config order, leaving out `passthrough`. They follow `[peers] expose_usage` (on when there is no `[peers]` table) and are absent when it is `false`.
 
 `status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. `reiki_cooldowns_total` also has `scope` (`key` or `model`): a model-scoped cooldown covers one route and model, deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
 

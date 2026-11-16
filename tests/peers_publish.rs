@@ -79,9 +79,26 @@ struct Rig {
     client: reqwest::Client,
 }
 
+/// An upstream that answers every request with a success and an OpenAI-style usage object.
+async fn usage_upstream() -> String {
+    let (listener, addr) = bind().await;
+    let app = Router::new().fallback(|| async {
+        let body = serde_json::json!({
+            "id": "chatcmpl-test",
+            "usage": {"prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10}
+        });
+        (StatusCode::OK, body.to_string())
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
 impl Rig {
     async fn new(peers_extra: &str) -> Self {
-        let upstream = limited_upstream().await;
+        Self::with_upstream(peers_extra, limited_upstream().await).await
+    }
+
+    async fn with_upstream(peers_extra: &str, upstream: String) -> Self {
         let (peer_listener, peer_addr) = bind().await;
         let config = Config::parse(&config_text(&upstream, peer_addr, peers_extra)).unwrap();
         let plugins =
@@ -119,6 +136,18 @@ impl Rig {
         }
         let res = request.send().await.unwrap();
         (res.status().as_u16(), res.text().await.unwrap())
+    }
+
+    async fn admin_metrics(&self) -> String {
+        self.client
+            .get(format!("{}/metrics", self.admin))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
     }
 
     async fn health(&self) -> serde_json::Value {
@@ -257,6 +286,7 @@ async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
     let rig = Rig::new("cooldown_bucket_secs = 0\n").await;
     let doc = rig.health().await;
     assert_eq!(doc["instance"], "peer-test");
+    assert_eq!(doc["reiki_version"], env!("CARGO_PKG_VERSION"));
     let observed = doc["observed_at"].as_str().unwrap();
     assert!(
         observed.len() == 20 && observed.ends_with('Z'),
@@ -334,6 +364,59 @@ async fn usage_counts_are_published_by_default_and_can_be_hidden() {
     for field in ["requests_1h", "limited_1h", "request_buckets"] {
         assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
     }
+}
+
+#[tokio::test]
+async fn tokens_are_counted_from_each_response_per_upstream() {
+    let rig = Rig::with_upstream("cooldown_bucket_secs = 0\n", usage_upstream().await).await;
+    assert_eq!(rig.health().await["upstreams"][0]["tokens_1h"], 0);
+    for _ in 0..2 {
+        assert_eq!(rig.send(None).await, 200);
+    }
+    let zen = &rig.health().await["upstreams"][0];
+    assert_eq!(zen["requests_1h"], 2);
+    assert_eq!(zen["limited_1h"], 0);
+    assert_eq!(zen["tokens_1h"], 20, "prompt plus completion, per response");
+    let buckets = zen["token_buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 12);
+    assert_eq!(buckets[11], 20);
+
+    let hidden = Rig::with_upstream("expose_usage = false\n", usage_upstream().await).await;
+    assert_eq!(hidden.send(None).await, 200);
+    let zen = &hidden.health().await["upstreams"][0];
+    for field in ["tokens_1h", "token_buckets"] {
+        assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
+    }
+}
+
+#[tokio::test]
+async fn metrics_gauges_equal_the_usage_the_health_document_reports() {
+    let successes = Rig::with_upstream("cooldown_bucket_secs = 0\n", usage_upstream().await).await;
+    for _ in 0..2 {
+        assert_eq!(successes.send(None).await, 200);
+    }
+    let limited = Rig::new("cooldown_bucket_secs = 0\n").await;
+    assert_eq!(limited.send(None).await, 503);
+
+    for rig in [&successes, &limited] {
+        let zen = rig.health().await["upstreams"][0].clone();
+        let text = rig.admin_metrics().await;
+        for (family, field) in [
+            ("reiki_upstream_requests_1h", "requests_1h"),
+            ("reiki_upstream_limited_1h", "limited_1h"),
+            ("reiki_upstream_tokens_1h", "tokens_1h"),
+        ] {
+            let sample = format!("{family}{{upstream=\"zen\"}} {}", zen[field]);
+            assert!(
+                text.lines().any(|line| line == sample),
+                "`{sample}` is in the scrape: {text}"
+            );
+        }
+    }
+
+    let hidden = Rig::with_upstream("expose_usage = false\n", usage_upstream().await).await;
+    assert_eq!(hidden.send(None).await, 200);
+    assert!(!hidden.admin_metrics().await.contains("reiki_upstream_"));
 }
 
 #[tokio::test]
@@ -478,6 +561,16 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
     assert_eq!(
         health["get"]["security"][0]["peerAuth"],
         serde_json::json!([])
+    );
+    let top = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"];
+    assert_eq!(top["properties"]["reiki_version"]["type"], "string");
+    assert!(
+        !top["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "reiki_version"),
+        "reiki_version stays optional for readers of older publishers"
     );
     let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]
         ["properties"]["upstreams"]["items"];

@@ -305,6 +305,9 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
         span(format!("{name}  "), Style::Title),
         span(format!("instance {}", peer.health.instance), Style::Plain),
     ];
+    if let Some(version) = &peer.health.reiki_version {
+        header.push(span(format!("  v{version}"), Style::Plain));
+    }
     for seg in host_segments(peer.health) {
         header.push(span(format!("  {seg}"), Style::Plain));
     }
@@ -457,14 +460,20 @@ const GAP_TEXT: &str = "  ";
 /// Header labels for the host columns, in the order `host_figures` returns them.
 const HOST_LABELS: [&str; 3] = ["load", "disk", "sess"];
 
-/// Layouts tried in order: the gauge goes before provider names are shortened, and the
-/// sparkline goes last.
-const FITS: [(usize, bool, bool); 5] = [
-    (LABEL_MAX, true, true),
-    (LABEL_MAX, true, false),
-    (6, true, false),
-    (3, true, false),
-    (3, false, false),
+/// Widest version text in the matrix; the detail card shows the whole of it.
+const VER_MAX: usize = 12;
+/// Header of the version column.
+const VER_HEADER: &str = "Ver";
+
+/// Layouts tried in order: the version column goes first, then the gauge, then provider names
+/// are shortened, and the sparkline goes last.
+const FITS: [(bool, usize, bool, bool); 6] = [
+    (true, LABEL_MAX, true, true),
+    (false, LABEL_MAX, true, true),
+    (false, LABEL_MAX, true, false),
+    (false, 6, true, false),
+    (false, 3, true, false),
+    (false, 3, false, false),
 ];
 
 /// The peers-by-providers matrix: a fleet line with one tally per provider, a header, then one
@@ -580,8 +589,8 @@ pub fn render_matrix(
         return out;
     }
 
-    for (label_max, spark, gauge) in FITS {
-        let grid = Grid::new(matrix, &order, history, label_max, spark, gauge);
+    for (ver, label_max, spark, gauge) in FITS {
+        let grid = Grid::new(matrix, &order, history, label_max, spark, gauge, ver);
         if grid.width() <= width {
             return grid.lines(title, selected, width);
         }
@@ -672,6 +681,10 @@ struct Grid<'a> {
     name_w: usize,
     /// Spans of each row's cells, padded per column later.
     cells: Vec<Vec<Vec<(String, Style)>>>,
+    /// Width of the version column, when the layout has one.
+    ver_w: Option<usize>,
+    /// Each row's version text, in row order.
+    versions: Vec<(String, Style)>,
     host: Vec<HostArea>,
     host_w: [usize; 3],
 }
@@ -684,6 +697,7 @@ impl<'a> Grid<'a> {
         label_max: usize,
         spark: bool,
         gauge: bool,
+        ver: bool,
     ) -> Self {
         let labels: Vec<String> = matrix
             .columns
@@ -731,6 +745,16 @@ impl<'a> Grid<'a> {
             .map(|&i| text_width(&clip(&matrix.rows[i].peer, NAME_MAX)))
             .max()
             .unwrap_or(0);
+        let versions: Vec<(String, Style)> = order
+            .iter()
+            .map(|&i| version_text(&matrix.rows[i]))
+            .collect();
+        let ver_w = ver.then(|| {
+            versions
+                .iter()
+                .map(|(text, _)| text_width(text))
+                .fold(text_width(VER_HEADER), usize::max)
+        });
         let host: Vec<HostArea> = order
             .iter()
             .map(|&i| host_area(&matrix.rows[i], history, spark))
@@ -750,6 +774,8 @@ impl<'a> Grid<'a> {
             widths,
             name_w,
             cells,
+            ver_w,
+            versions,
             host,
             host_w,
         }
@@ -757,8 +783,9 @@ impl<'a> Grid<'a> {
 
     fn width(&self) -> usize {
         let columns: usize = self.widths.iter().map(|w| GAP + w).sum();
+        let ver = self.ver_w.map_or(0, |w| GAP + w);
         let host: usize = self.host_w.iter().map(|w| GAP + w).sum();
-        2 + self.name_w + columns + host
+        2 + self.name_w + columns + ver + host
     }
 
     fn lines(&self, title: Vec<Span>, selected: Option<usize>, width: usize) -> Vec<Line> {
@@ -768,6 +795,10 @@ impl<'a> Grid<'a> {
         for (label, w) in self.labels.iter().zip(&self.widths) {
             head.push(span(GAP_TEXT, Style::Plain));
             head.push(span(pad(label, *w), Style::Title));
+        }
+        if let Some(w) = self.ver_w {
+            head.push(span(GAP_TEXT, Style::Plain));
+            head.push(span(pad(VER_HEADER, w), Style::Title));
         }
         for (label, w) in HOST_LABELS.iter().zip(self.host_w) {
             head.push(span(GAP_TEXT, Style::Plain));
@@ -804,6 +835,11 @@ impl<'a> Grid<'a> {
                     spans.push(span(" ".repeat(*w - used), Style::Plain));
                 }
             }
+            if let Some(w) = self.ver_w {
+                let (text, style) = &self.versions[pos];
+                spans.push(span(GAP_TEXT, Style::Plain));
+                spans.push(span(pad(text, w), *style));
+            }
             match host {
                 HostArea::Stale(text, style) => {
                     spans.push(span(GAP_TEXT, Style::Plain));
@@ -819,6 +855,14 @@ impl<'a> Grid<'a> {
             out.push(line(trim_end(spans), width));
         }
         out
+    }
+}
+
+/// A row's published version, clipped; `?` when the peer does not publish one.
+fn version_text(row: &Row) -> (String, Style) {
+    match &row.version {
+        Some(version) => (clip(version, VER_MAX), Style::Plain),
+        None => ("?".to_owned(), Style::Dim),
     }
 }
 
@@ -1120,6 +1164,78 @@ mod tests {
         positions(text, needle)[0]
     }
 
+    /// Two peers: one publishes its version, one is older and does not.
+    fn versioned_fleet(t0: Instant) -> (Fleet, Vec<String>) {
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            r#"{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t","upstreams":[
+            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx"},
+            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#,
+            t0,
+        );
+        add(&mut f, "peer-b", BARE_DOC, t0);
+        (f, names(&["peer-a", "peer-b"]))
+    }
+
+    #[test]
+    fn the_card_header_shows_the_version_after_the_instance() {
+        let t0 = Instant::now();
+        let (f, _) = versioned_fleet(t0);
+        let card = peer_detail(&f, "peer-a", t0, 100);
+        assert_eq!(
+            card[0].plain_text(),
+            "peer-a  instance peer-a  v0.10.3",
+            "{card:?}"
+        );
+        let bare = peer_detail(&f, "peer-b", t0, 100);
+        assert!(!bare[0].plain_text().contains(" v"), "{bare:?}");
+    }
+
+    #[test]
+    fn the_matrix_has_a_ver_column_between_providers_and_host_figures() {
+        let t0 = Instant::now();
+        let (f, peers) = versioned_fleet(t0);
+        let lines = matrix_lines(&f, &peers, t0, 100);
+        let header = lines[1].plain_text();
+        let ver = first(&header, "Ver");
+        assert!(first(&header, "openrouter") < ver, "{header:?}");
+        assert!(ver < first(&header, "load"), "{header:?}");
+        let rows: Vec<String> = lines[2..].iter().map(Line::plain_text).collect();
+        let a = rows.iter().find(|r| r.contains("peer-a")).unwrap();
+        let b = rows.iter().find(|r| r.contains("peer-b")).unwrap();
+        assert_eq!(positions(a, "0.10.3"), vec![ver], "{a:?}");
+        assert_eq!(b.chars().nth(ver), Some('?'), "an older peer: {b:?}");
+    }
+
+    #[test]
+    fn the_ver_column_is_the_first_thing_dropped_when_narrow() {
+        let t0 = Instant::now();
+        let (f, peers) = versioned_fleet(t0);
+        let narrowest = (20..=120)
+            .find(|&w| {
+                matrix_lines(&f, &peers, t0, w)[1]
+                    .plain_text()
+                    .contains("Ver")
+            })
+            .expect("the column fits somewhere");
+        let next = matrix_lines(&f, &peers, t0, narrowest - 1);
+        let header = next[1].plain_text();
+        assert!(
+            !header.contains("Ver"),
+            "dropped one column narrower: {header:?}"
+        );
+        assert!(
+            header.contains("openrouter"),
+            "full provider names stay: {header:?}"
+        );
+        let gauge = next[2].plain_text();
+        assert!(gauge.contains("······"), "the gauge stays: {gauge:?}");
+    }
+
     #[test]
     fn matrix_title_tallies_count_only_peers_with_the_provider() {
         let t0 = Instant::now();
@@ -1377,6 +1493,7 @@ mod tests {
             combos: vec![0],
             pressure: vec![None],
             host: HostSummary::default(),
+            version: None,
             error: Some("poll: cannot connect".to_owned()),
             stale: true,
             age,
@@ -1480,6 +1597,7 @@ mod tests {
                 disk_percent: Some(pct),
                 sessions: None,
             },
+            version: None,
             error: None,
             stale: false,
             age: Some(Duration::ZERO),
@@ -1561,6 +1679,7 @@ mod tests {
                 disk_percent: Some(100.0),
                 sessions: Some(sessions),
             },
+            version: None,
             error: None,
             stale: false,
             age: Some(Duration::ZERO),
@@ -1635,6 +1754,7 @@ mod tests {
             combos: vec![3],
             pressure: vec![None],
             host: HostSummary::default(),
+            version: None,
             error: None,
             stale: false,
             age: Some(Duration::ZERO),

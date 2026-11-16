@@ -205,17 +205,37 @@ pub struct KeyCounts {
     pub out_of_rotation: u64,
 }
 
+/// One upstream's attempts and tokens over the last hour, sampled for an admin request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamUsage {
+    pub upstream: String,
+    pub requests_1h: u64,
+    pub limited_1h: u64,
+    pub tokens_1h: u64,
+}
+
 /// An admin request for one of a plugin's paths.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct AdminCtx<'a> {
     pub path: &'a str,
     pub keys: KeyCounts,
+    /// Per-upstream usage, sampled for this request; `None` when the operator hides usage.
+    pub usage: Option<Vec<UpstreamUsage>>,
 }
 
 impl<'a> AdminCtx<'a> {
     pub fn new(path: &'a str, keys: KeyCounts) -> Self {
-        Self { path, keys }
+        Self {
+            path,
+            keys,
+            usage: None,
+        }
+    }
+
+    pub fn with_usage(mut self, usage: Option<Vec<UpstreamUsage>>) -> Self {
+        self.usage = usage;
+        self
     }
 }
 

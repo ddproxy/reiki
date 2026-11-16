@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `reiki top` shows a fleet-scaled gauge of the last hour's requests per provider and a last-hour trend in the detail card, fed by `requests_1h`, `limited_1h` and `request_buckets` in the peer document (off with `[peers] expose_usage = false`).
+- A quota 429 that carries `Retry-After` now cools the key for that long, and the failure logs the header and a bounded body snippet. A `quota_resets` schedule still takes precedence; with neither, the 5 hour window applies.
+
+- The peer document carries `reiki_version`, shown by `reiki top` as a `Ver` column and after each peer's name in its card; `?` for an older peer.
+- The peer document carries `tokens_1h` and `token_buckets` per upstream: input plus output tokens the provider reported, counted in the same hour window as the attempts, under `[peers] expose_usage`.
+- `/metrics` gains `reiki_upstream_requests_1h`, `reiki_upstream_limited_1h` and `reiki_upstream_tokens_1h` per upstream, sampled from the same counters as the peer document. Absent with `expose_usage = false`.
+
+### Changed
+
+- Token counts are read from response bodies only when `[peers]` or the `metrics` plugin is configured, so an install with neither pays no per-response cost.
+- `reiki top` opens a peer's detail pane for any peer you move to; Enter closes it.
+
+### Fixed
+
+- `reiki top` counts cooldowns down between snapshots instead of freezing them at the published value.
+- A healthy key with a model cooling is drawn as a yellow `◐+N`, and the detail card says how many models are cooling and the last non-2xx status.
+
 ## 0.10.2
 
 ### Added

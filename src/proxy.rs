@@ -282,8 +282,9 @@ const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
-    /// Per-upstream attempts for the last hour, in memory only.
-    pressure: PressureCounter,
+    /// Per-upstream attempts and tokens for the last hour, in memory only. Shared with the
+    /// response bodies, which record their tokens when they end.
+    pressure: Arc<PressureCounter>,
     /// Per-key outbound buckets, kept across reloads for an unchanged window.
     shaper: Shaper,
     /// The shaper snapshot last written and when, so natural expiry of a pause or
@@ -358,7 +359,7 @@ impl App {
         Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
-            pressure: PressureCounter::new(),
+            pressure: Arc::new(PressureCounter::new()),
             shaper,
             shaper_saved: Mutex::new((BTreeMap::new(), None)),
             policy,
@@ -1818,6 +1819,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 Err(response) => return Ok(*response),
             };
             let permit = if buffered { None } else { permit };
+            let accounting = Accounting {
+                permit,
+                pressure: snapshot
+                    .config
+                    .tracks_usage()
+                    .then(|| Arc::clone(&app.pressure)),
+            };
             return Ok(stream_response(
                 plugin_states,
                 &key_name,
@@ -1825,7 +1833,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 response,
                 parts.method == Method::HEAD,
                 &secrets,
-                permit,
+                accounting,
             ));
         }
 
@@ -2052,7 +2060,7 @@ async fn forward_passthrough(
                 response,
                 parts.method == Method::HEAD,
                 &[],
-                None,
+                Accounting::default(),
             ))
         }
         Ok(Err(err)) => {
@@ -2469,25 +2477,39 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
+/// What a streamed body settles when it ends: the shaping permit, whose estimate the measured
+/// usage replaces, and the counter that takes the measured tokens.
+#[derive(Default)]
+struct Accounting {
+    permit: Option<Permit>,
+    pressure: Option<Arc<PressureCounter>>,
+}
+
 /// Holds a shaping permit for as long as its body is streamed. Dropping the body
 /// (including a client disconnect) releases the key's concurrency slot.
 struct Permitted<S> {
     inner: S,
     permit: Option<Permit>,
     usage: Option<Usage>,
+    /// The counter and the upstream its tokens are attributed to.
+    tokens: Option<(Arc<PressureCounter>, String)>,
 }
 
 impl<S> Permitted<S> {
-    /// Replaces the estimate with the usage seen so far. Without usage the permit
-    /// is left to drop, keeping the estimate.
+    /// Settles with the usage seen so far. Without usage the permit is left to drop, keeping
+    /// the estimate, and no tokens are counted.
     fn finish(&mut self) {
         let Some(mut usage) = self.usage.take() else {
             return;
         };
-        if let Some(actual) = usage.total() {
-            if let Some(permit) = self.permit.take() {
-                permit.complete(actual);
-            }
+        let Some(actual) = usage.total() else {
+            return;
+        };
+        if let Some(permit) = self.permit.take() {
+            permit.complete(actual);
+        }
+        if let Some((pressure, upstream)) = self.tokens.take() {
+            pressure.record_tokens(&upstream, actual, Instant::now());
         }
     }
 }
@@ -2536,7 +2558,7 @@ fn stream_response(
     response: UpstreamResponse,
     is_head: bool,
     secrets: &[&str],
-    permit: Option<Permit>,
+    accounting: Accounting,
 ) -> Response {
     let mut status = response.status;
     let mut headers = HeaderMap::new();
@@ -2562,10 +2584,10 @@ fn stream_response(
     };
     // A compressed body is not the upstream's bytes, so its usage cannot be read here.
     let watch = !response.is_decoded() && !is_encoded(&response.headers);
-    let usage = permit
-        .as_ref()
-        .filter(|_| watch)
-        .map(|_| Usage::new(is_event_stream(&response.headers)));
+    let Accounting { permit, pressure } = accounting;
+    let usage = (watch && (permit.is_some() || pressure.is_some()))
+        .then(|| Usage::new(is_event_stream(&response.headers)));
+    let tokens = pressure.map(|pressure| (pressure, upstream.to_owned()));
     let stream = |response: UpstreamResponse| -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         match scrubber {
             Some(scrubber) => Box::pin(crate::scrub::ScrubbedStream::new(response.into_stream(), scrubber)),
@@ -2577,6 +2599,7 @@ fn stream_response(
             inner: stream(response),
             permit,
             usage,
+            tokens,
         })
     } else {
         let mut session = plugin_states;
@@ -2598,6 +2621,7 @@ fn stream_response(
             },
             permit,
             usage,
+            tokens,
         })
     };
     let mut out = Response::new(body);

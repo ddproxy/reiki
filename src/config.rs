@@ -1170,6 +1170,19 @@ fn hide_quoted(text: &str) -> String {
 }
 
 impl Config {
+    /// Whether per-upstream usage is kept, for the peer document and `/metrics`: `[peers]
+    /// expose_usage`, which is on when there is no `[peers]` table.
+    pub fn exposes_usage(&self) -> bool {
+        self.peers.as_ref().is_none_or(|peers| peers.expose_usage)
+    }
+
+    /// Whether response bodies are read for token counts. Reading costs memory per in-flight
+    /// response, so it happens only when something consumes the figures: the peer document
+    /// (`[peers]`) or the `metrics` plugin.
+    pub fn tracks_usage(&self) -> bool {
+        self.exposes_usage() && (self.peers.is_some() || self.plugins.contains_key("metrics"))
+    }
+
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let (config, warnings) = Self::parse_with_warnings(text)?;
         for warning in &warnings {
@@ -4223,6 +4236,20 @@ socket = "/run/forwarder.sock"
             assert!(hub_error(&at("http://127.0.0.1:4443")).contains("lists itself"));
             assert!(hub_error(&at("http://localhost:4443")).contains("lists itself"));
             assert!(Config::parse(&at("http://localhost:4444")).is_ok());
+        }
+    }
+
+    #[test]
+    fn token_counts_are_read_only_when_something_consumes_them() {
+        let base = "[upstream.api]\nbase_url = \"https://api.example.net/v1\"\n\
+                    [keys.k]\nupstream = \"api\"\nfile = \"/unused/k\"\n\
+                    [streams.s]\ntoken_sha256 = \"00\"\nchain = [\"k\"]\n";
+        let plain = Config::parse(base).unwrap();
+        assert!(plain.exposes_usage());
+        assert!(!plain.tracks_usage(), "nobody reads the figures");
+        let with_peers = Config::parse(&format!("{base}[peers]\nenabled = true\n"));
+        if let Ok(config) = with_peers {
+            assert!(config.tracks_usage());
         }
     }
 }

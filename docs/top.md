@@ -46,6 +46,7 @@ Fleet 3/3 fresh   gemini 2/2   zen 1/2   openrouter 0/1
 - After the state glyph, six cells show the last hour of attempts in ten-minute steps, from `▁` to `█`. They scale to the busiest bucket across the whole fleet for that provider, so rows compare at a glance; `·` is a zero bucket. A gauge turns yellow when any attempt in the hour was rate-limited or began a cooldown. A peer that publishes no figures, or an older publisher, draws `·` cells rather than an error.
 - A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it; the request total is never in the matrix.
 - The detail pane adds `last hour: N requests, M limited` and a twelve-cell five-minute trend for each upstream.
+- `Ver` is the version each peer publishes (`reiki_version`), after the provider columns and before the host figures, clipped to twelve characters. `?` means the peer does not publish one. The detail card shows it after the instance name, as `v0.10.3`.
 - `load` is the one-minute load with a sparkline of recent samples. `disk` is the fullest disk: green under 75%, yellow to 89%, red from 90%. `sess` is active sessions. A `-` means the peer does not publish that figure.
 - A stale row shows `stale <age>` in place of host figures. Its error goes to the detail pane.
 - The sparkline is built from samples taken once per redraw interval while the screen is live. `--once` has no history, so it shows the number only.
@@ -77,7 +78,7 @@ Peer and provider names come from the network. Control characters and invisible 
 
 ### Narrow terminals
 
-The matrix drops the last-hour gauge first, then shortens provider headers to six, then three characters, drops the sparkline, and as a last resort prints one chip line per peer with only the providers it uses. Below 20 columns it draws the fleet line and peer names. It never draws past the terminal width.
+The matrix drops the `Ver` column first, then the last-hour gauge, then shortens provider headers to six, then three characters, drops the sparkline, and as a last resort prints one chip line per peer with only the providers it uses. Below 20 columns it draws the fleet line and peer names. It never draws past the terminal width.
 
 ### `--once`
 

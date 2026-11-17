@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The columnar scanner shared by the PHI and finance plugins lives once in `reiki-detect` (about 360 duplicate lines removed).
+
 ## 0.10.5
 
 ### Added

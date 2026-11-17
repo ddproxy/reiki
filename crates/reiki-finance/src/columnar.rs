@@ -5,6 +5,7 @@
 //! so a bare account number under `account` is found even though nothing next to it says so.
 
 use crate::detect::{self, Hit, Kind};
+use reiki_detect::columnar::{self, Line};
 
 const DELIMITERS: [u8; 4] = *b"\t|,;";
 
@@ -45,78 +46,10 @@ fn cell_ok(kind: Kind, value: &str) -> bool {
     }
 }
 
-/// The `(start, end)` byte range of each cell in `line`, offset by `base`; quotes are excluded.
-fn split_cells(line: &str, delim: u8, base: usize) -> Vec<(usize, usize)> {
-    let b = line.as_bytes();
-    let mut cells = Vec::new();
-    let mut i = 0;
-    loop {
-        let mut start = i;
-        while b.get(start) == Some(&b' ') && delim != b' ' {
-            start += 1;
-        }
-        let (s, e, next);
-        if b.get(start) == Some(&b'"') {
-            let mut j = start + 1;
-            loop {
-                match b.get(j) {
-                    None => break,
-                    Some(b'"') if b.get(j + 1) == Some(&b'"') => j += 2,
-                    Some(b'"') => break,
-                    Some(_) => j += 1,
-                }
-            }
-            s = start + 1;
-            e = j.min(b.len());
-            let after = (j + 1).min(b.len());
-            next = b[after..]
-                .iter()
-                .position(|c| *c == delim)
-                .map(|p| after + p);
-        } else {
-            let end = b[i..]
-                .iter()
-                .position(|c| *c == delim)
-                .map_or(b.len(), |p| i + p);
-            s = start.min(end);
-            let mut trimmed = end;
-            while trimmed > s && b[trimmed - 1] == b' ' {
-                trimmed -= 1;
-            }
-            e = trimmed;
-            next = (end < b.len()).then_some(end);
-        }
-        cells.push((base + s, base + e));
-        match next {
-            Some(p) => i = p + 1,
-            None => break,
-        }
-    }
-    cells
-}
-
-struct Line<'a> {
-    start: usize,
-    text: &'a str,
-}
-
-fn lines(text: &str) -> Vec<Line<'_>> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for piece in text.split_inclusive('\n') {
-        out.push(Line {
-            start,
-            text: piece.trim_end_matches(['\r', '\n']),
-        });
-        start += piece.len();
-    }
-    out
-}
-
 /// Every hit in the tables of `text` for the wanted `kinds`.
 pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
     let mut hits = Vec::new();
-    let all = lines(text);
+    let all = columnar::lines(text);
     let want = |k: Kind| kinds.contains(&k);
     let mut i = 0;
     while i < all.len() {
@@ -131,7 +64,7 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             }
             // A row of another width is skipped, not treated as the end: a quoted cell that spans
             // lines leaves a short line behind.
-            let cells = split_cells(all[j].text, delim, all[j].start);
+            let cells = columnar::split_cells(all[j].text, delim, all[j].start);
             if cells.len() == width {
                 for (idx, (s, e)) in cells.iter().enumerate() {
                     if let Some(kind) = map[idx] {
@@ -150,7 +83,7 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
         i = j;
     }
     sql(text, &want, &mut hits);
-    copy_blocks(text, &all, &want, &mut hits);
+    columnar::copy_blocks(text, &all, &want, column_kind, cell_ok, &mut hits);
     hits
 }
 
@@ -158,7 +91,7 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
 #[allow(clippy::type_complexity)]
 fn header(line: &Line<'_>, want: &dyn Fn(Kind) -> bool) -> Option<(u8, Vec<Option<Kind>>, usize)> {
     for delim in DELIMITERS {
-        let cells = split_cells(line.text, delim, 0);
+        let cells = columnar::split_cells(line.text, delim, 0);
         if cells.len() < 2 {
             continue;
         }
@@ -225,123 +158,8 @@ fn sql(text: &str, want: &dyn Fn(Kind) -> bool, hits: &mut Vec<Hit>) {
         if map.iter().all(Option::is_none) {
             continue;
         }
-        i = tuples(text, i, &map, hits);
+        i = columnar::tuples(text, i, &map, hits, cell_ok);
         from = from.max(i);
-    }
-}
-
-/// Reads the `(...)` tuples after VALUES starting at `i`; returns where it stopped.
-fn tuples(text: &str, mut i: usize, map: &[Option<Kind>], hits: &mut Vec<Hit>) -> usize {
-    let b = text.as_bytes();
-    loop {
-        while b
-            .get(i)
-            .is_some_and(|c| c.is_ascii_whitespace() || *c == b',')
-        {
-            i += 1;
-        }
-        if b.get(i) != Some(&b'(') {
-            return i;
-        }
-        i += 1;
-        let mut column = 0;
-        loop {
-            while b.get(i).is_some_and(u8::is_ascii_whitespace) {
-                i += 1;
-            }
-            let (s, e, next) = if b.get(i) == Some(&b'\'') {
-                let mut j = i + 1;
-                loop {
-                    match b.get(j) {
-                        None => break,
-                        Some(b'\'') if b.get(j + 1) == Some(&b'\'') => j += 2,
-                        Some(b'\'') => break,
-                        Some(_) => j += 1,
-                    }
-                }
-                (i + 1, j.min(b.len()), (j + 1).min(b.len()))
-            } else {
-                let mut j = i;
-                let mut depth = 0usize;
-                while let Some(c) = b.get(j) {
-                    match c {
-                        b'(' => depth += 1,
-                        b')' if depth == 0 => break,
-                        b')' => depth -= 1,
-                        b',' if depth == 0 => break,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                let mut end = j;
-                while end > i && b[end - 1].is_ascii_whitespace() {
-                    end -= 1;
-                }
-                (i, end, j)
-            };
-            if let Some(Some(kind)) = map.get(column) {
-                if cell_ok(*kind, &text[s..e]) {
-                    hits.push(Hit {
-                        kind: *kind,
-                        start: s,
-                        end: e,
-                    });
-                }
-            }
-            column += 1;
-            i = next;
-            while b.get(i).is_some_and(u8::is_ascii_whitespace) {
-                i += 1;
-            }
-            match b.get(i) {
-                Some(b',') => i += 1,
-                Some(b')') => {
-                    i += 1;
-                    break;
-                }
-                _ => return i,
-            }
-        }
-    }
-}
-
-/// `COPY t (a, b) FROM stdin;` followed by tab-separated rows up to `\.`.
-fn copy_blocks(text: &str, all: &[Line<'_>], want: &dyn Fn(Kind) -> bool, hits: &mut Vec<Hit>) {
-    let mut i = 0;
-    while i < all.len() {
-        let lower = all[i].text.to_ascii_lowercase();
-        let head = lower.trim_start();
-        let (Some(open), Some(close)) = (all[i].text.find('('), all[i].text.find(')')) else {
-            i += 1;
-            continue;
-        };
-        if !(head.starts_with("copy ") && head.contains("from stdin") && open < close) {
-            i += 1;
-            continue;
-        }
-        let map: Vec<Option<Kind>> = all[i].text[open + 1..close]
-            .split(',')
-            .map(|name| column_kind(name.trim().trim_matches('"')).filter(|k| want(*k)))
-            .collect();
-        let mut j = i + 1;
-        while j < all.len() && all[j].text != "\\." {
-            let cells = split_cells(all[j].text, b'\t', all[j].start);
-            if cells.len() == map.len() {
-                for (idx, (s, e)) in cells.iter().enumerate() {
-                    if let Some(kind) = map[idx] {
-                        if cell_ok(kind, &text[*s..*e]) {
-                            hits.push(Hit {
-                                kind,
-                                start: *s,
-                                end: *e,
-                            });
-                        }
-                    }
-                }
-            }
-            j += 1;
-        }
-        i = j + 1;
     }
 }
 

@@ -7,6 +7,7 @@
 use http::header::CONTENT_ENCODING;
 use http::HeaderMap;
 
+pub mod columnar;
 pub mod guard;
 
 /// True when the headers describe a body that is more than the clear bytes on the wire.

@@ -12,7 +12,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by `check`, server mode, `keys`, `reload`, `peers` and `top`. `hash-token`, `ca-init` and `scan` do not read it. |
+| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by `check`, server mode, `keys`, `failures`, `reload`, `peers` and `top`. `hash-token`, `ca-init` and `scan` do not read it. |
 | `--listen ADDR` | from `listen` in the config | Client listen address. Used by server mode and `check`. Other commands ignore it. |
 
 ### Environment
@@ -20,7 +20,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 | Variable | Used by | Meaning |
 | --- | --- | --- |
 | `REIKI_LISTEN` | server mode, `check` | Client listen address. Overridden by `--listen`; overrides `listen` in the config. |
-| `REIKI_ADMIN_TOKEN` | `reload`, `keys` | Admin token, when `--token-file` is not given. |
+| `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. |
 | `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup. |
 
 `--listen` and `REIKI_LISTEN` accept an `IP:port` address or a `host:port` name.
@@ -263,6 +263,43 @@ Exit codes:
 | Health table or JSON | Answer received and parsed. | Admin listener answered with an error status, or the answer is not valid `/status` JSON. | No admin token, no admin address, the listener could not be reached, or the answer could not be read. |
 | `--enable` | Key re-enabled. | Refused, such as an unknown key (`404`). | As above. |
 | `--check` | Every key OK. | Any error or warning. | Config unreadable or does not parse. |
+
+## failures
+
+Shows the running instance's last key failures, from the same in-memory ring as `GET /v1/failures`.
+
+```
+reiki failures [--limit N] [--key NAME] [--json] [--url URL] [--token-file PATH]
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--limit N` | `20` | Records to show, newest first; 1 to 64. |
+| `--key NAME` | all keys | Only failures for this key name. |
+| `--json` | off | Print the same JSON array as the endpoint. |
+| `--url URL` | `[admin] listen` from the config | Admin address. |
+| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. |
+
+The table:
+
+```
+TIME               STREAM  KEY    STATUS  CLASS         COOLED  NOTE
+2026-11-17 12:00:00  client  zen-a  429     rate_limited  42s     {"error":"rate limited"}
+```
+
+| Column | Meaning |
+| --- | --- |
+| `TIME` | Failure time in UTC. |
+| `STREAM` | Stream that made the attempt. |
+| `KEY` | Key name from `[keys.NAME]`. |
+| `STATUS` | Upstream status code, or `-` for a transport failure. |
+| `CLASS` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. |
+| `COOLED` | Seconds left on the cooldown this failure started, or `-`. |
+| `NOTE` | Scrubbed, printable body snippet, cut to the terminal width (`COLUMNS`, default 120). |
+
+Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. `--json` prints an array whether or not `--limit` was given.
+
+Exit codes: `0` on success; `1` when the admin listener refuses the token or answer; `2` when it cannot be reached or no admin token or address is available.
 
 ## peers
 

@@ -87,6 +87,28 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Show recent key failures from the running instance's in-memory ring.
+    ///
+    /// Calls `GET /v1/failures` on the admin listener and prints a table, or the same JSON array
+    /// with `--json`. Exits 0 when the request succeeded, 1 when the instance refused it and 2
+    /// when it could not be reached.
+    Failures {
+        /// Records to show, newest first; 1 to 64.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+        /// Only failures for this key name.
+        #[arg(long)]
+        key: Option<String>,
+        /// Print the JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Admin address, such as `http://127.0.0.1:4098`. Default: the `[admin] listen` in the config.
+        #[arg(long)]
+        url: Option<String>,
+        /// File holding the admin token. Default: the `REIKI_ADMIN_TOKEN` environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Read each `[peers.<name>]` instance's `/v1/health` and print what it reports.
     ///
     /// A peer that cannot be reached, refuses the token or answers with data older than three
@@ -286,6 +308,87 @@ async fn run_keys(
     }
 }
 
+/// The `reiki failures` command: reads the running instance's `/v1/failures`.
+async fn run_failures(
+    config: &std::path::Path,
+    limit: u8,
+    key: Option<&str>,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+    json: bool,
+) -> i32 {
+    let target = match admin_target(config, url, token_file) {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return 2;
+        }
+    };
+    let mut request = format!("{}/v1/failures?limit={limit}", target.base);
+    if let Some(key) = key {
+        request.push_str("&key=");
+        request.push_str(&percent_encode_query(key));
+    }
+    let response = reqwest::Client::new()
+        .get(request)
+        .bearer_auth(&target.token)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("reiki: cannot reach {}: {e}", target.base);
+            return 2;
+        }
+    };
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("reiki: cannot read the answer: {e}");
+            return 2;
+        }
+    };
+    if !status.is_success() {
+        if !body.is_empty() {
+            eprintln!("{body}");
+        }
+        eprintln!("reiki: the admin listener answered {status}");
+        return 1;
+    }
+    let records = match reiki::failures::parse(&body) {
+        Ok(records) => records,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return 1;
+        }
+    };
+    let output = if json {
+        reiki::failures::render_json(&records)
+    } else {
+        Ok(reiki::failures::render_table(&records, terminal_width()))
+    };
+    match output {
+        Ok(text) => {
+            print!("{text}");
+            0
+        }
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            1
+        }
+    }
+}
+
+/// Terminal width for clipped tables: `COLUMNS` when set, otherwise a plain 120.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(120)
+}
+
 /// Percent-encodes one query value, so a key name may contain any character.
 fn percent_encode_query(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -461,6 +564,26 @@ async fn main() {
             run_keys(&cli.config, url.as_deref(), token_file.as_deref(), *json).await,
         );
     }
+    if let Some(Command::Failures {
+        limit,
+        key,
+        json,
+        url,
+        token_file,
+    }) = &cli.command
+    {
+        std::process::exit(
+            run_failures(
+                &cli.config,
+                *limit,
+                key.as_deref(),
+                url.as_deref(),
+                token_file.as_deref(),
+                *json,
+            )
+            .await,
+        );
+    }
     #[cfg(feature = "peers")]
     if let Some(Command::Peers { json, watch }) = &cli.command {
         let config = load_peers_config(&cli.config);
@@ -475,9 +598,11 @@ async fn main() {
     }) = &cli.command
     {
         let config = load_peers_config(&cli.config);
+        let local = reiki::top::LocalFailures::from_config(&config);
         std::process::exit(
-            reiki::top::run(
+            reiki::top::run_with_local(
                 config.peers.as_ref(),
+                local,
                 *once,
                 *interval,
                 *full,

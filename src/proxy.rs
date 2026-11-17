@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Request, State};
@@ -285,6 +285,8 @@ pub struct App {
     /// Per-upstream attempts and tokens for the last hour, in memory only. Shared with the
     /// response bodies, which record their tokens when they end.
     pressure: Arc<PressureCounter>,
+    /// The latest key failures, across streams, for `/v1/failures` and `reiki top`.
+    failures: crate::failures::FailureRing,
     /// Per-key outbound buckets, kept across reloads for an unchanged window.
     shaper: Shaper,
     /// The shaper snapshot last written and when, so natural expiry of a pause or
@@ -360,6 +362,7 @@ impl App {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             pressure: Arc::new(PressureCounter::new()),
+            failures: crate::failures::FailureRing::new(),
             shaper,
             shaper_saved: Mutex::new((BTreeMap::new(), None)),
             policy,
@@ -426,6 +429,11 @@ impl App {
 
     pub(crate) fn pressure(&self) -> &PressureCounter {
         &self.pressure
+    }
+
+    /// The in-memory ring of recent key failures.
+    pub(crate) fn failures(&self) -> &crate::failures::FailureRing {
+        &self.failures
     }
 
     /// Failed admin token checks, kept apart from the client listener's counts.
@@ -1934,6 +1942,19 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 // next key; if none helps, hand the upstream's own answer back to the caller.
                 tracing::debug!(status = status.as_u16(), body = %text.chars().take(160).collect::<String>(), "upstream refused this request");
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, trying the next key");
+                note_failure(
+                    app,
+                    stream,
+                    &key_name,
+                    FailureClass::AccessDisabled,
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
+                    },
+                );
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
@@ -1941,6 +1962,19 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             Outcome::KeyFailure(FailureClass::QuotaExhausted) if confirming => {
                 // The key stays in rotation: the next pass picks it again and only a repeat is recorded.
                 tracing::warn!(stream = %stream, key = %key_name, "quota 429, sending it once more before cooling the key");
+                note_failure(
+                    app,
+                    stream,
+                    &key_name,
+                    FailureClass::QuotaExhausted,
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
+                    },
+                );
                 confirmed.push(key_name);
                 tokio::time::sleep(QUOTA_CONFIRM_DELAY).await;
             }
@@ -1949,12 +1983,38 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             {
                 // A second key refusing the same request points at the request, not at the keys.
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request again, not disabling it");
+                note_failure(
+                    app,
+                    stream,
+                    &key_name,
+                    FailureClass::Unauthorized,
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
+                    },
+                );
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::Unauthorized));
             }
             Outcome::KeyFailure(FailureClass::Unauthorized) if upstream.hold_unauthorized => {
                 tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "key refused this request, holding its disable until a later key serves it");
+                note_failure(
+                    app,
+                    stream,
+                    &key_name,
+                    FailureClass::Unauthorized,
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
+                    },
+                );
                 held = Some((key_name.clone(), status.as_u16()));
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
@@ -1989,6 +2049,10 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                         status: Some(status.as_u16()),
                         scope: scope.as_ref(),
                         quota_hint,
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
                     },
                 );
                 // A first transient 5xx does not cool the key; skip it so the walk moves on.
@@ -2149,6 +2213,8 @@ fn release_held(app: &App, snapshot: &Snapshot, stream: &str, held: Option<(Stri
             FailureClass::Unauthorized,
             FailureNote {
                 status: Some(status),
+                // The held 401 was already added when it was held.
+                ring: false,
                 ..FailureNote::default()
             },
         );
@@ -2186,12 +2252,34 @@ fn is_encoded(headers: &HeaderMap) -> bool {
 }
 
 /// What an attempt reported about its failure.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct FailureNote<'a> {
     status: Option<u16>,
     scope: Option<&'a Scope>,
     /// The provider's own wait for a quota failure, from `Retry-After`.
     quota_hint: Option<Duration>,
+    /// `Retry-After` exactly as received, kept for the ring.
+    retry_after: Option<&'a str>,
+    /// The upstream error body, for the ring's scrubbed snippet.
+    body: Option<&'a str>,
+    /// Credentials to scrub from the snippet.
+    secrets: &'a [&'a str],
+    /// False when the caller already added this failure to the ring.
+    ring: bool,
+}
+
+impl Default for FailureNote<'_> {
+    fn default() -> Self {
+        Self {
+            status: None,
+            scope: None,
+            quota_hint: None,
+            retry_after: None,
+            body: None,
+            secrets: &[],
+            ring: true,
+        }
+    }
 }
 
 fn record(
@@ -2206,6 +2294,7 @@ fn record(
         status,
         scope,
         quota_hint,
+        ..
     } = note;
     let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now(), quota_hint);
     let scoped = failure_scope(class, status, scope);
@@ -2225,6 +2314,8 @@ fn record(
     let now = Instant::now();
     let mut counted = false;
     let mut limited = false;
+    let mut ring_cooled = false;
+    let mut ring_cooling = None;
     if let Ok(mut health) = app.health.lock() {
         // A reload that rotated this key's secret already reset its health; the old
         // secret's failure must not disable the new one.
@@ -2246,6 +2337,7 @@ fn record(
         health.record_status(key, status);
         limited = status == Some(429) || cooled.is_some();
         counted = true;
+        ring_cooled = cooled.is_some();
         if let Some(cooled_scope) = cooled {
             app.plugins().on_event(&Event::Cooldown {
                 key,
@@ -2254,6 +2346,7 @@ fn record(
             });
         }
         let cooling_secs = health.cooling_remaining(key, now).map(|d| d.as_secs());
+        ring_cooling = cooling_secs;
         tracing::warn!(
             stream,
             key,
@@ -2269,7 +2362,60 @@ fn record(
             app.pressure.record(&upstream, limited, now);
         }
     }
+    record_ring(app, stream, key, class, note, ring_cooled, ring_cooling);
     app.persist_state();
+}
+
+/// Adds a failure to the ring without touching key health, for branches that deliberately do
+/// not cool or disable the key.
+fn note_failure(app: &App, stream: &str, key: &str, class: FailureClass, note: FailureNote<'_>) {
+    if !note.ring {
+        return;
+    }
+    let cooling = app
+        .health
+        .try_lock()
+        .ok()
+        .and_then(|health| health.cooling_remaining(key, Instant::now()))
+        .map(|left| left.as_secs());
+    record_ring(app, stream, key, class, note, false, cooling);
+}
+
+fn record_ring(
+    app: &App,
+    stream: &str,
+    key: &str,
+    class: FailureClass,
+    note: FailureNote<'_>,
+    cooled: bool,
+    cooling_seconds: Option<u64>,
+) {
+    if !note.ring {
+        return;
+    }
+    let retry_after = note.retry_after.map(|value| {
+        let clean = crate::scrub::scrub_text(value, note.secrets);
+        printable_snippet(&clean, crate::failures::MAX_RETRY_AFTER_CHARS)
+    });
+    let snippet = note.body.map_or_else(String::new, |body| {
+        let clean = crate::scrub::scrub_text(body, note.secrets);
+        printable_snippet(&clean, crate::failures::MAX_NOTE_CHARS)
+    });
+    let time = app
+        .wall_now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    app.failures().record(crate::failures::FailureRecord {
+        time,
+        stream: stream.to_owned(),
+        key: key.to_owned(),
+        status: note.status,
+        class: class.name().to_owned(),
+        retry_after,
+        cooled,
+        cooling_seconds,
+        note: snippet,
+    });
 }
 
 /// The cooldown for a quota failure when the key names a reset schedule or the provider sent a
@@ -2299,7 +2445,7 @@ fn quota_window(schedule: Option<Duration>, hint: Option<Duration>) -> Option<Du
 }
 
 /// Printable, bounded text from an upstream body for a log line.
-fn printable_snippet(text: &str, max: usize) -> String {
+pub(crate) fn printable_snippet(text: &str, max: usize) -> String {
     text.chars()
         .take(max)
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -3353,5 +3499,44 @@ mod tests {
         let out = printable_snippet(&text, 20);
         assert_eq!(out.chars().count(), 20);
         assert!(out.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn a_ring_snippet_scrubs_the_key_and_strips_control_characters() {
+        let app = App::with_header_timeout(
+            Config::parse("").unwrap(),
+            HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(1),
+        );
+        let secret_text = ["sk-ring", "-secret-0123456789"].concat();
+        let secret = secret_text.as_str();
+        let body = format!("bad {secret}\u{1b}[31m\n{}", "x".repeat(300));
+        record_ring(
+            &app,
+            "s",
+            "a",
+            FailureClass::RateLimited(None),
+            FailureNote {
+                status: Some(429),
+                retry_after: Some("12\n0"),
+                body: Some(&body),
+                secrets: &[secret],
+                ..FailureNote::default()
+            },
+            true,
+            Some(30),
+        );
+        let rows = app.failures().snapshot(1, None);
+        assert_eq!(rows[0].status, Some(429));
+        assert_eq!(rows[0].retry_after.as_deref(), Some("12 0"));
+        assert!(rows[0].cooled);
+        assert_eq!(rows[0].cooling_seconds, Some(30));
+        assert!(!rows[0].note.contains(secret), "{}", rows[0].note);
+        assert!(!rows[0].note.chars().any(char::is_control));
+        assert_eq!(
+            rows[0].note.chars().count(),
+            crate::failures::MAX_NOTE_CHARS
+        );
     }
 }

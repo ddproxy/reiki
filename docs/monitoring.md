@@ -4,7 +4,7 @@ Reiki can serve a small admin listener with `GET /status` and any plugin-provide
 
 ## Admin API
 
-Routes: `GET /status`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API only gains fields.
+Routes: `GET /status`, `GET /failures`, `POST /reload`, `POST /keys/enable`, `GET /metrics` (when provided by a plugin), and all of the above under `/v1/...` with `GET /v1/openapi.json`. All admin routes require `Authorization: Bearer <admin token>`. Admin responses include `X-Reiki-Version`. The v1 API only gains fields.
 
 `GET /v1/health` and `GET /v1/health/stream`, the coarse summary other instances read, are never served here: they live on the separate `[peers]` listener with its own read-only token (see [peers](peers.md)). While publishing, `/v1/openapi.json` lists them with that listener as their server.
 
@@ -24,7 +24,7 @@ Both fields are required. The admin address is bound at startup, so adding, remo
 
 ## Authenticate
 
-Send `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body; the token is hashed and compared in constant time. Anything other than `/status`, `/reload`, `/keys/enable` or a configured plugin path returns 404. The listener is plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front.
+Send `Authorization: Bearer <token>`. A missing or wrong token gets a bare 401 with no body; the token is hashed and compared in constant time. Anything other than `/status`, `/failures`, `/reload`, `/keys/enable` or a configured plugin path returns 404. The listener is plain HTTP, so keep it on loopback or put a TLS-terminating proxy in front.
 
 ## GET /status
 
@@ -49,6 +49,30 @@ Each stream:
 - `config`: `generation` (successful reloads since start), `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and, after a failure, `error`
 
 The response carries no key values, token hashes or file paths.
+
+## GET /failures
+
+The last 64 key failures across all streams, newest first, as a JSON array. The ring is in memory only and starts empty after a restart. Recording never waits: a failure is dropped if another thread holds the buffer.
+
+Each entry:
+
+- `time`: Unix seconds
+- `stream`, `key`: where the failure happened
+- `status`: the upstream status, or `null` for a transport failure
+- `class`: `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`
+- `retry_after`: the `Retry-After` header as received, cut to 64 characters; `null` when absent
+- `cooled`: whether this failure put the key on cooldown
+- `cooling_seconds`: seconds left on the key's cooldown, or `null`
+- `note`: a printable body snippet of at most 200 characters, with every known form of the key scrubbed out
+
+`?limit=N` returns at most `N` entries, from 1 to 64; the default is 64. `?key=NAME` filters to one key name. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding answers `400`.
+
+The peer health document carries only per-class counts from the same ring, never bodies or key names.
+
+```bash
+reiki failures --token-file /etc/reiki/admin.token
+reiki failures --limit 5 --key zen-a --json
+```
 
 ## Check key health
 

@@ -79,6 +79,14 @@ Inside the Peers panel:
 - The sparkline is built from samples taken once per redraw interval while the screen is live. `--once` has no history, so it shows the number only.
 - Mismatched providers: a peer that does not use a provider shows `·`, and the tally leaves it out of both counts.
 
+### Failures
+
+Every peer's health document carries a `failures` object: counts of recent key failures by class over an in-memory ring of at most 64. The detail card prints those counts as `failures: rate_limited 2  transient 1`; names, streams and bodies are never published, so a remote peer can only be compared, not investigated.
+
+The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_TOKEN` holds its admin token (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, cooldown left and the scrubbed body snippet. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
+
+See [`GET /failures`](monitoring.md#get-failures) for the fields and the `reiki failures` command.
+
 ### Keys
 
 In the matrix:

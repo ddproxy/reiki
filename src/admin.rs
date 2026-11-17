@@ -30,6 +30,11 @@ const ROUTES: &[(&str, &str, &str)] = &[
         "Reload the config, or preview it with dry_run",
     ),
     ("/keys/enable", "post", "Re-enable a disabled key"),
+    (
+        "/failures",
+        "get",
+        "Recent key failures, newest first, from an in-memory ring",
+    ),
 ];
 
 /// True when the admin listener serves this path itself, bare or under [`V1`].
@@ -46,6 +51,7 @@ fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
     match (path, method) {
         ("/reload", "post") => post(reload),
         ("/keys/enable", "post") => post(enable_key),
+        ("/failures", "get") => get(failures),
         _ => get(status),
     }
 }
@@ -104,6 +110,23 @@ async fn openapi(
                 serde_json::json!({"description": "Unreadable dry_run value; nothing changed"});
             op["responses"]["422"] =
                 serde_json::json!({"description": "The config was refused; nothing changed"});
+        }
+        if *path == "/failures" {
+            op["parameters"] = serde_json::json!([
+                {
+                    "name": "limit", "in": "query", "required": false,
+                    "schema": {"type": "integer", "minimum": 1, "maximum": crate::failures::CAPACITY},
+                    "description": "Records to return, newest first; the default is the whole ring",
+                },
+                {
+                    "name": "key", "in": "query", "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Only failures for this key name",
+                },
+            ]);
+            op["responses"]["400"] = serde_json::json!({
+                "description": "limit is not 1..=64, a flag is repeated, or the key name is empty or invalid percent-encoding"
+            });
         }
         if *path == "/keys/enable" {
             op["parameters"] = serde_json::json!([{
@@ -357,6 +380,78 @@ async fn enable_key(
             ),
         )
     }
+}
+
+/// The last key failures, newest first. Bodies are snippets already scrubbed and bounded by the
+/// request path, so this answer cannot grow with the upstream response.
+async fn failures(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/failures", &headers) {
+        return *refusal;
+    }
+    let (limit, key) = match parse_failures_query(uri.query().unwrap_or("")) {
+        Ok(query) => query,
+        Err(e) => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                format!("{{\"ok\":false,\"error\":{}}}", json_string(e)),
+            );
+        }
+    };
+    let records = app.failures().snapshot(limit, key.as_deref());
+    match serde_json::to_string(&records) {
+        Ok(body) => text_response(StatusCode::OK, "application/json", body),
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            "{\"ok\":false,\"error\":\"cannot write the failure ring\"}".to_owned(),
+        ),
+    }
+}
+
+/// Reads `limit` and `key` strictly: a repeated or unknown flag, a bare `limit`, an empty key or
+/// invalid percent-encoding answers 400 rather than returning a list that was not asked for.
+fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static str> {
+    let mut limit = crate::failures::CAPACITY;
+    let mut key: Option<String> = None;
+    let mut saw_limit = false;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let Some((name, value)) = pair.split_once('=') else {
+            return Err("every flag needs a value");
+        };
+        match name {
+            "limit" => {
+                if saw_limit {
+                    return Err("limit may be given only once");
+                }
+                saw_limit = true;
+                let parsed = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| (1..=crate::failures::CAPACITY).contains(limit))
+                    .ok_or("limit must be a whole number from 1 to 64")?;
+                limit = parsed;
+            }
+            "key" => {
+                if key.is_some() {
+                    return Err("key may be given only once");
+                }
+                key = Some(
+                    decode_query_value(value)
+                        .filter(|key| !key.is_empty())
+                        .ok_or("the key name is empty or not valid percent-encoding")?,
+                );
+            }
+            _ => return Err("unknown flag; use limit and key"),
+        }
+    }
+    Ok((limit, key))
 }
 
 async fn plugin_route(
@@ -638,6 +733,34 @@ mod tests {
             "dry_run&x=1",
         ] {
             assert_eq!(parse_dry_run(bad), Err(()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn failures_query_defaults_and_filters_are_strict() {
+        assert_eq!(parse_failures_query(""), Ok((64, None)));
+        assert_eq!(parse_failures_query("limit=1"), Ok((1, None)));
+        assert_eq!(
+            parse_failures_query("key=a%2Fb"),
+            Ok((64, Some("a/b".to_owned())))
+        );
+        assert_eq!(
+            parse_failures_query("limit=64&key=a"),
+            Ok((64, Some("a".to_owned())))
+        );
+        for bad in [
+            "limit=0",
+            "limit=65",
+            "limit=x",
+            "limit",
+            "limit=1&limit=2",
+            "key=",
+            "key=%zz",
+            "key=a&key=b",
+            "other=1",
+            "other",
+        ] {
+            assert!(parse_failures_query(bad).is_err(), "{bad}");
         }
     }
 

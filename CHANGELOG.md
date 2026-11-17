@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- A bounded in-memory ring of the last 64 key failures, shared across streams. Each entry keeps Unix seconds, stream, key, status, class, `Retry-After` as received, whether and for how long the key cooled, and a printable body snippet capped at 200 characters with key material scrubbed out. Recording never waits on the lock, and the ring is never written to disk.
+- `GET /failures` and `GET /v1/failures` on the admin listener, newest first, with optional `?limit=1..64` and `?key=NAME`, plus its OpenAPI description.
+- `reiki failures [--limit N] [--key NAME] [--json]`, a table cut to `COLUMNS` or the endpoint's JSON array.
+- The peer health document carries failure counts by class over the ring, never bodies or key names. `reiki top` shows those counts for every peer and the full recent list only for the local instance when its admin token is available.
+
 ### Fixed
 
 - A 402 whose body says the request asked for more output tokens than affordable (for example messages containing `fewer max_tokens` or `can only afford`) is passed through to the client instead of cooling the key, so the client can retry with a smaller request. Other 402 responses still cool the key as before.

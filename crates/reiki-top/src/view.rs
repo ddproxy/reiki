@@ -458,6 +458,54 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
             }
         }
     }
+
+    if !peer.health.failures.is_empty() {
+        let mut spans = vec![span("  failures:", Style::Plain)];
+        for (class, count) in &peer.health.failures {
+            spans.push(span(format!("  {class} {count}"), Style::Warn));
+        }
+        out.push(line(spans, width));
+    }
+    // Only the local instance's admin listener returns rows; a remote peer publishes counts.
+    if let Some(failures) = fleet.local_failures(&peer.health.instance) {
+        for failure in failures {
+            out.push(failure_line(failure, width));
+        }
+    }
+}
+
+fn failure_line(failure: &crate::Failure, width: usize) -> Line {
+    let time = failure.time.rem_euclid(86_400);
+    let mut spans = vec![
+        span(
+            format!(
+                "    {:02}:{:02}:{:02}  ",
+                time / 3_600,
+                time % 3_600 / 60,
+                time % 60
+            ),
+            Style::Dim,
+        ),
+        span(format!("{}  ", failure.stream), Style::Plain),
+        span(format!("{}  ", failure.key), Style::Plain),
+        span(
+            failure
+                .status
+                .map_or_else(|| "-".to_owned(), |status| status.to_string()),
+            Style::Plain,
+        ),
+        span(format!("  {}", failure.class), Style::Warn),
+    ];
+    if failure.cooled {
+        let left = failure
+            .cooling_seconds
+            .map_or_else(|| "cooled".to_owned(), |secs| format!("cooled {secs}s"));
+        spans.push(span(format!("  {left}"), Style::Warn));
+    }
+    if !failure.note.is_empty() {
+        spans.push(span(format!("  {}", failure.note), Style::Dim));
+    }
+    line(spans, width)
 }
 
 /// A peer's last feed failure, dim so it never reads as health.
@@ -2851,6 +2899,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_card_shows_failure_counts_and_only_the_local_instance_gets_rows() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
+            "failures":{"rate_limited":2,"transient":1}}"#;
+        add(&mut f, "peer-a", doc, t0);
+        let remote = texts(&peer_detail(&f, "peer-a", t0, 100));
+        assert!(
+            remote.iter().any(|l| l.contains("rate_limited 2")),
+            "{remote:?}"
+        );
+        assert!(!remote.iter().any(|l| l.contains("cooled")), "{remote:?}");
+
+        f.set_local_failures(
+            "peer-a",
+            vec![crate::Failure {
+                time: 3_600,
+                stream: "s".to_owned(),
+                key: "k".to_owned(),
+                status: Some(429),
+                class: "rate_limited".to_owned(),
+                retry_after: Some("120".to_owned()),
+                cooled: true,
+                cooling_seconds: Some(30),
+                note: "body".to_owned(),
+            }],
+        );
+        let local = texts(&peer_detail(&f, "peer-a", t0, 100));
+        assert!(
+            local
+                .iter()
+                .any(|l| l.contains("01:00:00") && l.contains("rate_limited")),
+            "{local:?}"
+        );
+        assert!(local.iter().any(|l| l.contains("cooled 30s")), "{local:?}");
+        assert!(local.iter().any(|l| l.contains("body")), "{local:?}");
     }
 
     #[test]

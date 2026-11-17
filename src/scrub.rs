@@ -168,6 +168,16 @@ impl StreamScrubber {
     }
 }
 
+/// Returns `text` with every known form of every secret blanked, for a diagnostic snippet that
+/// is not streamed. The replacement keeps the length, as [`StreamScrubber`] does.
+pub fn scrub_text(text: &str, secrets: &[&str]) -> String {
+    let mut data = text.as_bytes().to_vec();
+    for secret in forms(secrets) {
+        blank(&mut data, &secret);
+    }
+    String::from_utf8_lossy(&data).into_owned()
+}
+
 /// Overwrites every occurrence of `secret` in `data` with `[***]` of the same length.
 fn blank(data: &mut [u8], secret: &[u8]) {
     let mut i = 0;
@@ -388,6 +398,16 @@ mod tests {
         let unique: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(unique.len(), all.len());
         assert!(all.iter().all(|f| f.len() >= MIN_SECRET));
+    }
+
+    #[test]
+    fn scrub_text_blanks_every_form_and_leaves_length_alone() {
+        let text = format!("raw {KEY} json {ODD}");
+        let out = scrub_text(&text, &[KEY, ODD]);
+        assert_eq!(out.len(), text.len());
+        assert!(!out.contains("secret"), "{out}");
+        assert!(!out.contains("sk-"), "{out}");
+        assert_eq!(scrub_text("nothing to hide", &[KEY]), "nothing to hide");
     }
 
     #[test]

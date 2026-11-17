@@ -17,7 +17,7 @@ use reiki_top::ui::{self, crossterm, ratatui, ChartMetric};
 use reiki_top::{view, Fleet, Health};
 use tokio::sync::mpsc;
 
-use crate::config::{PeerEntry, PeersConfig};
+use crate::config::{Config, PeerEntry, PeersConfig};
 use crate::peers::client::{self, Chunk, SseItem, SseParser, MAX_BODY};
 
 /// One message from a peer's feed task.
@@ -31,12 +31,74 @@ pub(crate) enum FeedEvent {
     Heartbeat,
     /// The stream and the fallback poll both failed; the text says why.
     Down(String),
+    /// The local instance's admin answer: full rows for one published instance.
+    LocalFailures {
+        instance: String,
+        failures: Vec<reiki_top::Failure>,
+    },
+}
+
+/// Where the local instance's admin listener is, and which published name is ours.
+#[derive(Clone)]
+pub struct LocalFailures {
+    base: String,
+    token: String,
+    instance: String,
+}
+
+impl LocalFailures {
+    /// The local admin address and token, or `None` without `[admin]` or `REIKI_ADMIN_TOKEN`.
+    /// Only then can `reiki top` show full failure rows; remote peers keep counts only.
+    pub fn from_config(config: &Config) -> Option<Self> {
+        let admin = config.admin.as_ref()?;
+        let token = std::env::var("REIKI_ADMIN_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())?;
+        let instance = config
+            .peers
+            .as_ref()
+            .and_then(|peers| peers.instance.clone())
+            .unwrap_or_else(|| "reiki".to_owned());
+        Some(Self {
+            base: format!("http://{}", admin.listen.replace("0.0.0.0", "127.0.0.1")),
+            token,
+            instance,
+        })
+    }
+
+    async fn fetch(&self) -> Result<Vec<reiki_top::Failure>, String> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/v1/failures", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("the admin listener answered {status}"));
+        }
+        serde_json::from_str(&body).map_err(|e| format!("bad failure list: {e}"))
+    }
 }
 
 /// The `reiki top` command: validates the `[peers]` config, then runs once or live. `full`
 /// selects the per-peer text view instead of the matrix.
 pub async fn run(
     peers: Option<&PeersConfig>,
+    once: bool,
+    interval: Option<u64>,
+    full: bool,
+    provider: Option<&str>,
+) -> i32 {
+    run_with_local(peers, None, once, interval, full, provider).await
+}
+
+/// [`run`] with the local instance's admin target, so its full failure rows can be shown while
+/// every remote peer keeps counts only.
+pub async fn run_with_local(
+    peers: Option<&PeersConfig>,
+    local: Option<LocalFailures>,
     once: bool,
     interval: Option<u64>,
     full: bool,
@@ -50,9 +112,9 @@ pub async fn run(
         }
     };
     if once {
-        run_once(peers, full, provider).await
+        run_once_with_local(peers, local.as_ref(), full, provider).await
     } else {
-        run_live(peers, interval, full, provider).await
+        run_live_with_local(peers, local, interval, full, provider).await
     }
 }
 
@@ -62,9 +124,37 @@ pub async fn run_once(peers: &PeersConfig, full: bool, provider: Option<&str>) -
     run_once_to(peers, full, provider, &mut io::stdout(), &mut io::stderr()).await
 }
 
+pub async fn run_once_with_local(
+    peers: &PeersConfig,
+    local: Option<&LocalFailures>,
+    full: bool,
+    provider: Option<&str>,
+) -> i32 {
+    run_once_to_with_local(
+        peers,
+        local,
+        full,
+        provider,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+    .await
+}
+
 /// [`run_once`] with the output handles passed in, so tests need no terminal.
 async fn run_once_to(
     peers: &PeersConfig,
+    full: bool,
+    provider: Option<&str>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
+    run_once_to_with_local(peers, None, full, provider, out, err).await
+}
+
+async fn run_once_to_with_local(
+    peers: &PeersConfig,
+    local: Option<&LocalFailures>,
     full: bool,
     provider: Option<&str>,
     out: &mut impl Write,
@@ -103,6 +193,13 @@ async fn run_once_to(
             Err(_) => {
                 let _ = writeln!(err, "reiki: a peer fetch task failed");
             }
+        }
+    }
+
+    if let Some(local) = local {
+        // A failed local fetch is not a peer error; the counts still come from health.
+        if let Ok(failures) = local.fetch().await {
+            fleet.set_local_failures(&local.instance, failures);
         }
     }
 
@@ -146,6 +243,9 @@ pub(crate) fn apply_feed(fleet: &mut Fleet, name: &str, feed: FeedEvent, now: In
         }
         FeedEvent::Heartbeat => fleet.touch(name, now),
         FeedEvent::Down(reason) => fleet.set_error(name, reason),
+        FeedEvent::LocalFailures { instance, failures } => {
+            fleet.set_local_failures(&instance, failures)
+        }
     }
 }
 
@@ -167,6 +267,22 @@ async fn feed_peer(
         };
         if tx.send((name.clone(), feed)).await.is_err() {
             return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Refreshes the local instance's failure rows on the same cadence as health polls.
+async fn feed_local(local: LocalFailures, poll: Duration, tx: mpsc::Sender<(String, FeedEvent)>) {
+    loop {
+        if let Ok(failures) = local.fetch().await {
+            let event = FeedEvent::LocalFailures {
+                instance: local.instance.clone(),
+                failures,
+            };
+            if tx.send((local.instance.clone(), event)).await.is_err() {
+                return;
+            }
         }
         tokio::time::sleep(poll).await;
     }
@@ -271,6 +387,16 @@ pub async fn run_live(
     full: bool,
     provider: Option<&str>,
 ) -> i32 {
+    run_live_with_local(peers, None, interval, full, provider).await
+}
+
+async fn run_live_with_local(
+    peers: &PeersConfig,
+    local: Option<LocalFailures>,
+    interval: Option<u64>,
+    full: bool,
+    provider: Option<&str>,
+) -> i32 {
     if !io::stdout().is_terminal() {
         eprintln!("reiki: stdout is not a terminal; use `reiki top --once`");
         return 2;
@@ -285,6 +411,9 @@ pub async fn run_live(
             poll,
             tx.clone(),
         )));
+    }
+    if let Some(local) = local {
+        tasks.push(tokio::spawn(feed_local(local, poll, tx.clone())));
     }
     drop(tx);
 

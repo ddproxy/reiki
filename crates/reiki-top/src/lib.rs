@@ -2,7 +2,7 @@
 //! apply the `GET /v1/health/stream` events. No UI, no networking; the caller supplies every
 //! clock reading.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -28,6 +28,10 @@ pub struct Health {
     #[serde(default)]
     pub age_seconds: Option<u64>,
     pub upstreams: Vec<Upstream>,
+    /// Counts of recent key failures by class over the peer's bounded ring. Counts only: the
+    /// bodies behind them never leave the peer.
+    #[serde(default)]
+    pub failures: BTreeMap<String, u64>,
     /// Only present when the peer sets `expose_host_stats`.
     #[serde(default)]
     pub host: Option<Value>,
@@ -42,6 +46,27 @@ impl Health {
     pub fn from_json(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|e| e.to_string())
     }
+}
+
+/// One recent key failure, as `/v1/failures` returns it. Only the local instance's admin
+/// listener supplies these; a remote peer publishes counts only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Failure {
+    /// Unix seconds.
+    pub time: u64,
+    pub stream: String,
+    pub key: String,
+    #[serde(default)]
+    pub status: Option<u16>,
+    pub class: String,
+    #[serde(default)]
+    pub retry_after: Option<String>,
+    #[serde(default)]
+    pub cooled: bool,
+    #[serde(default)]
+    pub cooling_seconds: Option<u64>,
+    #[serde(default)]
+    pub note: String,
 }
 
 /// Printable ASCII, at most 32 characters, so a peer's version cannot spoof a terminal line.
@@ -206,6 +231,9 @@ pub struct Fleet {
     peers: HashMap<String, Peer>,
     /// Why a peer's last feed failed, shown until a snapshot arrives.
     errors: HashMap<String, String>,
+    /// Full recent failures for the local instance's published name, when its admin listener
+    /// was reachable. Keyed by `Health::instance`, never by the local peer label.
+    local_failures: HashMap<String, Vec<Failure>>,
 }
 
 /// One upstream row of the provider summary: counts summed over every fresh peer.
@@ -233,7 +261,19 @@ impl Fleet {
             max_age,
             peers: HashMap::new(),
             errors: HashMap::new(),
+            local_failures: HashMap::new(),
         }
+    }
+
+    /// Replaces the full failure list for one published instance.
+    pub fn set_local_failures(&mut self, instance: &str, failures: Vec<Failure>) {
+        self.local_failures.insert(instance.to_owned(), failures);
+    }
+
+    /// The full failure list for one published instance, or `None` when this host did not
+    /// fetch it (a remote peer, or no admin token).
+    pub fn local_failures(&self, instance: &str) -> Option<&[Failure]> {
+        self.local_failures.get(instance).map(Vec::as_slice)
     }
 
     /// Replaces a peer's health, received at `now`, and clears its last feed error.
@@ -533,6 +573,38 @@ mod tests {
 
     fn fleet() -> Fleet {
         Fleet::new(Duration::from_secs(90))
+    }
+
+    #[test]
+    fn failure_counts_parse_and_default_to_empty() {
+        let with = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
+            "failures":{"rate_limited":2,"transient":1}}"#;
+        let health = Health::from_json(with).unwrap();
+        assert_eq!(health.failures.get("rate_limited"), Some(&2));
+        assert_eq!(health.failures.get("transient"), Some(&1));
+        let bare = Health::from_json(BARE_DOC).unwrap();
+        assert!(bare.failures.is_empty());
+    }
+
+    #[test]
+    fn local_failures_are_keyed_by_published_instance() {
+        let mut fleet = fleet();
+        fleet.set_local_failures(
+            "peer-a",
+            vec![Failure {
+                time: 1,
+                stream: "s".to_owned(),
+                key: "k".to_owned(),
+                status: Some(429),
+                class: "rate_limited".to_owned(),
+                retry_after: Some("120".to_owned()),
+                cooled: true,
+                cooling_seconds: Some(1),
+                note: "n".to_owned(),
+            }],
+        );
+        assert_eq!(fleet.local_failures("peer-a").unwrap().len(), 1);
+        assert!(fleet.local_failures("peer-b").is_none());
     }
 
     #[test]

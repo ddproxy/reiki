@@ -66,6 +66,11 @@ fn health_schema() -> Value {
             "age_seconds": {"type": "integer", "minimum": 0,
                 "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},
             "upstreams": {"type": "array", "items": upstream_schema()},
+            "failures": {
+                "type": "object",
+                "description": "Counts of recent key failures by class over a bounded in-memory ring, newest or not; never bodies, key names or streams",
+                "additionalProperties": {"type": "integer", "minimum": 0},
+            },
             "host": {
                 "description": "Only with expose_host_stats",
                 "type": "object",

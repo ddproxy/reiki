@@ -116,6 +116,15 @@ impl Rig {
         std::fs::write(&path, format!("{ADMIN_TOKEN}\n")).unwrap();
         path
     }
+
+    async fn admin_get(&self, path: &str, token: bool) -> (u16, String) {
+        let mut request = self.client.get(format!("{}{path}", self.admin));
+        if token {
+            request = request.bearer_auth(ADMIN_TOKEN);
+        }
+        let response = request.send().await.unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    }
 }
 
 #[tokio::test]
@@ -188,6 +197,112 @@ async fn the_json_output_carries_the_cooldown_class() {
     assert!(b.get("cooldown_class").is_none(), "{b}");
 }
 
+#[tokio::test]
+async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
+    let rig = Rig::new().await;
+    rig.set_status(429);
+    assert_ne!(rig.send().await, 200);
+    assert_ne!(rig.send().await, 200);
+
+    let (code, _) = rig.admin_get("/v1/failures", false).await;
+    assert_eq!(code, 401, "no token");
+
+    let (code, body) = rig.admin_get("/v1/failures", true).await;
+    assert_eq!(code, 200, "{body}");
+    let all: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert!(!all.is_empty(), "{body}");
+    let (code, bare) = rig.admin_get("/failures", true).await;
+    assert_eq!(code, 200, "{bare}");
+    assert_eq!(bare, body, "the v1 and bare routes answer the same");
+    let first = &all[0];
+    assert_eq!(first["key"], "a");
+    assert_eq!(first["stream"], "s");
+    assert_eq!(first["status"], 429);
+    assert_eq!(first["class"], "rate_limited");
+    assert_eq!(first["retry_after"], "120");
+    assert_eq!(first["cooled"], true);
+    assert!(first["time"].as_u64().is_some(), "{first}");
+    assert!(first["note"].as_str().unwrap().contains("mock"), "{first}");
+
+    let (_, body) = rig.admin_get("/v1/failures?limit=1", true).await;
+    let one: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(one.len(), 1, "{body}");
+
+    let (_, body) = rig.admin_get("/v1/failures?key=b", true).await;
+    let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert!(empty.is_empty(), "{body}");
+
+    for bad in ["?limit=0", "?limit=65", "?limit=x", "?key=%zz", "?other=1"] {
+        let (code, _) = rig.admin_get(&format!("/v1/failures{bad}"), true).await;
+        assert_eq!(code, 400, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn the_failures_table_and_json_read_the_same_ring() {
+    let rig = Rig::new().await;
+    rig.set_status(429);
+    assert_ne!(rig.send().await, 200);
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_failures(&["--url", &url, "--token-file", &token])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    let header = out.lines().next().unwrap();
+    for column in ["TIME", "STREAM", "KEY", "STATUS", "CLASS", "COOLED", "NOTE"] {
+        assert!(header.contains(column), "{header}");
+    }
+    let row = out.lines().nth(1).unwrap();
+    assert!(row.contains("rate_limited"), "{row}");
+    assert!(row.contains("429"), "{row}");
+
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_failures(&[
+            "--json",
+            "--limit",
+            "1",
+            "--url",
+            &url,
+            "--token-file",
+            &token,
+        ])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    let body: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(body.len(), 1, "{out}");
+
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_failures(&["--url", &url, "--token-file", &token, "--key", "gone"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "no failures\n");
+}
+
+#[tokio::test]
+async fn the_failures_table_is_cut_to_columns() {
+    let rig = Rig::new().await;
+    rig.set_status(429);
+    assert_ne!(rig.send().await, 200);
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_failures_width(&["--url", &url, "--token-file", &token], "30")
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    for line in out.lines() {
+        assert!(line.chars().count() <= 30, "{line:?}");
+    }
+}
+
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -195,12 +310,27 @@ impl Drop for Rig {
 }
 
 fn reiki_keys(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_reiki"))
-        .arg("keys")
+    reiki_command("keys", args, None)
+}
+
+fn reiki_failures(args: &[&str]) -> (i32, String, String) {
+    reiki_command("failures", args, None)
+}
+
+fn reiki_failures_width(args: &[&str], columns: &str) -> (i32, String, String) {
+    reiki_command("failures", args, Some(columns))
+}
+
+fn reiki_command(command: &str, args: &[&str], columns: Option<&str>) -> (i32, String, String) {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_reiki"));
+    process
+        .arg(command)
         .args(args)
-        .env_remove("REIKI_ADMIN_TOKEN")
-        .output()
-        .unwrap();
+        .env_remove("REIKI_ADMIN_TOKEN");
+    if let Some(columns) = columns {
+        process.env("COLUMNS", columns);
+    }
+    let out = process.output().unwrap();
     (
         out.status.code().unwrap(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

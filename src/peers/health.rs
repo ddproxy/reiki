@@ -148,6 +148,8 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         // Every figure is read as the answer is built; a reader adds its own time since receipt.
         "age_seconds": 0,
         "upstreams": upstreams,
+        // Counts over the same bounded ring as `/v1/failures`; bodies and key names never leave.
+        "failures": app.failures().counts(),
     });
     if peers.expose_host_stats {
         doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config)).await;
@@ -477,6 +479,43 @@ mod tests {
             ]
         );
         assert!(!zen.to_string().contains("cooldown_class"));
+    }
+
+    #[tokio::test]
+    async fn the_document_carries_failure_counts_but_never_bodies_or_key_names() {
+        let text = concat!(
+            "[upstream.zen]\nbase_url = \"https://example.com\"\n",
+            "[keys.secret-key-name]\nupstream = \"zen\"\nfile = \"/a\"\n",
+            "[peers]\n",
+        );
+        let config = Config::parse(text).unwrap();
+        let app = crate::proxy::App::with_header_timeout(
+            config,
+            std::collections::HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(1),
+        );
+        for class in ["rate_limited", "rate_limited", "transient"] {
+            app.failures().record(crate::failures::FailureRecord {
+                time: 1,
+                stream: "stream-name".to_owned(),
+                key: "secret-key-name".to_owned(),
+                status: Some(429),
+                class: class.to_owned(),
+                retry_after: Some("120".to_owned()),
+                cooled: true,
+                cooling_seconds: Some(10),
+                note: "a body with secret-key-name in it".to_owned(),
+            });
+        }
+        let peers = app.snapshot().config.peers.clone().unwrap();
+        let doc = document(&app, &peers).await;
+        assert_eq!(doc["failures"]["rate_limited"], 2);
+        assert_eq!(doc["failures"]["transient"], 1);
+        let text = doc.to_string();
+        for hidden in ["secret-key-name", "stream-name", "a body", "120"] {
+            assert!(!text.contains(hidden), "`{hidden}` leaked: {text}");
+        }
     }
 
     #[test]

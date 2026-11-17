@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A 402 whose body says the request asked for more output tokens than affordable (for example messages containing `fewer max_tokens` or `can only afford`) is passed through to the client instead of cooling the key, so the client can retry with a smaller request. Other 402 responses still cool the key as before.
+
 ## 0.10.4
 
 ### Added

@@ -48,7 +48,8 @@ Reiki reads the upstream status first. Then it reads the first 64 KiB of the bod
 | 400 | JSON pair `"reason": "API_KEY_INVALID"` | `unauthorized` | Disabled | Next key |
 | 400 | `credit balance is too low` | `quota_exhausted` | Cooling, whole key | Next key |
 | 400 | anything else | pass-through | None | Response is relayed |
-| 402 | none | `quota_exhausted` | Cooling for `(route, model)` | Next key |
+| 402 | body contains `fewer max_tokens` or `can only afford` (case-insensitive) | pass-through | None | Response is relayed |
+| 402 | anything else | `quota_exhausted` | Cooling for `(route, model)` | Next key |
 | 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
 | 429 | none of the above | `rate_limited` | Cooling for `(route, model)` | Next key |
 | 403 | `error code: 10` (edge block page) | pass-through | None | Response is relayed |
@@ -103,7 +104,7 @@ A scope is the pair of route and model:
 - Route: the request path after the upstream prefix. The query is dropped. Segments that are all digits, or longer than 24 characters, become `*`, so `/files/123` and `/files/456` share `/files/*`.
 - Model: the top-level `"model"` string in the JSON body. A request with no model is key-scoped.
 
-Only two failures are scoped: a `rate_limited` failure and a 402. A quota 429 is always key-wide, as are 401s, transients and any failure on a request with no model.
+Only two failures are scoped: a `rate_limited` failure and a 402 that is treated as `quota_exhausted` (not a `fewer max_tokens`/`can only afford` request-size pass-through). A quota 429 is always key-wide, as are 401s, transients and any failure on a request with no model.
 
 A key with many cooling models is treated as broken. `scope_escalate_after` sets the count per upstream. The default is 3, and the allowed range is 2 to 16. When three different models are cooling on a key, or the combinations reach twice that count, the next scoped failure cools the whole key for its duration. A whole-key cooldown clears the scoped entries.
 

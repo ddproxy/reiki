@@ -217,6 +217,11 @@ pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> O
     classify_at(status, retry_after, body_snippet, SystemTime::now())
 }
 
+/// Phrases in a 402 body that mean the request asked for more than affordable
+/// (e.g. OpenRouter's "fewer max_tokens"/"can only afford" message). These are
+/// client-fixable request-size issues, so pass the 402 through instead of cooling the key.
+const OPENROUTER_402_PASSTHROUGH_PHRASES: &[&str] = &["fewer max_tokens", "can only afford"];
+
 pub fn classify_at(
     status: u16,
     retry_after: Option<&str>,
@@ -227,7 +232,13 @@ pub fn classify_at(
     match status {
         200..=399 => Outcome::Success,
         401 => Outcome::KeyFailure(FailureClass::Unauthorized),
-        402 => Outcome::KeyFailure(FailureClass::QuotaExhausted),
+        402 => {
+            if contains_any(&body, OPENROUTER_402_PASSTHROUGH_PHRASES) {
+                Outcome::PassThrough
+            } else {
+                Outcome::KeyFailure(FailureClass::QuotaExhausted)
+            }
+        }
         400 => {
             if has_json_pair(&body, "reason", "api_key_invalid") {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
@@ -398,6 +409,28 @@ mod tests {
             classify(402, None, ""),
             Outcome::KeyFailure(FailureClass::QuotaExhausted)
         );
+    }
+
+    #[test]
+    fn openrouter_402_request_too_large_passes_through() {
+        let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 256000 tokens, but can only afford 199460. ..."}}"#;
+        assert_eq!(classify(402, None, body), Outcome::PassThrough);
+    }
+
+    #[test]
+    fn openrouter_402_other_messages_still_cool() {
+        assert_eq!(
+            classify(402, None, "insufficient credits"),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn openrouter_402_matching_is_case_insensitive() {
+        let body = "You requested more, please use FEWER MAX_TOKENS.";
+        assert_eq!(classify(402, None, body), Outcome::PassThrough);
+        let body2 = "CAN ONLY AFFORD 100 tokens";
+        assert_eq!(classify(402, None, body2), Outcome::PassThrough);
     }
 
     #[test]

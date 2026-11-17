@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.10.6
 
 ### Changed
 
 - The columnar scanner shared by the PHI and finance plugins lives once in `reiki-detect` (about 360 duplicate lines removed).
+
+### Fixed
+
+- An OpenRouter `free-models-per-day` 429 is a quota exhaustion and cools the whole key, not a short rate limit; the free tier allows only a small daily number of requests per account across every free model.
 
 ## 0.10.5
 

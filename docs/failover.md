@@ -50,7 +50,7 @@ Reiki reads the upstream status first. Then it reads the first 64 KiB of the bod
 | 400 | anything else | pass-through | None | Response is relayed |
 | 402 | body contains `fewer max_tokens` or `can only afford` (case-insensitive) | pass-through | None | Response is relayed |
 | 402 | anything else | `quota_exhausted` | Cooling for `(route, model)` | Next key |
-| 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
+| 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit`, `free-models-per-day` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
 | 429 | none of the above | `rate_limited` | Cooling for `(route, model)` | Next key |
 | 403 | `error code: 10` (edge block page) | pass-through | None | Response is relayed |
 | 403 | `access is disabled`, `free tier` or `not enabled` | `access_disabled` | None | Skip key for this request |

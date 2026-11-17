@@ -256,6 +256,7 @@ pub fn classify_at(
                     "quota",
                     "subscribe to go",
                     "free usage limit",
+                    "free-models-per-day",
                     "insufficient",
                 ],
             ) {
@@ -431,6 +432,15 @@ mod tests {
         assert_eq!(classify(402, None, body), Outcome::PassThrough);
         let body2 = "CAN ONLY AFFORD 100 tokens";
         assert_eq!(classify(402, None, body2), Outcome::PassThrough);
+    }
+
+    #[test]
+    fn a_daily_free_model_429_is_a_quota_not_a_rate_limit() {
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day"}}"#;
+        assert_eq!(
+            classify(429, None, body),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Security
 
-Reiki sits between a client (an agent such as opencode or Claude Code, or an application) and the providers it calls, isolating each side from what the other should not hold. It does not make either side trustworthy: a client that can read a secret on its own machine can still send it elsewhere, so masking backs up keeping secrets out of reach and does not replace it.
+Reiki sits between a client (an agent such as opencode or Claude Code, or an application) and the providers it calls. It keeps upstream credentials with Reiki and applies configured controls to traffic that passes through it, so each side receives only what that route and policy allow. Masking and filtering complement controls that keep secrets out of reach on the client. Trust boundaries and limits are described below.
 
 | Reiki keeps | From | Through |
 | --- | --- | --- |
@@ -15,13 +15,13 @@ Reiki sits between a client (an agent such as opencode or Claude Code, or an app
 - The key travels to whoever accepts on an `[upstream.X.forward]` socket or runs as its `command`, only in the normal credential header, with no second copy. A command gets an environment cleared except `PATH`, `HOME`, `LANG`, `LC_ALL` and the names in `pass_env`. Keep the socket in a directory only the Reiki user and listener can enter, and set `expect_uid`, which makes Reiki compare the uid of the process that accepted the connection (peer credentials, not the socket file's owner) and refuse a mismatch. It is optional, so without it whoever binds the path receives the keys; to bound that, a socket whose parent directory is group- or other-writable and lacks the sticky bit is refused at load when `expect_uid` is unset (sticky directories such as /tmp stay allowed). A failed link to the forwarder answers 502 and never cools the key.
 - Stream tokens are stored as SHA-256 hashes and compared in constant time across all streams.
 - `reiki hash-token` refuses a token shorter than 16 characters. A `token_sha256` is verified only as 64 hex characters; a hash does not reveal the token's length, so a token set another way is not checked. Use at least 16 random characters.
-- A failed token check is logged with the peer address and path on both the client and admin listener, never the presented token. An address with 10 failures in 60 seconds gets 429 with `Retry-After` until the window passes, and a good login clears its count. Up to 4096 addresses are tracked; when full, the weakest entry makes room. The throttle covers the client listener; a refused CONNECT is logged but not counted.
 - Upstreams come only from the config, so a request cannot choose its own destination and Reiki is not an open proxy.
-- Keys are read from the files named in the config at startup and again on SIGHUP. Reiki does not check file permissions at startup; `reiki keys --check` reports a key file the group or others can read. Create them mode 0600.
+- Upstream key files are read at startup and again on SIGHUP or reload. `reiki keys --check` (`src/keys.rs:check_files`) reports a missing, unreadable or empty key file and warns when a file is readable by its group or others. Create key files mode 0600.
+- The interception CA private key (`[tunnel.intercept].ca_key`) is checked for group or other access when it is loaded, according to `ca_key_permissions` (`error` or `warn`), during startup, `reiki check` and a reload that reads the CA (`src/intercept.rs`). The peer listener TLS private key (`[peers].tls_key`) is checked the same way according to `[peers].tls_key_permissions` during startup, `reiki check` and a reload that reads the peer TLS files (`src/peers/tls.rs`). Keep these keys private to the Reiki user.
 
 ## Network
 
-Reiki listens on `listen`, default `127.0.0.1:4097`, serves plain HTTP and has no TLS. Keep it on loopback, or put a TLS-terminating proxy in front before exposing it. Upstream URLs must be `https`, except loopback addresses used in tests.
+Reiki listens on `listen`, default `127.0.0.1:4097`, serves plain HTTP and has no TLS. Keep it on loopback, or put a TLS-terminating proxy in front before exposing it. Upstream `base_url` values must use `https`, or `http` on a loopback host (`127.0.0.1`, `localhost` or `[::1]`, with an optional port). This allows local mock and development endpoints without allowing plain HTTP to remote hosts.
 
 ## Header handling
 
@@ -47,15 +47,12 @@ Key values and stream tokens are not logged. Request and response bodies are not
 
 Plugins are compiled into the binary and run inside the Reiki process, so a plugin is as trusted as Reiki. A plugin sees request headers (including the client token) and bodies but never an upstream key, which is attached after the hooks run. Only compile in plugins you have read. [Plugins](plugins.md#what-a-plugin-can-see-and-do) covers the hooks and panic handling.
 
-## Limits
+## Limits and listener enforcement
 
-- A stream's chain is shared state: two streams that list the same key share its cooldown.
-- Streams are not a security boundary against each other beyond key separation. Run separate instances for mutually untrusted clients.
-- A stream's `rate_limit_per_minute`, when set, caps that stream's upstream attempts. Every selected-key attempt counts, including retries and a fallback upstream, so a failover cannot spend more calls than the limit allows. A rejected attempt does not reach the upstream or change key health.
-- The optional admin listener (`[admin]`) is a second socket guarded by its own bearer token, compared by hash in constant time. Keep it on loopback. It exposes key names, upstream names and stream routing, but never key values, token hashes or file paths.
-- The optional peer listener (`[peers]` with `enabled` and `publish`) is a third socket that serves only `GET /v1/health` and its event stream `GET /v1/health/stream` behind a read-only peer token, which must differ from the admin and every stream token. It must be on loopback, since it is plain HTTP. It publishes key counts and the soonest cooldown per upstream, which shows a token holder which accounts are under pressure and when they recover; it never carries key values, token hashes, file paths or stream names. See [peers](peers.md#what-a-peer-token-holder-learns).
-
-**Key health.** A stream-token holder can influence key health. A 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation for every stream that lists it until it is rotated and Reiki receives SIGHUP. To bound the damage, one request disables at most one key: a second key that refuses the same request is tried but not disabled. With `hold_unauthorized = true` on the upstream, the disable waits until a later key serves the same request, so a request that every key refuses disables none. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as text an upstream echoed back.
+- **Client listener.** Enforces stream token authentication, request parsing limits and connection caps from `[server]` (with loopback exempt from per-address caps). Failed token checks are counted per peer address and can trigger `[auth]` backoff and `429` responses on that listener. A stream's `rate_limit_per_minute` caps upstream attempts for that stream, including retries and fallback attempts. Tunnel `CONNECT` handling is logged; failed `CONNECT` authentication and refused tunnels follow tunnel rules rather than the stream-token backoff count.
+- **Admin listener.** Serves only the admin and plugin routes on its own socket. Requests need the admin bearer token compared by hash in constant time. Failed admin logins are counted per peer address and can trigger `[auth]` backoff and `429` responses on that listener (`src/admin.rs`). Keep the listener on loopback or behind TLS termination. Responses expose operational data such as key names, upstream names and stream routing, but not key values, token hashes or key file paths.
+- **Peer listener.** Serves `GET /v1/health` and `GET /v1/health/stream` on its own socket with a read-only peer token that must differ from admin and stream tokens. Failed peer logins are counted per peer address and can trigger `[auth]` backoff and `429` responses on that listener (`src/peers/publisher.rs`). The listener enforces peer connection and subscriber limits and publishes only the configured health summary. See [peers](peers.md#what-a-peer-token-holder-learns).
+- **Streams and keys.** A stream's chain is shared state: streams that list the same key share its cooldown and out-of-rotation state. Run separate instances for mutually untrusted clients. A stream-token holder can influence key health: a 401, or a 403 or 400 the upstream attributes to the key, takes that key out of rotation for every stream that lists it until it is rotated and reloaded. One request disables at most one key; with `hold_unauthorized = true`, the disable waits until a later key serves the same request. The invalid-key marker in a 400 body counts only as a real JSON field (`"reason": "API_KEY_INVALID"`), not as echoed text.
 
 ## Hardening
 

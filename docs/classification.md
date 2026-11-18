@@ -1,0 +1,114 @@
+# Response classification
+
+This page is the single source for upstream response classes, key effects and cooldown values. [Failover](failover.md) explains how a stream walks its chain, and [providers](providers.md) shows the per-upstream switches that change classification.
+
+## Reading order
+
+1. `/__reiki/healthz` and every `2xx` or `3xx` response reach the client directly. Byte-level failures after the status line belong to the client stream; no key cools.
+2. `pass_errors = true` on an upstream makes every status a pass-through: the response is relayed after secret scrubbing, and no key changes state.
+3. A transport failure is a `transient` class against the selected key. Idempotent methods are replayed on the next key; a non-idempotent method ends with `504` on timeout or `502` on connection failure.
+4. Error bodies are read up to 64 KiB, scrubbed of key and credential forms, and truncated with `x-reiki-truncated: 1` when longer. The body is lowercased with `to_ascii_lowercase` before checks.
+5. The rules below run in the order shown. The first match wins. All body conditions use lowercase substrings, except the `400` JSON pair, which must be a real unescaped `"reason": "api_key_invalid"` pair.
+6. With `confirm_quota = true`, the first quota `429` from a key in a request waits 3 seconds and retries the same key. Only a second quota `429` from that key is recorded. This switch applies to `429` only, never to `402`.
+7. One request disables at most one key. With `hold_unauthorized = true`, a `401` is held as a refusal until a later key serves the request; a second `401` in the same walk stays a refusal.
+
+## Response rules
+
+| Upstream status | Body check | Class | Key effect | Next step for the request |
+| --- | --- | --- | --- | --- |
+| 200-399 | none | success | Transient count reset | Response is delivered |
+| 401 | none | `unauthorized` | Disabled | Next key |
+| 400 | JSON pair `"reason": "API_KEY_INVALID"` | `unauthorized` | Disabled | Next key |
+| 400 | `credit balance is too low` | `quota_exhausted` | Cooling, whole key | Next key |
+| 400 | anything else | pass-through | None | Response is relayed |
+| 402 | JSON `error.message` or `message` contains `fewer max_tokens` or `can only afford`; whole-body substring match only when the body is not JSON | `request_error` | None; the key is not cooled | Next key; the last upstream 402 is relayed unchanged if no key serves |
+| 402 | anything else | `quota_exhausted` | Cooling for `(route, model)` | Next key |
+| 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit`, `free-models-per-day` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
+| 429 | none of the above | `rate_limited` | Cooling for `(route, model)` | Next key |
+| 403 | `error code: 10` (edge block page) | pass-through | None | Response is relayed |
+| 403 | `access is disabled`, `free tier` or `not enabled` | `access_disabled` | None | Skip key for this request |
+| 403 | names an invalid, expired or revoked key or token | `unauthorized` | Disabled | Next key |
+| 403 | anything else | `access_disabled` | None | Skip key for this request |
+| 5xx | `access is disabled` | `access_disabled` | None | Skip key for this request |
+| 5xx | `rate limit` | `rate_limited` | Cooling for `(route, model)` | Next key |
+| 5xx | anything else | `transient` | Cooling after two in a row | Skip key for this request |
+| other (404, 422, ...) | none | pass-through | None | Response is relayed |
+| No response (connect or timeout) | none | `transient` | Counted as a transient failure | See transport rules below |
+
+`(route, model)` means that combination. For a request with no `model`, the same failure cools the whole key.
+
+Each upstream can extend the built-in phrases; see [custom response phrases](#custom-response-phrases).
+
+With `pass_errors = true` on the upstream, every status is a pass-through. No key changes state. See [providers](providers.md#relaying-errors-as-they-are).
+
+With `hold_unauthorized = true`, a 401 does not disable the key until a later key serves the same request. See [providers](providers.md#unauthorized-keys).
+
+A second key that refuses the same request with a 401 is not disabled. One request disables at most one key.
+
+## Custom response phrases
+
+Each upstream may add body phrases to the built-in lists:
+
+```toml
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+request_error_phrases = ["fewer max_tokens", "your max_tokens is too high"]
+quota_phrases = ["plan limit reached", "top up your balance"]
+rate_limit_phrases = ["slow down"]
+```
+
+- Each list holds at most 16 unique phrases of 3 to 120 non-control characters. A bad list is a config error naming the upstream and the phrase.
+- Matching is case-insensitive, against a substring of the first 64 KiB of the body. Configured phrases extend, never replace, the built-ins above.
+- `request_error_phrases` apply to 400, 402 and 413 only. The response is relayed and the key stays healthy. Built-ins: `fewer max_tokens`, `can only afford`.
+- `quota_phrases` cool the whole key, like a quota 429. Built-ins: `credit balance is too low` on 400 and the six 429 phrases in the table above. A configured 402 quota phrase also cools the whole key; the built-in 402 request-size phrases still pass through.
+- `rate_limit_phrases` cool the `(route, model)` scope. Built-in: `rate limit` on 5xx.
+- When lists overlap in one response, the order is request error, then quota, then rate limit.
+
+Changes to these lists take effect on reload.
+
+## Cooldowns
+
+These values are compiled in. The config file has no setting for them.
+
+| Class | Cooldown | Scope |
+| --- | --- | --- |
+| `unauthorized` | Until enabled again. No timer. | Key |
+| `rate_limited` | `Retry-After` when present (zero means no cooldown), else 60 seconds | `(route, model)` |
+| `quota_exhausted` (402) | Same as the quota row below | `(route, model)` |
+| `quota_exhausted` (429) | Same as the quota row below | Key |
+| `access_disabled` | None. The key is skipped for the request only. | None |
+| `request_error` | None. The key is skipped for the request only. | None |
+| `transient` | 30 seconds, after two failures in a row with no success between | Key |
+
+Quota cooldown takes the first of these that applies:
+
+| Order | Source | Cooldown |
+| --- | --- | --- |
+| 1 | `quota_resets` on the key: `daily HH:MM zone` or `monthly D HH:MM zone` | Until the next reset |
+| 2 | `Retry-After` on the response, non-zero | That long |
+| 3 | Neither | 5 hours |
+
+`Retry-After` is capped at 24 hours, whether it is seconds or an HTTP date. An HTTP date in the past gives zero. For a quota, zero counts as absent, so the next rule applies.
+
+Since 0.10.3, a quota 429 with `Retry-After` cools the key for that long, not for the 5-hour default. A configured `quota_resets` still wins over the header. With neither, the 5-hour window applies. The test `a_quota_429_with_retry_after_cools_the_key_for_that_long` in `tests/exhausted.rs` covers this.
+
+A cooldown only moves later. A shorter failure does not shorten a longer cooldown. A later, longer failure extends it.
+
+Invalid-credential phrases matched on `403`: `invalid api key`, `incorrect api key`, `api key is invalid`, `api key not valid`, `api key is not valid`, `api key has expired`, `api key has been revoked`, `api key is disabled`, `api_key_invalid`, `invalid_api_key`, `invalid x-api-key`, `invalid credential`, `credential has been revoked`, `credential has expired`, `invalid token`, `token has been revoked`, `token has expired`.
+
+## Client errors from Reiki
+
+| Status | `error.type` | Cause |
+| --- | --- | --- |
+| `400` | `bad_path` | Malformed request path |
+| `401` | `unauthorized` | Missing or unknown stream token |
+| `404` | `not_found` | No upstream prefix, or unknown upstream |
+| `408` | `body_timeout` | Request body timed out |
+| `413` | `too_large` | Request body over 8 MiB |
+| `429` | `rate_limited` | Stream `rate_limit_per_minute` exceeded; `Retry-After` at least 1 |
+| `429` | `reiki_shaped` | Local shaping held the request; `x-reiki-origin: local` |
+| `502` | `bad_gateway` | Unreachable upstream, oversized buffered response, unreadable body, or failed forwarder link |
+| `503` | `reiki_exhausted` | Every key in the stream's chain is unavailable |
+| `504` | `gateway_timeout` | Upstream headers or buffered body timed out |
+
+Ten wrong stream tokens from one client address in a minute answer `429` with `Retry-After`. A `429` from the stream limit or local shaping leaves every key available. See [troubleshooting](troubleshooting.md) for first commands for each symptom.

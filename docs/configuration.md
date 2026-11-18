@@ -32,6 +32,18 @@ Conventions in this page:
 
 There is no top-level `[limits]` table. Outbound limits are set per upstream in `[upstream.NAME.limits]` and per account in `[accounts.LABEL.limits]`.
 
+## Default listeners and ports
+
+Each listener that is configured needs its own address. Client, admin, tunnel and peers addresses must differ from each other. The hub listener must differ from the client, admin and tunnel addresses and must be on loopback.
+
+| Listener | Setting | Default | Notes |
+| --- | --- | --- | --- |
+| Client | `listen` | `127.0.0.1:4097` | Serves the proxy API. |
+| Admin | `[admin].listen` | none | Enabled only with an `[admin]` table. |
+| Tunnel | `[tunnel].listen` | none | Enabled only with a `[tunnel]` table. |
+| Peers | `[peers].listen` | none | Used when `[peers]` publishes health. Loopback unless TLS is configured. |
+| Hub | `[hub].listen` | none | Parsed and validated; not served in this release. Loopback only. |
+
 ## Top level
 
 | Key | Type | Default | Meaning | Since |
@@ -40,7 +52,7 @@ There is no top-level `[limits]` table. Outbound limits are set per upstream in 
 
 ## `[admin]`
 
-The admin listener serves `/status`, `/reload`, `/keys/enable` and `/metrics`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener.
+The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST /keys/enable`, plugin routes such as `GET /metrics`, and `GET /v1/openapi.json`. Every route except `GET /v1/openapi.json` is also served under `/v1`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -74,16 +86,16 @@ Connection caps, read at startup. A changed value on reload is reported as needi
 | --- | --- | --- | --- | --- |
 | `shutdown_timeout_secs` | integer | `25` | After SIGTERM or SIGINT, time allowed for requests in flight before the listeners close. Range 1 to 300. Keep the unit's `TimeoutStopSec` above it. | 0.10.2 |
 
-See [service](service.md).
+See [deploy](deploy.md).
 
 ## `[reload]`
 
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
-| `watch` | bool | `false` | Reload when the config file, a key file or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. | 0.7.5 |
+| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. | 0.7.5 |
 | `interval_secs` | integer | `5` | Seconds between checks. Range 1 to 3600. | 0.7.5 |
 
-Reload also runs on SIGHUP and on `reiki reload`. See [troubleshooting](troubleshooting.md#reload).
+Reload also runs on SIGHUP and on `reiki reload`. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
 
 ## `[log]`
 
@@ -91,7 +103,7 @@ Reiki's own service log. The request log is a plugin; see [requestlog](requestlo
 
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
-| `level` | string | `"info"` | A level such as `info`, or a filter such as `info,reiki::tunnel=debug`. `RUST_LOG`, when set at startup, wins. | 0.4.2 |
+| `level` | string | `"info"` | A level such as `info`, or a filter such as `info,reiki::tunnel=debug`. `RUST_LOG`, when set at startup, keeps overriding `level` after reload. | 0.4.2 |
 | `file` | string | unset | Also write lines to this absolute path. The service user must be able to write it. Enables rotation. | 0.4.2 |
 | `format` | `"text"` or `"json"` | `"text"` | Line layout for the file. | 0.4.2 |
 | `stderr` | bool | `true` | Keep writing to stderr. Must stay `true` when `file` is unset. | 0.4.2 |

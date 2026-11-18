@@ -180,7 +180,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, cools the key until its `quota_resets` instant when one is set, else for the `Retry-After` the response carries, else for 5 h. Other 429s cool it for `Retry-After`, or 60 s without one. These rules are unit-tested but not exercised with a real exhausted key.
+Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, follows the [quota rules](classification.md#cooldown-values); other 429s follow the rate-limit rule there. These rules are unit-tested but not exercised with a real exhausted key.
 
 ## OpenCode Zen
 
@@ -191,9 +191,9 @@ base_url = "https://opencode.ai/zen/v1"
 
 Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.opencode.options.baseURL` to that URL and `apiKey` to the stream token.
 
-Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the next request. Set `confirm_quota = true` to send such a 429 once more on the same key after a 3-second pause before cooling it; only a repeated quota 429 takes the key out of rotation. A genuinely exhausted key pays one extra request and 3 seconds per request.
+Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the next request. Set `confirm_quota = true` to send such a 429 once more on the same key after the [pause in the classification rules](classification.md#reading-order) before cooling it; only a repeated quota 429 takes the key out of rotation. A genuinely exhausted key pays one extra request and the pause per request.
 
-A free-tier account answers a paid model with 402 while its free models keep working, so a whole-key cooldown would take them down too. A 402 and a plain rate-limit 429 are scoped to the request's route and model: the key keeps serving other combinations, and `/status` lists the cooling combination under `scopes`. A quota 429 still cools the whole key, because it concerns the account, not one model. `scope_escalate_after` (default 3, 2 to 16) sets how many models may be cooling before another failure cools the key.
+A free-tier account answers a paid model with 402 while its free models keep working, so a whole-key cooldown would take them down too. A 402 and a plain rate-limit 429 are scoped to the request's route and model: the key keeps serving other combinations, and `/status` lists the cooling combination under `scopes`. A quota 429 still cools the whole key, because it concerns the account, not one model. `scope_escalate_after` sets how many models may be cooling before another failure cools the key; see the [cooldown table](classification.md#cooldown-values).
 
 Zen's free models only accept requests carrying OpenCode's own headers; Reiki forwards every header except the credential, so the free tier keeps working.
 
@@ -234,15 +234,15 @@ Any HTTP API that takes its key in a header can be an upstream. For OpenAI-compa
 base_url = "https://openrouter.ai/api/v1"
 ```
 
-Reiki decides a key failure from the status code, the `Retry-After` header and a few error-body phrases. A provider that signals quota or key problems differently may need a new rule in `src/classify.rs`. These services are untested.
+Reiki decides a key failure from the status code, the `Retry-After` header, and a few error-body phrases. OpenAI and Gemini are covered by tests with invalid keys in this repository, and Anthropic's documented quota/error handling is exercised in `tests/anthropic_path.rs`. OpenAI-compatible services can use the same mapping, while a provider that signals quota or key problems differently may need a new rule in `src/classify.rs`.
 
 ## Unauthorized keys
 
-A 401 takes the key out of rotation at once, and one request disables at most one key: a second key that refuses the same request is tried but left alone. A request that every key refuses (a malformed credential header, a model the account cannot use) therefore still costs one good key. Set `hold_unauthorized = true` to hold that disable back until a later key serves the same request; only then is the first refusing key disabled. If every key of the upstream refuses, or the request ends in a fallback upstream or an error, no key is disabled. The default is `false`. While a bad key waits for a request to succeed, each request that reaches it pays one extra attempt.
+A 401 takes the key out of rotation at once, and one request disables at most one key: a second key that refuses the same request is tried but left alone, as described in [response classification](classification.md#reading-order). A request that every key refuses (a malformed credential header, a model the account cannot use) therefore still costs one good key. Set `hold_unauthorized = true` to hold that disable back until a later key serves the same request; only then is the first refusing key disabled. If every key of the upstream refuses, or the request ends in a fallback upstream or an error, no key is disabled. The default is `false`. While a bad key waits for a request to succeed, each request that reaches it pays one extra attempt.
 
 ## Relaying errors as they are
 
-Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply. An error body is relayed up to 64 KiB, scrubbed of the upstream key first; a longer body is cut there and the response carries `x-reiki-truncated: 1`.
+Reiki reads a 401, a 403 or a quota phrase as a key failure and tries the next key. A 401, or a 403 whose body names an invalid, expired or revoked credential, disables the key; any other 403 skips the key for that request only. That is wrong for an upstream where those statuses mean something else, such as a git server that answers 403 to a read-only token that tries to push. Set `pass_errors = true` to relay every error status to the client as it is. No key is cooled, disabled or replayed, and the key's failover and `fallback` do not apply. Error bodies are relayed with secrets scrubbed and a truncation marker when longer; see [response classification](classification.md#reading-order).
 
 ## Falling back to another upstream
 

@@ -37,89 +37,13 @@ stateDiagram-v2
 
 A combination cooldown is a fourth, narrower state. The key stays available for every other model and route. Only the `(route, model)` pair that failed is held back.
 
-## Status to class to key effect
+## Response rules and cooldowns
 
-Reiki reads the upstream status first. Then it reads the first 64 KiB of the body, lowercased. Body checks are substring matches unless noted.
+See [response classification](classification.md) for the rule for every status, the body and header conditions, the resulting key effect, the cooldown values, and the `Retry-After` and `quota_resets` precedence.
 
-| Upstream status | Body check | Class | Key effect | Next step for the request |
-| --- | --- | --- | --- | --- |
-| 200-399 | none | success | Transient count reset | Response is delivered |
-| 401 | none | `unauthorized` | Disabled | Next key |
-| 400 | JSON pair `"reason": "API_KEY_INVALID"` | `unauthorized` | Disabled | Next key |
-| 400 | `credit balance is too low` | `quota_exhausted` | Cooling, whole key | Next key |
-| 400 | anything else | pass-through | None | Response is relayed |
-| 402 | JSON `error.message` or `message` contains `fewer max_tokens` or `can only afford`; whole-body substring match only when the body is not JSON | `request_error` | None; the key is not cooled | Next key; the last upstream 402 is relayed unchanged if no key serves |
-| 402 | anything else | `quota_exhausted` | Cooling for `(route, model)` | Next key |
-| 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit`, `free-models-per-day` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
-| 429 | none of the above | `rate_limited` | Cooling for `(route, model)` | Next key |
-| 403 | `error code: 10` (edge block page) | pass-through | None | Response is relayed |
-| 403 | `access is disabled`, `free tier` or `not enabled` | `access_disabled` | None | Skip key for this request |
-| 403 | names an invalid, expired or revoked key or token | `unauthorized` | Disabled | Next key |
-| 403 | anything else | `access_disabled` | None | Skip key for this request |
-| 5xx | `access is disabled` | `access_disabled` | None | Skip key for this request |
-| 5xx | `rate limit` | `rate_limited` | Cooling for `(route, model)` | Next key |
-| 5xx | anything else | `transient` | Cooling after two in a row | Skip key for this request |
-| other (404, 422, ...) | none | pass-through | None | Response is relayed |
-| No response (connect or timeout) | none | `transient` | Counted as a transient failure | See transport rules below |
+`(route, model)` in that table means that combination. A request with no `model` cools the whole key. With `pass_errors = true` on the upstream, every status is a pass-through; see [providers](providers.md#relaying-errors-as-they-are). With `hold_unauthorized = true`, a `401` is held until a later key serves the same request; see [providers](providers.md#unauthorized-keys). One request disables at most one key.
 
-`(route, model)` means that combination. For a request with no `model`, the same failure cools the whole key.
-
-Each upstream can extend the built-in phrases; see [custom response phrases](#custom-response-phrases).
-
-With `pass_errors = true` on the upstream, every status is a pass-through. No key changes state. See [providers](providers.md#relaying-errors-as-they-are).
-
-With `hold_unauthorized = true`, a 401 does not disable the key until a later key serves the same request. See [providers](providers.md#unauthorized-keys).
-
-A second key that refuses the same request with a 401 is not disabled. One request disables at most one key.
-
-## Custom response phrases
-
-Each upstream may add body phrases to the built-in lists:
-
-```toml
-[upstream.zen]
-base_url = "https://opencode.ai/zen/v1"
-request_error_phrases = ["fewer max_tokens", "your max_tokens is too high"]
-quota_phrases = ["plan limit reached", "top up your balance"]
-rate_limit_phrases = ["slow down"]
-```
-
-- Each list holds at most 16 unique phrases of 3 to 120 non-control characters. A bad list is a config error naming the upstream and the phrase.
-- Matching is case-insensitive, against a substring of the first 64 KiB of the body. Configured phrases extend, never replace, the built-ins above.
-- `request_error_phrases` apply to 400, 402 and 413 only. The response is relayed and the key stays healthy. Built-ins: `fewer max_tokens`, `can only afford`.
-- `quota_phrases` cool the whole key, like a quota 429. Built-ins: `credit balance is too low` on 400 and the six 429 phrases in the table above. A configured 402 quota phrase also cools the whole key; the built-in 402 request-size phrases still pass through.
-- `rate_limit_phrases` cool the `(route, model)` scope. Built-in: `rate limit` on 5xx.
-- When lists overlap in one response, the order is request error, then quota, then rate limit.
-
-Changes to these lists take effect on reload.
-
-## Cooldowns
-
-These values are compiled in. The config file has no setting for them.
-
-| Class | Cooldown | Scope |
-| --- | --- | --- |
-| `unauthorized` | Until enabled again. No timer. | Key |
-| `rate_limited` | `Retry-After` when present (zero means no cooldown), else 60 seconds | `(route, model)` |
-| `quota_exhausted` (402) | Same as the quota row below | `(route, model)` |
-| `quota_exhausted` (429) | Same as the quota row below | Key |
-| `access_disabled` | None. The key is skipped for the request only. | None |
-| `request_error` | None. The key is skipped for the request only. | None |
-| `transient` | 30 seconds, after two failures in a row with no success between | Key |
-
-Quota cooldown takes the first of these that applies:
-
-| Order | Source | Cooldown |
-| --- | --- | --- |
-| 1 | `quota_resets` on the key: `daily HH:MM zone` or `monthly D HH:MM zone` | Until the next reset |
-| 2 | `Retry-After` on the response, non-zero | That long |
-| 3 | Neither | 5 hours |
-
-`Retry-After` is capped at 24 hours, whether it is seconds or an HTTP date. An HTTP date in the past gives zero. For a quota, zero counts as absent, so the next rule applies.
-
-Since 0.10.3, a quota 429 with `Retry-After` cools the key for that long, not for the 5-hour default. A configured `quota_resets` still wins over the header. With neither, the 5-hour window applies. The test `a_quota_429_with_retry_after_cools_the_key_for_that_long` in `tests/exhausted.rs` covers this.
-
-A cooldown only moves later. A shorter failure does not shorten a longer cooldown. A later, longer failure extends it.
+A cooldown only moves later. A shorter failure leaves a longer cooldown in place; a later, longer failure extends it.
 
 ## Scoped cooldowns
 
@@ -130,9 +54,7 @@ A scope is the pair of route and model:
 
 Only two failures are scoped: a `rate_limited` failure and a 402 that is treated as `quota_exhausted`. A request-size 402 (`fewer max_tokens` or `can only afford`) is `request_error`, not a key failure, so it neither cools nor disables the key. A quota 429 is always key-wide, as are 401s, transients and any failure on a request with no model.
 
-A key with many cooling models is treated as broken. `scope_escalate_after` sets the count per upstream. The default is 3, and the allowed range is 2 to 16. When three different models are cooling on a key, or the combinations reach twice that count, the next scoped failure cools the whole key for its duration. A whole-key cooldown clears the scoped entries.
-
-Each key remembers at most 64 combinations. When the map is full, the soonest-ending entry is dropped. Scoped cooldowns are held in memory only. They are not saved to the state file.
+A key with many cooling models is treated as broken. `scope_escalate_after` sets the count per upstream. The threshold, the combination limit and the eviction rule are in the [cooldown table](classification.md#cooldown-values). A whole-key cooldown clears the scoped entries. Scoped cooldowns live in memory; the state file holds key-level health.
 
 The `cooling_combinations` count in a peer's view is the number of combinations cooling on that upstream's keys. See [peers](peers.md).
 
@@ -190,7 +112,7 @@ Replaying a non-idempotent request could duplicate a side effect, so Reiki does 
 
 ## Re-enabling keys
 
-- `reiki keys --enable NAME` calls `POST /keys/enable` on the admin listener. This clears the key's cooldown, its disabled flag, its failure count and its combination cooldowns. The change is saved.
+- `reiki keys --enable NAME` calls `POST /keys/enable` on the admin listener. This clears the key's cooldown, its disabled flag, its failure count and its combination cooldowns. The change is saved. See [keys and streams](keys.md#key-state-and-enable).
 - A reload (`reiki reload`, SIGHUP, or `[reload] watch`) re-enables a key only when its key file content changed, or when the key is new. A disabled key whose file did not change stays disabled.
 - A restart restores disabled flags and key-level cooldowns from the state file, `<config>.state`. Combination cooldowns and the last status are not restored. A key whose file or upstream changed starts healthy.
 

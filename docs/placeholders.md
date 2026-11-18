@@ -38,7 +38,7 @@ Responses are restored as they stream; JSON and other bodies are held until they
 
 For event streams (`text/event-stream`), each event is parsed. A placeholder split across two events, such as `[[REI` then `KI_TERM_9b2e41f0c3a7d652]]`, is held back from the first and completed with the second, and a lone `[` at the end of a field is held the same way. A held fragment still unfinished when the stream ends, at `[DONE]`, at `message_stop` or at the last chunk, is sent as plain text. Events with no placeholder start keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
 
-Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plugins-at-build-time)); the default build registers `placeholders` before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response and the originals are restored only afterwards.
+Plugin order is set at build time (see [plugins](plugins.md#choose-and-order-plugins-at-build-time) and [plugin authoring](plugin-authoring.md#build-time-registration)); the default build registers `placeholders` before `requestlog`. Request hooks run in that order, so the log sees the masked request. Response hooks run in reverse, so the log sees the masked response and the originals are restored only afterwards.
 
 ## Claude Code
 

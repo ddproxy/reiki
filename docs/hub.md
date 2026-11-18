@@ -1,8 +1,8 @@
 # Hub
 
-The hub is configuration-only in this release. Nothing here opens a listener, builds a client or contacts a hub.
+The hub is a planned design for coordinating multiple Reiki instances. In this release, its tables are parsed and validated when the binary includes the `hub` cargo feature (not in the default set), but Reiki does not open a hub listener, build a hub client, or contact a hub.
 
-The tables below are parsed and validated only, and only behind the `hub` cargo feature (not in the default set). A binary built without the feature refuses a config that contains `[hubs]`, `[hub]` or `[accounts]`. With the feature on, `reiki check` accepts them, but nothing serves or uses them. Without these tables nothing changes.
+A binary built without the feature refuses a config that contains `[hubs]`, `[hub]`, or `[accounts]`. With the feature on, `reiki check` accepts valid hub tables, while runtime behavior is unchanged. Without these tables nothing changes.
 
 ## Tables
 

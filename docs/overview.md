@@ -26,10 +26,10 @@ Other listeners, each optional and on its own socket:
 
 | Listener | Table | Serves |
 | --- | --- | --- |
-| admin | `[admin]` | `GET /status`, `POST /reload`, `GET /metrics` |
-| peers | `[peers]` | `GET /v1/health` with a read-only peer token |
+| admin | `[admin]` | `GET /status`, `GET /failures`, `POST /reload`, `POST /keys/enable`, plugin routes such as `GET /metrics`, and `GET /v1/openapi.json` (routes are also served under `/v1`) |
+| peers | `[peers]` | `GET /v1/health` and `GET /v1/health/stream` with a read-only peer token |
 | tunnel | `[tunnel]` | CONNECT proxy with a destination allow-list; intercept for chosen hosts |
-| hub | `[hub]` | parsed and validated only in this release |
+| hub | `[hub]` | parsed and validated in this release; it does not open a hub listener yet |
 
 - **Client listener.** Serves the API. A request needs a stream token, except on a `passthrough` upstream. The path prefix chooses the upstream, so `/example/chat/completions` goes to the `example` upstream.
 - **Stream.** One client with its own token and key chain. The token is stored as a SHA-256 hash. Streams share cooldown state only for keys they both list.
@@ -57,7 +57,7 @@ Reiki decides what leaves the client's machine and what reaches the provider.
 - The `placeholders` plugin swaps credentials and listed terms for stable placeholders before the request leaves, and restores them in the response. See [placeholders](placeholders.md).
 - The `phi`, `finance` and `controlled` plugins block or report identifiers in outbound requests. See [phi](phi.md), [finance](finance.md) and [controlled](controlled.md).
 - Upstreams come only from the config. The optional CONNECT tunnel opens only listed destinations. Interception applies the same rules to chosen hosts. See [tunnel](tunnel.md).
-- Which plugins are compiled in, and their order, is set at build time. See [plugins](plugins.md).
+- Which plugins are compiled in, and their order, is set at build time. See [plugins](plugins.md) and [plugin authoring](plugin-authoring.md).
 
 ### Reliability and visibility
 
@@ -68,25 +68,15 @@ Requests keep working when one key fails, and you can see what happened.
 - Request log: what the client sent and what came back, with credentials masked. See [requestlog](requestlog.md).
 - Fleet view: `reiki top` shows key health across instances, peers publish that health, and `/metrics` exports it. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
 
-## Glossary
-
-| Term | Meaning |
-| --- | --- |
-| stream | One client with its own token (`[streams.NAME]`) and key chain. |
-| key | An upstream credential, read from the file named in `[keys.NAME]`. It is available, cooling or out of rotation. |
-| chain | The ordered keys a stream may use (`chain = [...]`). |
-| upstream | A provider as Reiki sees it: `[upstream.NAME]` with an https `base_url`. Clients reach it at `/NAME`. |
-| fallback | `[upstream.NAME.fallback]`: another upstream that takes a request when no key of NAME is usable. It is one hop. |
-| plugin | A compiled-in component, configured under `[plugins.NAME]`, that inspects or changes requests and responses. |
-| peer | Another Reiki instance whose key health this one reads (`[peers.NAME]`). Peers route nothing. |
-| intercept | TLS termination on the tunnel for chosen hosts, so plugins and key handling apply (`[tunnel.intercept]`). |
-| cooldown | The time a key, or one route and model on it, is skipped after a failure. Classes: `rate_limited`, `quota_exhausted`, `transient`. |
-
 ## Where to go next
 
+- [Architecture](architecture.md): request path, key states and source map.
+- [Glossary](glossary.md): terms and CLI/status vocabulary.
 - [Configuration](configuration.md): every table and field.
 - [CLI](cli.md): every subcommand.
+- [Keys and streams](keys.md): key files, token hashes, chains and rotation.
 - [Providers](providers.md): connect a provider and its client.
 - [Failover](failover.md) and [shaping](shaping.md): how keys are chosen, cooled and budgeted.
 - [Monitoring](monitoring.md) and [troubleshooting](troubleshooting.md): what to check when something fails.
-- [Service](service.md): run Reiki under systemd.
+- [Deploy](deploy.md): install paths, directory layout, listeners and a service unit.
+- [Upgrades](upgrades.md): reload and restart rules, state compatibility and rollback.

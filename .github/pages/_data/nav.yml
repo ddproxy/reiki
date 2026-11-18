@@ -2,17 +2,22 @@
   items:
     - { title: Home, url: / }
     - { title: Overview, url: /docs/overview.html }
+    - { title: Architecture, url: /docs/architecture.html }
+    - { title: Glossary, url: /docs/glossary.html }
     - { title: Command line, url: /docs/cli.html }
     - { title: Configuration, url: /docs/configuration.html }
+    - { title: Keys and streams, url: /docs/keys.html }
 - title: Reliability
   items:
     - { title: Failover, url: /docs/failover.html }
+    - { title: Classification, url: /docs/classification.html }
     - { title: Traffic shaping, url: /docs/shaping.html }
     - { title: Providers, url: /docs/providers.html }
 - title: Security and data
   items:
     - { title: Security, url: /docs/security.html }
     - { title: Plugins, url: /docs/plugins.html }
+    - { title: Plugin authoring, url: /docs/plugin-authoring.html }
     - { title: Placeholders, url: /docs/placeholders.html }
     - { title: PHI and NPPI, url: /docs/phi.html }
     - { title: Finance, url: /docs/finance.html }
@@ -21,9 +26,11 @@
     - { title: Request log, url: /docs/requestlog.html }
 - title: Operate
   items:
-    - { title: Running as a service, url: /docs/service.html }
+    - { title: Deploy, url: /docs/deploy.html }
+    - { title: Upgrades, url: /docs/upgrades.html }
     - { title: Monitoring, url: /docs/monitoring.html }
     - { title: Peers, url: /docs/peers.html }
+    - { title: Peers publishing, url: /docs/peers-publishing.html }
     - { title: reiki top, url: /docs/top.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
     - { title: Hub, url: /docs/hub.html }

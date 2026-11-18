@@ -4,13 +4,13 @@ The `[tunnel]` section starts a second listener that works as a CONNECT forward 
 
 ```toml
 [tunnel]
-listen = "127.0.0.1:4099"
+listen = "127.0.0.1:4098"
 allow = ["api.example.com", "*.example.net"]
 connect_timeout_secs = 10
 ```
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:4099 NO_PROXY=127.0.0.1,localhost some-client
+HTTPS_PROXY=http://127.0.0.1:4098 NO_PROXY=127.0.0.1,localhost some-client
 ```
 
 | Key | Default | Meaning |
@@ -29,7 +29,7 @@ HTTPS_PROXY=http://127.0.0.1:4099 NO_PROXY=127.0.0.1,localhost some-client
 - The filter also refuses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`. The host's other interface addresses are not filtered, so avoid a broad allowlist such as `*`.
 - Each closed tunnel is logged at `info` with the destination host and port, bytes in each direction and the duration. Nothing inside an opaque tunnel is visible, so there is no request log, no placeholders, no key injection and no failover for it.
 - At most 512 tunnels run at once and 64 from one peer address; more get 503. The CONNECT request head must arrive within 10 seconds, and an opaque tunnel is closed after one hour.
-- A reload changes `allow`, `deny_private`, `allow_loopback` and `connect_timeout_secs` without a restart; open tunnels keep running. A new `listen` address needs a restart. See [reload](troubleshooting.md#reload).
+- A reload changes `allow`, `deny_private`, `allow_loopback` and `connect_timeout_secs` without a restart; open tunnels keep running. A new `listen` address needs a restart. See [upgrades](upgrades.md#reload-vs-restart) and [reload](troubleshooting.md#reload).
 
 ## Interception
 
@@ -37,7 +37,7 @@ An opaque tunnel cannot be logged, masked or given a key. `[tunnel.intercept]` c
 
 ```toml
 [tunnel]
-listen = "10.0.0.1:4099"
+listen = "10.0.0.1:4098"
 allow = ["api.example.com"]
 
 [tunnel.intercept]
@@ -80,7 +80,7 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - A reload changes the intercept hosts, `require_auth` and `leaf_ttl_hours`.
 - A reload also swaps in a new CA when `ca_cert` or `ca_key` changes, or when the files are renewed in place. The new CA must have a key that matches its certificate, a DNS name constraint that covers every intercepted host, and no expiry in the past. A CA that fails a check refuses the whole reload, and the running CA keeps serving.
 - After a swap, new connections get certificates from the new CA, and clients must trust the new `ca.pem`. Connections already open keep their certificate until they close.
-- Adding or removing `[tunnel.intercept]` needs a restart. See [reload](troubleshooting.md#reload) and [security](security.md) for what to protect.
+- Adding or removing `[tunnel.intercept]` needs a restart. See [upgrades](upgrades.md#reload-vs-restart), [reload](troubleshooting.md#reload) and [security](security.md) for what to protect.
 
 ## Trust boundary
 

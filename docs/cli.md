@@ -21,7 +21,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 | --- | --- | --- |
 | `REIKI_LISTEN` | server mode, `check` | Client listen address. Overridden by `--listen`; overrides `listen` in the config. |
 | `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. |
-| `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup. |
+| `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup and after reload. |
 
 `--listen` and `REIKI_LISTEN` accept an `IP:port` address or a `host:port` name.
 
@@ -42,7 +42,7 @@ Starts the client listener, and the admin, peer and tunnel listeners when config
 | `0` | Stopped cleanly after a signal. |
 | `1` | Startup failed: config, key files, plugin build or a listener could not be bound. |
 
-Send SIGTERM for a clean stop. Requests in flight get `[service] shutdown_timeout_secs`. A second signal exits at once. See [service](service.md).
+Send SIGTERM for a clean stop. Requests in flight get `[service] shutdown_timeout_secs`. A second signal exits at once. See [deploy](deploy.md#signals-and-lifecycle).
 
 ## hash-token
 
@@ -160,7 +160,7 @@ A named kind that the selected plugin does not know exits `2`. For example, `--p
 
 ## reload
 
-Asks the running instance to reload its config over the admin listener. Posts to `/reload`. Use `--dry-run` to see what a reload would change without applying it. See [troubleshooting](troubleshooting.md#reload).
+Asks the running instance to reload its config over the admin listener. Posts to `/reload`. Use `--dry-run` to see what a reload would change without applying it. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
 
 ```
 reiki reload [--dry-run] [--url URL] [--token-file PATH]
@@ -198,7 +198,7 @@ Exit codes:
 
 ## keys
 
-Shows each key's health from the running instance, or checks key files offline. The three forms are mutually exclusive.
+Shows each key's health from the running instance, or checks key files offline. The three forms are mutually exclusive. See [keys and streams](keys.md).
 
 ```
 reiki keys [--json] [--url URL] [--token-file PATH]

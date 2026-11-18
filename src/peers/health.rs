@@ -495,7 +495,13 @@ mod tests {
             Policy::default(),
             Duration::from_secs(1),
         );
-        for class in ["rate_limited", "rate_limited", "transient"] {
+        for class in [
+            "rate_limited",
+            "rate_limited",
+            "transient",
+            "request_error",
+            "not_a_class",
+        ] {
             app.failures().record(crate::failures::FailureRecord {
                 time: 1,
                 stream: "stream-name".to_owned(),
@@ -512,6 +518,8 @@ mod tests {
         let doc = document(&app, &peers).await;
         assert_eq!(doc["failures"]["rate_limited"], 2);
         assert_eq!(doc["failures"]["transient"], 1);
+        assert_eq!(doc["failures"]["request_error"], 1);
+        assert!(doc["failures"].get("not_a_class").is_none());
         let text = doc.to_string();
         for hidden in ["secret-key-name", "stream-name", "a body", "120"] {
             assert!(!text.contains(hidden), "`{hidden}` leaked: {text}");

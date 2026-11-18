@@ -1,6 +1,44 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_CLASSIFY_BODY: usize = 64 * 1024;
+
+// One place for the built-in phrases, so the failover table and the classifier cannot drift.
+const BUILTIN_REQUEST_ERROR_PHRASES: &[&str] = &["fewer max_tokens", "can only afford"];
+const BUILTIN_QUOTA_400_PHRASES: &[&str] = &["credit balance is too low"];
+const BUILTIN_QUOTA_429_PHRASES: &[&str] = &[
+    "usage exceeded",
+    "quota",
+    "subscribe to go",
+    "free usage limit",
+    "free-models-per-day",
+    "insufficient",
+];
+const BUILTIN_RATE_LIMIT_PHRASES: &[&str] = &["rate limit"];
+const BUILTIN_INVALID_CREDENTIAL_PHRASES: &[&str] = &[
+    "invalid api key",
+    "incorrect api key",
+    "api key is invalid",
+    "api key not valid",
+    "api key is not valid",
+    "api key has expired",
+    "api key has been revoked",
+    "api key is disabled",
+    "api_key_invalid",
+    "invalid_api_key",
+    "invalid x-api-key",
+    "invalid credential",
+    "credential has been revoked",
+    "credential has expired",
+    "invalid token",
+    "token has been revoked",
+    "token has expired",
+];
+const BUILTIN_ACCESS_DISABLED_PHRASES: &[&str] =
+    &["access is disabled", "free tier", "not enabled"];
+const BUILTIN_ACCESS_DISABLED_5XX_PHRASES: &[&str] =
+    &["model access is disabled", "access is disabled"];
+const BUILTIN_EDGE_BLOCK_PHRASES: &[&str] = &["error code: 10"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
@@ -35,6 +73,8 @@ impl FailureClass {
 pub enum Outcome {
     Success,
     KeyFailure(FailureClass),
+    /// The request itself is too large for this account; another key may afford it.
+    RequestError,
     PassThrough,
 }
 
@@ -184,43 +224,45 @@ fn has_json_pair(body: &str, field: &str, value: &str) -> bool {
 }
 
 fn is_edge_block_page(body: &str) -> bool {
-    contains_any(body, &["error code: 10"])
+    contains_any(body, BUILTIN_EDGE_BLOCK_PHRASES)
 }
 
 /// 403 bodies that establish a bad credential rather than a request-scoped refusal.
 fn names_invalid_credential(body: &str) -> bool {
-    contains_any(
-        body,
-        &[
-            "invalid api key",
-            "incorrect api key",
-            "api key is invalid",
-            "api key not valid",
-            "api key is not valid",
-            "api key has expired",
-            "api key has been revoked",
-            "api key is disabled",
-            "api_key_invalid",
-            "invalid_api_key",
-            "invalid x-api-key",
-            "invalid credential",
-            "credential has been revoked",
-            "credential has expired",
-            "invalid token",
-            "token has been revoked",
-            "token has expired",
-        ],
-    )
+    contains_any(body, BUILTIN_INVALID_CREDENTIAL_PHRASES)
 }
 
 pub fn classify(status: u16, retry_after: Option<&str>, body_snippet: &str) -> Outcome {
     classify_at(status, retry_after, body_snippet, SystemTime::now())
 }
 
-/// Phrases in a 402 body that mean the request asked for more than affordable
-/// (e.g. OpenRouter's "fewer max_tokens"/"can only afford" message). These are
-/// client-fixable request-size issues, so pass the 402 through instead of cooling the key.
-const OPENROUTER_402_PASSTHROUGH_PHRASES: &[&str] = &["fewer max_tokens", "can only afford"];
+/// Extra body phrases configured on an upstream. They extend the built-in lists.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtraPhrases<'a> {
+    pub request_error: &'a [String],
+    pub quota: &'a [String],
+    pub rate_limit: &'a [String],
+}
+
+/// The class and whether a configured quota phrase chose it, which decides the cooldown scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Classification {
+    pub outcome: Outcome,
+    pub quota_phrase_matched: bool,
+}
+
+fn is_request_size_error(body: &str) -> bool {
+    let matches = |message: &str| contains_any(message, BUILTIN_REQUEST_ERROR_PHRASES);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return matches(body);
+    };
+    let error_message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str);
+    let message = value.get("message").and_then(serde_json::Value::as_str);
+    error_message.is_some_and(matches) || message.is_some_and(matches)
+}
 
 pub fn classify_at(
     status: u16,
@@ -228,38 +270,74 @@ pub fn classify_at(
     body_snippet: &str,
     now: SystemTime,
 ) -> Outcome {
-    let body = body_snippet.to_ascii_lowercase();
-    match status {
+    classify_with(
+        status,
+        retry_after,
+        body_snippet,
+        now,
+        &ExtraPhrases::default(),
+    )
+    .outcome
+}
+
+/// Classifies an upstream error with the configured extra phrases as well as the built-in ones.
+/// Only the first 64 KiB of the body is read; a multi-byte character at the cut is dropped.
+pub fn classify_with(
+    status: u16,
+    retry_after: Option<&str>,
+    body_snippet: &str,
+    now: SystemTime,
+    extra: &ExtraPhrases<'_>,
+) -> Classification {
+    let end = body_snippet.len().min(MAX_CLASSIFY_BODY);
+    let body = String::from_utf8_lossy(&body_snippet.as_bytes()[..end]).to_lowercase();
+    let quota_phrase = contains_extra(&body, extra.quota);
+    let rate_limit_phrase = contains_extra(&body, extra.rate_limit);
+    let request_error = matches!(status, 400 | 402 | 413)
+        && (is_request_size_error(&body) || contains_extra(&body, extra.request_error));
+
+    // A request-size error is the client's to fix: the key stays healthy and the proxy tries the
+    // next key, since another account may afford the request.
+    if request_error {
+        return Classification {
+            outcome: Outcome::RequestError,
+            quota_phrase_matched: false,
+        };
+    }
+
+    let outcome = match status {
         200..=399 => Outcome::Success,
         401 => Outcome::KeyFailure(FailureClass::Unauthorized),
-        402 => {
-            if contains_any(&body, OPENROUTER_402_PASSTHROUGH_PHRASES) {
-                Outcome::PassThrough
-            } else {
-                Outcome::KeyFailure(FailureClass::QuotaExhausted)
-            }
-        }
         400 => {
             if has_json_pair(&body, "reason", "api_key_invalid") {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
-            } else if contains_any(&body, &["credit balance is too low"]) {
+            } else if quota_phrase || contains_any(&body, BUILTIN_QUOTA_400_PHRASES) {
+                Outcome::KeyFailure(FailureClass::QuotaExhausted)
+            } else if rate_limit_phrase {
+                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
+                    retry_after,
+                    now,
+                )))
+            } else {
+                Outcome::PassThrough
+            }
+        }
+        402 | 413 => {
+            if quota_phrase {
+                Outcome::KeyFailure(FailureClass::QuotaExhausted)
+            } else if rate_limit_phrase {
+                Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
+                    retry_after,
+                    now,
+                )))
+            } else if status == 402 {
                 Outcome::KeyFailure(FailureClass::QuotaExhausted)
             } else {
                 Outcome::PassThrough
             }
         }
         429 => {
-            if contains_any(
-                &body,
-                &[
-                    "usage exceeded",
-                    "quota",
-                    "subscribe to go",
-                    "free usage limit",
-                    "free-models-per-day",
-                    "insufficient",
-                ],
-            ) {
+            if quota_phrase || contains_any(&body, BUILTIN_QUOTA_429_PHRASES) {
                 Outcome::KeyFailure(FailureClass::QuotaExhausted)
             } else {
                 Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
@@ -271,7 +349,7 @@ pub fn classify_at(
         403 => {
             if is_edge_block_page(&body) {
                 Outcome::PassThrough
-            } else if contains_any(&body, &["access is disabled", "free tier", "not enabled"]) {
+            } else if contains_any(&body, BUILTIN_ACCESS_DISABLED_PHRASES) {
                 Outcome::KeyFailure(FailureClass::AccessDisabled)
             } else if names_invalid_credential(&body) {
                 Outcome::KeyFailure(FailureClass::Unauthorized)
@@ -282,10 +360,11 @@ pub fn classify_at(
             }
         }
         500..=599 => {
-            // Some upstreams report an exhausted allowance as a 5xx with a body.
-            if contains_any(&body, &["model access is disabled", "access is disabled"]) {
+            if quota_phrase {
+                Outcome::KeyFailure(FailureClass::QuotaExhausted)
+            } else if contains_any(&body, BUILTIN_ACCESS_DISABLED_5XX_PHRASES) {
                 Outcome::KeyFailure(FailureClass::AccessDisabled)
-            } else if contains_any(&body, &["rate limit"]) {
+            } else if rate_limit_phrase || contains_any(&body, BUILTIN_RATE_LIMIT_PHRASES) {
                 Outcome::KeyFailure(FailureClass::RateLimited(parse_retry_after(
                     retry_after,
                     now,
@@ -295,7 +374,19 @@ pub fn classify_at(
             }
         }
         _ => Outcome::PassThrough,
+    };
+    Classification {
+        quota_phrase_matched: quota_phrase
+            && matches!(outcome, Outcome::KeyFailure(FailureClass::QuotaExhausted)),
+        outcome,
     }
+}
+
+fn contains_extra(body: &str, phrases: &[String]) -> bool {
+    phrases.iter().any(|phrase| {
+        let phrase = phrase.to_lowercase();
+        body.contains(phrase.as_str())
+    })
 }
 
 #[cfg(test)]
@@ -413,9 +504,9 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_402_request_too_large_passes_through() {
+    fn openrouter_402_request_too_large_is_a_request_error() {
         let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 256000 tokens, but can only afford 199460. ..."}}"#;
-        assert_eq!(classify(402, None, body), Outcome::PassThrough);
+        assert_eq!(classify(402, None, body), Outcome::RequestError);
     }
 
     #[test]
@@ -429,9 +520,31 @@ mod tests {
     #[test]
     fn openrouter_402_matching_is_case_insensitive() {
         let body = "You requested more, please use FEWER MAX_TOKENS.";
-        assert_eq!(classify(402, None, body), Outcome::PassThrough);
+        assert_eq!(classify(402, None, body), Outcome::RequestError);
         let body2 = "CAN ONLY AFFORD 100 tokens";
-        assert_eq!(classify(402, None, body2), Outcome::PassThrough);
+        assert_eq!(classify(402, None, body2), Outcome::RequestError);
+    }
+
+    #[test]
+    fn a_json_402_only_matches_the_message_fields() {
+        let in_message = r#"{"error":{"message":"please use fewer max_tokens"}}"#;
+        assert_eq!(classify(402, None, in_message), Outcome::RequestError);
+        let top_level = r#"{"message":"can only afford 10 tokens"}"#;
+        assert_eq!(classify(402, None, top_level), Outcome::RequestError);
+        let elsewhere = r#"{"error":{"type":"fewer max_tokens"},"message":"insufficient credits"}"#;
+        assert_eq!(
+            classify(402, None, elsewhere),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn a_json_402_without_the_phrase_does_not_fall_back_to_the_whole_body() {
+        let body = r#"{"error":{"code":"can only afford"},"detail":"insufficient credits"}"#;
+        assert_eq!(
+            classify(402, None, body),
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
     }
 
     #[test]
@@ -583,6 +696,168 @@ mod tests {
         assert_eq!(
             classify(400, None, real),
             Outcome::KeyFailure(FailureClass::Unauthorized)
+        );
+    }
+
+    fn classify_phrases(
+        status: u16,
+        retry_after: Option<&str>,
+        body: &str,
+        request_error: &[&str],
+        quota: &[&str],
+        rate_limit: &[&str],
+    ) -> Classification {
+        let owned = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let request_error = owned(request_error);
+        let quota = owned(quota);
+        let rate_limit = owned(rate_limit);
+        let extra = ExtraPhrases {
+            request_error: &request_error,
+            quota: &quota,
+            rate_limit: &rate_limit,
+        };
+        classify_with(status, retry_after, body, UNIX_EPOCH, &extra)
+    }
+
+    #[test]
+    fn extra_request_error_phrases_apply_to_400_402_and_413() {
+        for status in [400, 402, 413] {
+            assert_eq!(
+                classify_phrases(
+                    status,
+                    None,
+                    "too many tokens",
+                    &["too many tokens"],
+                    &[],
+                    &[]
+                )
+                .outcome,
+                Outcome::RequestError,
+                "status {status}"
+            );
+        }
+        for status in [401, 429, 500] {
+            assert_ne!(
+                classify_phrases(
+                    status,
+                    None,
+                    "too many tokens",
+                    &["too many tokens"],
+                    &[],
+                    &[]
+                )
+                .outcome,
+                Outcome::RequestError,
+                "request-error phrases do not apply to status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_quota_phrases_cool_the_whole_key() {
+        for status in [400, 402, 413, 429, 503] {
+            let result =
+                classify_phrases(status, Some("30"), "plan spent", &[], &["plan spent"], &[]);
+            assert_eq!(
+                result.outcome,
+                Outcome::KeyFailure(FailureClass::QuotaExhausted),
+                "status {status}"
+            );
+            assert!(result.quota_phrase_matched, "status {status}");
+        }
+    }
+
+    #[test]
+    fn extra_rate_limit_phrases_cool_a_scope() {
+        for status in [400, 402, 413, 429, 503] {
+            assert_eq!(
+                classify_phrases(status, Some("30"), "slow down", &[], &[], &["slow down"]).outcome,
+                Outcome::KeyFailure(FailureClass::RateLimited(Some(Duration::from_secs(30)))),
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_phrases_extend_built_in_lists() {
+        let extra = &["unrelated"];
+        assert_eq!(
+            classify_phrases(402, None, "fewer max_tokens", extra, &[], &[]).outcome,
+            Outcome::RequestError
+        );
+        assert_eq!(
+            classify_phrases(400, None, "credit balance is too low", extra, &[], &[]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_phrases(429, None, "free usage limit", &[], extra, &[]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_phrases(503, None, "rate limit", &[], &[], extra).outcome,
+            Outcome::KeyFailure(FailureClass::RateLimited(None))
+        );
+    }
+
+    #[test]
+    fn extra_phrases_match_without_regard_to_case() {
+        assert_eq!(
+            classify_phrases(400, None, "PLAN SPENT", &[], &["Plan Spent"], &[]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_phrases(402, None, "TOO MANY TOKENS", &["too many tokens"], &[], &[]).outcome,
+            Outcome::RequestError
+        );
+        assert_eq!(
+            classify_phrases(429, Some("30"), "SLOW DOWN", &[], &[], &["Slow Down"]).outcome,
+            Outcome::KeyFailure(FailureClass::RateLimited(Some(Duration::from_secs(30))))
+        );
+    }
+
+    #[test]
+    fn phrase_precedence_is_request_error_then_quota_then_rate_limit() {
+        let all = "too many tokens, plan spent, slow down";
+        assert_eq!(
+            classify_phrases(
+                402,
+                None,
+                all,
+                &["too many tokens"],
+                &["plan spent"],
+                &["slow down"]
+            )
+            .outcome,
+            Outcome::RequestError
+        );
+        assert_eq!(
+            classify_phrases(402, None, all, &[], &["plan spent"], &["slow down"]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_phrases(429, Some("30"), all, &[], &["plan spent"], &["slow down"]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+        assert_eq!(
+            classify_phrases(429, Some("30"), "quota slow down", &[], &[], &["slow down"]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted),
+            "a built-in quota phrase beats an extra rate-limit phrase"
+        );
+    }
+
+    #[test]
+    fn only_the_first_64_kib_of_a_body_is_matched() {
+        let mut before = "x".repeat(MAX_CLASSIFY_BODY);
+        before.push_str("plan spent");
+        assert_eq!(
+            classify_phrases(400, None, &before, &[], &["plan spent"], &[]).outcome,
+            Outcome::PassThrough
+        );
+        let mut inside = "x".repeat(MAX_CLASSIFY_BODY - "plan spent".len());
+        inside.push_str("plan spent");
+        assert_eq!(
+            classify_phrases(400, None, &inside, &[], &["plan spent"], &[]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
         );
     }
 }

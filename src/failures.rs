@@ -14,6 +14,21 @@ pub const MAX_NOTE_CHARS: usize = 200;
 /// Longest `Retry-After` kept. The value comes from the upstream and is only echoed.
 pub const MAX_RETRY_AFTER_CHARS: usize = 64;
 
+/// The only class labels `/v1/failures` counts. Keeping this fixed means a future or corrupted
+/// label cannot grow the peer health document into an unbounded map.
+pub const CLASSES: &[&str] = &[
+    "rate_limited",
+    "quota_exhausted",
+    "access_disabled",
+    "unauthorized",
+    "transient",
+    "request_error",
+];
+
+pub fn is_known_class(label: &str) -> bool {
+    CLASSES.contains(&label)
+}
+
 /// One key failure as `/v1/failures` and `reiki failures` show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
@@ -80,7 +95,10 @@ impl FailureRing {
     pub fn counts(&self) -> BTreeMap<String, u64> {
         let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out = BTreeMap::new();
-        for record in records.iter() {
+        for record in records
+            .iter()
+            .filter(|record| is_known_class(&record.class))
+        {
             *out.entry(record.class.clone()).or_insert(0) += 1;
         }
         out
@@ -242,6 +260,21 @@ mod tests {
         assert_eq!(counts.get("rate_limited"), Some(&1));
         assert_eq!(counts.get("transient"), Some(&1));
         assert_eq!(counts.get("quota_exhausted"), None);
+    }
+
+    #[test]
+    fn counts_include_request_errors_and_ignore_unknown_labels() {
+        let ring = FailureRing::new();
+        let mut request = failure("a");
+        request.class = "request_error".to_owned();
+        ring.record(request);
+        let mut unknown = failure("b");
+        unknown.class = "invented".to_owned();
+        ring.record(unknown);
+        let counts = ring.counts();
+        assert_eq!(counts.get("request_error"), Some(&1));
+        assert!(!counts.contains_key("invented"));
+        assert_eq!(counts.len(), 1);
     }
 
     #[test]

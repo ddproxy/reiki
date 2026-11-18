@@ -125,6 +125,7 @@ pub enum FailureKind {
     AccessDisabled,
     Unauthorized,
     Transient,
+    RequestError,
 }
 
 impl FailureKind {
@@ -135,6 +136,7 @@ impl FailureKind {
             Self::AccessDisabled => "access_disabled",
             Self::Unauthorized => "unauthorized",
             Self::Transient => "transient",
+            Self::RequestError => "request_error",
         }
     }
 }

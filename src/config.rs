@@ -736,6 +736,16 @@ pub struct Upstream {
     /// replayed, so an authorisation error from a non-LLM upstream cannot take the key out of rotation.
     #[serde(default)]
     pub pass_errors: bool,
+    /// Extra body phrases for client-fixable 400, 402 or 413 requests. The answer is relayed
+    /// unchanged and the key stays healthy.
+    #[serde(default)]
+    pub request_error_phrases: Vec<String>,
+    /// Extra body phrases for an exhausted key. These cool the whole key, even on a 402.
+    #[serde(default)]
+    pub quota_phrases: Vec<String>,
+    /// Extra body phrases for a scoped rate limit.
+    #[serde(default)]
+    pub rate_limit_phrases: Vec<String>,
     /// Re-send a quota-exhausted 429 once on the same key, after a short pause, before cooling
     /// the key. For upstreams that sometimes answer a good key with a spurious quota 429.
     #[serde(default)]
@@ -903,6 +913,28 @@ fn credential_problem(header: &str, format: &str) -> Option<String> {
     }
     if axum::http::HeaderValue::from_str(&format.replace("{key}", "k")).is_err() {
         return Some("auth_format is not a valid header value".to_owned());
+    }
+    None
+}
+
+fn phrase_list_problem(field: &str, phrases: &[String]) -> Option<String> {
+    if phrases.len() > 16 {
+        return Some(format!(
+            "{field} has {} phrases; at most 16 are allowed",
+            phrases.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for phrase in phrases {
+        let shown = crate::proxy::json_escape(phrase);
+        if !(3..=120).contains(&phrase.chars().count()) || phrase.chars().any(char::is_control) {
+            return Some(format!(
+                "{field} phrase `{shown}` must be 3 to 120 printable characters"
+            ));
+        }
+        if !seen.insert(phrase.to_lowercase()) {
+            return Some(format!("{field} lists `{shown}` twice"));
+        }
     }
     None
 }
@@ -1378,6 +1410,18 @@ impl Config {
             }
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
+            }
+            for (field, phrases) in [
+                ("request_error_phrases", &upstream.request_error_phrases),
+                ("quota_phrases", &upstream.quota_phrases),
+                ("rate_limit_phrases", &upstream.rate_limit_phrases),
+            ] {
+                if let Some(reason) = phrase_list_problem(field, phrases) {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason,
+                    });
+                }
             }
             if let Some(reason) = credential_problem(&upstream.auth_header, &upstream.auth_format) {
                 return Err(ConfigError::BadUpstream {
@@ -4258,5 +4302,90 @@ socket = "/run/forwarder.sock"
         ))
         .unwrap();
         assert!(!off.tracks_usage());
+    }
+
+    const PHRASE_FIELDS: &[&str] = &[
+        "quota_phrases",
+        "request_error_phrases",
+        "rate_limit_phrases",
+    ];
+
+    fn phrase_config(field: &str, entries: &[&str]) -> String {
+        let list = entries
+            .iter()
+            .map(|entry| format!("\"{entry}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        base("").replace(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+            &format!(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{field} = [{list}]"
+            ),
+        )
+    }
+
+    #[test]
+    fn phrase_lists_accept_the_length_and_count_limits() {
+        let max = "x".repeat(120);
+        for field in PHRASE_FIELDS {
+            assert!(Config::parse(&phrase_config(field, &[])).is_ok(), "{field}");
+            assert!(
+                Config::parse(&phrase_config(field, &["abc", max.as_str()])).is_ok(),
+                "{field}"
+            );
+            let sixteen = (0..16).map(|i| format!("phrase {i}")).collect::<Vec<_>>();
+            let refs = sixteen.iter().map(String::as_str).collect::<Vec<_>>();
+            assert!(
+                Config::parse(&phrase_config(field, &refs)).is_ok(),
+                "{field}"
+            );
+        }
+        let quota = Config::parse(&phrase_config("quota_phrases", &["plan spent"])).unwrap();
+        assert_eq!(quota.upstream["zen"].quota_phrases, ["plan spent"]);
+        let request =
+            Config::parse(&phrase_config("request_error_phrases", &["too large"])).unwrap();
+        assert_eq!(request.upstream["zen"].request_error_phrases, ["too large"]);
+        let rate = Config::parse(&phrase_config("rate_limit_phrases", &["slow down"])).unwrap();
+        assert_eq!(rate.upstream["zen"].rate_limit_phrases, ["slow down"]);
+    }
+
+    #[test]
+    fn a_phrase_list_over_sixteen_entries_is_refused() {
+        for field in PHRASE_FIELDS {
+            let seventeen = vec!["phrase one"; 17];
+            let error = Config::parse(&phrase_config(field, &seventeen))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("upstream `zen`"), "{field}: {error}");
+            assert!(error.contains(field), "{field}: {error}");
+            assert!(error.contains("16"), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_bad_phrase_names_the_upstream_and_the_entry() {
+        let short = "ab";
+        let long = "x".repeat(121);
+        let bad: &[(&str, &str)] = &[
+            (short, "short"),
+            (long.as_str(), "long"),
+            (r"bad\u0001phrase", "control"),
+        ];
+        for field in PHRASE_FIELDS {
+            for (entry, why) in bad {
+                let error = Config::parse(&phrase_config(field, &["ok phrase", entry]))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("upstream `zen`"), "{field} {why}: {error}");
+                assert!(error.contains(field), "{field} {why}: {error}");
+                assert!(error.contains(entry), "{field} {why}: {error}");
+            }
+            let error = Config::parse(&phrase_config(field, &["same phrase", "SAME PHRASE"]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("upstream `zen`"), "{field}: {error}");
+            assert!(error.contains(field), "{field}: {error}");
+            assert!(error.contains("SAME PHRASE"), "{field}: {error}");
+        }
     }
 }

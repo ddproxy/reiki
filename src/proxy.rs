@@ -18,7 +18,7 @@ use crate::auth::{
     ThrottleSettings,
 };
 use crate::chain::{scope_route, Chain, KeyState, Policy, SavedHealth, Scope};
-use crate::classify::{classify, FailureClass, Outcome};
+use crate::classify::{classify_with, Classification, ExtraPhrases, FailureClass, Outcome};
 use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
 use crate::forward::Forwarder;
 use crate::plugins::{PluginChain, PluginSession, RequestMeta};
@@ -35,6 +35,7 @@ const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
 const FORWARDER_FAILED_BODY: &[u8] =
     b"{\"error\":{\"type\":\"bad_gateway\",\"message\":\"the upstream could not be reached\"}}";
 const MAX_ERROR_BODY: usize = 64 * 1024;
+const WITHHELD_NOTE: &str = "[body withheld: contains key material]";
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Stands in for the stream name when a request needs none.
 pub(crate) const PASSTHROUGH_STREAM: &str = "passthrough";
@@ -1882,11 +1883,26 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             String::from_utf8_lossy(&snippet).into_owned()
         };
 
-        let outcome = if upstream.pass_errors {
-            Outcome::PassThrough
+        let classified = if upstream.pass_errors {
+            Classification {
+                outcome: Outcome::PassThrough,
+                quota_phrase_matched: false,
+            }
         } else {
-            classify(status.as_u16(), retry_after.as_deref(), &text)
+            let extra = ExtraPhrases {
+                request_error: &upstream.request_error_phrases,
+                quota: &upstream.quota_phrases,
+                rate_limit: &upstream.rate_limit_phrases,
+            };
+            classify_with(
+                status.as_u16(),
+                retry_after.as_deref(),
+                &text,
+                app.wall_now(),
+                &extra,
+            )
         };
+        let outcome = classified.outcome;
         // The first pass of a quota confirmation leaves the bucket untouched, so the
         // same key can be tried again before shaping takes it out of this request.
         let confirming = matches!(outcome, Outcome::KeyFailure(FailureClass::QuotaExhausted))
@@ -1900,8 +1916,13 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 // A failure that only cools one model on the key says nothing about the
                 // key's own budget, so it must not pause or close the whole bucket.
                 if let Outcome::KeyFailure(class) = outcome {
-                    let key_wide =
-                        failure_scope(class, Some(status.as_u16()), scope.as_ref()).is_none();
+                    let key_wide = failure_scope(
+                        class,
+                        Some(status.as_u16()),
+                        scope.as_ref(),
+                        classified.quota_phrase_matched,
+                    )
+                    .is_none();
                     match class {
                         FailureClass::RateLimited(retry_after) if key_wide => {
                             bucket.note_rate_limited(now, retry_after);
@@ -1958,6 +1979,26 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 skip.push(key_name.clone());
                 last_refusal = Some((key_name.clone(), status, response_headers, snippet));
                 pending_failover = Some((key_name, FailureKind::AccessDisabled));
+            }
+            Outcome::RequestError => {
+                // Another key may be able to afford the request, so this is a request-scoped
+                // refusal: record it, skip this key, and keep the response for a dead end.
+                tracing::warn!(stream = %stream, key = %key_name, status = status.as_u16(), "request needs more than this key can afford, trying the next key");
+                note_request_error(
+                    app,
+                    stream,
+                    &key_name,
+                    FailureNote {
+                        status: Some(status.as_u16()),
+                        retry_after: retry_after.as_deref(),
+                        body: Some(&text),
+                        secrets: &secrets,
+                        ..FailureNote::default()
+                    },
+                );
+                skip.push(key_name.clone());
+                last_refusal = Some((key_name.clone(), status, response_headers, snippet));
+                pending_failover = Some((key_name, FailureKind::RequestError));
             }
             Outcome::KeyFailure(FailureClass::QuotaExhausted) if confirming => {
                 // The key stays in rotation: the next pass picks it again and only a repeat is recorded.
@@ -2051,6 +2092,7 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                         quota_hint,
                         retry_after: retry_after.as_deref(),
                         body: Some(&text),
+                        quota_phrase_matched: classified.quota_phrase_matched,
                         secrets: &secrets,
                         ..FailureNote::default()
                     },
@@ -2221,16 +2263,19 @@ fn release_held(app: &App, snapshot: &Snapshot, stream: &str, held: Option<(Stri
     }
 }
 
-/// Combination failures: a plain rate-limit and a 402. A quota 429, a transient, a 401
-/// and every failure without a model stay key-scoped.
+/// Combination failures: a rate-limit and a built-in 402. A configured quota phrase on 402,
+/// a quota 429, a transient, a 401 and every failure without a model stay key-scoped.
 fn failure_scope(
     class: FailureClass,
     status: Option<u16>,
     scope: Option<&Scope>,
+    quota_phrase_matched: bool,
 ) -> Option<&Scope> {
     match class {
         FailureClass::RateLimited(_) => scope,
-        FailureClass::QuotaExhausted if status == Some(StatusCode::PAYMENT_REQUIRED.as_u16()) => {
+        FailureClass::QuotaExhausted
+            if status == Some(StatusCode::PAYMENT_REQUIRED.as_u16()) && !quota_phrase_matched =>
+        {
             scope
         }
         _ => None,
@@ -2262,6 +2307,8 @@ struct FailureNote<'a> {
     retry_after: Option<&'a str>,
     /// The upstream error body, for the ring's scrubbed snippet.
     body: Option<&'a str>,
+    /// A configured quota phrase chose this class, so a 402 cools the whole key.
+    quota_phrase_matched: bool,
     /// Credentials to scrub from the snippet.
     secrets: &'a [&'a str],
     /// False when the caller already added this failure to the ring.
@@ -2276,6 +2323,7 @@ impl Default for FailureNote<'_> {
             quota_hint: None,
             retry_after: None,
             body: None,
+            quota_phrase_matched: false,
             secrets: &[],
             ring: true,
         }
@@ -2294,10 +2342,11 @@ fn record(
         status,
         scope,
         quota_hint,
+        quota_phrase_matched,
         ..
     } = note;
     let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now(), quota_hint);
-    let scoped = failure_scope(class, status, scope);
+    let scoped = failure_scope(class, status, scope, quota_phrase_matched);
     let upstream = snapshot
         .config
         .keys
@@ -2362,7 +2411,15 @@ fn record(
             app.pressure.record(&upstream, limited, now);
         }
     }
-    record_ring(app, stream, key, class, note, ring_cooled, ring_cooling);
+    record_ring(
+        app,
+        stream,
+        key,
+        class.name(),
+        note,
+        ring_cooled,
+        ring_cooling,
+    );
     app.persist_state();
 }
 
@@ -2378,14 +2435,37 @@ fn note_failure(app: &App, stream: &str, key: &str, class: FailureClass, note: F
         .ok()
         .and_then(|health| health.cooling_remaining(key, Instant::now()))
         .map(|left| left.as_secs());
-    record_ring(app, stream, key, class, note, false, cooling);
+    record_ring(app, stream, key, class.name(), note, false, cooling);
+}
+
+/// Adds a request error to the ring under its own label. Unlike [`note_failure`], this uses a
+/// label that is not a [`FailureClass`], because the key is not at fault.
+fn note_request_error(app: &App, stream: &str, key: &str, note: FailureNote<'_>) {
+    if !note.ring {
+        return;
+    }
+    let cooling = app
+        .health
+        .try_lock()
+        .ok()
+        .and_then(|health| health.cooling_remaining(key, Instant::now()))
+        .map(|left| left.as_secs());
+    record_ring(
+        app,
+        stream,
+        key,
+        FailureKind::RequestError.label(),
+        note,
+        false,
+        cooling,
+    );
 }
 
 fn record_ring(
     app: &App,
     stream: &str,
     key: &str,
-    class: FailureClass,
+    class: &str,
     note: FailureNote<'_>,
     cooled: bool,
     cooling_seconds: Option<u64>,
@@ -2399,7 +2479,11 @@ fn record_ring(
     });
     let snippet = note.body.map_or_else(String::new, |body| {
         let clean = crate::scrub::scrub_text(body, note.secrets);
-        printable_snippet(&clean, crate::failures::MAX_NOTE_CHARS)
+        if crate::scrub::contains_key_material(&clean, note.secrets) {
+            WITHHELD_NOTE.to_owned()
+        } else {
+            printable_snippet(&clean, crate::failures::MAX_NOTE_CHARS)
+        }
     });
     let time = app
         .wall_now()
@@ -2410,7 +2494,7 @@ fn record_ring(
         stream: stream.to_owned(),
         key: key.to_owned(),
         status: note.status,
-        class: class.name().to_owned(),
+        class: class.to_owned(),
         retry_after,
         cooled,
         cooling_seconds,
@@ -3516,7 +3600,7 @@ mod tests {
             &app,
             "s",
             "a",
-            FailureClass::RateLimited(None),
+            FailureClass::RateLimited(None).name(),
             FailureNote {
                 status: Some(429),
                 retry_after: Some("12\n0"),
@@ -3537,6 +3621,64 @@ mod tests {
         assert_eq!(
             rows[0].note.chars().count(),
             crate::failures::MAX_NOTE_CHARS
+        );
+    }
+
+    #[test]
+    fn a_ring_snippet_with_split_key_material_is_withheld() {
+        let app = App::with_header_timeout(
+            Config::parse("").unwrap(),
+            HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(1),
+        );
+        let secret_text = ["sk-split", "-secret-0123456789"].concat();
+        let secret = secret_text.as_str();
+        let body = format!("{}\n{}  {}", "x".repeat(300), &secret[..6], &secret[6..]);
+        record_ring(
+            &app,
+            "s",
+            "a",
+            FailureKind::RequestError.label(),
+            FailureNote {
+                status: Some(402),
+                body: Some(&body),
+                secrets: &[secret],
+                ..FailureNote::default()
+            },
+            false,
+            None,
+        );
+        let rows = app.failures().snapshot(1, None);
+        assert_eq!(rows[0].note, WITHHELD_NOTE);
+        assert_eq!(rows[0].class, "request_error");
+        assert!(!rows[0].cooled);
+    }
+
+    #[test]
+    fn a_phrase_matched_quota_on_402_stays_key_wide() {
+        let scope = Scope {
+            route: "/chat".to_owned(),
+            model: "a-model".to_owned(),
+        };
+        assert_eq!(
+            failure_scope(FailureClass::QuotaExhausted, Some(402), Some(&scope), false),
+            Some(&scope),
+            "a built-in 402 quota is still scoped"
+        );
+        assert_eq!(
+            failure_scope(FailureClass::QuotaExhausted, Some(402), Some(&scope), true),
+            None,
+            "a configured quota phrase cools the whole key"
+        );
+        assert_eq!(
+            failure_scope(
+                FailureClass::RateLimited(None),
+                Some(402),
+                Some(&scope),
+                false
+            ),
+            Some(&scope)
         );
     }
 }

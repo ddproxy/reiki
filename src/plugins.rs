@@ -1700,9 +1700,11 @@ mod tests {
             "/status",
             "/reload",
             "/keys/enable",
+            "/failures",
             "/v1/status",
             "/v1/reload",
             "/v1/keys/enable",
+            "/v1/failures",
             "/v1/openapi.json",
         ] {
             let reserved = admin_chain(vec![admin("a", vec![path])]);

@@ -59,11 +59,11 @@ Each entry:
 - `time`: Unix seconds
 - `stream`, `key`: where the failure happened
 - `status`: the upstream status, or `null` for a transport failure
-- `class`: `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`
+- `class`: `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error`; `request_error` is a request-size 402, recorded without cooling the key
 - `retry_after`: the `Retry-After` header as received, cut to 64 characters; `null` when absent
 - `cooled`: whether this failure put the key on cooldown
 - `cooling_seconds`: seconds left on the key's cooldown, or `null`
-- `note`: a printable body snippet of at most 200 characters, with every known form of the key scrubbed out
+- `note`: a printable body snippet of at most 200 characters, with every known form of the key scrubbed out; `[body withheld: contains key material]` when a compacted copy still contains key material
 
 `?limit=N` returns at most `N` entries, from 1 to 64; the default is 64. `?key=NAME` filters to one key name. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding answers `400`.
 
@@ -149,7 +149,7 @@ Prometheus text exposition, format version 0.0.4. `reiki_requests_total` counts 
 
 `reiki_upstream_*_1h` are the last hour per upstream, read at scrape time from the counters behind `GET /v1/health`, so the two agree: `requests` is every attempt, `limited` the rate-limited or cooldown-starting ones, `tokens` the input plus output tokens the provider reported. Unlike `reiki_tokens_total` they fall as attempts age out and restart at zero with the process. Upstreams follow config order, leaving out `passthrough`. They follow `[peers] expose_usage` (on when there is no `[peers]` table) and are absent when it is `false`.
 
-`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. `reiki_cooldowns_total` also has `scope` (`key` or `model`): a model-scoped cooldown covers one route and model, deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
+`status` is `success`, `client_error` or `server_error`. `class` is `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`; `reiki_failovers_total` also uses `request_error` for a request-size 402 that skipped a key without cooling it. `reiki_cooldowns_total` also has `scope` (`key` or `model`): a model-scoped cooldown covers one route and model, deliberately not metric labels because they come from request bodies. The `reiki_keys` gauge always reports all three states, even at zero.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics

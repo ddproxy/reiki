@@ -677,6 +677,72 @@ async fn fails_over_on_429_replaying_the_same_body_and_remembers_the_cooldown() 
     assert_eq!(h.mock.keys_called(), ["up-a", "up-b", "up-b"]);
 }
 
+const REQUEST_TOO_LARGE: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 256000 tokens, but can only afford 199460."}}"#;
+
+async fn failure_ring(h: &Harness) -> serde_json::Value {
+    let admin = h.admin.as_ref().unwrap();
+    let text = h
+        .client
+        .get(format!("{admin}/v1/failures"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+#[tokio::test]
+async fn a_request_size_402_fails_over_without_cooling_the_key() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(402, REQUEST_TOO_LARGE, None)]);
+
+    let res = h
+        .post("tok-a", "/zen/chat/completions", "{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.text().await.unwrap(), "{\"ok\":true}");
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+    assert_eq!(admin_key_state(&h, "a").await, "available");
+
+    let failures = failure_ring(&h).await;
+    let rows = failures.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{failures}");
+    assert_eq!(rows[0]["class"], "request_error");
+    assert_eq!(rows[0]["cooled"], false);
+}
+
+#[tokio::test]
+async fn a_request_size_402_from_every_key_is_returned_unchanged() {
+    let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
+    h.mock
+        .script("up-a", vec![Reply::Status(402, REQUEST_TOO_LARGE, None)]);
+    h.mock
+        .script("up-b", vec![Reply::Status(402, REQUEST_TOO_LARGE, None)]);
+
+    let res = h
+        .post("tok-a", "/zen/chat/completions", "{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 402);
+    assert_eq!(res.text().await.unwrap(), REQUEST_TOO_LARGE);
+    assert_eq!(h.mock.keys_called(), ["up-a", "up-b"]);
+    assert_eq!(admin_key_state(&h, "a").await, "available");
+    assert_eq!(admin_key_state(&h, "b").await, "available");
+
+    let failures = failure_ring(&h).await;
+    let rows = failures.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{failures}");
+    assert!(rows.iter().all(|row| row["class"] == "request_error"));
+    assert!(rows.iter().all(|row| row["cooled"] == false));
+}
+
 #[tokio::test]
 async fn an_upstream_rewrites_the_model_and_drops_params_before_every_replay() {
     let h = harness_with_upstream(

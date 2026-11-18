@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A 402 that says the request asks for more tokens than the account can afford (`fewer max_tokens` or `can only afford`) is now `request_error`: the proxy tries the next key without cooling this one, records each occurrence in the failure ring as `request_error` with `cooled: false`, and returns the last upstream 402 unchanged when every key refuses. The phrases are read from JSON `error.message` or `message`, with the whole-body substring check kept only for non-JSON bodies.
+- The scrubber now also covers JSON `\uXXXX` escapes of letters and digits, percent-encoding of unreserved characters, base64 at the other two byte alignments with partial edge groups trimmed, and keys split by ASCII whitespace or control characters. Failure-ring snippets also check a compacted copy of the text and replace the whole snippet with `[body withheld: contains key material]` if key material remains.
+
+### Added
+
+- Per-upstream `request_error_phrases`, `quota_phrases` and `rate_limit_phrases` extend the built-in response body checks. Request-error phrases pass a 400, 402 or 413 through; quota phrases cool the whole key; rate-limit phrases cool the route and model. Lists are case-insensitive and validated on load.
+
 ## 0.10.6
 
 ### Changed

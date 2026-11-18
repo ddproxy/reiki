@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use axum::routing::any;
 use axum::Router;
 use reiki::chain::Policy;
@@ -48,11 +49,19 @@ impl Rig {
     }
 
     async fn new(extra: &str) -> Self {
+        Self::with_mock(
+            extra,
+            Router::new().fallback(any(|body: String| async move { body })),
+        )
+        .await
+    }
+
+    async fn with_mock(extra: &str, mock: Router) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("reiki-reload-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("key-a"), "upstream-secret\n").unwrap();
-        let mock_url = serve(Router::new().fallback(any(|body: String| async move { body }))).await;
+        let mock_url = serve(mock).await;
         let mut rig = Self {
             config: dir.join("reiki.toml"),
             dir,
@@ -89,6 +98,12 @@ impl Rig {
 
     fn rewrite(&self, extra: &str) {
         std::fs::write(&self.config, self.text(extra)).unwrap();
+    }
+
+    fn rewrite_upstream(&self, extra: &str) {
+        let base = format!("base_url = \"{}/v1\"", self.mock_url);
+        let text = self.text("").replace(&base, &format!("{base}\n{extra}"));
+        std::fs::write(&self.config, text).unwrap();
     }
 
     async fn send(&self, body: &str) -> u16 {
@@ -567,4 +582,28 @@ async fn overlapping_reloads_each_get_their_own_generation() {
     generations.sort_unstable();
     assert_eq!(generations, [1, 2, 3, 4, 5, 6]);
     assert_eq!(rig.send(SSN_BODY).await, 422);
+}
+
+#[tokio::test]
+async fn a_reload_applies_new_response_phrases() {
+    let mock = Router::new().fallback(any(|| async {
+        (StatusCode::PAYMENT_REQUIRED, "PLAN LIMIT REACHED")
+    }));
+    let rig = Rig::with_mock("", mock).await;
+    assert_eq!(rig.send("{}").await, 503, "the 402 cools the only key");
+    assert!(rig.app.enable_key("a"));
+
+    rig.rewrite_upstream("request_error_phrases = [\"plan limit\"]");
+    let app = Arc::clone(&rig.app);
+    let report = tokio::task::spawn_blocking(move || app.reload_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.generation, 1);
+    assert!(report.restart_needed.is_empty());
+    assert_eq!(
+        rig.send("{}").await,
+        402,
+        "the new phrase passes the error through"
+    );
 }

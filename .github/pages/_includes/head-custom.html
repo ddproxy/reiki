@@ -5,6 +5,24 @@
   header nav.menu li.current a { font-weight: 700; color: #222; }
   @media print, screen and (max-width: 960px) { header nav.menu { margin-bottom: 12px; } }
   div.mermaid { margin: 16px 0; overflow-x: auto; }
+  /* Wide layout: the Minimal theme fixes a 500px column; use the screen instead. */
+  @media screen and (min-width: 961px) {
+    .wrapper { display: grid; grid-template-columns: 250px minmax(0, 1fr); column-gap: 48px; width: min(96vw, 1480px); margin: 0 auto; }
+    header, section, footer { float: none; position: static; width: auto; }
+    header { grid-column: 1; grid-row: 1 / span 2; position: sticky; top: 24px; align-self: start; max-height: calc(100vh - 48px); overflow-y: auto; padding-right: 4px; }
+    section { grid-column: 2; grid-row: 1; max-width: none; min-width: 0; padding-bottom: 24px; }
+    footer { grid-column: 2; grid-row: 2; width: auto; }
+  }
+  section p, section li, section blockquote { max-width: 100ch; }
+  section h1, section h2, section h3 { max-width: 100ch; }
+  section img, section svg { max-width: 100%; height: auto; }
+  section pre { overflow-x: auto; max-width: 100%; }
+  section table { display: block; width: max-content; min-width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 16px 0; }
+  section table th, section table td { padding: 6px 12px; vertical-align: top; border-bottom: 1px solid #e5e5e5; text-align: left; }
+  section table th { font-weight: 700; white-space: nowrap; background: #f6f6f6; }
+  section table td code { white-space: nowrap; }
+  div.mermaid { text-align: center; }
+  div.mermaid svg { max-width: 100%; height: auto; }
 </style>
 <script type="module">
   // Pages does not render mermaid fences; turn each one into a diagram. The version is pinned.

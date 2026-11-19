@@ -3681,4 +3681,213 @@ mod tests {
             Some(&scope)
         );
     }
+
+    use std::collections::VecDeque;
+
+    const REQUEST_SIZE_402: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 256000 tokens, but can only afford 199460."}}"#;
+
+    #[derive(Default)]
+    struct MockUpstream {
+        calls: Vec<String>,
+        replies: HashMap<String, VecDeque<(u16, &'static str)>>,
+    }
+
+    async fn mock_upstream(State(mock): State<Arc<Mutex<MockUpstream>>>, req: Request) -> Response {
+        let key = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .trim_start_matches("Bearer ")
+            .to_owned();
+        let (status, body) = {
+            let mut mock = mock.lock().unwrap();
+            mock.calls.push(key.clone());
+            mock.replies
+                .get_mut(&key)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or((200, "{\"ok\":true}"))
+        };
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::from_u16(status).unwrap();
+        response
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    struct ProxyRig {
+        app: Arc<App>,
+        relay: String,
+        mock: Arc<Mutex<MockUpstream>>,
+        client: reqwest::Client,
+    }
+
+    impl ProxyRig {
+        async fn new(upstream_extra: &str) -> Self {
+            let mock = Arc::new(Mutex::new(MockUpstream::default()));
+            let mock_url = serve(
+                Router::new()
+                    .fallback(mock_upstream)
+                    .with_state(Arc::clone(&mock)),
+            )
+            .await;
+            let text = format!(
+                "[upstream.zen]\nbase_url = \"{mock_url}/v1\"\n{upstream_extra}\
+                 [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
+                 [keys.b]\nupstream = \"zen\"\nfile = \"/unused/b\"\n\
+                 [streams.client]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n",
+                sha256_hex("tok")
+            );
+            let app = App::with_header_timeout(
+                Config::parse(&text).unwrap(),
+                HashMap::from([
+                    ("a".to_owned(), Secret::new("up-a")),
+                    ("b".to_owned(), Secret::new("up-b")),
+                ]),
+                Policy::default(),
+                Duration::from_secs(5),
+            );
+            let relay = serve(router(Arc::clone(&app))).await;
+            Self {
+                app,
+                relay,
+                mock,
+                client: reqwest::Client::new(),
+            }
+        }
+
+        fn script(&self, key: &str, status: u16, body: &'static str) {
+            self.mock
+                .lock()
+                .unwrap()
+                .replies
+                .entry(key.to_owned())
+                .or_default()
+                .push_back((status, body));
+        }
+
+        fn keys_called(&self) -> Vec<String> {
+            self.mock.lock().unwrap().calls.clone()
+        }
+
+        fn post(&self) -> reqwest::RequestBuilder {
+            self.client
+                .post(format!("{}/zen/chat/completions", self.relay))
+                .bearer_auth("tok")
+                .body("{}")
+        }
+    }
+
+    fn cooling(app: &App, key: &str) -> Option<FailureClass> {
+        app.health()
+            .lock()
+            .unwrap()
+            .cooling_class(key, Instant::now())
+    }
+
+    #[tokio::test]
+    async fn a_402_request_size_error_fails_over_without_cooling_the_key() {
+        let rig = ProxyRig::new("").await;
+        rig.script("up-a", 402, REQUEST_SIZE_402);
+
+        let response = rig.post().send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+        assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
+        assert!(rig
+            .app
+            .health()
+            .lock()
+            .unwrap()
+            .is_available("a", Instant::now()));
+        assert_eq!(cooling(&rig.app, "a"), None);
+
+        let rows = rig.app.failures().snapshot(10, Some("a"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].class, FailureKind::RequestError.label());
+        assert_eq!(rows[0].status, Some(402));
+        assert!(!rows[0].cooled);
+    }
+
+    #[tokio::test]
+    async fn the_last_request_size_answer_is_relayed_when_every_key_refuses_it() {
+        let last = r#"{"error":{"message":"can only afford 100 tokens"}}"#;
+        let rig = ProxyRig::new("").await;
+        rig.script("up-a", 402, REQUEST_SIZE_402);
+        rig.script("up-b", 402, last);
+
+        let response = rig.post().send().await.unwrap();
+        assert_eq!(response.status(), 402);
+        assert_eq!(response.text().await.unwrap(), last);
+        assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
+        for key in ["a", "b"] {
+            assert!(rig
+                .app
+                .health()
+                .lock()
+                .unwrap()
+                .is_available(key, Instant::now()));
+            assert_eq!(cooling(&rig.app, key), None);
+        }
+
+        let rows = rig.app.failures().snapshot(10, None);
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row.class == FailureKind::RequestError.label()));
+        assert!(rows.iter().all(|row| !row.cooled));
+    }
+
+    #[tokio::test]
+    async fn a_configured_request_error_phrase_on_a_400_fails_over_without_cooling() {
+        let rig = ProxyRig::new("request_error_phrases = [\"prompt is oversized\"]\n").await;
+        rig.script("up-a", 400, "prompt is oversized");
+
+        let response = rig.post().send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+        assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
+        assert_eq!(cooling(&rig.app, "a"), None);
+
+        let rows = rig.app.failures().snapshot(10, Some("a"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].class, FailureKind::RequestError.label());
+        assert_eq!(rows[0].status, Some(400));
+        assert!(!rows[0].cooled);
+    }
+
+    #[tokio::test]
+    async fn a_402_without_a_matching_phrase_cools_the_key_and_moves_on() {
+        let rig = ProxyRig::new("request_error_phrases = [\"prompt is oversized\"]\n").await;
+        rig.script(
+            "up-a",
+            402,
+            "{\"error\":{\"message\":\"insufficient credits\"}}",
+        );
+
+        let response = rig.post().send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+        assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
+        assert_eq!(cooling(&rig.app, "a"), Some(FailureClass::QuotaExhausted));
+        assert!(!rig
+            .app
+            .health()
+            .lock()
+            .unwrap()
+            .is_available("a", Instant::now()));
+
+        let rows = rig.app.failures().snapshot(10, Some("a"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].class, FailureClass::QuotaExhausted.name());
+        assert_eq!(rows[0].status, Some(402));
+        assert!(rows[0].cooled);
+    }
 }

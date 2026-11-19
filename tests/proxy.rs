@@ -864,6 +864,63 @@ async fn a_request_body_that_stalls_is_timed_out() {
 }
 
 #[tokio::test]
+async fn a_slow_body_client_on_the_client_listener_gets_a_bounded_408() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Same App as production, but on the real client listener (reiki::serve), rather
+    // than axum::serve, and with the body deadline shortened so the test is quick.
+    let mock = Arc::new(Mock::default());
+    let mock_url = serve(
+        Router::new()
+            .fallback(mock_handler)
+            .with_state(mock.clone()),
+    )
+    .await;
+    let (config, key_map) = config_for(&mock_url, &[("a", "up-a"), ("b", "up-b")], &one_stream());
+    let app = App::with_header_timeout(
+        config,
+        key_map,
+        Policy::default(),
+        Duration::from_millis(300),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(reiki::serve::serve_with(
+        listener,
+        router(app),
+        8,
+        Duration::from_secs(5), // headers are complete; only the body stalls
+        std::future::pending(),
+    ));
+
+    // A fixed Content-Length with only part of the body, and a chunked body with
+    // no terminating chunk, both leave a client stalled after a complete head.
+    let requests = [
+        "POST /zen/x HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-a\r\nContent-Length: 100\r\n\r\nab",
+        "POST /zen/x HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n",
+    ];
+    for request in requests {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut reply = Vec::new();
+            while !String::from_utf8_lossy(&reply).contains("body_timeout") {
+                if stream.read_buf(&mut reply).await.unwrap() == 0 {
+                    break;
+                }
+            }
+            reply
+        })
+        .await
+        .expect("no answer to a stalled body");
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 408"), "reply was {reply}");
+        assert!(reply.contains("body_timeout"), "reply was {reply}");
+    }
+    assert!(mock.keys_called().is_empty());
+}
+
+#[tokio::test]
 async fn without_hold_unauthorized_the_first_refusing_key_is_disabled_at_once() {
     let h = harness(&one_stream(), Policy::default()).await;
     h.mock

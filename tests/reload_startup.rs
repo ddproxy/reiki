@@ -170,9 +170,8 @@ fn a_toml_error_in_a_reload_never_echoes_the_source() {
     assert!(!status.contains("SENTINEL"), "{status}");
 }
 
-#[cfg(feature = "plugin-controlled")]
 #[test]
-fn a_startup_config_warning_reaches_the_log() {
+fn a_removed_plugin_name_fails_startup_with_its_replacement() {
     let dir = std::env::temp_dir().join(format!("reiki-startup-warn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
@@ -198,8 +197,12 @@ fn a_startup_config_warning_reaches_the_log() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("old name"), "{stderr}");
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("gov") && stderr.contains("controlled"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("plugin-controlled"), "{stderr}");
 }
 
 #[cfg(unix)]

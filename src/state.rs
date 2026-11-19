@@ -24,6 +24,22 @@ pub fn path_for(config_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Probes a directory by creating and removing a file, so the daemon fails before binding
+/// listeners instead of silently losing state later.
+pub fn check_writable(dir: &Path) -> Result<(), String> {
+    let probe = dir.join(format!(".reiki-probe-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let failure =
+        |e: std::io::Error| format!("state directory {} is not writable: {e}", dir.display());
+    options
+        .open(&probe)
+        .map_err(failure)
+        .and_then(|_| std::fs::remove_file(&probe).map_err(failure))
+}
+
 #[derive(Debug, Default)]
 pub struct LoadedState {
     pub health: HashMap<String, SavedHealth>,
@@ -371,6 +387,30 @@ mod tests {
         std::env::temp_dir().join(format!("reiki-state-{}-{tag}.toml", std::process::id()))
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn a_read_only_directory_fails_the_probe_with_its_path_and_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("reiki-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(check_writable(&dir).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root bypasses mode bits, so there is nothing to assert on a root runner.
+        let root_bypasses = std::fs::File::create(dir.join(".root-check")).is_ok();
+        if !root_bypasses {
+            let err = check_writable(&dir).unwrap_err();
+            assert!(err.contains(&dir.display().to_string()), "{err}");
+            assert!(
+                err.contains("not writable") && err.contains("Permission denied"),
+                "{err}"
+            );
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A key file last modified an hour ago, so state saved now is newer than it.
     fn old_key_file(tag: &str) -> PathBuf {
         let path = temp_path(&format!("{tag}-key"));
@@ -529,6 +569,68 @@ mod tests {
         state.restore("a", loaded["a"], Instant::now());
         assert!(state.cooling_remaining("a", Instant::now()).is_some());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hostile_recovery_and_saved_at_values_are_rejected_or_capped() {
+        let path = temp_path("hostile-recovery");
+        let _ = std::fs::remove_file(&path);
+        let key_file = old_key_file("hostile-recovery");
+        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
+        // The recorded digest keeps the key eligible regardless of saved_at, so the
+        // test isolates how the timestamps themselves are handled.
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        let now = unix_millis(SystemTime::now());
+
+        let write = |saved_at: &str, recovery: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "saved_at = {saved_at}\n[keys.a]\nrecovery = {recovery}\n\
+                     key_sha256 = \"{digest}\"\nupstream = \"zen\"\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        // The largest TOML integer is accepted, but capped before it reaches Instant.
+        write(&now.to_string(), &(i64::MAX as u64).to_string());
+        let loaded = load(&path, &config);
+        assert_eq!(loaded["a"].cooling, Some(MAX_RESTORED_COOLDOWN));
+        let mut state = KeyState::default();
+        state.restore("a", loaded["a"], Instant::now());
+        assert!(state.cooling_remaining("a", Instant::now()).is_some());
+
+        // A value beyond TOML's integer range is rejected with the whole file.
+        write(&now.to_string(), "18446744073709551615");
+        assert!(load(&path, &config).is_empty());
+
+        // Zero and a deadline that has already passed never become a cooldown.
+        write(&now.to_string(), "0");
+        assert_eq!(load(&path, &config)["a"].cooling, None);
+        write(&now.to_string(), &now.to_string());
+        assert_eq!(load(&path, &config)["a"].cooling, None);
+
+        // Negative, NaN-like and float values are not u64: the file is ignored,
+        // rather than reaching any Instant/SystemTime arithmetic.
+        for recovery in ["-1", "nan", "inf", "-inf", "1e30", "\"NaN\""] {
+            write(&now.to_string(), recovery);
+            assert!(load(&path, &config).is_empty(), "recovery = {recovery}");
+        }
+        for saved_at in ["-1", "nan", "inf", "1e30"] {
+            write(saved_at, &(now + 3_600_000).to_string());
+            assert!(load(&path, &config).is_empty(), "saved_at = {saved_at}");
+        }
+
+        // A huge but valid saved_at converts to SystemTime without panicking.
+        write(
+            &(i64::MAX as u64).to_string(),
+            &(now + 3_600_000).to_string(),
+        );
+        assert!(load(&path, &config)["a"].cooling.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
     }
 
     #[test]

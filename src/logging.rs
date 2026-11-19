@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, Once, PoisonError};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -190,6 +190,39 @@ fn filter_from(level: &str) -> (EnvFilter, bool) {
     }
 }
 
+/// Logs panics through `tracing` once a subscriber exists, then calls the previous hook so the
+/// default stderr report, unwinding and abort behaviour stay unchanged.
+pub fn install_panic_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("{}", format_panic(info.payload(), info.location()));
+            previous(info);
+        }));
+    });
+}
+
+fn format_panic(
+    payload: &(dyn std::any::Any + Send),
+    location: Option<&std::panic::Location<'_>>,
+) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    match location {
+        Some(at) => format!(
+            "panic at {}:{}:{}: {message}",
+            at.file(),
+            at.line(),
+            at.column()
+        ),
+        None => format!("panic at unknown location: {message}"),
+    }
+}
+
 /// Starts logging. Returns an error when the log file cannot be opened.
 pub fn init(config: &LogConfig, with_file: bool) -> Result<Logging, String> {
     let (filter, from_env) = filter_from(&config.level);
@@ -282,6 +315,19 @@ impl Logging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_hook_message_carries_the_location_and_payload() {
+        let text = format_panic(&"boom", Some(std::panic::Location::caller()));
+        assert!(
+            text.contains("boom") && text.contains("logging.rs"),
+            "{text}"
+        );
+        assert!(text.contains("panic at"), "{text}");
+        let owned = String::from("owned boom");
+        assert!(format_panic(&owned, None).contains("owned boom"));
+        assert!(format_panic(&7_u8, None).contains("unknown panic"));
+    }
 
     fn dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("reiki-log-{label}-{}", std::process::id()));

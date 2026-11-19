@@ -4,7 +4,7 @@ The `controlled` plugin stops controlled-information markings and identifier val
 
 It is a safeguard that catches common markings. It does not prove a request is free of controlled data. Read [What it does not cover](#what-it-does-not-cover) before relying on it.
 
-Compiled in by the default `plugin-controlled` feature; inactive until a `[plugins.controlled]` table exists. The earlier name `gov` still works as a table name, a `reiki scan` plugin and a feature, and will be removed in a later major version.
+Compiled in by the default `plugin-controlled` feature; inactive until a `[plugins.controlled]` table exists. The former name `gov` was removed: `[plugins.gov]`, `--plugin gov`, `REIKI_PLUGINS=gov` and the `plugin-gov` feature now fail with an error naming `controlled`.
 
 ## Configure
 

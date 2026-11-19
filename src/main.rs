@@ -648,6 +648,7 @@ async fn main() {
     let checking = matches!(cli.command, Some(Command::Check));
     let logging =
         Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
+    reiki::logging::install_panic_hook();
     for warning in &warnings {
         tracing::warn!("{warning}");
     }
@@ -749,6 +750,13 @@ async fn main() {
         return;
     }
 
+    let state_path = reiki::state::path_for(&cli.config);
+    let state_dir = state_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    reiki::state::check_writable(state_dir).unwrap_or_else(|e| fail(&e));
+
     let tunnel_config = config.tunnel.clone();
     let caps = config.server;
     for text in reiki::forward::socket_warnings(&config) {
@@ -761,7 +769,7 @@ async fn main() {
     reiki::lifecycle::warn_if_open_files_low();
     reiki::notify::spawn_watchdog();
     let app = App::new(config, keys, Policy::default(), plugins);
-    app.set_state_path(reiki::state::path_for(&cli.config));
+    app.set_state_path(state_path);
     app.start_state_writer();
     app.set_config_path(cli.config.clone());
     app.set_logging(Arc::clone(&logging));

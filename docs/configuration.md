@@ -320,7 +320,7 @@ Plugin-specific keys are documented on each plugin's page:
 | Controlled information | `[plugins.controlled]` | [controlled](controlled.md) |
 | Metrics | `[plugins.metrics]` | [monitoring](monitoring.md) |
 
-The name `gov` was the old name of `controlled`. A `[plugins.gov]` table is renamed with a warning. Keep only one of the two.
+The former name `gov` was removed. A `[plugins.gov]` table is rejected with an error naming `controlled`; use `[plugins.controlled]`.
 
 ## Limit presets
 

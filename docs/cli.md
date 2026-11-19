@@ -110,7 +110,7 @@ reiki scan [--plugin NAME]... [--kinds K1,K2 | --all] [--json] [FILE]...
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--plugin NAME` | every compiled-in plugin | Run only this plugin. Repeat for several. Names: `phi`, `finance`, `controlled`. The old name `gov` also works. |
+| `--plugin NAME` | every compiled-in plugin | Run only this plugin. Repeat for several. Names: `phi`, `finance`, `controlled`. The former name `gov` is rejected. |
 | `--kinds K1,K2` | each plugin's default set | Kinds to look for, comma separated. A kind is matched only by the selected plugins that know it. Conflicts with `--all`. |
 | `--all` | off | Look for every kind, including the ones that are off by default. |
 | `--json` | off | One JSON object per finding. |

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Test coverage re-verifies the state-file recovery path: huge, negative, NaN-like and zero recovery and saved-at values are rejected or capped before any `Instant`/`SystemTime` arithmetic.
+- Test coverage re-verifies the request-body timeout: a client that sends complete headers and then stalls on a `Content-Length` or chunked body is cut off with 408 on the real client listener.
+
 ## 0.11.0
 
 ### Fixed
@@ -10,6 +17,12 @@
 ### Added
 
 - Per-upstream `request_error_phrases`, `quota_phrases` and `rate_limit_phrases` extend the built-in response body checks. Request-error phrases pass a 400, 402 or 413 through; quota phrases cool the whole key; rate-limit phrases cool the route and model. Lists are case-insensitive and validated on load.
+- Startup probes the state directory (parent of `<config>.state`) by creating and removing a file before binding listeners. A failure exits 1 with an error naming the directory and the OS cause.
+- Panics are logged at error through `tracing` with message and file:line:col, then passed to the previous hook, so unwinding and the default stderr report are unchanged.
+
+### Removed
+
+- The `plugin-gov` feature, `[plugins.gov]` config table, `reiki scan --plugin gov` alias and `REIKI_PLUGINS=gov`. Use `plugin-controlled`, `[plugins.controlled]` and `controlled`; the old forms fail with an error naming the replacement.
 
 ## 0.10.6
 
@@ -306,7 +319,7 @@
 
 ### Changed
 
-- The `gov` plugin is now `controlled` (crate `reiki-controlled`, feature `plugin-controlled`, docs `controlled.md`), since it looks for controlled-information markings and identifiers, not government data in general. `[plugins.gov]`, `reiki scan --plugin gov` and the `plugin-gov` feature still work. Findings now name the plugin `controlled`, so a dashboard or alert that matches `plugin="gov"` needs the new name.
+- The `gov` plugin is now `controlled` (crate `reiki-controlled`, feature `plugin-controlled`, docs `controlled.md`), since it looks for controlled-information markings and identifiers, not government data in general. `[plugins.gov]`, `reiki scan --plugin gov` and the `plugin-gov` feature worked then but were removed in 0.11.0. Findings now name the plugin `controlled`, so a dashboard or alert that matches `plugin="gov"` needs the new name.
 
 ### Added
 

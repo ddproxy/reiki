@@ -97,7 +97,6 @@ default = ["plugin-phi", "plugin-finance", "plugin-controlled", "plugin-placehol
 plugin-phi = ["dep:reiki-phi"]
 plugin-finance = ["dep:reiki-finance"]
 plugin-controlled = ["dep:reiki-controlled"]
-plugin-gov = ["plugin-controlled"]
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]

@@ -81,6 +81,10 @@ pub enum ConfigError {
         name: String,
         known: Vec<String>,
     },
+    RemovedPlugin {
+        old: String,
+        new: String,
+    },
     PluginConfig {
         name: String,
         message: String,
@@ -201,6 +205,10 @@ impl fmt::Display for ConfigError {
                     )
                 }
             }
+            Self::RemovedPlugin { old, new } => write!(
+                f,
+                "plugin `{old}` was removed; use `{new}` instead (feature `plugin-{new}`)"
+            ),
             Self::PluginConfig { name, message } => {
                 write!(f, "plugin `{name}`: {message}")
             }
@@ -210,8 +218,8 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Plugin names that were renamed, as (old, current).
-const RENAMED_PLUGINS: &[(&str, &str)] = &[("gov", "controlled")];
+/// Plugin names that were removed, as (old, replacement).
+const REMOVED_PLUGINS: &[(&str, &str)] = &[("gov", "controlled")];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1216,43 +1224,30 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let (config, warnings) = Self::parse_with_warnings(text)?;
-        for warning in &warnings {
-            tracing::warn!("{warning}");
-        }
-        Ok(config)
+        Self::parse_with_warnings(text).map(|(config, _)| config)
     }
 
-    /// Like [`Config::parse`], but hands back the warnings instead of logging them, for a caller
-    /// that starts logging only after it has read the config.
+    /// Like [`Config::parse`], but hands back warnings instead of logging them, for a caller that
+    /// starts logging only after it has read the config. No config warnings are emitted today.
     pub fn parse_with_warnings(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
         let mut config: Config =
             toml::from_str(text).map_err(|e| ConfigError::Parse(describe_parse_error(text, &e)))?;
-        let mut warnings = Vec::new();
-        config.rename_old_plugins(&mut warnings)?;
+        config.check_removed_plugins()?;
         config.resolve_quota_resets()?;
         config.validate()?;
-        Ok((config, warnings))
+        Ok((config, Vec::new()))
     }
 
-    /// Plugin tables under a name the plugin used to have move to the current one.
-    fn rename_old_plugins(&mut self, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
-        for (old, new) in RENAMED_PLUGINS {
-            let Some(table) = self.plugins.remove(*old) else {
-                continue;
-            };
-            if self.plugins.contains_key(*new) {
-                return Err(ConfigError::PluginConfig {
-                    name: (*old).to_owned(),
-                    message: format!(
-                        "`{old}` is the old name of `{new}`; keep only `[plugins.{new}]`"
-                    ),
-                });
-            }
-            warnings.push(format!(
-                "plugin table `{old}` uses an old name; rename it to `{new}`"
-            ));
-            self.plugins.insert((*new).to_owned(), table);
+    /// A removed name is an error, not an alias: silently renaming it would hide a stale config.
+    fn check_removed_plugins(&self) -> Result<(), ConfigError> {
+        if let Some((old, new)) = REMOVED_PLUGINS
+            .iter()
+            .find(|(old, _)| self.plugins.contains_key(*old))
+        {
+            return Err(ConfigError::RemovedPlugin {
+                old: (*old).to_owned(),
+                new: (*new).to_owned(),
+            });
         }
         Ok(())
     }
@@ -3816,25 +3811,14 @@ socket = "/run/forwarder.sock"
     }
 
     #[test]
-    fn an_old_plugin_name_is_renamed_and_never_doubled() {
-        let old = Config::parse(&base("[plugins.gov]\nmode = \"report\"\n")).unwrap();
-        assert!(old.plugins.contains_key("controlled") && !old.plugins.contains_key("gov"));
-        let both = base("[plugins.gov]\n[plugins.controlled]\n");
-        let err = Config::parse(&both).unwrap_err().to_string();
+    fn a_removed_plugin_name_is_rejected_with_its_replacement() {
+        let err = Config::parse(&base("[plugins.gov]\nmode = \"report\"\n"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("gov") && err.contains("controlled"), "{err}");
-    }
-
-    #[test]
-    fn parse_hands_back_a_renamed_plugin_warning_instead_of_logging_it() {
-        let (config, warnings) =
-            Config::parse_with_warnings(&base("[plugins.gov]\nmode = \"report\"\n")).unwrap();
-        assert!(config.plugins.contains_key("controlled"));
-        assert_eq!(
-            warnings,
-            ["plugin table `gov` uses an old name; rename it to `controlled`"]
-        );
-        let (_, none) = Config::parse_with_warnings(&base("")).unwrap();
-        assert!(none.is_empty());
+        assert!(err.contains("plugin-controlled"), "{err}");
+        let (_, warnings) = Config::parse_with_warnings(&base("")).unwrap();
+        assert!(warnings.is_empty());
     }
 
     #[test]

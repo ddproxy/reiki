@@ -39,7 +39,7 @@ These are recommended paths. Reiki creates the state file, service log, request-
 
 Reiki enforces `0600` on the state file and request-log file and socket. It tightens an existing service log to `0640`. `reiki keys --check` warns when a key file has group or other read bits; startup does not check key-file modes. Peer tokens, peer TLS keys and the intercept CA key must be private. See [keys](keys.md#key-files), [peers](peers.md) and [security](security.md#hardening).
 
-If the state directory is not writable, Reiki logs a warning and runs without health persistence. The unit below uses `ReadWritePaths=/etc/reiki` for the default config path. For a config under `StateDirectory`, that line is not needed.
+Before binding listeners, Reiki creates and removes a probe file in the state directory (the parent of `<config>.state`). A failed probe exits 1 with an error naming that directory and the OS cause, so a read-only mount cannot leave a running instance without health persistence. The unit below uses `ReadWritePaths=/etc/reiki` for the default config path. For a config under `StateDirectory`, that line is not needed.
 
 ## Listeners
 
@@ -65,7 +65,7 @@ A streamed response still running when the drain ends is cut. Open tunnel connec
 
 With `Type=notify`, Reiki sends `READY=1` after every listener binds and `STOPPING=1` when a stop begins. With `WatchdogSec=`, it sends `WATCHDOG=1` at half the period while the async runtime is alive. Without `NOTIFY_SOCKET` these calls do nothing, so the same binary runs under any manager or none. Each client and upstream connection uses a file descriptor; the client listener admits 1024 connections by default. Reiki warns at start when the soft limit is below 4096.
 
-Exit status: 0 after a clean stop, 1 for config, key, plugin or bind failure, 143 or 130 after a second stop signal. CLI usage errors use 2. See [CLI](cli.md#exit-codes).
+Exit status: 0 after a clean stop, 1 for config, key, plugin, state-directory or bind failure, 143 or 130 after a second stop signal. CLI usage errors use 2. See [CLI](cli.md#exit-codes).
 
 ## systemd unit
 

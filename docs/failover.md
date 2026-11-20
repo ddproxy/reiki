@@ -54,7 +54,7 @@ A scope is the pair of route and model:
 
 Only two failures are scoped: a `rate_limited` failure and a 402 that is treated as `quota_exhausted`. A request-size 402 (`fewer max_tokens` or `can only afford`) is `request_error`, not a key failure, so it neither cools nor disables the key. A quota 429 is always key-wide, as are 401s, transients and any failure on a request with no model.
 
-A key with many cooling models is treated as broken. `scope_escalate_after` sets the count per upstream. The threshold, the combination limit and the eviction rule are in the [cooldown table](classification.md#cooldown-values). A whole-key cooldown clears the scoped entries. Scoped cooldowns live in memory; the state file holds key-level health.
+A key with many cooling models is treated as broken. `scope_escalate_after` sets the per-upstream threshold (default 3, range 2–16). A combination failure escalates to a whole-key cooldown when that many distinct models are already cooling, or when the number of remembered combinations would reach twice that. At most 64 combinations are remembered; the soonest-ending one is evicted when full. A whole-key cooldown clears the scoped entries. Scoped cooldowns live in memory; the state file holds key-level health.
 
 The `cooling_combinations` count in a peer's view is the number of combinations cooling on that upstream's keys. See [peers](peers.md).
 
@@ -72,11 +72,11 @@ The `cooling_combinations` count in a peer's view is the number of combinations 
 
 `Retry-After` on `reiki_exhausted` is the shortest wait until any non-disabled key recovers. It is rounded up to whole seconds and is at least 1. When the request has a model, the wait accounts for that model's cooldowns too.
 
-A refusal does not cool the key. A request-size 402 is recorded in the failure ring as `request_error`, but it also does not cool the key: another key may still afford the request. The client sees the upstream's error, which says more than `reiki_exhausted`.
+An `access_disabled`, `request_error` or held/second-`401` refusal does not cool the key. A transient 5xx, which is also kept as the last refusal, does cool the key after two in a row. A request-size 402 is recorded in the failure ring as `request_error` but does not cool the key: another key may still afford the request. The client sees the upstream's error, which says more than `reiki_exhausted`.
 
 ## Confirming a quota 429
 
-`confirm_quota = true` is set per upstream. The default is `false`. With it, the first quota 429 from a key in a request is not recorded. Reiki waits 3 seconds and sends the request to the same key again. Only a second quota 429 from that key in the same request cools it. Use this for an upstream that sometimes returns a quota 429 for a good key. It does not apply to 402.
+`confirm_quota = true` is set per upstream. The default is `false`. With it, the first quota 429 from a key in a request does not count against key health and does not cool the key, though it is still added to the failure ring. Reiki waits 3 seconds and sends the request to the same key again. Only a second quota 429 from that key in the same request cools it. Use this for an upstream that sometimes returns a quota 429 for a good key. It does not apply to 402.
 
 ## Fallback upstream
 
@@ -90,7 +90,7 @@ model_aliases = { "*" = "openrouter/free" }
 - It runs when no key can serve, or when the walk recorded a refusal, including a request-size 402.
 - It does not run after a stream rate limit (`rate_limited` 429), after a `reiki_shaped` 429 with no refusal, after a pass-through answer, or after a forwarder link failure.
 - Model aliases apply in order: first the fallback's `model_aliases`, then the target's own `model_aliases`. `"*"` matches any model.
-- Startup refuses a fallback that names the upstream itself, an unknown upstream, or a passthrough upstream. It also refuses a stream that uses the source upstream without a key for the target.
+- Startup refuses a fallback that names the upstream itself or an unknown upstream. A passthrough upstream cannot have a fallback at all, and a stream that uses the source upstream must also hold a key for the target.
 
 ## What happens after bytes reach the client
 

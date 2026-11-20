@@ -5,11 +5,7 @@
 //! so a bare nine-digit value under `ssn` is found even though nothing next to it says so.
 
 use crate::detect::{self, Hit, Kind};
-use reiki_detect::columnar::{self, Line};
-
-/// Longest column list read after `INSERT INTO t (`.
-const MAX_COLUMN_LIST: usize = 4096;
-const DELIMITERS: [u8; 4] = *b"\t|,;";
+use reiki_detect::columnar;
 
 /// The kind of identifier a column holds, from its header name.
 fn column_kind(name: &str) -> Option<Kind> {
@@ -129,149 +125,15 @@ fn cell_ok(kind: Kind, value: &str) -> bool {
 
 /// Every hit in the tables of `text` for the wanted `kinds`.
 pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    let all = columnar::lines(text);
-    let want = |k: Kind| kinds.contains(&k);
-    let mut i = 0;
-    while i < all.len() {
-        let prev = i.checked_sub(1).map(|p| &all[p]);
-        let Some((delim, map, width)) = header(&all[i], prev, &want) else {
-            i += 1;
-            continue;
-        };
-        let mut j = i + 1;
-        while j < all.len() {
-            if all[j].text.trim().is_empty() {
-                break;
-            }
-            // A row of another width is skipped, not treated as the end: a quoted cell that spans
-            // lines leaves a short line behind.
-            let cells = columnar::split_cells(all[j].text, delim, all[j].start);
-            if cells.len() == width {
-                for (idx, (s, e)) in cells.iter().enumerate() {
-                    if let Some(kind) = map[idx] {
-                        if cell_ok(kind, &text[*s..*e]) {
-                            hits.push(Hit {
-                                kind,
-                                start: *s,
-                                end: *e,
-                            });
-                        }
-                    }
-                }
-            }
-            j += 1;
-        }
-        i = j;
-    }
-    sql(text, &want, &mut hits);
-    columnar::copy_blocks(text, &all, &want, column_kind, cell_ok, &mut hits);
-    hits
-}
-
-/// True when `delim` starts a table on this line: the line is the first one in the document or
-/// follows a blank line or a line without that delimiter.
-fn starts_table(prev: Option<&Line<'_>>, delim: u8) -> bool {
-    match prev {
-        None => true,
-        Some(p) => p.text.trim().is_empty() || columnar::split_cells(p.text, delim, 0).len() < 2,
-    }
-}
-
-/// The delimiter, the kind of each column and the column count when `line` is a table header.
-///
-/// A header starts its table and, when it maps to [`Kind::Column`], which accepts almost any
-/// cell, at least half of its non-empty cells must be known column names. Without that, a data
-/// row such as `alice,address` would be read as a header and the next row flagged as a column.
-#[allow(clippy::type_complexity)]
-fn header(
-    line: &Line<'_>,
-    prev: Option<&Line<'_>>,
-    want: &dyn Fn(Kind) -> bool,
-) -> Option<(u8, Vec<Option<Kind>>, usize)> {
-    for delim in DELIMITERS {
-        let cells = columnar::split_cells(line.text, delim, 0);
-        if cells.len() < 2 || !starts_table(prev, delim) {
-            continue;
-        }
-        let known = cells
-            .iter()
-            .filter(|(s, e)| column_kind(&line.text[*s..*e]).is_some())
-            .count();
-        let nonempty = cells
-            .iter()
-            .filter(|(s, e)| !line.text[*s..*e].is_empty())
-            .count();
-        let map: Vec<Option<Kind>> = cells
-            .iter()
-            .map(|(s, e)| column_kind(&line.text[*s..*e]).filter(|k| want(*k)))
-            .collect();
-        if !map.iter().any(Option::is_some) {
-            continue;
-        }
-        if map.contains(&Some(Kind::Column)) && known * 2 < nonempty {
-            continue;
-        }
-        return Some((delim, map, cells.len()));
-    }
-    None
-}
-
-fn is_ident(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'"' | b'`' | b'.' | b'[' | b']')
-}
-
-/// `INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y');`
-fn sql(text: &str, want: &dyn Fn(Kind) -> bool, hits: &mut Vec<Hit>) {
-    let b = text.as_bytes();
-    let lower = text.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(p) = lower[from..].find("insert into") {
-        let mut i = from + p + "insert into".len();
-        from = i;
-        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
-            i += 1;
-        }
-        while b.get(i).is_some_and(|c| is_ident(*c)) {
-            i += 1;
-        }
-        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
-            i += 1;
-        }
-        if b.get(i) != Some(&b'(') {
-            continue;
-        }
-        // A column list is short and holds no '('. Stopping there keeps a body of unclosed INSERTs
-        // from rescanning ahead on every occurrence.
-        let Some(close) = b[i + 1..]
-            .iter()
-            .take(MAX_COLUMN_LIST)
-            .take_while(|c| **c != b'(')
-            .position(|c| *c == b')')
-            .map(|q| i + 1 + q)
-        else {
-            continue;
-        };
-        let map: Vec<Option<Kind>> = text[i + 1..close]
-            .split(',')
-            .map(|name| {
-                column_kind(name.trim().trim_matches(['"', '`', '[', ']'])).filter(|k| want(*k))
-            })
-            .collect();
-        i = close + 1;
-        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
-            i += 1;
-        }
-        if !lower[i..].starts_with("values") {
-            continue;
-        }
-        i += "values".len();
-        if map.iter().all(Option::is_none) {
-            continue;
-        }
-        i = columnar::tuples(text, i, &map, hits, cell_ok);
-        from = from.max(i);
-    }
+    columnar::scan_tables(
+        text,
+        &|k| kinds.contains(&k),
+        columnar::TableRules {
+            column_kind,
+            cell_ok,
+            catch_all: Some(|k| k == Kind::Column),
+        },
+    )
 }
 
 #[cfg(test)]

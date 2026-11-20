@@ -41,7 +41,7 @@ Request hooks run once before the failover loop, so every key attempt sees the s
 
 ## Key states
 
-`docs/failover.md` defines the key state diagram and the status-to-effect table. See [Key states](failover.md#key-states) and [Status to class to key effect](failover.md#status-to-class-to-key-effect).
+`docs/failover.md` defines the key state diagram, and [Response classification](classification.md#response-rules) has the status-to-effect table. See [Key states](failover.md#key-states).
 
 ## Stage map
 

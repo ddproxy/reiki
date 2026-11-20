@@ -298,16 +298,15 @@ async fn a_compressed_error_body_reaches_the_caller_as_text() {
 }
 
 #[tokio::test]
-async fn an_unknown_encoding_passes_through_untouched() {
-    let payload = b"not really lzma";
-    let setup = setup("unknown", encoded_response("200 OK", "lzma", payload)).await;
-    let (status, head, body) = send(&setup, b"{}").await;
-    assert_eq!(status, 200, "{head}");
-    assert_eq!(body, payload, "{head}");
-    assert_eq!(header(&head, "content-encoding"), Some("lzma"), "{head}");
-    assert_eq!(
-        header(&head, "content-length").map(|value| value.parse().unwrap()),
-        Some(payload.len()),
-        "{head}"
-    );
+async fn an_encoding_reiki_did_not_decode_is_refused_instead_of_relayed_raw() {
+    let payload = b"a key could be in here";
+    for (label, coding) in [("unknown", "lzma"), ("multiple", "gzip, br")] {
+        let setup = setup(label, encoded_response("200 OK", coding, payload)).await;
+        let (status, head, body) = send(&setup, b"{}").await;
+        assert_eq!(status, 502, "{coding}: {head}");
+        assert!(header(&head, "content-encoding").is_none(), "{head}");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("content coding"), "{coding}: {text}");
+        assert!(!text.contains("could be in here"), "{coding}: {text}");
+    }
 }

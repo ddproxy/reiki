@@ -4,7 +4,14 @@
 //! such as SWIFT codes and account numbers, are only reported next to a label, an adjacent IBAN
 //! or a table header. A hit never carries the matched text, only its position.
 
-use reiki_detect::{digit_run, luhn, word_at, word_before};
+use reiki_detect::{account_value, digit_run, keyed, luhn, word_at, word_before, KeyedStyle};
+
+/// Account numbers need a label; this style keeps the finance separator grammar.
+const KEYED: KeyedStyle = KeyedStyle {
+    allow_word_suffix: false,
+    dot_separator: true,
+    any_whitespace: false,
+};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 
@@ -94,6 +101,7 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             CUSIP_WORDS,
             Kind::Cusip,
             cusip_value,
+            KEYED,
             &mut hits,
         );
     }
@@ -110,6 +118,7 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             ACCOUNT_WORDS,
             Kind::Account,
             account_value,
+            KEYED,
             &mut hits,
         );
     }
@@ -120,6 +129,7 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             SEDOL_WORDS,
             Kind::Sedol,
             sedol_value,
+            KEYED,
             &mut hits,
         );
     }
@@ -852,11 +862,6 @@ fn pan_sad(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
     }
 }
 
-fn account_value(bytes: &[u8], at: usize) -> Option<usize> {
-    let n = digit_run(bytes, at);
-    ((6..=17).contains(&n) && !word_at(bytes, at + n)).then_some(at + n)
-}
-
 pub(crate) fn valid_account(v: &[u8]) -> bool {
     (6..=17).contains(&v.len()) && v.iter().all(u8::is_ascii_digit)
 }
@@ -885,41 +890,6 @@ fn sedol_value(bytes: &[u8], at: usize) -> Option<usize> {
         .take_while(|b| b.is_ascii_alphanumeric())
         .count();
     (n == 7 && !word_at(bytes, at + n) && valid_sedol(&bytes[at..at + n])).then_some(at + n)
-}
-
-/// Finds each keyword, then asks `value` for the end of the identifier that follows it.
-fn keyed(
-    bytes: &[u8],
-    lower: &[u8],
-    words: &[&str],
-    kind: Kind,
-    value: fn(&[u8], usize) -> Option<usize>,
-    hits: &mut Vec<Hit>,
-) {
-    for w in words {
-        let w = w.as_bytes();
-        let mut from = 0;
-        while let Some(at) = lower[from..]
-            .windows(w.len())
-            .position(|c| c == w)
-            .map(|p| p + from)
-        {
-            from = at + w.len();
-            if word_before(lower, at) || word_at(lower, from) {
-                continue;
-            }
-            let mut start = from;
-            let skipped = bytes[start..]
-                .iter()
-                .take(8)
-                .take_while(|b| matches!(**b, b' ' | b':' | b'#' | b'=' | b'"' | b'\'' | b'.'))
-                .count();
-            start += skipped;
-            if let Some(end) = value(bytes, start) {
-                hits.push(Hit { kind, start, end });
-            }
-        }
-    }
 }
 
 #[cfg(test)]

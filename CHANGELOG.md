@@ -7,6 +7,27 @@
 - Test coverage re-verifies the state-file recovery path: huge, negative, NaN-like and zero recovery and saved-at values are rejected or capped before any `Instant`/`SystemTime` arithmetic.
 - Test coverage re-verifies the request-body timeout: a client that sends complete headers and then stalls on a `Content-Length` or chunked body is cut off with 408 on the real client listener.
 
+### Changed
+
+- Behaviour change: `[admin].listen` must be a loopback address (when given as an IP:port). The admin listener has no TLS option, so a non-loopback bind is now a config error; terminate TLS in front and bind on loopback if the admin routes must be reachable off-host.
+
+### Fixed
+
+- Login throttling on the client, admin and peer listeners now checks the lockout and reserves the attempt under one lock. A concurrent burst of bad tokens can no longer all pass the check before any failure is counted; a successful peer poll still leaves earlier failures counted.
+- Plugin panics in `new_state` and `on_shutdown` are caught and logged like the other hooks. A panicking `new_state` yields the default `()` state for that request, and a panicking `on_shutdown` no longer stops later plugins from shutting down.
+### Fixed
+
+- An intercepted CONNECT now keeps the exact authorised host entry (upstream and stream) for its lifetime. A reload between authorisation and `serve` can no longer switch an already-authorised tunnel to a different upstream or stream; new CONNECTs use the reloaded table.
+- A response that still carries a content coding Reiki did not decode (an unknown name or a list such as `gzip, br`) is refused with 502 when a key is in play, instead of relaying raw bytes that could contain an echoed key. Responses without a key in play, bodyless responses, and single recognised codings are unaffected.
+- The scrubber reserves half of each key's 4096-form budget for the raw form and its split variants, with space-separated forms first. A long key with a space inserted at any boundary is now redacted instead of being crowded out by encoding variants.
+- `GET /status` gains `log.write_errors`, the number of service-log file writes dropped since start. A failed write now warns on stderr at most once a minute instead of only once ever.
+- A rewrite body with more than 4096 top-level members is left byte-for-byte unchanged, matching `request_model`'s scan cap.
+
+### Fixed
+
+- `reiki peers --watch` no longer grows a watched document without bound: key events that would add a 257th upstream are dropped and counted in a warning.
+- A reload that changes `leaf_ttl_hours` now clears the cached leaves, so new intercepted connections use the new lifetime instead of reusing a leaf minted under the old TTL.
+
 ## 0.11.0
 
 ### Fixed
@@ -370,7 +391,7 @@
 
 ### Added
 
-- A `gov` plugin that blocks or reports CUI, classification and dissemination markings, plus label-bound EIN, ITIN, CAGE, UEI, EDIPI and ECCN values, in outbound request bodies. See [docs/gov.md](docs/gov.md).
+- A `gov` plugin that blocks or reports CUI, classification and dissemination markings, plus label-bound EIN, ITIN, CAGE, UEI, EDIPI and ECCN values, in outbound request bodies. See [docs/controlled.md](docs/controlled.md).
 - A `finance` plugin that blocks or reports financial identifiers (IBAN, SWIFT/BIC, Bitcoin and Ethereum addresses, CUSIP, ISIN, card data next to CVV or track data, and header-bound account and SEDOL values) in outbound request bodies. See [docs/finance.md](docs/finance.md).
 - A `reiki-detect` crate holds the scanning helpers the detection plugins share.
 

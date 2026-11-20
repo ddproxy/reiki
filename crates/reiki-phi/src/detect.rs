@@ -5,9 +5,18 @@
 //! ones that look like any other number are only reported next to a keyword. Free-text names
 //! and addresses are not detected. A hit never carries the matched text, only its position.
 
-use reiki_detect::{digit_run, keyword_before, word_at, word_before};
+use reiki_detect::{
+    account_value, digit_run, keyed, keyword_before, word_at, word_before, KeyedStyle,
+};
 
 pub(crate) use reiki_detect::luhn;
+
+/// PHI keywords may run into their value and accept `.` as a separator.
+const KEYED: KeyedStyle = KeyedStyle {
+    allow_word_suffix: true,
+    dot_separator: true,
+    any_whitespace: false,
+};
 
 /// What a hit is an identifier of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -236,11 +245,20 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             ACCOUNT_WORDS,
             Kind::Account,
             account_value,
+            KEYED,
             &mut hits,
         );
     }
     if want(Kind::Dob) {
-        keyed(bytes, lower, DOB_WORDS, Kind::Dob, date_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            DOB_WORDS,
+            Kind::Dob,
+            date_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::MedicalId) {
         keyed(
@@ -249,11 +267,20 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             MEDICAL_WORDS,
             Kind::MedicalId,
             id_value,
+            KEYED,
             &mut hits,
         );
     }
     if want(Kind::Icd10) {
-        keyed(bytes, lower, ICD_WORDS, Kind::Icd10, icd_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            ICD_WORDS,
+            Kind::Icd10,
+            icd_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::Field) {
         field(bytes, lower, &mut hits);
@@ -415,46 +442,6 @@ fn npi(bytes: &[u8], lower: &[u8], hits: &mut Vec<Hit>) {
             });
         }
     }
-}
-
-/// Finds each keyword, then asks `value` for the end of the identifier that follows it.
-fn keyed(
-    bytes: &[u8],
-    lower: &[u8],
-    words: &[&str],
-    kind: Kind,
-    value: fn(&[u8], usize) -> Option<usize>,
-    hits: &mut Vec<Hit>,
-) {
-    for w in words {
-        let w = w.as_bytes();
-        let mut from = 0;
-        while let Some(at) = lower[from..]
-            .windows(w.len())
-            .position(|c| c == w)
-            .map(|p| p + from)
-        {
-            from = at + w.len();
-            if word_before(lower, at) {
-                continue;
-            }
-            let mut start = from;
-            let skipped = bytes[start..]
-                .iter()
-                .take(8)
-                .take_while(|b| matches!(**b, b' ' | b':' | b'#' | b'=' | b'"' | b'\'' | b'.'))
-                .count();
-            start += skipped;
-            if let Some(end) = value(bytes, start) {
-                hits.push(Hit { kind, start, end });
-            }
-        }
-    }
-}
-
-fn account_value(bytes: &[u8], at: usize) -> Option<usize> {
-    let n = digit_run(bytes, at);
-    ((6..=17).contains(&n) && !word_at(bytes, at + n)).then_some(at + n)
 }
 
 pub(crate) fn id_value(bytes: &[u8], at: usize) -> Option<usize> {

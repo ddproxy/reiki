@@ -1,8 +1,9 @@
 //! Text scanning helpers shared by the detection plugins.
 //!
 //! A plugin keeps its own `Kind` and its own rules. This crate holds the byte-level pieces that
-//! more than one plugin needs: word boundaries, keyword proximity, digit runs, a Luhn checksum and
-//! the hit type. The `guard` module is the plugin shell the detection plugins share.
+//! more than one plugin needs: word boundaries, keyword proximity, labelled values, digit runs, a
+//! Luhn checksum and the hit type. The `guard` module is the plugin shell, and `columnar` the table
+//! scanner, that the detection plugins share.
 
 use http::header::CONTENT_ENCODING;
 use http::HeaderMap;
@@ -84,6 +85,69 @@ pub fn keyword_before(lower: &[u8], at: usize, words: &[&str], window: usize) ->
         let w = w.as_bytes();
         slice.windows(w.len()).any(|c| c == w)
     })
+}
+
+/// The keyword/value grammar of a detection plugin.
+///
+/// The plugins differ in three small ways: whether a keyword may be the prefix of a longer word,
+/// whether `.` may separate the keyword from its value, and whether any ASCII whitespace may do
+/// so. Passing the style keeps each caller's behaviour unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyedStyle {
+    pub allow_word_suffix: bool,
+    pub dot_separator: bool,
+    pub any_whitespace: bool,
+}
+
+/// Finds each keyword in `lower`, then asks `value` for the end of the identifier that follows it.
+///
+/// `lower` must be the ASCII-lowercase form of `bytes`. Only separators are skipped; `value`
+/// decides which identifier shapes count.
+pub fn keyed<K: Copy>(
+    bytes: &[u8],
+    lower: &[u8],
+    words: &[&str],
+    kind: K,
+    value: fn(&[u8], usize) -> Option<usize>,
+    style: KeyedStyle,
+    hits: &mut Vec<Hit<K>>,
+) {
+    for w in words {
+        let w = w.as_bytes();
+        let mut from = 0;
+        while let Some(at) = lower[from..]
+            .windows(w.len())
+            .position(|c| c == w)
+            .map(|p| p + from)
+        {
+            from = at + w.len();
+            if word_before(lower, at) || (!style.allow_word_suffix && word_at(lower, from)) {
+                continue;
+            }
+            let mut start = from;
+            let skipped = bytes[start..]
+                .iter()
+                .take(8)
+                .take_while(|b| {
+                    if style.any_whitespace && b.is_ascii_whitespace() {
+                        return true;
+                    }
+                    (style.dot_separator && **b == b'.')
+                        || matches!(**b, b' ' | b':' | b'#' | b'=' | b'"' | b'\'')
+                })
+                .count();
+            start += skipped;
+            if let Some(end) = value(bytes, start) {
+                hits.push(Hit { kind, start, end });
+            }
+        }
+    }
+}
+
+/// End of a 6 to 17 digit account number at `at`, unless it runs into a longer word.
+pub fn account_value(bytes: &[u8], at: usize) -> Option<usize> {
+    let n = digit_run(bytes, at);
+    ((6..=17).contains(&n) && !word_at(bytes, at + n)).then_some(at + n)
 }
 
 /// The run of ASCII digits starting at `i`.
@@ -235,5 +299,158 @@ mod tests {
             [hit(0, 5), hit_kind(b'a', 10, 20), hit_kind(b'b', 20, 30)],
             "adjacent extras do not overlap"
         );
+    }
+
+    const PHI: KeyedStyle = KeyedStyle {
+        allow_word_suffix: true,
+        dot_separator: true,
+        any_whitespace: false,
+    };
+    const FINANCE: KeyedStyle = KeyedStyle {
+        allow_word_suffix: false,
+        dot_separator: true,
+        any_whitespace: false,
+    };
+    const CONTROLLED: KeyedStyle = KeyedStyle {
+        allow_word_suffix: false,
+        dot_separator: false,
+        any_whitespace: true,
+    };
+
+    fn labelled<'a>(text: &'a str, words: &[&str], style: KeyedStyle) -> Vec<&'a str> {
+        let lower = text.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        keyed(
+            text.as_bytes(),
+            lower.as_bytes(),
+            words,
+            0u8,
+            account_value,
+            style,
+            &mut hits,
+        );
+        hits.iter().map(|h| &text[h.start..h.end]).collect()
+    }
+
+    fn token_value(bytes: &[u8], at: usize) -> Option<usize> {
+        let n = bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
+            .count();
+        ((5..=20).contains(&n) && !word_at(bytes, at + n)).then_some(at + n)
+    }
+
+    fn tokens<'a>(text: &'a str, words: &[&str], style: KeyedStyle) -> Vec<&'a str> {
+        let lower = text.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        keyed(
+            text.as_bytes(),
+            lower.as_bytes(),
+            words,
+            0u8,
+            token_value,
+            style,
+            &mut hits,
+        );
+        hits.iter().map(|h| &text[h.start..h.end]).collect()
+    }
+
+    #[test]
+    fn keyed_finds_values_after_their_keyword() {
+        let account = [
+            "account number",
+            "account_number",
+            "account no",
+            "account #",
+            "acct",
+        ];
+        assert_eq!(
+            labelled("account number: 000123456789", &account, PHI),
+            ["000123456789"]
+        );
+        assert!(labelled("account number: 123", &account, PHI).is_empty());
+        assert_eq!(
+            labelled("acct_no 12345678", &["account", "acct_no"], FINANCE),
+            ["12345678"]
+        );
+        assert_eq!(
+            labelled("cusip 037833100", &["cusip", "cusip number"], FINANCE),
+            ["037833100"]
+        );
+        assert_eq!(
+            tokens("EIN 12-3456789", &["ein", "employer id"], CONTROLLED),
+            ["12-3456789"]
+        );
+        assert_eq!(
+            tokens("CAGE Code: 0A1B2", &["cage", "cage code"], CONTROLLED),
+            ["0A1B2"]
+        );
+        assert_eq!(
+            tokens("ECCN 5A002.a", &["eccn"], CONTROLLED),
+            ["5A002"],
+            "the value ends at the dot"
+        );
+        assert!(
+            labelled("xaccount 12345678", &account, PHI).is_empty(),
+            "a keyword inside a word does not count"
+        );
+        assert!(tokens("12-3456789", &["ein"], CONTROLLED).is_empty());
+    }
+
+    #[test]
+    fn keyed_styles_keep_each_callers_separator_and_word_rules() {
+        fn date_value(bytes: &[u8], at: usize) -> Option<usize> {
+            let tail = &bytes[at..];
+            let n = tail
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || matches!(**b, b'/' | b'-'))
+                .count();
+            (n == 10).then_some(at + n)
+        }
+        fn dates(text: &str, style: KeyedStyle) -> Vec<&str> {
+            let lower = text.to_ascii_lowercase();
+            let mut hits = Vec::new();
+            keyed(
+                text.as_bytes(),
+                lower.as_bytes(),
+                &["dob", "date of birth"],
+                0u8,
+                date_value,
+                style,
+                &mut hits,
+            );
+            hits.iter().map(|h| &text[h.start..h.end]).collect()
+        }
+
+        assert_eq!(dates("dob.02/03/1980", PHI), ["02/03/1980"]);
+        assert_eq!(dates("dob.02/03/1980", FINANCE), ["02/03/1980"]);
+        assert!(
+            dates("dob.02/03/1980", CONTROLLED).is_empty(),
+            "controlled does not skip a dot"
+        );
+        assert_eq!(
+            labelled("account\t12345678", &["account"], CONTROLLED),
+            ["12345678"]
+        );
+        assert!(
+            labelled("account\t12345678", &["account"], PHI).is_empty(),
+            "PHI skips a space, not every ASCII whitespace"
+        );
+        assert_eq!(
+            tokens("mrnA1234567", &["mrn"], PHI),
+            ["A1234567"],
+            "PHI allows a keyword to run into its value"
+        );
+        assert!(tokens("mrnA1234567", &["mrn"], FINANCE).is_empty());
+        assert!(tokens("mrnA1234567", &["mrn"], CONTROLLED).is_empty());
+    }
+
+    #[test]
+    fn account_value_checks_width_and_word_end() {
+        assert_eq!(account_value(b"123456", 0), Some(6));
+        assert_eq!(account_value(b"x 1234567", 2), Some(9));
+        assert_eq!(account_value(b"12345", 0), None);
+        assert_eq!(account_value(b"123456789012345678", 0), None);
+        assert_eq!(account_value(b"1234567x", 0), None);
     }
 }

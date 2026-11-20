@@ -66,6 +66,26 @@ fn throttle_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// One attempt reserved by [`LoginThrottle::reserve`]. Dropping it on a failed login leaves the
+/// attempt counted; a listener that does not count successes can give it back with
+/// [`LoginThrottle::release`] instead.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginAttempt {
+    key: IpAddr,
+    /// Start of the window the reservation belongs to, so a release cannot undo a later window.
+    since: Instant,
+    /// Number of counted failures after this reservation.
+    failures: u32,
+    counted: bool,
+}
+
+impl LoginAttempt {
+    /// How many failures are counted for the address after this reservation.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+}
+
 /// Counts failed token checks per address so token guessing is slowed and visible.
 pub struct LoginThrottle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -99,6 +119,74 @@ impl LoginThrottle {
         *self.settings.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Frees a slot for a new address when the table is full. Callers hold the `seen` lock.
+    fn make_room(
+        seen: &mut HashMap<IpAddr, (u32, Instant)>,
+        key: IpAddr,
+        now: Instant,
+        settings: ThrottleSettings,
+    ) {
+        if seen.len() < MAX_TRACKED || seen.contains_key(&key) {
+            return;
+        }
+        // Free one slot: an expired entry, else the least-failed oldest unblocked one, else
+        // the oldest blocked one, so a flood of blocked addresses cannot leave new ones untracked.
+        let victim = seen.iter().min_by_key(|(_, (count, since))| {
+            let expired = now.saturating_duration_since(*since) >= settings.window;
+            (!expired, *count >= settings.max_failures, *count, *since)
+        });
+        if let Some((victim, _)) = victim {
+            let victim = *victim;
+            seen.remove(&victim);
+        }
+    }
+
+    /// Checks whether `ip` may try and reserves the attempt in one lock, so a concurrent burst
+    /// cannot all pass the check before any attempt is counted. `Ok` carries the reservation;
+    /// `Err` is how long the address must wait.
+    pub fn reserve(&self, ip: IpAddr, now: Instant) -> Result<LoginAttempt, Duration> {
+        let key = throttle_key(ip);
+        let settings = self.settings();
+        if !settings.enabled {
+            return Ok(LoginAttempt {
+                key,
+                since: now,
+                failures: 0,
+                counted: false,
+            });
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::make_room(&mut seen, key, now, settings);
+        let entry = seen.entry(key).or_insert((0, now));
+        if now.saturating_duration_since(entry.1) >= settings.window {
+            *entry = (0, now);
+        }
+        if entry.0 >= settings.max_failures {
+            return Err(settings.window - now.saturating_duration_since(entry.1));
+        }
+        entry.0 += 1;
+        Ok(LoginAttempt {
+            key,
+            since: entry.1,
+            failures: entry.0,
+            counted: true,
+        })
+    }
+
+    /// Gives back a reserved attempt without clearing earlier failures, for listeners that do
+    /// not reset the count on a successful login. A reservation from another window is ignored.
+    pub fn release(&self, attempt: LoginAttempt) {
+        if !attempt.counted {
+            return;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = seen.get_mut(&attempt.key) {
+            if entry.1 == attempt.since && entry.0 > 0 {
+                entry.0 -= 1;
+            }
+        }
+    }
+
     /// How long `ip` must wait, or `None` when it may try.
     pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let ip = throttle_key(ip);
@@ -123,18 +211,7 @@ impl LoginThrottle {
             return 0;
         }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
-            // Free one slot: an expired entry, else the least-failed oldest unblocked one, else
-            // the oldest blocked one, so a flood of blocked addresses cannot leave new ones untracked.
-            let victim = seen.iter().min_by_key(|(_, (count, since))| {
-                let expired = now.saturating_duration_since(*since) >= settings.window;
-                (!expired, *count >= settings.max_failures, *count, *since)
-            });
-            if let Some((victim, _)) = victim {
-                let victim = *victim;
-                seen.remove(&victim);
-            }
-        }
+        Self::make_room(&mut seen, ip, now, settings);
         let entry = seen.entry(ip).or_insert((0, now));
         if now.saturating_duration_since(entry.1) >= settings.window {
             *entry = (0, now);
@@ -343,6 +420,9 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(throttle.fail(ip, t0), 0);
         }
+        let attempt = throttle.reserve(ip, t0).unwrap();
+        assert_eq!(attempt.failures(), 0, "a disabled backoff counts nothing");
+        throttle.release(attempt);
         assert!(throttle.blocked(ip, t0).is_none());
     }
 
@@ -462,6 +542,70 @@ mod tests {
         );
         throttle.succeed(sibling);
         assert!(throttle.blocked(sibling, t0).is_none());
+    }
+
+    #[test]
+    fn a_concurrent_burst_cannot_pass_the_check_before_failures_are_recorded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 32;
+        let throttle = Arc::new(LoginThrottle::new(ThrottleSettings {
+            enabled: true,
+            max_failures: 1,
+            window: Duration::from_secs(60),
+        }));
+        let ip: IpAddr = "192.0.2.44".parse().unwrap();
+        let now = Instant::now();
+        let start = Arc::new(Barrier::new(N));
+        let checked = Arc::new(Barrier::new(N));
+        let allowed = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..N)
+            .map(|_| {
+                let throttle = Arc::clone(&throttle);
+                let start = Arc::clone(&start);
+                let checked = Arc::clone(&checked);
+                let allowed = Arc::clone(&allowed);
+                std::thread::spawn(move || {
+                    start.wait();
+                    if throttle.reserve(ip, now).is_ok() {
+                        allowed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    checked.wait();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            allowed.load(Ordering::SeqCst),
+            1,
+            "only the first attempt may pass the check"
+        );
+        assert!(throttle.blocked(ip, now).is_some(), "it is counted at once");
+    }
+
+    #[test]
+    fn releasing_a_reservation_keeps_earlier_failures() {
+        let throttle = LoginThrottle::new(ThrottleSettings {
+            enabled: true,
+            max_failures: 3,
+            window: Duration::from_secs(60),
+        });
+        let ip: IpAddr = "192.0.2.45".parse().unwrap();
+        let now = Instant::now();
+        let first = throttle.reserve(ip, now).unwrap();
+        let second = throttle.reserve(ip, now).unwrap();
+        assert_eq!(second.failures(), 2);
+        throttle.release(first);
+        assert_eq!(
+            throttle.fail(ip, now),
+            2,
+            "only the given-up attempt was removed"
+        );
+        throttle.fail(ip, now);
+        assert!(throttle.blocked(ip, now).is_some());
     }
 
     #[test]

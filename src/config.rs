@@ -57,6 +57,8 @@ pub enum ConfigError {
     AdminTokenReused(String),
     ReservedStreamName(String),
     AdminListenConflict,
+    /// The admin listener would serve plain HTTP on a reachable address.
+    BadAdminListen(String),
     BadTunnel(String),
     BadLog(String),
     BadReload(String),
@@ -191,6 +193,7 @@ impl fmt::Display for ConfigError {
             Self::AdminListenConflict => {
                 write!(f, "admin listen must differ from the client listen address")
             }
+            Self::BadAdminListen(reason) => write!(f, "invalid [admin]: {reason}"),
             Self::UnknownPlugin { name, known } => {
                 if known.is_empty() {
                     write!(
@@ -1699,6 +1702,16 @@ impl Config {
             if admin.listen == self.listen {
                 return Err(ConfigError::AdminListenConflict);
             }
+            // The admin listener has no TLS option, so a reachable address would carry its
+            // bearer token and operational data in plain HTTP. A hostname cannot be checked
+            // here and is left to the binder, as before.
+            if let Ok(addr) = admin.listen.parse::<std::net::SocketAddr>() {
+                if !addr.ip().is_loopback() {
+                    return Err(ConfigError::BadAdminListen(format!(
+                        "listen `{addr}` is not a loopback address; the admin listener serves plain HTTP, so terminate TLS in front and listen on loopback"
+                    )));
+                }
+            }
         }
         if !(1..=300).contains(&self.service.shutdown_timeout_secs) {
             return Err(ConfigError::BadService(format!(
@@ -2776,6 +2789,25 @@ file = "/etc/reiki/keys/zen-b"
             Config::parse(&text).unwrap_err(),
             ConfigError::AdminListenConflict
         );
+    }
+
+    #[test]
+    fn rejects_a_non_loopback_admin_listen_address() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"0.0.0.0:4098\"\ntoken_sha256 = \"{HASH_B}\"\n"
+        ));
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("loopback"), "{err}");
+        assert!(err.contains("TLS"), "{err}");
+    }
+
+    #[test]
+    fn accepts_an_ipv6_loopback_admin_listen_address() {
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"[::1]:4098\"\ntoken_sha256 = \"{HASH_B}\"\n"
+        ));
+        let admin = Config::parse(&text).unwrap().admin.unwrap();
+        assert_eq!(admin.listen, "[::1]:4098");
     }
 
     #[test]

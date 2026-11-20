@@ -4,7 +4,14 @@
 //! level with a `//` caveat chain. Identifiers with no usable checksum are only reported next to
 //! their own label. A hit never carries the matched text, only its position.
 
-use reiki_detect::{digit_run, word_at, word_before};
+use reiki_detect::{digit_run, keyed, word_at, word_before, KeyedStyle};
+
+/// Controlled identifiers keep their own separator grammar (no `.`, any ASCII whitespace).
+const KEYED: KeyedStyle = KeyedStyle {
+    allow_word_suffix: false,
+    dot_separator: false,
+    any_whitespace: true,
+};
 
 /// What a hit is an identifier of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -109,16 +116,48 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
         dissemination(bytes, &mut hits);
     }
     if want(Kind::Ein) {
-        keyed(bytes, lower, EIN_WORDS, Kind::Ein, ein_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            EIN_WORDS,
+            Kind::Ein,
+            ein_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::Itin) {
-        keyed(bytes, lower, ITIN_WORDS, Kind::Itin, itin_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            ITIN_WORDS,
+            Kind::Itin,
+            itin_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::Cage) {
-        keyed(bytes, lower, CAGE_WORDS, Kind::Cage, cage_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            CAGE_WORDS,
+            Kind::Cage,
+            cage_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::Uei) {
-        keyed(bytes, lower, UEI_WORDS, Kind::Uei, uei_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            UEI_WORDS,
+            Kind::Uei,
+            uei_value,
+            KEYED,
+            &mut hits,
+        );
     }
     if want(Kind::Edipi) {
         keyed(
@@ -127,11 +166,20 @@ pub fn scan(text: &str, kinds: &[Kind]) -> Vec<Hit> {
             EDIPI_WORDS,
             Kind::Edipi,
             edipi_value,
+            KEYED,
             &mut hits,
         );
     }
     if want(Kind::Eccn) {
-        keyed(bytes, lower, ECCN_WORDS, Kind::Eccn, eccn_value, &mut hits);
+        keyed(
+            bytes,
+            lower,
+            ECCN_WORDS,
+            Kind::Eccn,
+            eccn_value,
+            KEYED,
+            &mut hits,
+        );
     }
     hits
 }
@@ -438,43 +486,6 @@ fn dissemination(bytes: &[u8], hits: &mut Vec<Hit>) {
                     start: p,
                     end: i,
                 });
-            }
-        }
-    }
-}
-
-/// Finds each keyword, then asks `value` for the end of the identifier that follows it.
-fn keyed(
-    bytes: &[u8],
-    lower: &[u8],
-    words: &[&str],
-    kind: Kind,
-    value: fn(&[u8], usize) -> Option<usize>,
-    hits: &mut Vec<Hit>,
-) {
-    for w in words {
-        let w = w.as_bytes();
-        let mut from = 0;
-        while let Some(at) = lower[from..]
-            .windows(w.len())
-            .position(|c| c == w)
-            .map(|p| p + from)
-        {
-            from = at + w.len();
-            if word_before(lower, at) || word_at(lower, from) {
-                continue;
-            }
-            let mut start = from;
-            let skipped = bytes[start..]
-                .iter()
-                .take(8)
-                .take_while(|b| {
-                    b.is_ascii_whitespace() || matches!(**b, b':' | b'#' | b'=' | b'"' | b'\'')
-                })
-                .count();
-            start += skipped;
-            if let Some(end) = value(bytes, start) {
-                hits.push(Hit { kind, start, end });
             }
         }
     }

@@ -121,6 +121,7 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 **Operations and security**
 
 - [Deploy](docs/deploy.md): install paths, directory layout, listeners and a service unit.
+- [Service (legacy stub)](docs/service.md): redirect kept for the old service page URL.
 - [Upgrades](docs/upgrades.md): reload and restart rules, state compatibility and rollback.
 - [Monitoring](docs/monitoring.md): the admin listener, `/status`, `/metrics` and key checks.
 - [Peers](docs/peers.md): read-only key health shared between instances; health document schema.

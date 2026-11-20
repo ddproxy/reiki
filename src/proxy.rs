@@ -29,6 +29,7 @@ use crate::shaper::headers::{observe, Observed};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use crate::usage::Usage;
+use reiki_detect::body_is_encoded as is_encoded;
 use reiki_plugin::{Event, FailureKind};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
@@ -43,6 +44,19 @@ pub(crate) const PASSTHROUGH_STREAM: &str = "passthrough";
 const PASSTHROUGH_KEY: &str = "-";
 const HEALTH_PATH: &str = "/__reiki/healthz";
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Source of the wall clock. Production reads the system clock; tests inject one they can pin.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> SystemTime;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
 
 /// Fixed-window request counter for one stream. A window is a minute long; the
 /// first request starts it. Counters live in the snapshot, so a reload resets them.
@@ -303,9 +317,8 @@ pub struct App {
     persist_lock: Mutex<()>,
     /// Wakes the state writer thread; absent until [`App::start_state_writer`] runs.
     persist_tx: OnceLock<std::sync::mpsc::SyncSender<()>>,
-    /// Overrides the wall clock for tests; production reads the system clock.
-    /// The override advances with real time, and tests may set it again to jump.
-    wall_clock: RwLock<Option<(SystemTime, Instant)>>,
+    /// Where wall-clock reads come from; production uses [`SystemClock`].
+    clock: Arc<dyn Clock>,
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: RwLock<Option<i64>>,
     logins: LoginThrottle,
@@ -346,7 +359,31 @@ impl App {
         policy: Policy,
         header_timeout: Duration,
     ) -> Arc<Self> {
-        Self::with_plugins(config, keys, policy, header_timeout, PluginChain::default())
+        Self::with_header_timeout_and_clock(
+            config,
+            keys,
+            policy,
+            header_timeout,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Builds an app whose clock the caller controls; useful for deterministic tests.
+    pub fn with_header_timeout_and_clock(
+        config: Config,
+        keys: HashMap<String, Secret>,
+        policy: Policy,
+        header_timeout: Duration,
+        clock: Arc<dyn Clock>,
+    ) -> Arc<Self> {
+        Self::with_plugins_and_clock(
+            config,
+            keys,
+            policy,
+            header_timeout,
+            PluginChain::default(),
+            clock,
+        )
     }
 
     pub fn with_plugins(
@@ -355,6 +392,24 @@ impl App {
         policy: Policy,
         header_timeout: Duration,
         plugins: PluginChain,
+    ) -> Arc<Self> {
+        Self::with_plugins_and_clock(
+            config,
+            keys,
+            policy,
+            header_timeout,
+            plugins,
+            Arc::new(SystemClock),
+        )
+    }
+
+    pub fn with_plugins_and_clock(
+        config: Config,
+        keys: HashMap<String, Secret>,
+        policy: Policy,
+        header_timeout: Duration,
+        plugins: PluginChain,
+        clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         let throttle = ThrottleSettings::from(&config.auth);
         let shaper = Shaper::new();
@@ -374,7 +429,7 @@ impl App {
             state_path: OnceLock::new(),
             persist_lock: Mutex::new(()),
             persist_tx: OnceLock::new(),
-            wall_clock: RwLock::new(None),
+            clock,
             ca_not_after: RwLock::new(None),
             logins: LoginThrottle::new(throttle),
             admin_logins: LoginThrottle::new(throttle),
@@ -481,22 +536,8 @@ impl App {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn set_wall_clock(&self, now: SystemTime) {
-        *self
-            .wall_clock
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Some((now, Instant::now()));
-    }
-
     pub(crate) fn wall_now(&self) -> SystemTime {
-        match *self
-            .wall_clock
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
-            Some((base, started)) => base.checked_add(started.elapsed()).unwrap_or(base),
-            None => SystemTime::now(),
-        }
+        self.clock.now()
     }
 
     /// Apply persisted key health and shaper state. Missing or corrupt state is ignored.
@@ -722,6 +763,14 @@ impl App {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .status_json()
+    }
+
+    /// Failed service-log file writes dropped since start, for `/status`.
+    pub(crate) fn file_write_errors(&self) -> u64 {
+        self.logging
+            .get()
+            .and_then(|logging| logging.file_write_errors())
+            .unwrap_or(0)
     }
 
     /// The SIGHUP action. Live health is authoritative once running, so the state
@@ -1069,7 +1118,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         PASSTHROUGH_STREAM.to_owned()
     } else {
         let peer = parts.extensions.get::<Peer>().map(|p| p.0);
-        if let Some(wait) = peer.and_then(|ip| app.logins.blocked(ip, Instant::now())) {
+        // Check and reserve in one lock, so a burst cannot all pass before any attempt is counted.
+        let attempt = peer.map(|ip| app.logins.reserve(ip, Instant::now()));
+        if let Some(Err(wait)) = attempt {
             tracing::warn!(
                 ?peer,
                 path = %parts.uri.path(),
@@ -1078,7 +1129,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             return rate_limited_response(wait);
         }
         let fail = |reason: &str| {
-            let failures = peer.map(|ip| app.logins.fail(ip, Instant::now()));
+            let failures = attempt.and_then(Result::ok).map(|a| a.failures());
             tracing::warn!(?peer, reason, ?failures, path = %parts.uri.path(), "failed login");
             json_error(StatusCode::UNAUTHORIZED, "unauthorized", reason)
         };
@@ -2282,20 +2333,6 @@ fn failure_scope(
     }
 }
 
-/// True when the body is in a content coding Reiki did not decode, so a key echoed in it
-/// cannot be found. `identity` is a legal no-op and counts as plain.
-fn is_encoded(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::CONTENT_ENCODING)
-        .iter()
-        .any(|value| {
-            value.to_str().map_or(true, |text| {
-                text.split(',')
-                    .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
-            })
-        })
-}
-
 /// What an attempt reported about its failure.
 #[derive(Clone, Copy)]
 struct FailureNote<'a> {
@@ -2792,8 +2829,24 @@ fn stream_response(
 ) -> Response {
     let mut status = response.status;
     let mut headers = HeaderMap::new();
-    // An upstream that echoes the key back must not hand it to a plugin or the client. A
-    // compressed body cannot be read, so it is passed on as it is.
+    // A coding that remains in the headers is one Reiki did not decode: a list such as
+    // `gzip, br` or an unknown name. The body's echoed key cannot be scrubbed in that form, so
+    // refuse it instead of handing the raw bytes to a plugin or the client. Bodyless responses
+    // have nothing to scrub and keep their headers.
+    if !secrets.is_empty()
+        && is_encoded(&response.headers)
+        && !is_head
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+    {
+        tracing::warn!(%upstream, "upstream left a content coding Reiki cannot decode; refusing an unscrubbed body");
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "bad_gateway",
+            "the upstream response uses a content coding Reiki cannot decode",
+        );
+    }
+    // An upstream that echoes the key back must not hand it to a plugin or the client.
     let echoed_headers = if secrets.is_empty() {
         None
     } else {
@@ -3280,6 +3333,71 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-echo", HeaderValue::from_static("sk-a%2Fb%2Bc%22d-1234"));
         assert_eq!(scrub_headers(headers, &secrets)["x-echo"], "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_coding_is_refused_when_a_key_could_be_echoed() {
+        let secret = "sk-secret-1234";
+        for coding in ["gzip, br", "x-unknown"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(coding).unwrap(),
+            );
+            let response = UpstreamResponse::from_bytes(
+                StatusCode::OK,
+                headers,
+                axum::http::Version::HTTP_11,
+                Bytes::from(format!("echo {secret}").into_bytes()),
+            );
+            let out = stream_response(
+                PluginSession::default(),
+                "k",
+                "up",
+                response,
+                false,
+                &[secret],
+                Accounting::default(),
+            );
+            assert_eq!(out.status(), StatusCode::BAD_GATEWAY, "{coding}");
+            let body = to_bytes(out.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("content coding"), "{coding}: {body}");
+            assert!(!body.contains(secret), "{coding}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_coding_still_passes_through_without_a_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        let response = UpstreamResponse::from_bytes(
+            StatusCode::OK,
+            headers,
+            axum::http::Version::HTTP_11,
+            Bytes::from_static(b"raw bytes"),
+        );
+        let out = stream_response(
+            PluginSession::default(),
+            "k",
+            "up",
+            response,
+            false,
+            &[],
+            Accounting::default(),
+        );
+        assert_eq!(out.status(), StatusCode::OK);
+        assert_eq!(
+            out.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip, br"
+        );
+        assert_eq!(
+            to_bytes(out.into_body(), usize::MAX).await.unwrap(),
+            Bytes::from_static(b"raw bytes")
+        );
     }
 
     #[test]

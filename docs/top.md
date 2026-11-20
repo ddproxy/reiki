@@ -34,7 +34,7 @@ reiki top --interval 2    # redraw every two seconds instead of every second
 ### The screen
 
 ```
-╭reiki top v0.10.3─────────────────────────────────────────12:00:00Z╮
+╭reiki top v0.11.0─────────────────────────────────────────12:00:00Z╮
 │live · 3 of 3 peers fresh                                          │
 │q quit  j/k peer  Enter detail  f filter  u metric  w window  m ...│
 ╰───────────────────────────────────────────────────────────────────╯

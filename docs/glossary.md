@@ -12,7 +12,7 @@ Terms used in the documentation and command output. Each term links to the page 
 | provider | The service behind an upstream, such as an LLM API. | [providers](providers.md) |
 | route | The request path after the upstream prefix. Cooldowns can apply to one route and model pair. | [failover](failover.md#scoped-cooldowns) |
 | model scope | A cooldown limited to one `(route, model)` combination, so the key stays usable for other models. | [failover](failover.md#scoped-cooldowns) |
-| cooldown | A period during which a key, or one route and model on it, is skipped after a failure. | [failover](failover.md#cooldowns) |
+| cooldown | A period during which a key, or one route and model on it, is skipped after a failure. | [classification](classification.md#cooldowns) |
 | cooling | A key state where the key waits out a cooldown before it can be tried again. | [failover](failover.md#key-states) |
 | disabled | A key state where the key is out of rotation until it is re-enabled or its key file changes on reload. Called `out_of_rotation` in `/v1/status`. | [failover](failover.md#re-enabling-keys), [monitoring](monitoring.md#post-keysenable) |
 | available | A key state where the key can be selected by a chain. Called `ok` in `reiki keys`. | [failover](failover.md#key-states) |

@@ -210,6 +210,7 @@ async fn status(
         }
         None => body,
     };
+    let body = with_log_status(body, app.file_write_errors());
     text_response(StatusCode::OK, "application/json", body)
 }
 
@@ -505,11 +506,11 @@ fn authorize(
     path: &str,
     headers: &HeaderMap,
 ) -> Result<(), Box<Response>> {
-    if let Some(ip) = peer {
-        if let Some(wait) = app.admin_logins().blocked(ip, Instant::now()) {
-            tracing::warn!(?peer, path = %path, "too many failed admin logins, refusing");
-            return Err(Box::new(throttled(wait)));
-        }
+    // Check and reserve in one lock, so a burst cannot all pass before any attempt is counted.
+    let attempt = peer.map(|ip| app.admin_logins().reserve(ip, Instant::now()));
+    if let Some(Err(wait)) = attempt {
+        tracing::warn!(?peer, path = %path, "too many failed admin logins, refusing");
+        return Err(Box::new(throttled(wait)));
     }
     match token_matches(app, headers) {
         Ok(()) => {
@@ -519,7 +520,7 @@ fn authorize(
             Ok(())
         }
         Err(reason) => {
-            let failures = peer.map(|ip| app.admin_logins().fail(ip, Instant::now()));
+            let failures = attempt.and_then(Result::ok).map(|a| a.failures());
             tracing::warn!(?peer, reason, ?failures, path = %path, "failed admin login");
             Err(Box::new(unauthorized()))
         }
@@ -577,6 +578,12 @@ pub(crate) fn text_response(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
+}
+
+/// Adds the service-log counters to a status document.
+fn with_log_status(mut body: String, write_errors: u64) -> String {
+    body.pop();
+    format!("{body},\"log\":{{\"write_errors\":{write_errors}}}}}")
 }
 
 /// Snapshot of key health and stream routing for operators. Carries no key
@@ -762,6 +769,12 @@ mod tests {
         ] {
             assert!(parse_failures_query(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn status_exposes_the_service_log_write_error_count() {
+        let body = with_log_status(r#"{"keys":[]}"#.to_owned(), 3);
+        assert_eq!(body, r#"{"keys":[],"log":{"write_errors":3}}"#);
     }
 
     #[test]

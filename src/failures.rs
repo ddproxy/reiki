@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::classify::civil_from_days;
+use reiki_plugin::format_utc;
 
 /// Records kept across all streams. Small on purpose: this is a live diagnostic, not a log.
 pub const CAPACITY: usize = 64;
@@ -192,15 +192,7 @@ fn clip(text: &str, max: usize) -> String {
 /// Unix seconds as `YYYY-MM-DD HH:MM:SS` in UTC, with no time-zone dependency.
 fn format_time(unix: u64) -> String {
     let secs = i64::try_from(unix).unwrap_or(i64::MAX);
-    let days = secs.div_euclid(86_400);
-    let rest = secs.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
-        rest / 3_600,
-        rest % 3_600 / 60,
-        rest % 60
-    )
+    format_utc(secs, ' ', None, "")
 }
 
 #[cfg(test)]

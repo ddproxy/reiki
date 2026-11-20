@@ -493,20 +493,25 @@ impl Interceptor {
         })
     }
 
-    /// Swaps in a plan from [`Interceptor::plan_reload`], dropping the certificates the old CA minted.
+    /// Swaps in a plan from [`Interceptor::plan_reload`], dropping the certificates the old CA
+    /// minted and any leaf whose lifetime the old TTL governed.
     pub fn apply_reload(&self, plan: InterceptPlan) {
         if !plan.settings.require_auth {
             tracing::warn!(
                 "interception does not require a stream token on CONNECT; anyone who can reach the tunnel listener can spend the stream keys"
             );
         }
-        if let Some(authority) = plan.authority {
-            self.app.set_ca_not_after(authority.not_after);
-            tracing::warn!(
-                "the interception CA changed; clients must trust the new CA before their next connection"
-            );
+        let ttl_changed = self.settings().ttl != plan.settings.ttl;
+        let authority = plan.authority;
+        if authority.is_some() || ttl_changed {
             let mut minting = self.minting.lock().unwrap_or_else(PoisonError::into_inner);
-            minting.authority = authority;
+            if let Some(authority) = authority {
+                self.app.set_ca_not_after(authority.not_after);
+                tracing::warn!(
+                    "the interception CA changed; clients must trust the new CA before their next connection"
+                );
+                minting.authority = authority;
+            }
             minting.leaves.clear();
         }
         *self
@@ -519,20 +524,23 @@ impl Interceptor {
         self.settings().hosts.contains_key(host)
     }
 
-    /// True when a CONNECT to `host` may be intercepted. A host served from a stream spends that
-    /// stream's keys, so the client must present the stream's token; a passthrough host spends none.
-    pub fn authorize(&self, host: &str, proxy_authorization: Option<&str>) -> bool {
+    /// Returns the authorised host entry from one settings snapshot, or `None` when a CONNECT to
+    /// `host` may not be intercepted. A host served from a stream spends that stream's keys, so the
+    /// client must present the stream's token; a passthrough host spends none. The caller passes
+    /// the returned entry to [`Interceptor::serve`], so a reload cannot change the stream that
+    /// serves an already-authorised tunnel.
+    pub fn authorize(
+        &self,
+        host: &str,
+        proxy_authorization: Option<&str>,
+    ) -> Option<InterceptHost> {
         let settings = self.settings();
-        let Some(entry) = settings.hosts.get(host) else {
-            return false;
-        };
+        let entry = settings.hosts.get(host)?;
         let Some(stream) = entry.stream.as_deref().filter(|_| settings.require_auth) else {
-            return true;
+            return Some(entry.clone());
         };
-        let Some(token) = proxy_authorization.and_then(crate::auth::proxy_token) else {
-            return false;
-        };
-        self.app.snapshot().authenticate(&token) == Some(stream)
+        let token = proxy_authorization.and_then(crate::auth::proxy_token)?;
+        (self.app.snapshot().authenticate(&token) == Some(stream)).then(|| entry.clone())
     }
 
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
@@ -541,14 +549,12 @@ impl Interceptor {
         minting.config_for(host, ttl, Instant::now())
     }
 
-    /// Runs the handshake on `io`, then relays requests until the client closes.
-    pub async fn serve<S>(&self, host: &str, io: S)
+    /// Runs the handshake on `io`, then relays requests to `target` until the client closes.
+    /// `target` is the entry [`Interceptor::authorize`] approved, not a fresh settings lookup.
+    pub async fn serve<S>(&self, host: &str, target: InterceptHost, io: S)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Some(target) = self.settings().hosts.get(host).cloned() else {
-            return;
-        };
         let config = match self.config_for(host) {
             Ok(config) => config,
             Err(error) => {
@@ -748,6 +754,21 @@ mod tests {
         dir
     }
 
+    fn app_for_stream(token: &str) -> Arc<App> {
+        let text = format!(
+            "[upstream.api]\nbase_url = \"https://example.com/v1\"\n\
+             [keys.k]\nupstream = \"api\"\nfile = \"/unused\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+            crate::auth::sha256_hex(token)
+        );
+        App::new(
+            crate::config::Config::parse(&text).unwrap(),
+            [("k".to_owned(), crate::proxy::Secret::new("upstream-secret"))].into(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        )
+    }
+
     fn intercept_config(dir: &Path, hosts: &[&str]) -> InterceptConfig {
         InterceptConfig {
             ca_cert: dir.join("ca.pem").display().to_string(),
@@ -765,6 +786,43 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn an_authorised_target_survives_a_reload_before_serve() {
+        let dir = scratch("authorised-target");
+        let ca = dir.join("ca");
+        init_ca(&ca, &["api.test".to_owned()], 30, false).unwrap();
+        let mut config = intercept_config(&ca, &["api.test"]);
+        config.hosts[0].upstream = "api".to_owned();
+        config.hosts[0].stream = Some("s".to_owned());
+        let interceptor = Interceptor::new(app_for_stream("tok"), &config).unwrap();
+
+        assert!(interceptor
+            .authorize("api.test", Some("Bearer wrong"))
+            .is_none());
+        assert!(interceptor.authorize("api.test", None).is_none());
+        let target = interceptor
+            .authorize("api.test", Some("Bearer tok"))
+            .expect("the stream token authorises the host");
+        assert_eq!(target.upstream, "api");
+        assert_eq!(target.stream.as_deref(), Some("s"));
+
+        let mut next = config.clone();
+        next.hosts[0].upstream = "other".to_owned();
+        interceptor.apply_reload(interceptor.plan_reload(&next).unwrap());
+        assert_eq!(
+            target.upstream, "api",
+            "the entry handed to serve must be the authorised one"
+        );
+        assert_eq!(
+            interceptor
+                .authorize("api.test", Some("Bearer tok"))
+                .unwrap()
+                .upstream,
+            "other",
+            "a fresh CONNECT uses the reloaded host"
+        );
     }
 
     fn write_ca(dir: &Path, params: CertificateParams) {
@@ -796,6 +854,38 @@ mod tests {
             .config_for("api.example.com", ttl, t0 + Duration::from_secs(1801))
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &renewed));
+    }
+
+    #[test]
+    fn a_leaf_ttl_change_drops_the_cached_leaves() {
+        let dir = scratch("ttl-cache");
+        let ca = dir.join("ca");
+        init_ca(&ca, &["api.example.com".to_owned()], 30, false).unwrap();
+        let mut config = intercept_config(&ca, &["api.example.com"]);
+        let app = crate::proxy::App::new(
+            crate::config::Config::parse("").unwrap(),
+            HashMap::new(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let interceptor = Interceptor::new(Arc::clone(&app), &config).unwrap();
+        let first = interceptor.config_for("api.example.com").unwrap();
+
+        config.leaf_ttl_hours = 48;
+        let plan = interceptor.plan_reload(&config).unwrap();
+        assert!(
+            plan.changed
+                .iter()
+                .any(|change| change == "intercept leaf_ttl_hours"),
+            "{:?}",
+            plan.changed
+        );
+        interceptor.apply_reload(plan);
+        let second = interceptor.config_for("api.example.com").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the cached leaf must be replaced when the TTL changes"
+        );
     }
 
     #[test]

@@ -96,14 +96,14 @@ pub(crate) fn upstreams(
                 .map_or(Value::Null, status_class),
         });
         if let Some(pressure) = pressure {
-            let (requests, limited) = pressure.totals(name, now);
-            entry["requests_1h"] = json!(requests);
-            entry["limited_1h"] = json!(limited);
-            entry["request_buckets"] = json!(pressure.buckets(name, now));
-            entry["tokens_1h"] = json!(pressure.token_totals(name, now));
-            entry["token_buckets"] = json!(pressure.token_buckets(name, now));
-            entry["request_minutes"] = json!(pressure.minutes(name, now));
-            entry["token_minutes"] = json!(pressure.token_minutes(name, now));
+            let snapshot = pressure.snapshot(name, now);
+            entry["requests_1h"] = json!(snapshot.requests_1h);
+            entry["limited_1h"] = json!(snapshot.limited_1h);
+            entry["request_buckets"] = json!(snapshot.buckets);
+            entry["tokens_1h"] = json!(snapshot.tokens_1h);
+            entry["token_buckets"] = json!(snapshot.token_buckets);
+            entry["request_minutes"] = json!(snapshot.minutes);
+            entry["token_minutes"] = json!(snapshot.token_minutes);
         }
         if labels {
             entry["keys"] = Value::Array(listed);

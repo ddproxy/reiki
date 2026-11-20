@@ -64,6 +64,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "json"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
+reiki-detect = { path = "crates/reiki-detect" }
 reiki-phi = { path = "crates/reiki-phi", optional = true }
 reiki-finance = { path = "crates/reiki-finance", optional = true }
 reiki-controlled = { path = "crates/reiki-controlled", optional = true }

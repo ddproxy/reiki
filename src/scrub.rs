@@ -21,6 +21,12 @@ type ByteResult = Result<Bytes, std::io::Error>;
 /// one form per boundary per separator. The cap keeps an unusually long credential bounded.
 const MAX_FORMS_PER_SECRET: usize = 4096;
 
+/// Slots of each secret's budget that the raw form and its split forms keep for themselves.
+/// Encodings and escapes may use only what is left, so they cannot push the split forms out of a
+/// long key's list. Space-separated forms come first, so an echoed key with a space at any
+/// boundary is still recognised.
+const SPLIT_FORM_BUDGET: usize = MAX_FORMS_PER_SECRET / 2;
+
 /// Every byte string that stands for one of `secrets`, longest first.
 pub fn forms(secrets: &[&str]) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -28,6 +34,9 @@ pub fn forms(secrets: &[&str]) -> Vec<Vec<u8>> {
         let raw = secret.as_bytes();
         let mut per_secret: Vec<Vec<u8>> = Vec::new();
         per_secret.push(raw.to_vec());
+        // The raw form and its split forms come first and get a reserved half of the budget, so
+        // the many encoding variants below cannot crowd them out for a long key.
+        per_secret.extend(split_forms(secret).into_iter().take(SPLIT_FORM_BUDGET));
         per_secret.extend(json_forms(secret));
         per_secret.extend(percent_forms(raw));
         per_secret.extend(percent_all_forms(raw));
@@ -46,7 +55,6 @@ pub fn forms(secrets: &[&str]) -> Vec<Vec<u8>> {
                 }
             }
         }
-        per_secret.extend(split_forms(secret));
         per_secret.truncate(MAX_FORMS_PER_SECRET);
         out.extend(per_secret);
     }
@@ -269,7 +277,14 @@ fn base64_at_offset(raw: &[u8], offset: usize, alphabet: &[u8; 64]) -> Option<Ve
 fn split_forms(text: &str) -> Vec<Vec<u8>> {
     let chars: Vec<char> = text.chars().collect();
     let mut forms = Vec::new();
-    for byte in (0u8..=0x20).chain(std::iter::once(0x7f)) {
+    // A space is by far the most common separator injected by an echoing service, so its forms
+    // come first and survive a budget that cannot hold every separator for a very long key.
+    let separators = std::iter::once(b' ').chain(
+        (0u8..=0x20)
+            .chain(std::iter::once(0x7f))
+            .filter(|b| *b != b' '),
+    );
+    for byte in separators {
         let separator = char::from(byte);
         let mut joined = String::new();
         for (i, c) in chars.iter().enumerate() {
@@ -686,6 +701,26 @@ mod tests {
     fn forms_are_capped_per_secret() {
         let long = "k".repeat(512);
         assert!(forms(&[&long]).len() <= MAX_FORMS_PER_SECRET);
+    }
+
+    #[test]
+    fn a_long_key_with_an_inserted_space_is_scrubbed() {
+        let key = format!("sk-{}", "a".repeat(97));
+        assert_eq!(key.len(), 100);
+        let mut scrubber = StreamScrubber::new(&[&key]).unwrap();
+        for split in 1..key.len() {
+            let echoed = format!("echo {} {} end", &key[..split], &key[split..]);
+            let expected = format!("echo [{}] end", "*".repeat(key.len() - 1));
+            let out = scrubber.feed(echoed.as_bytes(), true);
+            assert_eq!(out.len(), echoed.len(), "split {split}");
+            assert_eq!(
+                String::from_utf8(out.to_vec()).unwrap(),
+                expected,
+                "split {split}"
+            );
+        }
+        let echoed = format!("echo {} {} end", &key[..50], &key[50..]);
+        assert!(!scrub_text(&echoed, &[&key]).contains(&key[..20]));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::classify::{civil_from_days, days_from_civil};
+use crate::classify::days_from_civil;
+use reiki_plugin::civil_from_days;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_OFFSET_SECONDS: i64 = 14 * 3_600;

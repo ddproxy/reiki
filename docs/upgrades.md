@@ -40,7 +40,7 @@ This is the complete map for every config table and key. "Live" means the change
 | `[tunnel.intercept]`: `ca_key_permissions` | Check only | — | The CA key mode check runs on each reload. The policy has no running state to swap. |
 | `[tunnel.intercept]`: `hosts` | Live | — | Rebuilds the intercept host table. |
 | Adding or removing `[tunnel.intercept]` | — | Yes | Interception is bound at start. |
-| `[[tunnel.intercept.hosts]]`: `host`, `upstream`, `stream`, `paths` | Live | — | Applied with the intercept host table. |
+| `[[tunnel.intercept.hosts]]`: `host`, `upstream`, `stream`, `paths` | Live | — | Applied with the intercept host table to new CONNECTs; an open CONNECT keeps the host it was authorised with. |
 | `[peers]`: `enabled`, `publish`, `listen` | — | Yes | Label `peers.listen` when the publishing listener appears, moves or goes away. |
 | `[peers]`: `instance`, `expose_key_labels`, `expose_host_stats`, `expose_usage`, `session_header`, `session_window_secs`, `stream_interval_secs`, `cooldown_bucket_secs` | Live | — | Publisher payload and stream events. |
 | `[peers]`: `max_subscribers`, `max_subscribers_per_peer`, `max_subscribers_per_token` | Live | — | Apply to new streams. Open streams keep their limits, and the listener's accepted-connection capacity is fixed at start. |

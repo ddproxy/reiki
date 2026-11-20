@@ -529,6 +529,30 @@ async fn concurrent_stale_logins_still_lock_out_the_shared_address() {
 }
 
 #[tokio::test]
+async fn a_concurrent_burst_cannot_all_pass_the_login_check() {
+    // With a one-failure threshold only the very first concurrent guess may be authenticated
+    // and counted; the rest must see the reservation made under the same lock.
+    let rig = Rig::new("[auth]\nmax_failures = 1\n").await;
+    let burst = futures_util::future::join_all(
+        (0..16).map(|_| rig.peer_get("/v1/health", Some("revoked-token"))),
+    )
+    .await;
+    let allowed = burst.iter().filter(|(code, _)| *code == 401).count();
+    assert_eq!(
+        allowed,
+        1,
+        "statuses: {:?}",
+        burst.iter().map(|(c, _)| c).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        burst.iter().filter(|(code, _)| *code == 429).count(),
+        15,
+        "every other guess is refused"
+    );
+    assert_eq!(rig.peer_get("/v1/health", Some(PEER_TOKEN)).await.0, 429);
+}
+
+#[tokio::test]
 async fn the_openapi_document_describes_health_on_the_peer_listener() {
     let rig = Rig::new("").await;
     let text = rig

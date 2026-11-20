@@ -25,14 +25,14 @@ model_aliases = { "gpt-4o" = "opencode/gpt-4o" }
 drop_params = ["stream_options"]
 ```
 
-Reiki rewrites the body once before picking a key, so failover replays the same bytes. A non-object body, a missing or non-string `model`, an unknown model and a non-matching `drop_params` pass through byte-for-byte. Only top-level keys are dropped; nested objects stay. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise they must match exactly.
+Reiki rewrites the body once before picking a key, so failover replays the same bytes. A non-object body, a missing or non-string `model`, an unknown model and a non-matching `drop_params` pass through byte-for-byte. Only top-level keys are dropped; nested objects stay. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise they must match exactly. A body with more than 4096 top-level members is left untouched instead of being scanned to the end.
 
 ## Transport options
 
 By default Reiki uses HTTP/1.1, asks for uncompressed responses and sends lowercase header names. Optional settings make the relay more of a plain pass-through:
 
 - `http2 = true` negotiates HTTP/2 when the upstream offers it over TLS; without TLS the connection stays HTTP/1.1.
-- `forward_accept_encoding = true` sends the client's `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd so error bodies can be read for failover and logging; the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is.
+- `forward_accept_encoding = true` sends the client's `Accept-Encoding` upstream instead of `identity`; a client that sent none still gets `identity`. Reiki decodes gzip, deflate, brotli and zstd so error bodies can be read for failover and logging; the client gets plain bytes without `Content-Encoding`. A forward upstream relays `content-encoding` as-is; if that coding is one Reiki cannot decode and a key is in play, the response is refused with 502 instead of relayed with an unscrubbed echoed key.
 - `max_decoded_bytes` caps a body after decoding, compressed responses included. Default 64 MiB, at least 1. A decoded non-SSE response over the cap becomes a 502 before anything reaches the client; an SSE response that passes the cap ends with an error. The compressed bytes read are capped too, at max(2x this cap, 1 MiB), so an endless body that decodes to nothing cannot be consumed without bound; exceeding it fails the response the same way.
 - `response_idle_timeout_secs` drops a response body with no chunk for that many seconds. Default 300, at least 1. A buffered decoded body answers 504; a streamed body ends with an error.
 - `response_timeout_secs` bounds the whole body from its head. Unset means 300 seconds for a body that is not an event stream, and no total limit for an event stream; at least 1 when set. An explicit value applies to event streams too. The separate 120-second request timeout bounds the wait for the head.
@@ -118,7 +118,7 @@ Client-sent `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Pro
 
 ### What Reiki does with the answer
 
-The status must be 200-599. Without `streaming`, the body is buffered whole: up to 8 MiB, 128 headers and 64 KiB per header value; chunked responses are joined. Reiki sets `content-length` to the buffered length (HEAD keeps the forwarder's length; 204 and 304 carry none) and relays `content-encoding` without decoding it. `Expect` is not passed on and hop-by-hop headers are removed. Nothing reaches the client until the forwarder finishes.
+The status must be 200-599. Without `streaming`, the body is buffered whole: up to 8 MiB, 128 headers and 64 KiB per header value; chunked responses are joined. Reiki sets `content-length` to the buffered length (HEAD keeps the forwarder's length; 204 and 304 carry none) and relays `content-encoding` without decoding it; when a key is in play, a coding Reiki cannot decode makes the response fail with 502 rather than relay raw bytes. `Expect` is not passed on and hop-by-hop headers are removed. Nothing reaches the client until the forwarder finishes.
 
 ### Streaming
 
@@ -133,7 +133,7 @@ streaming = true
 
 - The response returns as soon as its head is in; the body then flows unbuffered, so the 8 MiB cap does not apply.
 - The 120-second request timeout bounds only the wait for the head, not the body.
-- A reported `content-length` is kept; otherwise the body is chunked. `transfer-encoding` and the other hop-by-hop headers are removed, and `content-encoding` is still relayed as-is.
+- A reported `content-length` is kept; otherwise the body is chunked. `transfer-encoding` and the other hop-by-hop headers are removed, and `content-encoding` is still relayed as-is unless it names a coding Reiki cannot decode while a key is in play, in which case the response is refused with 502.
 - A forwarder that fails after the head cannot be retried or fall back: the client sees the body end early with an error. A failure before the head is handled as for a buffered answer.
 - A `command` keeps its concurrency slot and process until the body ends or the client disconnects; a disconnecting client ends the child after the usual 1-second grace.
 - Error statuses are read whole for key classification, so a streaming forwarder's 401 or 429 fails over as before.
@@ -180,7 +180,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, follows the [quota rules](classification.md#cooldown-values); other 429s follow the rate-limit rule there. These rules are unit-tested but not exercised with a real exhausted key.
+Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, follows the [quota rules](classification.md#cooldowns); other 429s follow the rate-limit rule there. These rules are unit-tested but not exercised with a real exhausted key.
 
 ## OpenCode Zen
 
@@ -193,7 +193,7 @@ Client base URL: `http://127.0.0.1:4097/zen`. For OpenCode, set `provider.openco
 
 Some providers answer a usable key with a transient quota 429 (`FreeUsageLimitError`) and accepts the next request. Set `confirm_quota = true` to send such a 429 once more on the same key after the [pause in the classification rules](classification.md#reading-order) before cooling it; only a repeated quota 429 takes the key out of rotation. A genuinely exhausted key pays one extra request and the pause per request.
 
-A free-tier account answers a paid model with 402 while its free models keep working, so a whole-key cooldown would take them down too. A 402 and a plain rate-limit 429 are scoped to the request's route and model: the key keeps serving other combinations, and `/status` lists the cooling combination under `scopes`. A quota 429 still cools the whole key, because it concerns the account, not one model. `scope_escalate_after` sets how many models may be cooling before another failure cools the key; see the [cooldown table](classification.md#cooldown-values).
+A free-tier account answers a paid model with 402 while its free models keep working, so a whole-key cooldown would take them down too. A 402 and a plain rate-limit 429 are scoped to the request's route and model: the key keeps serving other combinations, and `/status` lists the cooling combination under `scopes`. A quota 429 still cools the whole key, because it concerns the account, not one model. `scope_escalate_after` sets how many models may be cooling before another failure cools the key; see the [cooldown table](classification.md#cooldowns).
 
 Zen's free models only accept requests carrying OpenCode's own headers; Reiki forwards every header except the credential, so the free tier keeps working.
 
@@ -280,5 +280,5 @@ A request to `/zen-direct/chat/completions` goes to `https://opencode.ai/zen/v1/
 - No Reiki token is checked, so a client needs none. Anything that can reach the listener can use the upstream with its own credentials, so keep the listener on loopback or behind your own access control.
 - No key from the chain is used and there is no failover. Keys and streams cannot refer to a passthrough upstream, and it cannot have a `fallback`.
 - Plugins still run, so the request log and the placeholders plugin work. The log names the key `-`.
-- Only hop-by-hop headers, `Host` and `Content-Length` are dropped. `Accept-Encoding` is forwarded when the upstream sets `forward_accept_encoding`, and replaced with `identity` otherwise.
+- Only hop-by-hop headers, `Host` and `Content-Length` are dropped. `Accept-Encoding` is forwarded when the upstream sets `forward_accept_encoding`, and replaced with `identity` otherwise. A response coding Reiki cannot decode is refused with 502 when a key is in play, so raw bytes cannot bypass scrubbing.
 - Reiki still terminates TLS and opens its own connection, as any reverse proxy does, so the upstream sees Reiki's TLS handshake and HTTP version rather than the client's.

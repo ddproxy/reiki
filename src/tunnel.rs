@@ -396,7 +396,7 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
         .as_ref()
         .filter(|i| port == 443 && i.handles(&host))
     {
-        if !interceptor.authorize(&host, proxy_authorization.as_deref()) {
+        let Some(target) = interceptor.authorize(&host, proxy_authorization.as_deref()) else {
             tracing::warn!(%host, "tunnel refused an intercepted host without a valid stream token");
             let message = "a stream token is required";
             let response = format!(
@@ -405,14 +405,14 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
             );
             client.write_all(response.as_bytes()).await?;
             return client.shutdown().await;
-        }
+        };
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         tracing::info!(%host, "tunnel intercepting");
         let _ = tokio::time::timeout(
             MAX_TUNNEL_LIFETIME,
-            interceptor.serve(&host, Prefixed::new(rest, client)),
+            interceptor.serve(&host, target, Prefixed::new(rest, client)),
         )
         .await;
         return Ok(());

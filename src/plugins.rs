@@ -446,9 +446,12 @@ impl PluginChain {
     }
 
     /// Tells each plugin the process is stopping, so a buffering plugin can write out what it holds.
+    /// A panicking hook is logged and skipped, so the other plugins still get to shut down.
     pub fn shutdown(&self) {
         for entry in &self.entries {
-            entry.plugin.on_shutdown();
+            let _ = guard(entry.plugin.name(), "on_shutdown", || {
+                entry.plugin.on_shutdown();
+            });
         }
     }
 
@@ -460,9 +463,17 @@ impl PluginChain {
             .collect()
     }
 
-    /// Creates the per-request state for every plugin, in chain order.
+    /// Creates the per-request state for every plugin, in chain order. A panicking hook is
+    /// logged and skipped: that plugin gets the same default state as one that implements no
+    /// `new_state`, so the request keeps its one-state-per-plugin shape.
     pub fn states(&self) -> Vec<Box<dyn Any + Send>> {
-        self.entries.iter().map(|e| e.plugin.new_state()).collect()
+        self.entries
+            .iter()
+            .map(|e| {
+                guard(e.plugin.name(), "new_state", || e.plugin.new_state())
+                    .unwrap_or_else(|| Box::new(()))
+            })
+            .collect()
     }
 
     /// Runs `on_request` on every plugin, in order, mutating the request in
@@ -1383,6 +1394,77 @@ mod tests {
             *SEEN.lock().unwrap(),
             [Some("getweatherx".to_owned()), None]
         );
+    }
+
+    #[test]
+    fn a_panicking_on_shutdown_does_not_stop_the_other_plugins() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLED: AtomicUsize = AtomicUsize::new(0);
+
+        struct PanicShutdown;
+        impl Plugin for PanicShutdown {
+            fn name(&self) -> &str {
+                "panic_shutdown"
+            }
+            fn on_shutdown(&self) {
+                panic!("boom");
+            }
+        }
+        struct After;
+        impl Plugin for After {
+            fn name(&self) -> &str {
+                "after"
+            }
+            fn on_shutdown(&self) {
+                CALLED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let registry = vec![
+            Registration {
+                name: "panic_shutdown",
+                build: |_| Ok(Box::new(PanicShutdown) as Box<dyn Plugin>),
+            },
+            Registration {
+                name: "after",
+                build: |_| Ok(Box::new(After) as Box<dyn Plugin>),
+            },
+        ];
+        let chain =
+            PluginChain::build(&configured("[panic_shutdown]\n[after]\n"), &registry).unwrap();
+        chain.shutdown();
+        assert_eq!(CALLED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_new_state_yields_a_skippable_default_state() {
+        struct PanicState;
+        impl Plugin for PanicState {
+            fn name(&self) -> &str {
+                "panic_state"
+            }
+            fn new_state(&self) -> Box<dyn Any + Send> {
+                panic!("boom");
+            }
+            fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+                *ctx.body = Bytes::from_static(b"still served");
+                Ok(())
+            }
+        }
+        let registry = vec![Registration {
+            name: "panic_state",
+            build: |_| Ok(Box::new(PanicState) as Box<dyn Plugin>),
+        }];
+        let chain = PluginChain::build(&configured("[panic_state]\n"), &registry).unwrap();
+        let mut states = chain.states();
+        assert_eq!(states.len(), 1, "one state per plugin, even after a panic");
+        assert!(
+            states[0].is::<()>(),
+            "the default state lets the other hooks skip as usual"
+        );
+        let mut body = Bytes::new();
+        request(&chain, &mut states, &mut body).unwrap();
+        assert_eq!(&body[..], b"still served");
     }
 
     #[test]

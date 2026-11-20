@@ -42,6 +42,18 @@ pub(crate) struct PressureCounter {
     upstreams: Mutex<HashMap<String, Series>>,
 }
 
+/// The last-hour request and token figures for one upstream, read under a single lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PressureSnapshot {
+    pub(crate) requests_1h: u64,
+    pub(crate) limited_1h: u32,
+    pub(crate) tokens_1h: u64,
+    pub(crate) buckets: [u32; BUCKETS],
+    pub(crate) token_buckets: [u64; BUCKETS],
+    pub(crate) minutes: [u32; MINUTE_SLOTS],
+    pub(crate) token_minutes: [u32; MINUTE_SLOTS],
+}
+
 impl PressureCounter {
     pub(crate) fn new() -> Self {
         Self {
@@ -82,113 +94,40 @@ impl PressureCounter {
         slot.tokens = slot.tokens.saturating_add(tokens);
     }
 
-    /// Attempts and limited attempts in the last hour, saturating rather than wrapping.
-    pub(crate) fn totals(&self, upstream: &str, now: Instant) -> (u64, u32) {
+    /// All last-hour figures for `upstream`, read under one lock and at the same minute.
+    pub(crate) fn snapshot(&self, upstream: &str, now: Instant) -> PressureSnapshot {
         let minute = self.minute(now);
         let map = self
             .upstreams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(series) = map.get(upstream) else {
-            return (0, 0);
+            return PressureSnapshot::default();
         };
-        let (mut requests, mut limited) = (0u64, 0u32);
+        let mut out = PressureSnapshot::default();
         for slot in series.slots.iter().filter(|slot| in_hour(slot, minute)) {
-            requests = requests.saturating_add(u64::from(slot.requests));
-            limited = limited.saturating_add(slot.limited);
-        }
-        (requests, limited)
-    }
-
-    /// Tokens in the last hour, saturating rather than wrapping.
-    pub(crate) fn token_totals(&self, upstream: &str, now: Instant) -> u64 {
-        let minute = self.minute(now);
-        let map = self
-            .upstreams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(series) = map.get(upstream) else {
-            return 0;
-        };
-        series
-            .slots
-            .iter()
-            .filter(|slot| in_hour(slot, minute))
-            .fold(0u64, |total, slot| total.saturating_add(slot.tokens))
-    }
-
-    /// Twelve five-minute token counts, oldest first and newest last.
-    pub(crate) fn token_buckets(&self, upstream: &str, now: Instant) -> [u64; BUCKETS] {
-        let minute = self.minute(now);
-        let map = self
-            .upstreams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(series) = map.get(upstream) else {
-            return [0; BUCKETS];
-        };
-        let mut out = [0u64; BUCKETS];
-        for slot in series.slots.iter().filter(|slot| in_hour(slot, minute)) {
+            out.requests_1h = out.requests_1h.saturating_add(u64::from(slot.requests));
+            out.limited_1h = out.limited_1h.saturating_add(slot.limited);
+            out.tokens_1h = out.tokens_1h.saturating_add(slot.tokens);
             let bucket = bucket_of(slot, minute);
-            out[bucket] = out[bucket].saturating_add(slot.tokens);
+            out.buckets[bucket] = out.buckets[bucket].saturating_add(slot.requests);
+            out.token_buckets[bucket] = out.token_buckets[bucket].saturating_add(slot.tokens);
         }
-        out
-    }
-
-    /// Twelve five-minute buckets, oldest first and newest last.
-    pub(crate) fn buckets(&self, upstream: &str, now: Instant) -> [u32; BUCKETS] {
-        let minute = self.minute(now);
-        let map = self
-            .upstreams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(series) = map.get(upstream) else {
-            return [0; BUCKETS];
-        };
-        let mut out = [0u32; BUCKETS];
-        for slot in series.slots.iter().filter(|slot| in_hour(slot, minute)) {
-            let bucket = bucket_of(slot, minute);
-            out[bucket] = out[bucket].saturating_add(slot.requests);
-        }
-        out
-    }
-
-    /// The last ten one-minute request counts, oldest first and newest last, saturating at u32.
-    pub(crate) fn minutes(&self, upstream: &str, now: Instant) -> [u32; MINUTE_SLOTS] {
-        self.recent(upstream, now, |slot| slot.requests)
-    }
-
-    /// The last ten one-minute token counts, oldest first and newest last, saturating at u32.
-    pub(crate) fn token_minutes(&self, upstream: &str, now: Instant) -> [u32; MINUTE_SLOTS] {
-        self.recent(upstream, now, |slot| {
-            u32::try_from(slot.tokens).unwrap_or(u32::MAX)
-        })
-    }
-
-    fn recent(
-        &self,
-        upstream: &str,
-        now: Instant,
-        figure: impl Fn(&Slot) -> u32,
-    ) -> [u32; MINUTE_SLOTS] {
-        let minute = self.minute(now);
-        let map = self
-            .upstreams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(series) = map.get(upstream) else {
-            return [0; MINUTE_SLOTS];
-        };
         // Looked up by minute: an empty slot still carries minute 0, so scanning the slots would
         // let an unused one overwrite a real minute 0.
-        let mut out = [0u32; MINUTE_SLOTS];
-        for (position, value) in out.iter_mut().enumerate() {
+        for (position, (requests, tokens)) in out
+            .minutes
+            .iter_mut()
+            .zip(out.token_minutes.iter_mut())
+            .enumerate()
+        {
             let Some(wanted) = minute.checked_sub((MINUTE_SLOTS - 1 - position) as u64) else {
                 continue;
             };
             let slot = &series.slots[(wanted % MINUTES as u64) as usize];
             if slot.minute == wanted {
-                *value = figure(slot);
+                *requests = slot.requests;
+                *tokens = u32::try_from(slot.tokens).unwrap_or(u32::MAX);
             }
         }
         out
@@ -211,12 +150,12 @@ pub(crate) fn upstream_usage(
         .iter()
         .filter(|(_, upstream)| !upstream.passthrough)
         .map(|(name, _)| {
-            let (requests, limited) = pressure.totals(name, now);
+            let snapshot = pressure.snapshot(name, now);
             UpstreamUsage {
                 upstream: name.clone(),
-                requests_1h: requests,
-                limited_1h: u64::from(limited),
-                tokens_1h: pressure.token_totals(name, now),
+                requests_1h: snapshot.requests_1h,
+                limited_1h: u64::from(snapshot.limited_1h),
+                tokens_1h: snapshot.tokens_1h,
             }
         })
         .collect()
@@ -271,9 +210,10 @@ mod tests {
         }
         counter.record("zen", true, t0 + std::time::Duration::from_secs(55 * 60));
         let at = t0 + std::time::Duration::from_secs(59 * 60);
-        assert_eq!(counter.totals("zen", at), (5, 1));
+        let snapshot = counter.snapshot("zen", at);
+        assert_eq!((snapshot.requests_1h, snapshot.limited_1h), (5, 1));
         assert_eq!(
-            counter.buckets("zen", at),
+            counter.snapshot("zen", at).buckets,
             [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2],
             "minutes 0, 5 and 10 fall into their own five-minute buckets"
         );
@@ -286,9 +226,10 @@ mod tests {
         counter.record("zen", false, t0);
         counter.record("zen", false, t0 + std::time::Duration::from_secs(59));
         let at = t0 + std::time::Duration::from_secs(60);
-        assert_eq!(counter.totals("zen", at), (2, 0));
+        let snapshot = counter.snapshot("zen", at);
+        assert_eq!((snapshot.requests_1h, snapshot.limited_1h), (2, 0));
         assert_eq!(
-            counter.buckets("zen", at),
+            counter.snapshot("zen", at).buckets,
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
             "both seconds are in the newest five-minute bucket"
         );
@@ -300,10 +241,12 @@ mod tests {
         let t0 = Instant::now();
         counter.record("zen", true, t0);
         let later = t0 + std::time::Duration::from_secs(60 * 60);
-        assert_eq!(counter.totals("zen", later), (0, 0));
-        assert_eq!(counter.buckets("zen", later), [0; BUCKETS]);
-        assert_eq!(counter.totals("never-seen", t0), (0, 0));
-        assert_eq!(counter.buckets("never-seen", t0), [0; BUCKETS]);
+        let snapshot = counter.snapshot("zen", later);
+        assert_eq!((snapshot.requests_1h, snapshot.limited_1h), (0, 0));
+        assert_eq!(snapshot.buckets, [0; BUCKETS]);
+        let snapshot = counter.snapshot("never-seen", t0);
+        assert_eq!((snapshot.requests_1h, snapshot.limited_1h), (0, 0));
+        assert_eq!(snapshot.buckets, [0; BUCKETS]);
     }
 
     #[test]
@@ -319,8 +262,12 @@ mod tests {
             slot.limited = u32::MAX;
         }
         counter.record("zen", true, t0);
-        assert_eq!(counter.totals("zen", t0), (u64::from(u32::MAX), u32::MAX));
-        assert_eq!(counter.buckets("zen", t0)[BUCKETS - 1], u32::MAX);
+        let snapshot = counter.snapshot("zen", t0);
+        assert_eq!(
+            (snapshot.requests_1h, snapshot.limited_1h),
+            (u64::from(u32::MAX), u32::MAX)
+        );
+        assert_eq!(snapshot.buckets[BUCKETS - 1], u32::MAX);
     }
 
     #[test]
@@ -340,8 +287,9 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(counter.totals("zen", t0), (8000, 8000));
-        assert_eq!(counter.buckets("zen", t0)[BUCKETS - 1], 8000);
+        let snapshot = counter.snapshot("zen", t0);
+        assert_eq!((snapshot.requests_1h, snapshot.limited_1h), (8000, 8000));
+        assert_eq!(snapshot.buckets[BUCKETS - 1], 8000);
     }
 
     #[test]
@@ -353,19 +301,20 @@ mod tests {
         counter.record_tokens("zen", 5, at(5 * 60));
         counter.record_tokens("zen", 7, at(59 * 60));
         counter.record_tokens("other", 1, t0);
-        assert_eq!(counter.token_totals("zen", at(59 * 60)), 22);
+        assert_eq!(counter.snapshot("zen", at(59 * 60)).tokens_1h, 22);
         let mut expected = [0u64; BUCKETS];
         expected[0] = 10;
         expected[1] = 5;
         expected[BUCKETS - 1] = 7;
-        assert_eq!(counter.token_buckets("zen", at(59 * 60)), expected);
+        assert_eq!(counter.snapshot("zen", at(59 * 60)).token_buckets, expected);
+        let snapshot = counter.snapshot("zen", at(59 * 60));
         assert_eq!(
-            counter.totals("zen", at(59 * 60)),
+            (snapshot.requests_1h, snapshot.limited_1h),
             (0, 0),
             "requests are separate"
         );
         assert_eq!(
-            counter.token_totals("zen", at(60 * 60 + 60)),
+            counter.snapshot("zen", at(60 * 60 + 60)).tokens_1h,
             12,
             "minute 0 ages out"
         );
@@ -373,12 +322,15 @@ mod tests {
         counter.record_tokens("zen", u64::MAX, t0);
         counter.record_tokens("zen", 1, t0);
         assert_eq!(
-            counter.token_totals("zen", t0),
+            counter.snapshot("zen", t0).tokens_1h,
             u64::MAX,
             "saturates, never wraps"
         );
-        assert_eq!(counter.token_totals("never-seen", t0), 0);
-        assert_eq!(counter.token_buckets("never-seen", t0), [0; BUCKETS]);
+        assert_eq!(counter.snapshot("never-seen", t0).tokens_1h, 0);
+        assert_eq!(
+            counter.snapshot("never-seen", t0).token_buckets,
+            [0; BUCKETS]
+        );
     }
 
     #[test]
@@ -388,7 +340,7 @@ mod tests {
         counter.record_tokens("zen", 100, t0);
         let later = t0 + std::time::Duration::from_secs(60 * 60);
         counter.record_tokens("zen", 3, later);
-        assert_eq!(counter.token_totals("zen", later), 3);
+        assert_eq!(counter.snapshot("zen", later).tokens_1h, 3);
     }
 
     #[test]
@@ -405,20 +357,23 @@ mod tests {
         counter.record_tokens("zen", 5, at(3));
         counter.record_tokens("zen", u64::from(u32::MAX) + 9, at(12));
         assert_eq!(
-            counter.minutes("zen", at(12)),
+            counter.snapshot("zen", at(12)).minutes,
             [2, 0, 0, 0, 0, 0, 0, 0, 0, 3],
             "minute 2 is outside the ten minutes ending at minute 12"
         );
         assert_eq!(
-            counter.token_minutes("zen", at(12))[9],
+            counter.snapshot("zen", at(12)).token_minutes[9],
             u32::MAX,
             "tokens saturate to u32"
         );
-        assert_eq!(counter.token_minutes("zen", at(12))[0], 5);
-        assert_eq!(counter.minutes("zen", at(70)), [0; MINUTE_SLOTS]);
-        assert_eq!(counter.minutes("never-seen", at(12)), [0; MINUTE_SLOTS]);
+        assert_eq!(counter.snapshot("zen", at(12)).token_minutes[0], 5);
+        assert_eq!(counter.snapshot("zen", at(70)).minutes, [0; MINUTE_SLOTS]);
         assert_eq!(
-            counter.token_minutes("never-seen", at(12)),
+            counter.snapshot("never-seen", at(12)).minutes,
+            [0; MINUTE_SLOTS]
+        );
+        assert_eq!(
+            counter.snapshot("never-seen", at(12)).token_minutes,
             [0; MINUTE_SLOTS]
         );
     }
@@ -430,7 +385,7 @@ mod tests {
         counter.record("zen", false, t0);
         let at_nine = t0 + std::time::Duration::from_secs(9 * 60);
         assert_eq!(
-            counter.minutes("zen", at_nine),
+            counter.snapshot("zen", at_nine).minutes,
             [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             "minute 0 is the oldest of the ten, and empty slots draw nothing"
         );

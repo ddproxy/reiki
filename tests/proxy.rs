@@ -9,7 +9,7 @@ use axum::response::Response;
 use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{router, App, Clock, Secret};
 
 mod common;
 use common::serve;
@@ -187,7 +187,32 @@ struct Harness {
     relay: String,
     client: reqwest::Client,
     app: Arc<App>,
+    clock: Arc<TestClock>,
     admin: Option<String>,
+}
+
+/// The clock injected into test apps: pinned at `new` or `set`, then advancing with real time.
+struct TestClock {
+    state: Mutex<(SystemTime, Instant)>,
+}
+
+impl TestClock {
+    fn at(now: SystemTime) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new((now, Instant::now())),
+        })
+    }
+
+    fn set(&self, now: SystemTime) {
+        *self.state.lock().unwrap() = (now, Instant::now());
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> SystemTime {
+        let (base, started) = *self.state.lock().unwrap();
+        base.checked_add(started.elapsed()).unwrap_or(base)
+    }
 }
 
 fn sha(token: &str) -> String {
@@ -375,14 +400,15 @@ async fn harness_with_shaper(
     let (config, keys) = config_with_shaper(&mock_url, &keys, streams, limits);
     let plugins =
         reiki::plugins::PluginChain::build(&config.plugins, &reiki::plugins::builtin()).unwrap();
-    let app = App::with_plugins(
+    let clock = TestClock::at(wall);
+    let app = App::with_plugins_and_clock(
         config,
         keys,
         Policy::default(),
         Duration::from_secs(120),
         plugins,
+        Arc::clone(&clock) as Arc<dyn Clock>,
     );
-    app.set_wall_clock(wall);
     let relay = serve(router(Arc::clone(&app))).await;
     let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
     Harness {
@@ -391,6 +417,7 @@ async fn harness_with_shaper(
         relay,
         client: reqwest::Client::new(),
         app,
+        clock,
         admin: Some(admin),
     }
 }
@@ -470,7 +497,15 @@ async fn harness_with_admin_opts(
     let config = Config::parse(&text).unwrap();
     let plugins =
         reiki::plugins::PluginChain::build(&config.plugins, &reiki::plugins::builtin()).unwrap();
-    let app = App::with_plugins(config, key_map, policy, Duration::from_secs(120), plugins);
+    let clock = TestClock::at(SystemTime::now());
+    let app = App::with_plugins_and_clock(
+        config,
+        key_map,
+        policy,
+        Duration::from_secs(120),
+        plugins,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
     let relay = serve(router(Arc::clone(&app))).await;
     let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
     Harness {
@@ -479,6 +514,7 @@ async fn harness_with_admin_opts(
         relay,
         client: reqwest::Client::new(),
         app,
+        clock,
         admin: Some(admin),
     }
 }
@@ -498,8 +534,14 @@ async fn harness_with_quota_resets(
 
     let keys = [("a", "up-a"), ("b", "up-b"), ("c", "up-c"), ("d", "up-d")];
     let (config, keys) = config_with_quota_resets(&mock_url, &keys, resets, streams);
-    let app = App::with_header_timeout(config, keys, Policy::default(), Duration::from_secs(120));
-    app.set_wall_clock(now);
+    let clock = TestClock::at(now);
+    let app = App::with_header_timeout_and_clock(
+        config,
+        keys,
+        Policy::default(),
+        Duration::from_secs(120),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
     let relay = serve(router(Arc::clone(&app))).await;
     let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
     Harness {
@@ -508,6 +550,7 @@ async fn harness_with_quota_resets(
         relay,
         client: reqwest::Client::new(),
         app,
+        clock,
         admin: Some(admin),
     }
 }
@@ -565,7 +608,14 @@ async fn assemble(
     policy: Policy,
     header_timeout: Duration,
 ) -> Harness {
-    let app = App::with_header_timeout(config, keys, policy, header_timeout);
+    let clock = TestClock::at(SystemTime::now());
+    let app = App::with_header_timeout_and_clock(
+        config,
+        keys,
+        policy,
+        header_timeout,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
     let relay = serve(router(Arc::clone(&app))).await;
     Harness {
         mock,
@@ -573,6 +623,7 @@ async fn assemble(
         relay,
         client: reqwest::Client::new(),
         app,
+        clock,
         admin: None,
     }
 }
@@ -1195,7 +1246,7 @@ async fn a_shaped_rpm_budget_waits_for_the_next_slot() {
     }
 
     // One second short of the first slot's expiry: the request must sleep for it.
-    h.app.set_wall_clock(now + Duration::from_secs(59));
+    h.clock.set(now + Duration::from_secs(59));
     let started = Instant::now();
     let res = h.post("tok-a", "/zen/x", "3").send().await.unwrap();
     assert_eq!(res.status(), 200);
@@ -1569,7 +1620,7 @@ async fn a_provider_429_lowers_the_bucket_so_the_next_request_waits() {
     // Let the key's health cooldown pass, then jump to just before the learned
     // cap's next slot so the second request has to sleep for it.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
-    h.app.set_wall_clock(now + Duration::from_secs(59));
+    h.clock.set(now + Duration::from_secs(59));
     let started = Instant::now();
     let res = h.post("tok-a", "/zen/x", "2").send().await.unwrap();
     assert_eq!(res.status(), 200);

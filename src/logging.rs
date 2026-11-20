@@ -3,8 +3,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -107,8 +108,10 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
 /// The log file, shared by the subscriber and the SIGHUP handler.
 pub struct LogFile {
     state: Mutex<FileState>,
-    /// Set by the first failed write, which is also reported on stderr.
-    warned: AtomicBool,
+    /// Failed writes dropped because the file could not be written.
+    write_errors: AtomicU64,
+    /// Unix seconds of the last stderr warning, 0 if none yet.
+    last_warn_secs: AtomicU64,
 }
 
 impl LogFile {
@@ -124,7 +127,8 @@ impl LogFile {
         state.open()?;
         Ok(Arc::new(Self {
             state: Mutex::new(state),
-            warned: AtomicBool::new(false),
+            write_errors: AtomicU64::new(0),
+            last_warn_secs: AtomicU64::new(0),
         }))
     }
 
@@ -134,6 +138,16 @@ impl LogFile {
         state.file = None;
         state.open()
     }
+
+    fn write_errors(&self) -> u64 {
+        self.write_errors.load(Ordering::Relaxed)
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub struct FileWriter(Arc<LogFile>);
@@ -147,9 +161,18 @@ impl Write for FileWriter {
         // A log line must never take the service down, so a failed write is dropped.
         // Reported on stderr: a tracing event would come straight back to this writer.
         if let Err(error) = result {
-            if !self.0.warned.swap(true, Ordering::Relaxed) {
+            self.0.write_errors.fetch_add(1, Ordering::Relaxed);
+            let now = now_secs();
+            let prev = self.0.last_warn_secs.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 60
+                && self
+                    .0
+                    .last_warn_secs
+                    .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
                 eprintln!(
-                    "reiki: cannot write to the log file: {error}; later failures are dropped silently"
+                    "reiki: cannot write to the log file: {error}; logging errors are counted"
                 );
             }
         }
@@ -310,6 +333,11 @@ impl Logging {
         }
         self.reopen();
     }
+
+    /// Failed writes dropped by the file writer, if a log file is active.
+    pub fn file_write_errors(&self) -> Option<u64> {
+        self.file.as_ref().map(|file| file.write_errors())
+    }
 }
 
 #[cfg(test)]
@@ -452,16 +480,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_file_writes_never_fail_the_caller() {
+    fn failed_file_writes_never_fail_the_caller_and_count_errors() {
         let dir = dir("failing");
         let log = Arc::new(LogFile {
             state: Mutex::new(state(dir.join("no-such-dir").join("reiki.log"), 0, 2)),
-            warned: AtomicBool::new(false),
+            write_errors: AtomicU64::new(0),
+            last_warn_secs: AtomicU64::new(0),
         });
         let mut writer = FileWriter(Arc::clone(&log));
         assert_eq!(writer.write(b"one\n").unwrap(), 4);
         assert_eq!(writer.write(b"two\n").unwrap(), 4);
-        assert!(log.warned.load(Ordering::Relaxed));
+        assert_eq!(log.write_errors(), 2);
+        assert!(log.last_warn_secs.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

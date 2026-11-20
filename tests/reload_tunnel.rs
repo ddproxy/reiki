@@ -149,7 +149,7 @@ fn a_new_intercepted_host_and_allow_entry_apply_in_place() {
 fn require_auth_and_the_private_range_policy_change_live() {
     let rig = rig();
     assert!(
-        !rig.interceptor.authorize("api.test", None),
+        rig.interceptor.authorize("api.test", None).is_none(),
         "a token is required"
     );
     let mut wanted = rig.config(&["api.test"], "deny_private = true", &ca_of(&rig));
@@ -169,7 +169,7 @@ fn require_auth_and_the_private_range_policy_change_live() {
     );
     rig.tunnel.apply_reload(plan);
     assert!(
-        rig.interceptor.authorize("api.test", None),
+        rig.interceptor.authorize("api.test", None).is_some(),
         "no token needed any more"
     );
 }

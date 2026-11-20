@@ -12,7 +12,7 @@ token_sha256 = "<sha256 of the admin token>"
 
 Both fields are required. The address is bound at startup, so moving `[admin]` needs a restart; a changed token hash applies on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address next to the client one.
 
-Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`; ten bad tokens from one address in a minute get `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404`. Keep the listener on loopback or terminate TLS in front of it.
+Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`; ten bad tokens from one address in a minute get `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
 
 ```bash
 export ADMIN_TOKEN='...'
@@ -69,7 +69,8 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
     "loaded_at": "2026-11-18T09:00:00Z",
     "last_reload": { "ok": true, "at": "2026-11-18T10:12:00Z" }
   },
-  "intercept": { "ca_not_after": 1790000000, "ca_days_left": 120 }
+  "intercept": { "ca_not_after": 1790000000, "ca_days_left": 120 },
+  "log": { "write_errors": 0 }
 }
 ```
 
@@ -85,9 +86,9 @@ Key fields:
 | `cooldown_class` | Present while cooling with a known class: `rate_limited`, `quota_exhausted` or `transient`; a restored cooldown has no class |
 | `scopes` | Soonest-first route-and-model cooldowns, at most 16 entries; the key can stay `available` for other combinations |
 
-Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. The response carries key names, never key values, token hashes or file paths.
+Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. The response carries key names, never key values, token hashes or file paths.
 
-`reiki keys` reads this route and prints a table; `reiki keys --json` prints the same document. See [key health](troubleshooting.md#key-health).
+`reiki keys` reads this route and prints a table; `reiki keys --json` prints a derived key-only document with remapped states and a `streams` name list per key. See [key health](troubleshooting.md#key-health).
 
 ## GET /failures
 
@@ -130,7 +131,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 | `time` | Unix seconds |
 | `stream`, `key` | Where the failure happened |
 | `status` | Upstream status, or `null` for a transport failure |
-| `class` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient` |
+| `class` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error` |
 | `retry_after` | Received `Retry-After` header, cut to 64 characters, or `null` |
 | `cooled` | True when this failure started a cooldown or disabled the key |
 | `cooling_seconds` | Seconds left on the key's cooldown, or `null` |
@@ -170,10 +171,10 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 ```json
-{"ok":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[],"dry_run":true}
+{"ok":true,"dry_run":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-A successful apply has the same fields without `dry_run`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
+A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
 
 ## GET /v1/openapi.json
 
@@ -185,7 +186,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 ```
 
 ```text
-{"title":"Reiki admin API","version":"0.10.6"}
+{"title":"Reiki admin API","version":"0.11.0"}
 /v1/failures
 /v1/keys/enable
 /v1/metrics

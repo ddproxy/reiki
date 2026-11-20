@@ -310,17 +310,24 @@ async fn authorize<'a>(
 ) -> Result<&'a str, Box<Response>> {
     let logins = app.peer_publisher().logins();
     let key = peer.unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    if let Some(wait) = logins.blocked(key, Instant::now()) {
-        tracing::warn!(?peer, "too many failed peer logins, refusing");
-        return Err(Box::new(throttled(wait)));
-    }
+    // Check and reserve in one lock, so a burst cannot all pass before any attempt is counted.
+    let reserved = match logins.reserve(key, Instant::now()) {
+        Ok(reserved) => reserved,
+        Err(wait) => {
+            tracing::warn!(?peer, "too many failed peer logins, refusing");
+            return Err(Box::new(throttled(wait)));
+        }
+    };
     match token_matches(peers, headers) {
         Ok(name) => {
+            // Valid polls must not clear earlier failures on this listener; give back only this
+            // reservation.
+            logins.release(reserved);
             tracing::debug!(?peer, token = name, "peer authenticated");
             Ok(name)
         }
         Err(reason) => {
-            let failures = logins.fail(key, Instant::now());
+            let failures = reserved.failures();
             tracing::warn!(?peer, reason, failures, "failed peer login");
             Err(Box::new(unauthorized()))
         }

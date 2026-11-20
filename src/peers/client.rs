@@ -466,6 +466,10 @@ pub(crate) fn print_reports(reports: &[PeerReport], json: bool) -> i32 {
 /// A stream that sends nothing, not even a heartbeat, for this long is given up.
 const STREAM_IDLE: Duration = Duration::from_secs(40);
 
+/// Largest number of upstreams a watched peer's document may grow to through key events.
+/// A snapshot may be larger, but no key event adds an upstream past this cap.
+const MAX_KEY_UPSTREAMS: usize = 256;
+
 /// One parsed Server-Sent Events item.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SseItem {
@@ -546,6 +550,34 @@ enum Watched {
     Alive,
 }
 
+/// Applies one `key` event to a watched document. Returns false when the event is dropped
+/// because it would grow the upstream table past [`MAX_KEY_UPSTREAMS`]; the drop is counted
+/// and the first one warns, so a peer cannot grow the view without bound.
+fn apply_key_event(doc: &mut HealthDoc, key: KeyEvent, drops: &mut u64) -> bool {
+    let existing = doc
+        .upstreams
+        .iter()
+        .position(|u| u.name == key.upstream.name);
+    if existing.is_none() && doc.upstreams.len() >= MAX_KEY_UPSTREAMS {
+        *drops += 1;
+        if *drops == 1 {
+            tracing::warn!(
+                dropped = *drops,
+                cap = MAX_KEY_UPSTREAMS,
+                "a peer key event would add too many upstreams; dropping it"
+            );
+        }
+        return false;
+    }
+    doc.observed_at = key.observed_at;
+    doc.age_seconds = key.age_seconds;
+    match existing {
+        Some(index) => doc.upstreams[index] = key.upstream,
+        None => doc.upstreams.push(key.upstream),
+    }
+    true
+}
+
 /// Opens one peer's event stream with the same pinned client, token and checks as a poll.
 pub(crate) async fn open_stream(peer: &PeerEntry) -> Result<reqwest::Response, String> {
     let token = read_token(peer)?;
@@ -602,6 +634,7 @@ async fn follow_stream(
     };
     let mut parser = SseParser::new(MAX_BODY);
     let mut doc: Option<HealthDoc> = None;
+    let mut dropped_keys = 0u64;
     loop {
         let chunk = match next_chunk(&mut response).await {
             Ok(Chunk::Data(chunk)) => chunk,
@@ -624,19 +657,7 @@ async fn follow_stream(
                         Err(e) => return format!("not a /v1/health snapshot: {e}"),
                     },
                     "key" => match (serde_json::from_str::<KeyEvent>(&data), doc.as_mut()) {
-                        (Ok(key), Some(doc)) => {
-                            doc.observed_at = key.observed_at;
-                            doc.age_seconds = key.age_seconds;
-                            match doc
-                                .upstreams
-                                .iter_mut()
-                                .find(|u| u.name == key.upstream.name)
-                            {
-                                Some(slot) => *slot = key.upstream,
-                                None => doc.upstreams.push(key.upstream),
-                            }
-                            true
-                        }
+                        (Ok(key), Some(doc)) => apply_key_event(doc, key, &mut dropped_keys),
                         (Err(e), _) => return format!("not a key event: {e}"),
                         (Ok(_), None) => return "a key event came before the snapshot".to_owned(),
                     },
@@ -827,6 +848,45 @@ mod tests {
     fn at(text: &str) -> SystemTime {
         SystemTime::UNIX_EPOCH
             + Duration::from_secs(u64::try_from(parse_rfc3339(text).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn key_events_stop_growing_the_upstream_table_at_the_cap() {
+        let upstream = |name: &str| UpstreamHealth {
+            name: name.to_owned(),
+            healthy_keys: 1,
+            cooling_keys: 0,
+            disabled_keys: 0,
+            soonest_cooldown_seconds: None,
+            last_status_class: None,
+        };
+        let mut watched = doc("2026-11-13T09:59:58Z");
+        for n in 1..MAX_KEY_UPSTREAMS {
+            watched.upstreams.push(upstream(&format!("u{n}")));
+        }
+        assert_eq!(watched.upstreams.len(), MAX_KEY_UPSTREAMS);
+        let mut drops = 0;
+        let new = KeyEvent {
+            observed_at: "2026-11-13T10:00:00Z".to_owned(),
+            age_seconds: Some(0),
+            upstream: upstream("one-too-many"),
+        };
+        assert!(!apply_key_event(&mut watched, new, &mut drops));
+        assert_eq!(drops, 1);
+        assert_eq!(watched.upstreams.len(), MAX_KEY_UPSTREAMS);
+        assert_eq!(watched.observed_at, "2026-11-13T09:59:58Z");
+
+        let mut known = upstream("zen");
+        known.healthy_keys = 7;
+        let update = KeyEvent {
+            observed_at: "2026-11-13T10:00:00Z".to_owned(),
+            age_seconds: Some(0),
+            upstream: known,
+        };
+        assert!(apply_key_event(&mut watched, update, &mut drops));
+        assert_eq!(drops, 1, "an update to a known upstream is not a drop");
+        assert_eq!(watched.upstreams[0].healthy_keys, 7);
+        assert_eq!(watched.observed_at, "2026-11-13T10:00:00Z");
     }
 
     #[test]

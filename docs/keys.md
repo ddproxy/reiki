@@ -94,7 +94,7 @@ Clients may send the token as `Authorization: Bearer <token>`, `x-api-key`, `x-g
 | `sticky` | Keeps the current key until it cannot serve, then moves to the next usable key. |
 | `round_robin` | Starts each request on the key after the one the last request used. Cooling and disabled keys are skipped. |
 
-A request uses only the chain keys whose upstream matches the request path. One chain can hold keys for several upstreams. Keys are shared state: two streams that list the same key share its cooldown and disabled flag. One request disables at most one key. Use separate instances for mutually untrusted clients. See [failover](failover.md#chains) and [security](security.md#limits).
+A request uses only the chain keys whose upstream matches the request path. One chain can hold keys for several upstreams. Keys are shared state: two streams that list the same key share its cooldown and disabled flag. One request disables at most one key. Use separate instances for mutually untrusted clients. See [failover](failover.md#chains) and [security](security.md#limits-and-listener-enforcement).
 
 ## Key state and enable
 
@@ -104,9 +104,9 @@ A request uses only the chain keys whose upstream matches the request path. One 
 | `cooling` | `cooling` | Key waits for `retry_after_seconds`. |
 | `disabled` | `out_of_rotation` | Key stays out until enabled or its file changes. |
 
-A key with scoped cooldowns stays `ok` for other routes and models. `reiki keys --json` shows the `scopes` array. See [monitoring](monitoring.md#check-key-health).
+A key with scoped cooldowns stays `ok` for other routes and models. `reiki keys --json` shows the `scopes` array. See [monitoring](monitoring.md#get-status).
 
-Set up the admin listener first; see [monitoring](monitoring.md#configure). Then:
+Set up the admin listener first; see [monitoring](monitoring.md#configure-and-authenticate). Then:
 
 ```bash
 export REIKI_ADMIN_TOKEN="$(cat /etc/reiki/admin.token)"

@@ -6,6 +6,10 @@
 //! requests and keeps per-request data in the state returned by
 //! [`Plugin::new_state`].
 
+mod timefmt;
+
+pub use timefmt::{civil_from_days, format_utc};
+
 use std::any::Any;
 use std::collections::hash_map::RandomState;
 use std::fmt;

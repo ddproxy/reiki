@@ -24,7 +24,7 @@ flowchart LR
 | `on_attempt` | After each selected upstream attempt, including failed attempts | `AttemptCtx` | Per-request state only | No return value. A panic is logged and the next plugin runs. |
 | `on_response_head` | After the upstream status and headers are known | `ResponseHeadCtx` | Status, headers, per-request state | No return value. A panic is logged and the next plugin runs. Runs in reverse registry order. |
 | `on_response_chunk` | For each body chunk, then once with `is_last = true` | `ChunkCtx` | Chunk, per-request state | No return value. A panic is logged and the next plugin runs. Runs in reverse registry order. |
-| `on_shutdown` | After listeners drain on a clean stop, in registry order | none | Anything the plugin owns, synchronously | No return value. A panic is **not** caught. |
+| `on_shutdown` | After listeners drain on a clean stop, in registry order | none | Anything the plugin owns, synchronously | No return value. A panic is logged and skipped; the other plugins still shut down. |
 | `on_event` | On relay facts: request done, failover, cooldown, stream rate limit, plugin rejection, finding | `Event` | Nothing; read-only | No return value. A panic is logged and skipped. |
 | `on_admin` | An authenticated `GET` on a path from `admin_paths` | `AdminCtx` | Returns `Option<AdminReply>` | `None` or a panic gives an empty 404. |
 
@@ -38,7 +38,7 @@ The final `on_response_chunk` call with `is_last = true` happens on normal end o
 | --- | --- | --- |
 | `name(&self) -> &str` | required | Plugin name; must match the catalog `name` and config table. |
 | `fails_closed(&self) -> bool` | `false` | Sets the default `on_error` to `reject`. |
-| `new_state(&self) -> Box<dyn Any + Send>` | `Box::new(())` | Creates one state value per request. |
+| `new_state(&self) -> Box<dyn Any + Send>` | `Box::new(())` | Creates one state value per request. A panic is logged and gives the default unit state for that request. |
 | `live_reload(&self) -> bool` | `true` | `false` keeps the running instance when a rebuild is needed and reports `restart_needed`. |
 | `watched_files(&self) -> Vec<PathBuf>` | empty | Files whose metadata a reload checks; a change rebuilds the plugin. |
 | `needs_response_hooks(&self) -> bool` | `uses_bodies()` | Ask for response hooks without changing bodies. |
@@ -80,7 +80,7 @@ Admin paths must start with `/`, must not be `/`, have no trailing slash, `%`, o
 
 The default `on_error` is `reject` when `fails_closed()` is true, otherwise `pass_through`. An explicit setting wins. Explicit `pass_through` on a fail-closed plugin is allowed and logs a warning when that plugin is built. `Reject` messages reach the client and the log, so never put request text or secrets in them.
 
-A panic in `on_request` counts as `Skip`. Panics in the other request-path hooks and in `on_event` or `on_admin` are caught and logged. Release builds keep `panic = "unwind"`; a panic in `on_shutdown` is not caught.
+A panic in `on_request` counts as `Skip`. Panics in the other request-path hooks and in `on_event`, `on_admin`, `new_state` or `on_shutdown` are caught and logged. A `new_state` panic falls back to the default `()` state, so later hooks may skip when they downcast it. Release builds keep `panic = "unwind"`.
 
 ## Crate layout
 

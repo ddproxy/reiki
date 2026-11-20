@@ -55,7 +55,7 @@ Every field is optional. An explicit `0` means unlimited, and it overrides the p
 | `daily_tokens` | `0`, unlimited | Tokens per UTC day, per key. |
 | `min_rpm` | `1`, or the preset's value | Floor for the rate Reiki learns from responses. |
 | `max_wait_secs` | `20` | Longest a request may sleep for a slot on one key. Must be 1 to 120. |
-| `[keys.NAME] quota_resets` | unset | Reset schedule for a quota failure. Also closes the key's budget after a quota 429. See [cooldown values](classification.md#cooldown-values). |
+| `[keys.NAME] quota_resets` | unset | Reset schedule for a quota failure. Also closes the key's budget after a quota 429. See [cooldown values](classification.md#cooldowns). |
 
 Presets seed the table. Explicit fields override them.
 
@@ -118,7 +118,7 @@ These apply only to the key that sent the attempt. They use the bucket for that 
 | Success, at least a minute after the last change | Raises a learned cap by 5 % of the configured `rpm`, at least 1. When the cap reaches the ceiling, it is cleared. Without a configured `rpm`, the next success after a quiet minute clears the learned cap. |
 | Transient, `access_disabled`, `unauthorized` | No change. |
 
-The quota cooldown is the same one that cools the key. See [cooldown values](classification.md#cooldown-values).
+The quota cooldown is the same one that cools the key. See [cooldown values](classification.md#cooldowns).
 
 The limit is scoped to the route and model on purpose: a provider can rate-limit each model and route independently, so one model hitting its limit must not stop the key's traffic to the others.
 

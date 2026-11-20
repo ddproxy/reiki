@@ -6,7 +6,7 @@ Conventions in this page:
 
 - **Required** means the key has no default and must be set when its table exists.
 - Durations are whole seconds unless the name says otherwise. Sizes are bytes.
-- Unknown keys are errors in every table except `[plugins.<name>]`. Each plugin checks its own keys.
+- Unknown keys are errors everywhere. Reiki tables reject them while parsing, and each plugin rejects unknown keys in its own table, apart from the host keys `enabled`, `on_error`, `dry_run` and `streams`.
 - "Since" gives the version in which the key was added, only where the changelog states it.
 
 ## Tables
@@ -39,7 +39,7 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | Listener | Setting | Default | Notes |
 | --- | --- | --- | --- |
 | Client | `listen` | `127.0.0.1:4097` | Serves the proxy API. |
-| Admin | `[admin].listen` | none | Enabled only with an `[admin]` table. |
+| Admin | `[admin].listen` | none | Enabled only with an `[admin]` table. Loopback only; terminate TLS in front for remote access. |
 | Tunnel | `[tunnel].listen` | none | Enabled only with a `[tunnel]` table. |
 | Peers | `[peers].listen` | none | Used when `[peers]` publishes health. Loopback unless TLS is configured. |
 | Hub | `[hub].listen` | none | Parsed and validated; not served in this release. Loopback only. |
@@ -56,7 +56,7 @@ The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST 
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `listen` | string | required | Admin listener address. Must differ from `listen`. |
+| `listen` | string | required | Admin listener address: a loopback IP and port. Must differ from `listen`. There is no admin TLS option; terminate TLS in front and bind on loopback for remote access. |
 | `token_sha256` | string | required | SHA-256 hex of the admin token, 64 characters. Must differ from every stream token. Make it with `reiki hash-token`, from a token of at least 16 characters. |
 
 ## `[auth]`
@@ -92,7 +92,7 @@ See [deploy](deploy.md).
 
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
-| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. | 0.7.5 |
+| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file (when the peer listener publishes), or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. | 0.7.5 |
 | `interval_secs` | integer | `5` | Seconds between checks. Range 1 to 3600. | 0.7.5 |
 
 Reload also runs on SIGHUP and on `reiki reload`. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
@@ -130,9 +130,9 @@ One provider endpoint. Keys and streams refer to it by `NAME`. Fields marked as 
 | `send_keep_alive` | bool | `false` | Send `Connection: keep-alive` explicitly. Not allowed with `forward`. | 0.4.3 |
 | `pass_errors` | bool | `false` | Relay every upstream error status unchanged. No key is cooled, disabled or retried. Use it for upstreams that are not LLM providers. | 0.7.3 |
 | `confirm_quota` | bool | `false` | Re-send a quota 429 once on the same key after 3 seconds before cooling the key. | 0.7.1 |
-| `request_error_phrases` | array of strings | `[]` | Extra body phrases that make a 400, 402 or 413 pass through without changing the key. See [failover](failover.md#custom-response-phrases). | |
-| `quota_phrases` | array of strings | `[]` | Extra body phrases that cool the whole key as quota exhaustion. See [failover](failover.md#custom-response-phrases). | |
-| `rate_limit_phrases` | array of strings | `[]` | Extra body phrases that cool the route and model as a rate limit. See [failover](failover.md#custom-response-phrases). | |
+| `request_error_phrases` | array of strings | `[]` | Extra body phrases that make a 400, 402 or 413 pass through without changing the key. See [classification](classification.md#custom-response-phrases). | |
+| `quota_phrases` | array of strings | `[]` | Extra body phrases that cool the whole key as quota exhaustion. See [classification](classification.md#custom-response-phrases). | |
+| `rate_limit_phrases` | array of strings | `[]` | Extra body phrases that cool the route and model as a rate limit. See [classification](classification.md#custom-response-phrases). | |
 | `scope_escalate_after` | integer | `3` | Cool the whole key when this many models cool on it and another failure arrives. Range 2 to 16. | 0.10.0 |
 | `hold_unauthorized` | bool | `false` | Delay disabling the first key that answers 401 until a later key serves the same request. | 0.8.3 |
 | `passthrough` | bool | `false` | Plain reverse proxy. The client's own credentials go upstream unchanged. No Reiki token and no key from a chain. A passthrough upstream cannot have `fallback`. | 0.3.0 |
@@ -146,7 +146,7 @@ Model and body rewrites run once, before a key is picked. Failover replays the s
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `upstream` | string | required | Another upstream to try. It must exist, must not be this upstream, and must not be `passthrough`. |
+| `upstream` | string | required | Another upstream to try. It must exist and must not be this upstream. A stream that uses this upstream must also hold a key for the target (see below). |
 | `model_aliases` | table of strings | `{}` | Applied before the target's own `model_aliases`. `"*"` matches any model. |
 
 Every stream whose chain uses this upstream must also hold a key for the fallback target. Otherwise the config is refused.
@@ -307,6 +307,7 @@ Keys that every plugin accepts:
 | --- | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Set `false` to keep the table and not run the plugin. | |
 | `on_error` | `"pass_through"` or `"reject"` | plugin-specific | What happens when the plugin fails. `pass_through` continues without it. `reject` stops the request with a 503. Plugins that mask data reject by default, and so do detectors in `block` mode. | |
+| `dry_run` | bool | `false` where used | Accepted by every plugin. Plugins that use it validate settings without opening files, sockets or threads; `reiki check` adds `dry_run = true` to every plugin table. | |
 | `streams` | array of strings | all streams | Run only for requests on these streams. Each name is a configured stream or `passthrough`. | 0.8.0 |
 
 Plugin-specific keys are documented on each plugin's page:
@@ -331,7 +332,7 @@ The former name `gov` was removed. A `[plugins.gov]` table is rejected with an e
 | `zen-free` | 10 | none | 2 | none | 1 |
 | `openrouter-free` | 20 | none | none | 50 | 1 |
 
-These values are the ones in the build. The source marks them as to be re-checked on each release.
+These values are the ones in the build; the source notes that the `openrouter-free` figures should be re-checked on each release.
 
 ## Hubs, hub and accounts
 
@@ -394,7 +395,7 @@ One account: its key or keys on one upstream.
 
 ## Validation
 
-`reiki check` runs the same load as the service. It parses the file, reads every key file, builds each plugin in dry-run mode, and checks the intercept CA and the peer certificate when they are set. It prints one `ok:` line when all of this passes and exits 1 otherwise.
+`reiki check` runs the same load as the service. It parses the file, reads every key file, builds each plugin in dry-run mode, checks the intercept CA when interception is configured, and checks the peer TLS certificate when the peer listener is published with TLS. It prints one `ok:` line when all of this passes and exits 1 otherwise.
 
 Rules, by section:
 
@@ -402,14 +403,14 @@ Rules, by section:
 - **Logging.** `level` is a valid level or filter. `file` is an absolute path. `stderr = false` needs `file`. `file_keep` is at most 100.
 - **Service, reload, auth.** Each value is in the range shown above.
 - **Server.** Each cap is in range. A per-address cap is at most its total.
-- **Listeners.** `admin.listen`, `tunnel.listen` and `peers.listen` must differ from each other and from `listen`. A non-loopback peer listener needs TLS.
+- **Listeners.** `admin.listen`, `tunnel.listen` and `peers.listen` must differ from each other and from `listen`. A non-loopback peer listener needs TLS; a non-loopback admin listener is refused because it has no TLS option.
 - **Upstream.** `base_url` is `https`, or `http` on loopback. `auth_header` is a valid header name. `auth_format` has `{key}` once and makes a valid header value. Model alias keys and values are not empty. Drop-parameter names are not empty. The timeouts and `max_decoded_bytes` are at least 1. `scope_escalate_after` is 2 to 16. Each response phrase list has at most 16 unique phrases of 3 to 120 non-control characters.
 - **Upstream limits.** The table sets a preset or a limit. `max_wait_secs` is 1 to 120. The preset name is known.
-- **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write, or with `expect_uid` set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
+- **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
 - **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes.
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
-- **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token.
+- **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a loopback address when it is an IP:port.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
 - **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `[peers.NAME]` has a valid URL and `token_file`. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset.
 - **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid.

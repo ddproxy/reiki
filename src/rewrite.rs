@@ -223,7 +223,12 @@ fn scan_members(
 
 fn top_level_members(body: &[u8]) -> Option<Vec<Member>> {
     let mut members = Vec::new();
+    let mut over_cap = false;
     scan_members(body, |start, key_end, value_start, value_end, is_string| {
+        if members.len() >= MAX_SCANNED_MEMBERS {
+            over_cap = true;
+            return false;
+        }
         members.push(Member {
             start,
             key_end,
@@ -234,7 +239,7 @@ fn top_level_members(body: &[u8]) -> Option<Vec<Member>> {
         });
         true
     })?;
-    Some(members)
+    (!over_cap).then_some(members)
 }
 
 fn scan_value(body: &[u8], i: usize) -> Option<(usize, bool)> {
@@ -523,6 +528,33 @@ mod tests {
         let other = request_model(other_body.as_bytes()).unwrap();
         assert_eq!(&other[..100], &scoped[..100]);
         assert_ne!(other, scoped);
+    }
+
+    #[test]
+    fn rewriting_gives_up_on_a_body_with_too_many_top_level_members() {
+        let many = format!(
+            "{{{}\"model\":\"gpt-4o\"}}",
+            "\"a\":1,".repeat(MAX_SCANNED_MEMBERS)
+        );
+        assert!(top_level_members(many.as_bytes()).is_none());
+        let out = run(&many, &aliases(&[("gpt-4o", "zen")]), &[]);
+        assert_eq!(out, Bytes::copy_from_slice(many.as_bytes()));
+
+        let at_cap = format!(
+            "{{{}\"model\":\"gpt-4o\"}}",
+            "\"a\":1,".repeat(MAX_SCANNED_MEMBERS - 1)
+        );
+        assert_eq!(
+            top_level_members(at_cap.as_bytes()).unwrap().len(),
+            MAX_SCANNED_MEMBERS
+        );
+        assert_eq!(
+            run(&at_cap, &aliases(&[("gpt-4o", "zen")]), &[]),
+            Bytes::from(format!(
+                "{{{}\"model\":\"zen\"}}",
+                "\"a\":1,".repeat(MAX_SCANNED_MEMBERS - 1)
+            ))
+        );
     }
 
     #[test]

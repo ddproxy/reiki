@@ -49,11 +49,6 @@ pub fn request_stop() {
     process_stop().request();
 }
 
-/// Whether a stop has been requested.
-pub fn stop_requested() -> bool {
-    process_stop().requested()
-}
-
 /// Completes once a stop is requested; completes at once if it already was.
 pub async fn stopped() {
     process_stop().wait().await;

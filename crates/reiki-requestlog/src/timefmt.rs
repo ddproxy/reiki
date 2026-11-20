@@ -1,32 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reiki_plugin::format_utc;
+
 /// `2026-10-23T21:04:10.860Z` for a point in time, without a date library.
 pub fn rfc3339_millis(time: SystemTime) -> String {
     let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = since.as_secs() as i64;
     let millis = since.subsec_millis();
-    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
-    let rem = secs.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        rem / 3_600,
-        rem % 3_600 / 60,
-        rem % 60
-    )
-}
-
-// Days since 1970-01-01 to a proleptic Gregorian date (Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if month <= 2 { year + 1 } else { year }, month, day)
+    format_utc(secs, 'T', Some(millis), "Z")
 }
 
 #[cfg(test)]

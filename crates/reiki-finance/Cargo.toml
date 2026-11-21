@@ -11,7 +11,7 @@ publish = false
 reiki-detect = { path = "../reiki-detect" }
 reiki-plugin = { path = "../reiki-plugin" }
 http = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 sha3 = "0.10"
 toml = "0.8"
 tracing = "0.1"

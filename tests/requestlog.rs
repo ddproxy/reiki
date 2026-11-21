@@ -446,7 +446,7 @@ async fn an_export_only_config_writes_allow_listed_summaries_and_publishes_its_m
 
     let text = std::fs::read_to_string(&path).unwrap();
     for secret in [CLIENT_TOKEN, KEY_A, KEY_B, "query-secret", "prompt-secret"] {
-        assert!(!text.contains(secret), "{secret} leaked into the export");
+        assert!(!text.contains(secret), "a secret leaked into the export");
     }
 
     let metrics = rig.admin_get("/v1/requestlog/metrics").await;

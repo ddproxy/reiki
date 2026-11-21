@@ -26,6 +26,13 @@ use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, Respon
 pub use config::{
     BodyMode, Config, LogFormat, ResponseMode, SseMode, SyslogTarget, DENIED_HEADERS,
 };
+/// Internal redaction and stream-shaping parsers exposed only to the cargo-fuzz targets when the
+/// `fuzzing` feature is on.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub use crate::redact::{form, header, json, path, secrets, secrets_cut, stream_deltas};
+    pub use crate::shape::sse_events;
+}
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
@@ -158,6 +165,11 @@ fn enqueue(
 
 impl RequestLog {
     pub fn new(config: Config) -> Result<Self, String> {
+        if config.capture_bodies {
+            tracing::warn!(
+                "requestlog: capture_bodies = true; request and response bodies will be written to the log, masked and capped, so keep every sink private"
+            );
+        }
         if config.dry_run {
             return Ok(Self {
                 config: Arc::new(config),
@@ -361,13 +373,19 @@ impl Plugin for RequestLog {
                 ))
             })
             .collect();
-        let body = (self.config.body != BodyMode::None).then(|| {
-            if ctx.body.len() > self.config.max_capture_bytes {
+        // A summary needs the bytes to count messages and tools, but they never reach the record as
+        // text. Full bodies are copied only after the explicit opt-in.
+        let body = if self.config.body == BodyMode::None
+            || (self.config.body == BodyMode::Full && !self.config.capture_bodies)
+        {
+            None
+        } else {
+            Some(if ctx.body.len() > self.config.max_capture_bytes {
                 Bytes::copy_from_slice(&ctx.body[..self.config.max_capture_bytes])
             } else {
                 ctx.body.clone()
-            }
-        });
+            })
+        };
         self.send(Event::Request(RequestEvent {
             id,
             at: SystemTime::now(),
@@ -384,8 +402,10 @@ impl Plugin for RequestLog {
 
     fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
-            let body = (state.response == ResponseMode::Body && !ctx.body.is_empty())
-                .then(|| ctx.body[..ctx.body.len().min(state.max_body)].to_vec());
+            let body = (self.config.capture_bodies
+                && state.response == ResponseMode::Body
+                && !ctx.body.is_empty())
+            .then(|| ctx.body[..ctx.body.len().min(state.max_body)].to_vec());
             state.attempts.push(AttemptEvent {
                 key: ctx.key.to_owned(),
                 status: ctx.status,
@@ -405,7 +425,7 @@ impl Plugin for RequestLog {
     fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
             state.bytes += ctx.chunk.len() as u64;
-            if state.response == ResponseMode::Body {
+            if self.config.capture_bodies && state.response == ResponseMode::Body {
                 let room = state.max_body.saturating_sub(state.body.len());
                 let take = ctx.chunk.len().min(room);
                 state.body.extend_from_slice(&ctx.chunk[..take]);
@@ -491,7 +511,10 @@ mod tests {
     fn a_request_and_its_response_are_logged_and_correlated() {
         let dir = dir("pair");
         let path = dir.join("req.jsonl");
-        let plugin = plugin("headers = [\"user-agent\"]", &path);
+        let plugin = plugin(
+            "capture_bodies = true\nbody = \"full\"\nheaders = [\"user-agent\"]",
+            &path,
+        );
         drive(
             plugin.as_ref(),
             &[
@@ -520,6 +543,103 @@ mod tests {
         );
         assert!(!text.to_lowercase().contains("authorization"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_config_records_a_summary_and_no_body() {
+        let dir = dir("default-body");
+        let path = dir.join("req.jsonl");
+        let plugin = plugin("", &path);
+        let secret = ["sk-", "0123456789abcdef0123456789"].concat();
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"content":"{secret}"}}],"tools":[{{"name":"bash","arguments":{{"command":"private"}}}}]}}"#
+        );
+        drive(plugin.as_ref(), &[], &body, 200);
+        drop(plugin);
+
+        let records = lines(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["body_bytes"], body.len());
+        assert_eq!(records[0]["body_summary"]["messages"], 1);
+        assert_eq!(records[0]["body_summary"]["tools"], 1);
+        assert!(records[0].get("body").is_none(), "{text}");
+        assert!(records[1].get("body").is_none(), "{text}");
+        assert!(!text.contains(&secret), "{text}");
+        assert!(!text.contains("private"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_opt_in_records_a_scrubbed_size_capped_body() {
+        let dir = dir("opt-in-body");
+        let path = dir.join("req.jsonl");
+        let plugin = plugin(
+            "capture_bodies = true\nbody = \"full\"\nresponse = \"body\"\nmax_body_bytes = 64",
+            &path,
+        );
+        let secret = ["sk-", "0123456789abcdef0123456789"].concat();
+        let body = format!(r#"{{"content":"{secret}","pad":"{}"}}"#, "y".repeat(400));
+        drive(plugin.as_ref(), &[], &body, 200);
+        drop(plugin);
+
+        let records = lines(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].get("body").is_some(), "{text}");
+        assert!(!text.contains(&secret), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        let logged = records[0]["body"].as_str().unwrap();
+        assert!(logged.len() <= 64, "{logged}");
+        assert_eq!(records[0]["body_truncated"], true);
+        assert_eq!(records[0]["body_bytes"], body.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opting_in_warns_at_startup() {
+        use std::io::Write;
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = BufferWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                BufferWriter(Arc::clone(&self.0))
+            }
+        }
+
+        struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for BufferWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let dir = dir("warn");
+            let plugin = plugin("capture_bodies = true", &dir.join("req.jsonl"));
+            drop(plugin);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+        let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("capture_bodies"), "{text}");
+        assert!(text.contains("WARN"), "{text}");
     }
 
     #[test]
@@ -771,7 +891,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_stream_carries_the_same_records() {
+    fn the_stream_carries_the_same_records_and_no_body_by_default() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
@@ -791,7 +911,44 @@ mod tests {
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         let record: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(record["body"]["model"], "streamed");
+        assert_eq!(record["body_summary"]["model"], "streamed");
+        assert!(record.get("body").is_none(), "{line}");
+        drop(plugin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stream_honours_the_same_body_opt_in() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let dir = dir("stream-opt-in");
+        let sock = dir.join("req.sock");
+        let text = format!(
+            "socket = \"{}\"\nresponse = \"none\"\ncapture_bodies = true\nbody = \"full\"\nmax_body_bytes = 64",
+            sock.display()
+        );
+        let plugin = build(&text.parse().unwrap()).unwrap();
+
+        let client = UnixStream::connect(&sock).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let secret = ["sk-", "0123456789abcdef0123456789"].concat();
+        let body = format!(r#"{{"content":"{secret}","pad":"{}"}}"#, "z".repeat(400));
+        drive(plugin.as_ref(), &[], &body, 200);
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        let record: Value = serde_json::from_str(&line).unwrap();
+        assert!(!line.contains(&secret), "{line}");
+        let logged = record["body"].as_str().unwrap_or_default();
+        assert!(logged.contains("[REDACTED]"), "{line}");
+        assert!(logged.len() <= 64, "{logged}");
+        assert_eq!(record["body_truncated"], true);
         drop(plugin);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -882,7 +1039,10 @@ mod tests {
     fn the_bytes_captured_per_request_are_capped() {
         let dir = dir("capture");
         let path = dir.join("req.jsonl");
-        let plugin = plugin("max_capture_bytes = 64", &path);
+        let plugin = plugin(
+            "capture_bodies = true\nbody = \"full\"\nmax_capture_bytes = 64",
+            &path,
+        );
         let body = format!(r#"{{"content":"{}"}}"#, "y".repeat(10_000));
         drive(plugin.as_ref(), &[], &body, 200);
         drop(plugin);
@@ -897,7 +1057,10 @@ mod tests {
     fn a_body_within_the_cap_is_logged_whole() {
         let dir = dir("capture-ok");
         let path = dir.join("req.jsonl");
-        let plugin = plugin("max_capture_bytes = 64", &path);
+        let plugin = plugin(
+            "capture_bodies = true\nbody = \"full\"\nmax_capture_bytes = 64",
+            &path,
+        );
         drive(plugin.as_ref(), &[], r#"{"a":1}"#, 200);
         drop(plugin);
         let records = lines(&path);

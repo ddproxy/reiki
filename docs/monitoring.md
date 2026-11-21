@@ -203,11 +203,12 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | --- | --- | --- | --- |
 | `GET /__reiki/healthz` | Client listener | None | Returns `200` with body `ok` while Reiki is up |
 | `GET /v1/metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
+| `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Bearer token | Prometheus tool-call counters |
 | `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 
-The plugin routes exist only with `[plugins.metrics]` in the config. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
+The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]` and `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
 
 ## GET /v1/metrics
 
@@ -249,6 +250,16 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_upstream_tokens_1h` | gauge | `upstream` | Input plus output tokens in the last hour |
 
 `status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The three `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists).
+
+## GET /v1/toolpolicy/metrics
+
+Served by the `toolpolicy` plugin with the same bearer auth. Without `[plugins.toolpolicy]` the route returns `404`. See [tool policy](toolpolicy.md#metrics) for the settings and a rollout sequence.
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `reiki_toolpolicy_calls_total` | counter | `stream`, `upstream`, `action` | Tool calls seen in responses; `action` is `passed`, `reported` or `blocked` |
+| `reiki_toolpolicy_findings_total` | counter | `rule`, `severity` | Rule matches, including findings below `block_severity` |
+| `reiki_toolpolicy_unparsed_total` | counter | `stream`, `upstream` | Recognized responses that could not be parsed |
 
 ## GET /v1/usage
 

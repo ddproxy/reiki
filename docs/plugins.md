@@ -33,6 +33,7 @@ file = "/var/lib/reiki/requests.jsonl"
 | `placeholders` | `plugin-placeholders` | Swaps credentials and listed terms for placeholders on the way out and restores them in responses. See [placeholders](placeholders.md). |
 | `requestlog` | `plugin-requestlog` | Logs requests to a file and a live socket. See [requestlog](requestlog.md). |
 | `metrics` | `plugin-metrics` | Serves Prometheus metrics at `GET /v1/metrics` on the admin listener. See [monitoring](monitoring.md). |
+| `toolpolicy` | `plugin-toolpolicy` | Reports or blocks flagged tool calls in OpenAI Chat and Anthropic Messages responses. See [tool policy](toolpolicy.md). |
 
 ## Tune a detector with `reiki scan`
 

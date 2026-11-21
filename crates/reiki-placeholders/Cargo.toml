@@ -7,6 +7,10 @@ description = "Reiki plugin that swaps sensitive values for placeholders on the 
 license = "MIT"
 publish = false
 
+[features]
+# Exposes the masking internals to the fuzz targets in `fuzz/`. Never enabled in a normal build.
+fuzzing = []
+
 [dependencies]
 aho-corasick = "1"
 reiki-detect = { path = "../reiki-detect" }

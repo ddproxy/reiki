@@ -90,7 +90,7 @@ impl Rig {
              [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
              [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n\
              [plugins.placeholders]\nterms = [\"Falcon\"]\n\
-             [plugins.requestlog]\nfile = \"{}/req.jsonl\"\nresponse = \"body\"\n",
+             [plugins.requestlog]\nfile = \"{}/req.jsonl\"\ncapture_bodies = true\nbody = \"full\"\nresponse = \"body\"\n",
             reiki::auth::sha256_hex(CLIENT_TOKEN),
             dir.display()
         );

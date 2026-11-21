@@ -7,6 +7,10 @@ description = "Reiki plugin that logs requests to a file and a live stream"
 license = "MIT"
 publish = false
 
+[features]
+# Exposes the redaction internals to the fuzz targets in `fuzz/`. Never enabled in a normal build.
+fuzzing = []
+
 [dependencies]
 reiki-plugin = { path = "../reiki-plugin" }
 reiki-redact = { path = "../reiki-redact" }
@@ -21,6 +25,9 @@ tracing = "0.1"
 libc = "0.2"
 # Safe fcntl wrappers: clearing O_NONBLOCK on the verified regular file must not need unsafe.
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

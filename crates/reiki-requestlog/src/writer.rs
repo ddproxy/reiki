@@ -518,6 +518,17 @@ mod tests {
         Config::parse(&text.parse().unwrap()).unwrap()
     }
 
+    /// The default records no bodies: tests of body rendering opt in explicitly.
+    fn body_config(extra: &str) -> Config {
+        config(&format!("capture_bodies = true\nbody = \"full\"\n{extra}"))
+    }
+
+    fn response_config(extra: &str) -> Config {
+        config(&format!(
+            "capture_bodies = true\nresponse = \"body\"\n{extra}"
+        ))
+    }
+
     fn request(body: &str) -> RequestEvent {
         RequestEvent {
             id: "abc".to_owned(),
@@ -541,7 +552,7 @@ mod tests {
         let body =
             r#"{"model":"big-pickle","messages":[{"role":"user","content":"key TOKEN ok"}]}"#
                 .replace("TOKEN", &["sk-", "0123456789abcdef0123456789"].concat());
-        let record = parsed(&config(""), request(&body));
+        let record = parsed(&body_config(""), request(&body));
         assert_eq!(record["event"], "request");
         assert_eq!(record["ts"], "2000-02-29T00:00:00.000Z");
         assert_eq!(record["headers"]["user-agent"], "client/1.0");
@@ -558,14 +569,14 @@ mod tests {
     fn redaction_can_be_turned_off() {
         let token = ["sk-", "0123456789abcdef0123456789"].concat();
         let body = format!(r#"{{"content":"{token}"}}"#);
-        let record = parsed(&config("redact = false"), request(&body));
+        let record = parsed(&body_config("redact = false"), request(&body));
         assert_eq!(record["body"]["content"], token);
     }
 
     #[test]
     fn an_oversized_body_is_cut_on_a_character_boundary_and_flagged() {
         let body = format!(r#"{{"content":"{}"}}"#, "é".repeat(100));
-        let record = parsed(&config("max_body_bytes = 31"), request(&body));
+        let record = parsed(&body_config("max_body_bytes = 31"), request(&body));
         let text = record["body"].as_str().unwrap();
         assert!(
             text.len() <= 31 && text.starts_with(r#"{"content":"é"#),
@@ -577,7 +588,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_json_is_logged_as_masked_text() {
         let record = parsed(
-            &config(""),
+            &body_config(""),
             request("plain Bearer abcdef0123456789abcdef text"),
         );
         assert_eq!(record["body"], "plain Bearer [REDACTED] text");
@@ -657,7 +668,7 @@ mod tests {
     #[test]
     fn the_response_record_has_status_timing_and_size() {
         let line = render(
-            &config(""),
+            &response_config(""),
             Event::Response(ResponseEvent {
                 id: "abc".to_owned(),
                 at: UNIX_EPOCH,
@@ -714,7 +725,7 @@ mod tests {
     fn a_response_body_is_parsed_masked_and_marked_when_cut() {
         let json = br#"{"answer":"ok","note":"Bearer abcdefghijklmnopqrstuvwxyz0123456789"}"#;
         let record: Value = serde_json::from_str(&render(
-            &config(""),
+            &response_config(""),
             Event::Response(response_with(Some(json), false)),
         ))
         .unwrap();
@@ -726,7 +737,7 @@ mod tests {
 
         let sse = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
         let record: Value = serde_json::from_str(&render(
-            &config("sse = \"raw\""),
+            &response_config("sse = \"raw\""),
             Event::Response(response_with(Some(sse), true)),
         ))
         .unwrap();
@@ -734,7 +745,7 @@ mod tests {
         assert_eq!(record["body_truncated"], true);
 
         let record: Value = serde_json::from_str(&render(
-            &config(""),
+            &response_config(""),
             Event::Response(response_with(Some(b""), false)),
         ))
         .unwrap();
@@ -744,7 +755,7 @@ mod tests {
     #[test]
     fn excluded_and_summarized_paths_leave_a_smaller_json_body() {
         let body = r#"{"model":"m","tools":[{"function":{"name":"bash"}}],"system":"abcdefghij"}"#;
-        let config = config("exclude = [\"system\"]\nsummarize = [\"tools\"]");
+        let config = body_config("exclude = [\"system\"]\nsummarize = [\"tools\"]");
         let record = parsed(&config, request(body));
         assert_eq!(record["body"], json!({"model": "m", "tools": ["bash"]}));
         assert_eq!(record["body_excluded"], json!(["system"]));
@@ -756,7 +767,7 @@ mod tests {
     fn long_strings_are_cut_before_the_size_cap_so_the_body_stays_json() {
         let long = "x".repeat(5000);
         let body = format!(r#"{{"a":"{long}","b":"{long}"}}"#);
-        let config = config("max_body_bytes = 2000\nmax_string_bytes = 100");
+        let config = body_config("max_body_bytes = 2000\nmax_string_bytes = 100");
         let record = parsed(&config, request(&body));
         assert!(record["body"].is_object(), "{record}");
         assert!(record["body"]["a"]
@@ -770,7 +781,7 @@ mod tests {
     fn an_event_stream_is_logged_as_parsed_events() {
         let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         let record: Value = serde_json::from_str(&render(
-            &config(""),
+            &response_config(""),
             Event::Response(response_with(Some(sse), false)),
         ))
         .unwrap();
@@ -783,7 +794,7 @@ mod tests {
     fn an_assembled_stream_keeps_text_and_drops_a_cut_final_event() {
         let sse = b"data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con";
         let record: Value = serde_json::from_str(&render(
-            &config("sse = \"assembled\""),
+            &response_config("sse = \"assembled\""),
             Event::Response(response_with(Some(sse), true)),
         ))
         .unwrap();
@@ -997,7 +1008,7 @@ mod tests {
         let (a, b) = key.split_at(11);
         let body = sse(&[&format!("key {a}"), &format!("{b} end")]);
         for mode in ["events", "assembled"] {
-            let config = config(&format!("response = \"body\"\nsse = \"{mode}\""));
+            let config = response_config(&format!("sse = \"{mode}\""));
             let line = render(
                 &config,
                 Event::Response(response_with(Some(body.as_bytes()), false)),
@@ -1012,7 +1023,7 @@ mod tests {
     fn a_response_cut_inside_a_secret_never_logs_half_of_it() {
         let cut = r#"{"text":"key sk-0123456"#;
         let line = render(
-            &config("response = \"body\""),
+            &response_config(""),
             Event::Response(response_with(Some(cut.as_bytes()), true)),
         );
         assert!(!line.contains("sk-0123"), "{line}");
@@ -1021,7 +1032,7 @@ mod tests {
             "{line}"
         );
         let line = render(
-            &config("response = \"body\"\nsse = \"assembled\""),
+            &response_config("sse = \"assembled\""),
             Event::Response(response_with(
                 Some(sse(&["key ", "sk-0123456"]).as_bytes()),
                 true,
@@ -1039,7 +1050,7 @@ mod tests {
         let cap = full.find("sk-").unwrap() + 9;
         let mut event = request(&full[..cap]);
         event.body_bytes = full.len();
-        let record = parsed(&config(""), event);
+        let record = parsed(&body_config(""), event);
         assert_eq!(record["body_truncated"], true);
         assert!(!record.to_string().contains("sk-0123"), "{record}");
         assert_eq!(record["body_bytes"], full.len());
@@ -1048,7 +1059,7 @@ mod tests {
     #[test]
     fn a_form_body_has_its_credential_values_masked() {
         let record = parsed(
-            &config(""),
+            &body_config(""),
             request("password=hunter2&client_secret=abc&user=bob"),
         );
         assert_eq!(
@@ -1059,11 +1070,11 @@ mod tests {
 
     #[test]
     fn a_form_body_masks_percent_encoded_names_and_a_cut_pair() {
-        let record = parsed(&config(""), request("pass%77ord=x&a=1"));
+        let record = parsed(&body_config(""), request("pass%77ord=x&a=1"));
         assert_eq!(record["body"], "pass%77ord=[REDACTED]&a=1");
         let mut event = request("password=hunter2&client_sec");
         event.body_bytes = 64;
-        let record = parsed(&config(""), event);
+        let record = parsed(&body_config(""), event);
         assert_eq!(record["body"], "password=[REDACTED]&client_sec");
         assert_eq!(record["body_truncated"], true);
     }
@@ -1071,7 +1082,7 @@ mod tests {
     #[test]
     fn a_form_response_body_is_masked_too() {
         let record: Value = serde_json::from_str(&render(
-            &config("response = \"body\""),
+            &response_config(""),
             Event::Response(response_with(Some(b"token=abc123&user=bob"), false)),
         ))
         .unwrap();
@@ -1081,7 +1092,7 @@ mod tests {
     #[test]
     fn prose_with_an_equals_sign_is_not_a_form() {
         let text = "the ratio a=b is fine, and password=set later";
-        let record = parsed(&config(""), request(text));
+        let record = parsed(&body_config(""), request(text));
         assert_eq!(record["body"], text);
     }
 }

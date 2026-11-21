@@ -59,7 +59,7 @@ Run [`reiki scan`](plugins.md#tune-a-detector-with-reiki-scan) over sample data 
 - The plugin reads the request body as text. Matches never leave the plugin: the log and the rejection name each kind and its count, such as `ssn x1, card x2`, and never a value.
 - A blocked request gets `422`. A body with a `Content-Encoding` other than `identity`, or a body that is not valid UTF-8, cannot be read, so `block` mode rejects it with `415` and `report` mode logs that it was not checked. `Content-Encoding: identity` is a no-op and is checked as if the header were absent.
 - The plugin runs before `placeholders` in the default build, so it sees the original request.
-- The [request log](requestlog.md#findings-from-detection-plugins) records a `finding` for each hit, but its default `body = "full"` keeps the request body, identifiers included, when the plugin only reports. Set `body = "summary"` where a detector runs in `report` mode.
+- The [request log](requestlog.md#findings-from-detection-plugins) records a `finding` for each hit. Its default `body = "summary"` does not keep prompt text. With `capture_bodies = true` and `body = "full"`, it keeps the request body, identifiers included, when the plugin only reports. Leave body capture off where a detector runs in `report` mode.
 - Only the request body is checked. Headers, the query string and responses are not.
 
 ## What it does not cover

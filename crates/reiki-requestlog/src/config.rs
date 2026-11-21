@@ -84,6 +84,8 @@ pub struct Config {
     /// The RFC 5424 facility code, `local0` (16) by default.
     pub syslog_facility: u8,
     pub syslog_app_name: String,
+    /// Whether request and response bodies may be written to the sinks at all.
+    pub capture_bodies: bool,
     pub body: BodyMode,
     pub max_body_bytes: usize,
     /// Most body bytes copied per request onto the writer queue.
@@ -115,6 +117,7 @@ impl Config {
             "syslog",
             "syslog_facility",
             "syslog_app_name",
+            "capture_bodies",
             "body",
             "max_body_bytes",
             "max_capture_bytes",
@@ -177,9 +180,19 @@ impl Config {
             }
         };
 
+        let capture_bodies = match table.get("capture_bodies") {
+            None => false,
+            Some(Value::Boolean(value)) => *value,
+            Some(other) => {
+                return Err(format!(
+                    "`capture_bodies` must be a boolean, got {}",
+                    other.type_str()
+                ))
+            }
+        };
         let body = match string(table, "body")?.as_deref() {
-            None | Some("full") => BodyMode::Full,
-            Some("summary") => BodyMode::Summary,
+            None | Some("summary") => BodyMode::Summary,
+            Some("full") => BodyMode::Full,
             Some("none") => BodyMode::None,
             Some(other) => {
                 return Err(format!(
@@ -197,6 +210,13 @@ impl Config {
                 ))
             }
         };
+
+        if !capture_bodies && body == BodyMode::Full {
+            return Err("`body = \"full\"` needs `capture_bodies = true`".to_owned());
+        }
+        if !capture_bodies && response == ResponseMode::Body {
+            return Err("`response = \"body\"` needs `capture_bodies = true`".to_owned());
+        }
 
         let file_max_bytes = integer(table, "file_max_bytes", DEFAULT_FILE_MAX_BYTES, 0, u64::MAX)?;
         let file_keep = integer(table, "file_keep", u64::from(DEFAULT_FILE_KEEP), 0, 100)? as u32;
@@ -276,6 +296,7 @@ impl Config {
             syslog,
             syslog_facility,
             syslog_app_name,
+            capture_bodies,
             body,
             max_body_bytes,
             max_capture_bytes,
@@ -441,7 +462,8 @@ mod tests {
     #[test]
     fn defaults_apply_when_only_a_file_is_set() {
         let config = parse("file = \"/var/log/reiki/req.jsonl\"").unwrap();
-        assert_eq!(config.body, BodyMode::Full);
+        assert!(!config.capture_bodies);
+        assert_eq!(config.body, BodyMode::Summary);
         assert_eq!(config.response, ResponseMode::Status);
         assert!(config.redact);
         assert_eq!(config.file_keep, 5);
@@ -449,6 +471,26 @@ mod tests {
         assert_eq!(config.max_capture_bytes, 1_048_576);
         assert_eq!(config.queue_max_bytes, 67_108_864);
         assert!(config.headers.is_empty() && config.socket.is_none());
+    }
+
+    #[test]
+    fn full_bodies_require_an_explicit_opt_in() {
+        assert!(parse("file = \"/x\"\nbody = \"full\"")
+            .unwrap_err()
+            .contains("capture_bodies"));
+        assert!(parse("file = \"/x\"\nresponse = \"body\"")
+            .unwrap_err()
+            .contains("capture_bodies"));
+        let config =
+            parse("file = \"/x\"\ncapture_bodies = true\nbody = \"full\"\nresponse = \"body\"")
+                .unwrap();
+        assert!(config.capture_bodies);
+        assert_eq!(config.body, BodyMode::Full);
+        assert_eq!(config.response, ResponseMode::Body);
+        let summary = parse("file = \"/x\"\ncapture_bodies = false").unwrap();
+        assert_eq!(summary.body, BodyMode::Summary);
+        assert!(parse("file = \"/x\"\ncapture_bodies = \"yes\"").is_err());
+        assert!(parse("file = \"/x\"\ncapture_bodies = true\nbody = \"none\"").is_ok());
     }
 
     #[test]
@@ -613,7 +655,7 @@ mod tests {
         assert!(parse("file = \"/x\"\nbody = \"all\"").is_err());
         assert!(parse("file = \"/x\"\nresponse = \"all\"").is_err());
         assert_eq!(
-            parse("file = \"/x\"\nresponse = \"body\"")
+            parse("file = \"/x\"\ncapture_bodies = true\nresponse = \"body\"")
                 .unwrap()
                 .response,
             ResponseMode::Body

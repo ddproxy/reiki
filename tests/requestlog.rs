@@ -151,7 +151,9 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     assert_eq!(records[0]["method"], "POST");
     assert_eq!(records[0]["path"], "/zen/chat/completions");
     assert_eq!(records[0]["headers"]["user-agent"], "client/1.0");
-    assert_eq!(records[0]["body"]["messages"][0]["content"], "hello there");
+    // The default records counts, never the prompt or the tool arguments.
+    assert_eq!(records[0]["body_summary"]["messages"], 1);
+    assert!(records[0].get("body").is_none(), "{records:?}");
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["id"], records[0]["id"]);
     assert_eq!(records[1]["status"], 200);
@@ -169,6 +171,10 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     assert!(records[1]["attempts"][0].get("body").is_none());
 
     let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("hello there"),
+        "the prompt leaked into the log"
+    );
     for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
         assert!(!text.contains(secret), "{secret} leaked into the log");
     }
@@ -230,7 +236,8 @@ async fn the_live_stream_carries_requests_without_credentials() {
     let mut line = String::new();
     BufReader::new(client).read_line(&mut line).unwrap();
     let record: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(record["body"]["model"], "live");
+    assert_eq!(record["body_summary"]["model"], "live");
+    assert!(record.get("body").is_none(), "{line}");
     for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
         assert!(!line.contains(secret), "{secret} leaked into the stream");
     }
@@ -255,7 +262,7 @@ async fn an_invalid_plugin_table_stops_the_chain_from_building() {
 async fn body_mode_records_the_response_body_and_never_a_key() {
     let rig = Rig::start(
         "respbody",
-        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"",
+        "file = \"{dir}/req.jsonl\"\ncapture_bodies = true\nresponse = \"body\"",
     )
     .await;
     let path = rig.dir.join("req.jsonl");
@@ -287,7 +294,7 @@ async fn body_mode_records_the_response_body_and_never_a_key() {
 async fn a_streamed_response_body_is_kept_up_to_the_cap_and_marked_cut() {
     let rig = Rig::start(
         "respcap",
-        "file = \"{dir}/req.jsonl\"\nresponse = \"body\"\nmax_body_bytes = 20\nsse = \"raw\"",
+        "file = \"{dir}/req.jsonl\"\ncapture_bodies = true\nresponse = \"body\"\nmax_body_bytes = 20\nsse = \"raw\"",
     )
     .await;
     let path = rig.dir.join("req.jsonl");
@@ -304,6 +311,37 @@ async fn a_streamed_response_body_is_kept_up_to_the_cap_and_marked_cut() {
     assert_eq!(records[1]["body_truncated"], true);
     // The byte count still covers the whole response.
     assert_eq!(records[1]["bytes"], text.len());
+    let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test]
+async fn an_opt_in_records_a_masked_size_capped_body() {
+    let rig = Rig::start(
+        "optin-body",
+        "file = \"{dir}/req.jsonl\"\ncapture_bodies = true\nbody = \"full\"\nmax_body_bytes = 64",
+    )
+    .await;
+    let path = rig.dir.join("req.jsonl");
+    let secret = ["sk-", "0123456789abcdef0123456789"].concat();
+    let body = format!(r#"{{"content":"{secret}","pad":"{}"}}"#, "q".repeat(400));
+
+    let response = rig
+        .post("/zen/chat/completions", &body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+
+    let records = records_when(&path, 2);
+    assert_eq!(records.len(), 2, "{records:?}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains(&secret), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+    let logged = records[0]["body"].as_str().unwrap_or_default();
+    assert!(logged.len() <= 64, "{logged}");
+    assert_eq!(records[0]["body_truncated"], true);
+    assert_eq!(records[0]["body_bytes"], body.len());
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
 

@@ -11,7 +11,8 @@ Compiled in by the default `plugin-requestlog` feature; inactive until a `[plugi
 file = "/var/lib/reiki/requests.jsonl"     # JSON lines, rotated by size
 socket = "/run/reiki/requests.sock"        # live feed, one JSON line per record
 # syslog = "tcp://collector.example.com:514"  # RFC 5424 messages, see Syslog output
-body = "full"                              # "full", "summary" or "none"
+# capture_bodies = false                   # set true only to record body text
+body = "summary"                            # "summary", "full" or "none"
 headers = ["user-agent", "x-session-id"]
 ```
 
@@ -26,11 +27,12 @@ At least one of `file`, `socket` and `syslog` is required. File and socket paths
 | `syslog` | none | Syslog collector: `udp://host:port`, `tcp://host:port` or `unix:///dev/log`. Each record is sent as an RFC 5424 message. See [Syslog output](#syslog-output). |
 | `syslog_facility` | `local0` | RFC 5424 facility name, from `kern` to `local7`. Needs `syslog`. |
 | `syslog_app_name` | `reiki` | APP-NAME: 1 to 48 printable ASCII characters, no spaces, not `-`. Needs `syslog`. |
-| `body` | `full` | `full` logs the request body, `summary` logs counts only, `none` logs its size only. |
-| `max_body_bytes` | 65536 | Longest body text logged (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
-| `max_capture_bytes` | 1048576 | Most body bytes copied per request onto the writer queue (1 to 67108864). A request body over it is cut, logged as masked text and marked `body_truncated`; `body_bytes` still has the full size. It also caps the response body and error bodies kept for `response = "body"`, together with `max_body_bytes`. The queue is also bounded in total by `queue_max_bytes`. |
+| `capture_bodies` | `false` | Permit body text in the log. With `false`, only metadata and summaries are recorded; `body = "full"` and `response = "body"` are config errors. Enabling it warns at startup, applies to the file, socket and syslog sinks together, and requires keeping those sinks private. Captured bodies are masked and capped as below. |
+| `body` | `summary` | `summary` logs counts and scalar settings, never prompt or tool text; `none` logs the body size only. `full` logs the request body, but needs `capture_bodies = true`. |
+| `max_body_bytes` | 65536 | Longest body text logged when `capture_bodies = true` (1 to 16777216). Longer bodies are cut on a character boundary and marked `body_truncated`. |
+| `max_capture_bytes` | 1048576 | Most body bytes copied per request onto the writer queue (1 to 67108864). In summary mode this only bounds the bytes inspected for counts; no body text is logged. In full-capture mode a request body over it is cut, logged as masked text and marked `body_truncated`; `body_bytes` still has the full size. It also caps the response body and error bodies kept for `response = "body"`, together with `max_body_bytes`. The queue is also bounded in total by `queue_max_bytes`. |
 | `headers` | none | Request headers to log, matched case-insensitively, each value cut at 256 bytes. Credential headers are refused (see below). |
-| `response` | `status` | `status` writes a response record per request with its status, size, serving key and attempts. `body` adds the response body, cut at `max_body_bytes`. `none` writes no response record. |
+| `response` | `status` | `status` writes a response record per request with its status, size, duration, serving key and attempts. `body` adds the response and failed-attempt bodies, cut at `max_body_bytes`, but needs `capture_bodies = true`. `none` writes no response record. |
 | `exclude` | none | Top-level keys or JSON pointers removed from logged JSON bodies, for example `["tools", "/messages/0"]`. The record lists what was dropped in `body_excluded`. |
 | `summarize` | none | Paths replaced by a short description: an array of named items (such as tools) becomes the list of names, any other array becomes `"[N items]"`, an object becomes its key names. |
 | `max_string_bytes` | `0` | Longest string kept in a logged JSON body; `0` keeps them whole. Longer ones are cut and end in `…[+N bytes]`. |
@@ -46,7 +48,7 @@ Stopping Reiki with a signal leaves the socket file behind; the next start repla
 
 ## Stability of records
 
-Every JSON record carries `"v":1`, written by `crates/reiki-requestlog/src/writer.rs` on `request`, `response`, `finding` and `dropped` records. OCSF output has no `v`; it sets `metadata.version` to the external schema version `1.3.0` (`crates/reiki-requestlog/src/ocsf.rs`). Syslog `VERSION 1` is the RFC 5424 protocol version.
+Every JSON record carries `"v":1`, written by `crates/reiki-requestlog/src/writer.rs` on `request`, `response`, `finding` and `dropped` records. By default a request record carries method, stream, upstream, redacted route and body size; a response record carries status, duration, byte count, key name and attempts. Neither carries body text. OCSF output has no `v`; it sets `metadata.version` to the external schema version `1.3.0` (`crates/reiki-requestlog/src/ocsf.rs`). Syslog `VERSION 1` is the RFC 5424 protocol version.
 
 > **Limit:** `v:1` is a marker only. No code checks it, there is no `v:2` path, and no stability policy for log fields is written in this repository. The only stated stability promise is for the versioned admin API (`/v1`), not the request log.
 
@@ -77,14 +79,14 @@ A field addition changes no version marker: the record stays `v:1`. The `dropped
 Every record is one line with `"v":1`. A request produces two records that share an `id`.
 
 ```json
-{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"client-a","upstream":"example","method":"POST","headers":{"user-agent":"client/1.0"},"body_bytes":75,"body":{"model":"small","messages":[{"role":"user","content":"hello there"}]}}
+{"v":1,"event":"request","id":"d87b738bb70ccae6","ts":"2026-10-23T23:27:24.291Z","stream":"client-a","upstream":"example","method":"POST","headers":{"user-agent":"client/1.0"},"body_bytes":75,"body_summary":{"model":"small","messages":1}}
 {"v":1,"event":"response","id":"d87b738bb70ccae6","ts":"2025-01-01T12:00:00.000Z","status":200,"duration_ms":249,"bytes":11,"key":"example-primary","attempts":[{"key":"example-primary","status":200}]}
 ```
 
 - `stream` is the Reiki stream (client) and `upstream` the provider name from the config.
-- `body` is parsed JSON when the body is JSON and fits `max_body_bytes` after `exclude`, `summarize` and `max_string_bytes` have trimmed it; otherwise it is a string. `body_bytes` is always the original size. Trim with those options instead of raising the cap, so large bodies stay parsed JSON.
-- In `summary` mode the record has `body_summary` with `model`, `stream`, `max_tokens`, `temperature` and the counts of `messages`, `tools` and `input_items`.
-- The response record is written once the response has finished, or the client has gone away. `status` is the upstream status, and `null` when Reiki answered without an upstream response, for example when every key is cooling. `bytes` is the size of the response body as it passed through the plugin. Response bodies are never logged.
+- No body text is logged by default. `body_bytes` is always the original size. In the default `summary` mode, JSON request bodies yield `body_summary` with `model`, `stream`, `max_tokens`, `temperature` and the counts of `messages`, `tools` and `input_items`; message contents and tool arguments are not included. `body = "none"` records the size only.
+- With `capture_bodies = true` and `body = "full"`, `body` is parsed JSON when the body is JSON and fits `max_body_bytes` after `exclude`, `summarize` and `max_string_bytes` have trimmed it; otherwise it is a string. Trim with those options instead of raising the cap, so large bodies stay parsed JSON.
+- The response record is written once the response has finished, or the client has gone away. `status` is the upstream status, and `null` when Reiki answered without an upstream response, for example when every key is cooling. `bytes` is the size of the response body as it passed through the plugin, and `duration_ms` its elapsed time. Response bodies are not logged by default and require both `response = "body"` and `capture_bodies = true`.
 - If the writer cannot keep up, records are dropped rather than slowing requests, and a `{"event":"dropped","count":N}` record follows. A record is dropped when the queue is full or the queued bytes would pass `queue_max_bytes`; the first drop also logs one warning. A record only the syslog collector misses is reported to syslog alone, see [Syslog output](#syslog-output).
 
 The request record carries the request `path` without its query string. The response record carries `key`, the name in the config of the key that produced the response (`null` when Reiki answered itself), and `attempts`, every key tried in order with the upstream status it returned (`null` for a connection error or timeout). Only key names are logged, never a key's value.
@@ -104,8 +106,10 @@ At most 32 subscribers connect at once. Each has its own bounded queue. On each 
 
 ## What is kept out of the log
 
-Request bodies are prompts, so treat the file and socket as sensitive. Both are readable by their owner only.
+Request bodies are prompts, so they are not recorded by default. If you opt in with `capture_bodies = true`, treat the file, socket and syslog collector as sensitive; the file and socket are readable by their owner only.
 
+- **No bodies by default.** With `capture_bodies = false`, prompt text, response text, tool arguments and failed-attempt error bodies never reach a record. Only sizes, counts and metadata are written. The default `body = "summary"` and `response = "status"` need no opt-in.
+- **Every captured body is scrubbed and capped.** With `capture_bodies = true`, request bodies, response bodies and failed-attempt bodies are masked by the rules below, then cut at `max_capture_bytes` and `max_body_bytes`. The same records go to the file, socket and syslog; there is no sink-specific body setting.
 - **Credential headers are never logged.** Any header whose name contains `auth`, `token`, `key`, `secret`, `cookie` or `credential` is refused in `headers` (case-insensitively), so Reiki will not start with one listed — the fixed names `authorization`, `proxy-authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, `set-cookie` and `x-auth-token` are covered, as are names like `x-credential`. Upstream keys are never visible to a plugin.
 - **Credential-shaped text is masked** with `[REDACTED]` in bodies and listed headers: `sk-…`, `sk_live_`/`sk_test_`/`rk_live_`/`whsec_` (Stripe), `oc_sk_…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_` tokens, `glpat-`/`glptt-`, `AKIA`/`ASIA` access keys, `AIza…` and `ya29.` Google keys and tokens, `xox[bpas]-` tokens, `hf_`, `gsk_`, `xai-`, `pplx-`, `nvapi-`, `csk-`, `jina_`, `tvly-`, `r8_`, `npm_`, `pypi-`, `shpat_`, `SG.`, `dop_v1_`, `lin_api_`, `sbp_`, `dckr_pat_`, `hvs.` and `ATATT3` tokens, JWT-shaped `eyJ…` strings, `Bearer <token>` and PEM private key blocks.
 - **Encoded credentials are masked** when the value decodes to one anywhere in it: a base64 (standard or URL-safe) value whose decoded text holds one of the shapes above or a PEM private key, and a percent-encoded run, such as `sk%2D…` or `Bearer%20…`, that decodes to one. So a base64 `user:sk-…`, `{"token":"sk-…"}` or text with the key after a prefix is masked whole.
@@ -114,7 +118,7 @@ Request bodies are prompts, so treat the file and socket as sensitive. Both are 
 - **Masking comes before cutting.** When a capture stops at `max_capture_bytes`, `max_body_bytes` or an error body's limit, a credential cut off at the end is masked too, even if it is shorter than its usual minimum length.
 - Headers that carry credentials (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-goog-api-key`) are masked whole.
 - The logged path has credential query parameters (`key`, `token`, `api_key`, `access_token`, `auth_token`, `api_secret`, `password`, `signature` and similar) and credential-shaped segments masked. The name is percent-decoded and matched without regard to case, dashes and underscores, so `api-key`, `api%2Dkey` and `Auth` are masked too, while `monkey`, `keyboard` and `page_token_count` are not. The same rule masks the values of a form body (`password=…&user=…`, not JSON) in requests and responses. JSON object keys are masked as well as values.
-- Masking is pattern based and applies to the text of JSON strings. It will not catch a secret in an unrecognised format, a password in prose, or personal data. Set `body = "summary"` or `"none"` where that matters.
+- Masking is pattern based and applies to the text of JSON strings. It will not catch a secret in an unrecognised format, a password in prose, or personal data. Keep `capture_bodies = false` (the default), or use `body = "none"` where even summaries are too much.
 
 ## Where it sits in the chain
 
@@ -128,7 +132,7 @@ A request a plugin blocks is rejected before it reaches the request log, so it h
 
 A finding can also carry a `detail` label, such as a tool name, when the plugin reports one. It is a short sanitised string (see [Report findings with a detail](plugins.md#report-findings-with-a-detail)), and the record has no `detail` field when the plugin sent none.
 
-The request log does not mask detected identifiers in the body it records. With the default `body = "full"`, a request that `phi` only reports is written to the log with its identifiers in it. Where a detection plugin runs in `report` mode, set `body = "summary"` or `body = "none"`.
+The request log does not mask detected identifiers in a body it records. By default it records a summary, not the body. If you explicitly set `capture_bodies = true` and `body = "full"`, a request that `phi` only reports is written to the log with its identifiers in it. Where a detection plugin runs in `report` mode, leave `capture_bodies = false`, or set `body = "none"` when even summaries are too much.
 
 ## OCSF output
 
@@ -140,7 +144,7 @@ The request log does not mask detected identifiers in the body it records. With 
 | response | HTTP Activity (4002) | `http_response.code`, `duration` in milliseconds, `status_id` 1 or 2 |
 | finding | Detection Finding (2004) | `finding_info.types` is the kind, `count`, and `disposition` `Blocked` or `Logged`. With a `detail`, `finding_info.title` ends in `(kind:detail)` |
 
-Every event carries `metadata.correlation_uid`, the request id, so a SIEM can join a request, its response and its findings. Redaction, `headers` and `body` apply as in the JSON format.
+Every event carries `metadata.correlation_uid`, the request id, so a SIEM can join a request, its response and its findings. Redaction, `headers` and `body` apply as in the JSON format, including the `capture_bodies` opt-in.
 
 ## Syslog output
 
@@ -207,5 +211,5 @@ if $programname == 'reiki' then {
 }
 ```
 
-Open the collector's port only to the hosts that send to it. The records hold prompts, so keep the collector's files readable by its operators only.
+Open the collector's port only to the hosts that send to it. With `capture_bodies = true` the records hold prompts, so keep the collector's files readable by its operators only.
 

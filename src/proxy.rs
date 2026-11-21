@@ -170,6 +170,53 @@ impl std::error::Error for LoadError {
     }
 }
 
+/// Validates one key's contents and file mode without touching the filesystem. `load_keys` feeds
+/// this the bytes and metadata it read from one handle; the fuzz target feeds it arbitrary text.
+pub(crate) fn key_file_verdict(
+    name: &str,
+    raw: &str,
+    mode: Option<u32>,
+    strict: bool,
+) -> Result<String, LoadError> {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        if let Some(crate::keys::CheckIssue::GroupOrWorldReadable(_)) =
+            crate::keys::permission_verdict(mode)
+        {
+            if strict {
+                return Err(LoadError::Permissions {
+                    key: name.to_owned(),
+                    mode,
+                });
+            }
+            tracing::warn!(
+                key = %name,
+                "key file has group or world read/write bits (mode {mode:04o}); set strict_key_permissions = true to refuse it"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (mode, strict);
+
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(LoadError::Empty(name.to_owned()));
+    }
+    if value.len() < crate::scrub::MIN_SECRET {
+        return Err(LoadError::Short {
+            key: name.to_owned(),
+            len: value.len(),
+        });
+    }
+    if value.len() > crate::scrub::MAX_SECRET {
+        return Err(LoadError::Long {
+            key: name.to_owned(),
+            len: value.len(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
 pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> {
     let mut keys = HashMap::new();
     for (name, key) in &config.keys {
@@ -180,55 +227,29 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
             source,
         })?;
         #[cfg(unix)]
-        {
+        let mode = {
             use std::os::unix::fs::PermissionsExt;
 
-            let mode = handle
-                .metadata()
-                .map_err(|source| LoadError::Read {
-                    key: name.clone(),
-                    source,
-                })?
-                .permissions()
-                .mode()
-                & 0o777;
-            if let Some(crate::keys::CheckIssue::GroupOrWorldReadable(_)) =
-                crate::keys::permission_verdict(mode)
-            {
-                if config.strict_key_permissions {
-                    return Err(LoadError::Permissions {
+            Some(
+                handle
+                    .metadata()
+                    .map_err(|source| LoadError::Read {
                         key: name.clone(),
-                        mode,
-                    });
-                }
-                tracing::warn!(
-                    key = %name,
-                    "key file {} has group or world read/write bits (mode {mode:04o}); set strict_key_permissions = true to refuse it",
-                    key.file
-                );
-            }
-        }
+                        source,
+                    })?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+            )
+        };
+        #[cfg(not(unix))]
+        let mode = None;
         let mut raw = String::new();
         std::io::Read::read_to_string(&mut handle, &mut raw).map_err(|source| LoadError::Read {
             key: name.clone(),
             source,
         })?;
-        let value = raw.trim();
-        if value.is_empty() {
-            return Err(LoadError::Empty(name.clone()));
-        }
-        if value.len() < crate::scrub::MIN_SECRET {
-            return Err(LoadError::Short {
-                key: name.clone(),
-                len: value.len(),
-            });
-        }
-        if value.len() > crate::scrub::MAX_SECRET {
-            return Err(LoadError::Long {
-                key: name.clone(),
-                len: value.len(),
-            });
-        }
+        let value = key_file_verdict(name, &raw, mode, config.strict_key_permissions)?;
         keys.insert(name.clone(), Secret::new(value));
     }
     Ok(keys)
@@ -1058,7 +1079,7 @@ const MAX_PATH_DECODE_LAYERS: usize = 8;
 /// True for a `.` or `..` segment, plain or percent-encoded, an encoded `/` or `\`, or a
 /// raw backslash: forms an upstream may normalise into a path outside the one Reiki checked.
 /// Every encoding layer is checked, so `%252e%252e` is caught once it decodes to `%2e%2e`.
-fn has_path_trick(path: &str) -> bool {
+pub(crate) fn has_path_trick(path: &str) -> bool {
     let mut layer = path.to_owned();
     for _ in 0..MAX_PATH_DECODE_LAYERS {
         let lower = layer.to_ascii_lowercase();
@@ -1086,7 +1107,7 @@ fn has_path_trick(path: &str) -> bool {
 }
 
 /// One pass of percent-decoding, or `None` for a malformed escape or non-UTF-8 result.
-fn decode_path_layer(path: &str) -> Option<String> {
+pub(crate) fn decode_path_layer(path: &str) -> Option<String> {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -1212,7 +1233,7 @@ pub(crate) fn upstream_headers(
     out
 }
 
-fn split_upstream(path: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_upstream(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.strip_prefix('/')?;
     let (name, rest) = match trimmed.find('/') {
         Some(i) => (&trimmed[..i], &trimmed[i..]),

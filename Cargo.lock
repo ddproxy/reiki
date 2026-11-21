@@ -1595,6 +1595,7 @@ dependencies = [
  "reiki-placeholders",
  "reiki-plugin",
  "reiki-requestlog",
+ "reiki-toolpolicy",
  "reiki-top",
  "reqwest",
  "rustix",
@@ -1710,6 +1711,20 @@ dependencies = [
  "reiki-plugin",
  "reiki-redact",
  "rustix",
+ "serde_json",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "reiki-toolpolicy"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "reiki-plugin",
+ "reiki-redact",
  "serde_json",
  "toml",
  "tracing",

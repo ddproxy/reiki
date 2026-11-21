@@ -29,7 +29,7 @@ Reiki is a security proxy for coding-agent and LLM traffic. It sits between a cl
 1. [Overview](docs/overview.md) — the model and the listeners. Use the [glossary](docs/glossary.md) for CLI and status vocabulary.
 2. [Configuration](docs/configuration.md) and [command line](docs/cli.md) — every table and flag; then [keys and streams](docs/keys.md).
 3. [Providers](docs/providers.md) — mapping and test coverage; then [failover](docs/failover.md) and [classification](docs/classification.md).
-4. [Security](docs/security.md) — assets and trust boundaries; then the [redaction reference](docs/redaction.md) and the egress plugins: [placeholders](docs/placeholders.md), [PHI](docs/phi.md), [finance](docs/finance.md), [controlled information](docs/controlled.md).
+4. [Security](docs/security.md) — assets and trust boundaries; then the [redaction reference](docs/redaction.md) and the egress plugins: [placeholders](docs/placeholders.md), [PHI](docs/phi.md), [finance](docs/finance.md), [controlled information](docs/controlled.md), [tool policy](docs/toolpolicy.md).
 5. [Request log](docs/requestlog.md), [monitoring](docs/monitoring.md), [troubleshooting](docs/troubleshooting.md) and the [FAQ](docs/faq.md) — observe and diagnose.
 6. [Tunnel](docs/tunnel.md), [shaping](docs/shaping.md), [peers](docs/peers.md), [reiki top](docs/top.md) and [hub](docs/hub.md) — optional subsystems.
 7. [Deploy](docs/deploy.md), [upgrades](docs/upgrades.md) and [worked examples](docs/examples.md) — run, change and see the output.
@@ -152,7 +152,7 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 
 - [Plugins](docs/plugins.md): the plugin model and the bundled set.
 - [Plugin authoring](docs/plugin-authoring.md): hooks, tests and build-time registration.
-- [Placeholders](docs/placeholders.md), [PHI and NPPI](docs/phi.md), [Finance](docs/finance.md), [Controlled information](docs/controlled.md).
+- [Placeholders](docs/placeholders.md), [PHI and NPPI](docs/phi.md), [Finance](docs/finance.md), [Controlled information](docs/controlled.md), [Tool policy](docs/toolpolicy.md).
 - [Request log](docs/requestlog.md): records and their stability note.
 - [Redaction reference](docs/redaction.md): the exact forms scrubbed from relayed bodies and headers.
 - [Tunnel](docs/tunnel.md): CONNECT proxy, destination allow-list and interception.

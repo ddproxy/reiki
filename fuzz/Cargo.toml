@@ -1,0 +1,85 @@
+[package]
+name = "reiki-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+http = "1"
+serde_json = "1"
+reiki = { path = "..", features = ["fuzzing"] }
+reiki-detect = { path = "../crates/reiki-detect" }
+reiki-placeholders = { path = "../crates/reiki-placeholders", features = ["fuzzing"] }
+reiki-redact = { path = "../crates/reiki-redact" }
+reiki-requestlog = { path = "../crates/reiki-requestlog", features = ["fuzzing"] }
+
+# Keep cargo-fuzz's own workspace separate from the main workspace.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "sse_parser"
+path = "fuzz_targets/sse_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "scrub_forms"
+path = "fuzz_targets/scrub_forms.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "placeholders"
+path = "fuzz_targets/placeholders.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "redaction"
+path = "fuzz_targets/redaction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "json_pair"
+path = "fuzz_targets/json_pair.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "key_file"
+path = "fuzz_targets/key_file.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "path_normalization"
+path = "fuzz_targets/path_normalization.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tunnel_allowlist"
+path = "fuzz_targets/tunnel_allowlist.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false

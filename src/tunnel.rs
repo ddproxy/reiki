@@ -578,7 +578,7 @@ fn split_target(target: &str) -> Option<(String, u16)> {
 
 /// Splits `host`, `host:port`, `[ipv6]:port` or a bare IPv6 literal. A bare IPv6 literal with no
 /// brackets keeps `default_port`, because an unbracketed trailing `:port` is ambiguous.
-fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(String, u16)> {
+pub(crate) fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(String, u16)> {
     use std::net::Ipv6Addr;
     let text = text.to_ascii_lowercase();
     if let Some(rest) = text.strip_prefix('[') {

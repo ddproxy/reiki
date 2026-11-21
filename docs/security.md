@@ -7,7 +7,7 @@ Reiki sits between a client (an agent such as opencode or Claude Code, or an app
 | Upstream API keys | The client | Key files read by Reiki; credential headers replaced per request |
 | Credentials and listed terms in prompts | The provider | The `placeholders` plugin ([placeholders](placeholders.md)) swaps them for placeholders before the request leaves and restores them in the response |
 | Arbitrary destinations | The client | Config-only upstreams and the tunnel allowlist |
-| A record of what was sent | Nobody; it is for you | The `requestlog` plugin ([requestlog](requestlog.md)), with credentials masked |
+| A record of what was sent | Nobody; it is for you | The `requestlog` plugin ([requestlog](requestlog.md)), which records summaries by default and masks any bodies you explicitly opt in to capture |
 
 ## Clients and keys
 
@@ -42,12 +42,12 @@ Reiki forwards every request header except hop-by-hop headers (`connection`, `ke
 - Certificates are minted for one exact host and live `leaf_ttl_hours` (default 24). Wildcards and addresses are refused.
 - A request is relayed only if its `Host` header matches the tunnel destination and its path lies under the upstream's base path; anything else is refused. This keeps one tunnel from reaching other hosts or other parts of the API.
 - Reiki verifies the upstream's certificate on its own TLS connection, as it does for every other route.
-- Plugins see decrypted requests and responses on intercepted hosts. Enable `requestlog` bodies there only when you intend to record them.
+- Plugins see decrypted requests and responses on intercepted hosts. Keep `requestlog`'s `capture_bodies = false` there unless you intend to record the bodies; enabling body capture warns at startup and applies to every sink.
 - Other tunnel destinations stay opaque and are not read.
 
 ## Logging
 
-Key values and stream tokens are not logged. Request and response bodies are not logged, except the first 160 characters of upstream error bodies at `debug` level, and whatever the `requestlog` plugin is configured to record, which masks credentials in paths, query parameters, credential headers and JSON keys and values. A failure-ring snippet is scrubbed the same way as a relayed body; if a compacted copy still contains key material after ASCII whitespace and control bytes are removed, the whole snippet becomes `[body withheld: contains key material]`.
+Key values and stream tokens are not logged. Reiki's service log does not record request or response bodies, except the first 160 characters of upstream error bodies at `debug` level. The `requestlog` plugin records method, route, status, durations, sizes, counts, key names and failure findings, but no body text by default: `capture_bodies` defaults to `false`, and setting it to `true` warns at startup. Opting in lets `body = "full"` and `response = "body"` write request, response and failed-attempt bodies to every configured sink; those bodies are masked in paths, query parameters, credential headers and JSON keys and values, and capped per entry. A failure-ring snippet is scrubbed the same way as a relayed body; if a compacted copy still contains key material after ASCII whitespace and control bytes are removed, the whole snippet becomes `[body withheld: contains key material]`.
 
 ## Plugins
 

@@ -1,5 +1,7 @@
 /target
 /scripts/check-workflows/target
+/fuzz/target
+/fuzz/artifacts
 *.key
 /keys/
 reiki.toml

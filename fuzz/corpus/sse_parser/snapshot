@@ -1,0 +1,3 @@
+event: snapshot
+data: {"type":"health"}
+

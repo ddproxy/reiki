@@ -40,7 +40,7 @@ fn local_now() -> i64 {
 }
 
 // Absolute resets use the provider's `Date`, so local clock skew does not shift them.
-fn observe_at(headers: &HeaderMap, local_now: i64) -> Observed {
+pub(crate) fn observe_at(headers: &HeaderMap, local_now: i64) -> Observed {
     let date = text(headers, "date")
         .and_then(parse_http_date)
         .filter(|secs| *secs >= 0);
@@ -116,7 +116,7 @@ fn within_cap(wait: Duration) -> Option<Duration> {
 }
 
 /// Integers only: plain seconds, or `h`/`m`/`s`/`ms` components such as `6m0s`.
-fn parse_duration(value: &str) -> Option<Duration> {
+pub(crate) fn parse_duration(value: &str) -> Option<Duration> {
     if value.is_empty() {
         return None;
     }

@@ -18,7 +18,7 @@ on_error = "reject"
 
 > **Fail-open case.** `on_error = "pass_through"` lets a request through when `placeholders` reports it could not mask the body. Use it only where unmasked egress is acceptable.
 
-With a `[plugins.requestlog]` table, set `body = "summary"`. The default is `body = "full"`, which records the request body after masking. See [request log](requestlog.md#configure).
+With a `[plugins.requestlog]` table, no body setting is needed: `body = "summary"` is the default and records counts, not prompt text. `capture_bodies` also defaults to `false`; recording body text requires `capture_bodies = true` together with `body = "full"`, and logs a warning at startup. See [request log](requestlog.md#configure).
 
 ## 2. Report PHI without blocking
 
@@ -31,7 +31,7 @@ on_error = "reject"
 
 `report` logs the finding and lets the request through. Add `field`, `email` and `phone` only after checking samples: they match fields, commit metadata and source code more often than the default kinds. Restrict `upstreams` when only some routes need the check. See [PHI and NPPI](phi.md#configure).
 
-The request log gets a `finding` record with `action: "reported"`. It names the kind and count, never the matched text. A request log at `body = "full"` still records the original identifiers: `phi` reports them and lets the request through, and the request log does not mask detected identifiers. Set `body = "summary"` or `"none"` during this phase. See [request log](requestlog.md#findings-from-detection-plugins).
+The request log gets a `finding` record with `action: "reported"`. It names the kind and count, never the matched text. By default it also records a body summary, not the body. With `capture_bodies = true` and `body = "full"`, it still records the original identifiers: `phi` reports them and lets the request through, and the request log does not mask detected identifiers. Leave body capture off, or set `body = "none"`, during this phase. See [request log](requestlog.md#findings-from-detection-plugins).
 
 > **Not covered.** `phi` reads only the request body as text. Headers, the query string and responses are not checked. A body with a `Content-Encoding` other than `identity`, or one that is not valid UTF-8, is logged as unchecked in `report` mode.
 

@@ -1,0 +1,2 @@
+[upstream.example]
+base_url = "http://localhost:1234"

@@ -265,7 +265,7 @@ async fn reload(
 /// The `dry_run` flag of a reload query: absent is `false`; a bare name, an empty or unknown
 /// value, or a second `dry_run` is an error, so a flag that was not understood never applies a
 /// live reload.
-fn parse_dry_run(query: &str) -> Result<bool, ()> {
+pub(crate) fn parse_dry_run(query: &str) -> Result<bool, ()> {
     let mut found = None;
     for pair in query.split('&') {
         let (name, value) = pair
@@ -288,7 +288,7 @@ fn parse_dry_run(query: &str) -> Result<bool, ()> {
 
 /// Percent-decodes one query value. `+` is a space; an invalid escape or bytes that are not
 /// UTF-8 yields `None`, so the caller answers 400 instead of guessing the key name.
-fn decode_query_value(value: &str) -> Option<String> {
+pub(crate) fn decode_query_value(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -322,7 +322,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 /// Reads `key` strictly: a repeated, bare, empty or unknown flag, or invalid percent-encoding,
 /// answers 400 rather than enabling a key the caller did not name unambiguously.
-fn parse_key_query(query: &str) -> Result<String, &'static str> {
+pub(crate) fn parse_key_query(query: &str) -> Result<String, &'static str> {
     let mut key = None;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let Some((name, value)) = pair.split_once('=') else {

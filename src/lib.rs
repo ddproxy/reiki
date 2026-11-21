@@ -5,6 +5,8 @@ pub mod classify;
 pub mod config;
 pub mod failures;
 pub mod forward;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 pub mod intercept;
 pub mod keys;
 pub mod lifecycle;

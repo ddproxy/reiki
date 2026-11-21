@@ -546,7 +546,7 @@ const MAX_KEY_UPSTREAMS: usize = 256;
 
 /// Largest number of items one `feed` may emit. A comment is three bytes and one item, so
 /// without this cap one chunk could enqueue tens of thousands of them.
-const MAX_SSE_ITEMS_PER_FEED: usize = 1024;
+pub(crate) const MAX_SSE_ITEMS_PER_FEED: usize = 1024;
 
 /// One parsed Server-Sent Events item.
 #[derive(Debug, PartialEq, Eq)]

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- `requestlog` now records summaries only by default. `body` defaults to `summary`, and a new `capture_bodies` option defaults to `false`; no prompt, response or tool-argument text is written to the file, socket or syslog unless body capture is explicitly enabled. The summary still records method, route, status, durations, byte counts, token-setting counts, key names, attempts and failure findings.
+- Body capture requires `capture_bodies = true`: `body = "full"` and `response = "body"` are config errors without it, and enabling it logs a startup warning. Every captured request, response and failed-attempt body is masked and capped by `max_capture_bytes` and `max_body_bytes`, and the live socket feed follows the same rules as the file and syslog sinks.
+### Added
+
+- New `toolpolicy` plugin inspects tool calls in OpenAI Chat and Anthropic Messages responses, in whole bodies and streams. It checks declared tools, user/system host provenance and command tripwires; `report` is the default and `block` replaces flagged calls with a plain-text notice. See [tool policy](docs/toolpolicy.md).
+- `toolpolicy` writes a rotating owner-only JSONL journal and serves counters at `GET /v1/toolpolicy/metrics` on the admin listener.
+### Added
+
+- Cargo-fuzz targets for the SSE/stream parser, scrubbing and redaction, JSON key-invalid detection, config and key-file parsing, percent-decoding and path normalisation, tunnel allow-lists and header parsers. Each target checks for panics, leaked secrets and unbounded output, with hand-written seed corpora and a weekly/manual CI workflow that uploads crash artifacts.
+- A `fuzzing` feature that exposes the parser internals the harnesses need without adding `unsafe` code or changing default builds.
+
 ### Fixed
 
 - Terms in the `placeholders` plugin now match Unicode spellings whose lowercase mapping expands to several characters. A term written as `i` plus a combining dot is masked by `İ`, whose lowercase mapping is two characters, and a match inside the expansion masks the whole original character.

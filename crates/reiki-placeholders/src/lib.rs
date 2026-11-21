@@ -21,6 +21,14 @@ pub use config::Config;
 use mask::Masker;
 use restore::Restorer;
 
+/// Internal parsers exposed only to the cargo-fuzz targets when the `fuzzing` feature is on.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub use crate::config::validate_terms;
+    pub use crate::mask::{Masker, HEAD, TAIL};
+    pub use crate::restore::{incomplete_start, restore_text, Restorer};
+}
+
 /// The `[plugins.placeholders]` table this plugin reads.
 pub const NAME: &str = "placeholders";
 

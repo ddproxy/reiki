@@ -1,0 +1,3 @@
+[keys.main]
+file = "/tmp/example.key"
+upstream = "example"

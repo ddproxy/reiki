@@ -327,6 +327,8 @@ Plugin-specific keys are documented on each plugin's page:
 | Controlled information | `[plugins.controlled]` | [controlled](controlled.md) |
 | Metrics | `[plugins.metrics]` | [monitoring](monitoring.md) |
 
+The `requestlog` plugin records summaries only by default: `body = "summary"` and `capture_bodies = false`. Request, response and error body text requires the explicit `capture_bodies = true` opt-in together with `body = "full"` or `response = "body"`; the opt-in warns at startup and applies to every configured sink. See [requestlog](requestlog.md#configure).
+
 ## Limit presets
 
 `limits.preset` and `accounts.LABEL.limits.preset` take one of these names. Explicit fields override the preset's value.
@@ -417,7 +419,7 @@ Rules, by section:
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
 - **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `[peers.NAME]` has a valid URL and `token_file`. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset.
-- **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid.
+- **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`.
 - **Hub.** Only with the `hub` feature. Names, URLs and token hashes are valid, edge tokens are unique and differ from every other credential, accounts and keys exist, and no key is used by two accounts.
 - **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature.
 

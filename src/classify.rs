@@ -187,7 +187,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 /// True when `field` is a real JSON string property with exactly `value`, anywhere in a parsed
 /// body. A `field`/`value` pair that merely appears in text (including inside an echoed string)
 /// is not a field, so it cannot make a healthy key look rejected.
-fn has_json_pair(body: &str, field: &str, value: &str) -> bool {
+pub(crate) fn has_json_pair(body: &str, field: &str, value: &str) -> bool {
     fn find(json: &serde_json::Value, field: &str, value: &str) -> bool {
         match json {
             serde_json::Value::Object(map) => map.iter().any(|(key, child)| {

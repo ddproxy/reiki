@@ -899,6 +899,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn toolpolicy_is_registered_after_metrics() {
+        let registry = builtin();
+        let names: Vec<&str> = registry
+            .iter()
+            .map(|registration| registration.name)
+            .collect();
+        let metrics = names.iter().position(|name| *name == "metrics");
+        let toolpolicy = names.iter().position(|name| *name == "toolpolicy");
+        if let (Some(metrics), Some(toolpolicy)) = (metrics, toolpolicy) {
+            assert!(metrics < toolpolicy, "compiled plugin order is {names:?}");
+        }
+    }
+
     struct Append(&'static str);
     impl Plugin for Append {
         fn name(&self) -> &str {

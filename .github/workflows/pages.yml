@@ -10,8 +10,7 @@ on:
       - .github/pages/**
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: pages

@@ -7,6 +7,12 @@
 
 # Reiki
 
+[![ci](https://github.com/ddproxy/reiki/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ddproxy/reiki/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/ddproxy/reiki/actions/workflows/codeql.yml/badge.svg)](https://github.com/ddproxy/reiki/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ddproxy/reiki/badge)](https://scorecard.dev/viewer/?uri=github.com/ddproxy/reiki)
+[![Release](https://img.shields.io/github/v/release/ddproxy/reiki)](https://github.com/ddproxy/reiki/releases/latest)
+[![License](https://img.shields.io/github/license/ddproxy/reiki)](LICENSE)
+
 Reiki is a security proxy for coding-agent and LLM traffic. It sits between a client and the providers it calls, keeps upstream API keys in files on the Reiki host, and gives the client a revocable stream token instead. Requests pass through one place where Reiki can rotate and fail over keys, filter outbound content and expose health and logs. Reiki runs as one binary, reads one TOML file and compiles plugins in at build time.
 
 ## Is it for you
@@ -37,6 +43,24 @@ From a checkout (Rust 1.99 or newer), `make install` builds with `reiki top` and
 Or download a prebuilt archive from the [releases page](https://github.com/ddproxy/reiki/releases) (Linux static musl and macOS, x86_64 and aarch64; `reiki top` included), check it against its `.sha256` file and copy `reiki` onto your `PATH`.
 
 Plugin selection and order are build arguments; see [plugins](docs/plugins.md#choose-and-order-plugins-at-build-time). To write a plugin, see [plugin authoring](docs/plugin-authoring.md). For service files and first-start checks, see [deploy](docs/deploy.md).
+
+## Security
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). [Security scanning](docs/security-scanning.md) lists the repository checks, where their findings appear and the settings the owner must enable.
+
+## Verify a release
+
+Archives ship with `.sha256` files, a CycloneDX SBOM and build provenance attestations. Check the one you use:
+
+```bash
+tag=v0.12.0
+gh release download "$tag" --repo ddproxy/reiki \
+  --pattern '*.tar.gz' --pattern '*.sha256' --pattern '*-sbom.json' --dir dist
+gh attestation verify "dist/reiki-$tag-x86_64-unknown-linux-musl.tar.gz" --repo ddproxy/reiki
+(cd dist && shasum -a 256 -c *.sha256)
+```
+
+The `.sha256` files cover the archives and `reiki-$tag-sbom.json`; the SBOM lists the components in the release build.
 
 ## Quick start
 
@@ -147,6 +171,7 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 - [Troubleshooting](docs/troubleshooting.md): status codes, logs, reload and common problems.
 - [FAQ](docs/faq.md): short answers to the questions asked most often.
 - [Security](docs/security.md): protections, limits and trust boundaries.
+- [Security scanning](docs/security-scanning.md): repository checks, findings and release verification.
 - [Observe, then enforce](docs/rollout.md): placeholders, report mode, `reiki scan` and the reload gate.
 - [What Reiki does not protect against](docs/limits.md): key-file modes, plugins, tunnels and encodings.
 

@@ -5,12 +5,14 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   test:
+    name: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,5 +29,3 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked --features top -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo test --locked --workspace --features top
-      - run: cargo install cargo-deny --locked --version 0.20.2
-      - run: cargo deny check

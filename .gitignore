@@ -1,4 +1,5 @@
 /target
+/scripts/check-workflows/target
 *.key
 /keys/
 reiki.toml

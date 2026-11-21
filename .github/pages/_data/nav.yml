@@ -20,6 +20,7 @@
 - title: Security and data
   items:
     - { title: Security, url: /docs/security.html }
+    - { title: Security scanning, url: /docs/security-scanning.html }
     - { title: What Reiki does not protect against, url: /docs/limits.html }
     - { title: Observe, then enforce, url: /docs/rollout.html }
     - { title: Redaction reference, url: /docs/redaction.html }

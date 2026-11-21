@@ -13,6 +13,7 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
 ]
 
 [bans]

@@ -7,7 +7,6 @@ Conventions in this page:
 - **Required** means the key has no default and must be set when its table exists.
 - Durations are whole seconds unless the name says otherwise. Sizes are bytes.
 - Unknown keys are errors everywhere. Reiki tables reject them while parsing, and each plugin rejects unknown keys in its own table, apart from the host keys `enabled`, `on_error`, `dry_run` and `streams`.
-- "Since" gives the version in which the key was added, only where the changelog states it.
 
 ## Tables
 
@@ -50,10 +49,14 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | --- | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. | |
 | `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits (anything looser than `0600`). Set to `false` to accept it with a warning instead. | |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable by group or others. Set to `false` to accept it with a warning instead. |
 
 ## `[admin]`
 
-The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST /keys/enable`, plugin routes such as `GET /metrics`, and `GET /v1/openapi.json`. Every route except `GET /v1/openapi.json` is also served under `/v1`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener.
+The admin listener serves `GET /v1/status`, `GET /v1/failures`, `POST /v1/reload`, `POST /v1/keys/enable`, plugin routes such as `GET /v1/metrics`, and `GET /v1/openapi.json`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -64,37 +67,37 @@ The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST 
 
 Counts failed token checks per peer address on the client, admin, peer and tunnel listeners. Intercepted `CONNECT` requests share the client listener's count; a `429` with `Retry-After` answers a locked-out address. A reload changes these values without a restart.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `backoff` | bool | `true` | Refuse an address for `window_secs` after `max_failures` failures. | 0.8.1 |
-| `max_failures` | integer | `10` | Failures allowed in `window_secs`. Range 1 to 10000. | 0.8.1 |
-| `window_secs` | integer | `60` | How long a failure counts, and how long a refused address waits. Range 1 to 86400. | 0.8.1 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `backoff` | bool | `true` | Refuse an address for `window_secs` after `max_failures` failures. |
+| `max_failures` | integer | `10` | Failures allowed in `window_secs`. Range 1 to 10000. |
+| `window_secs` | integer | `60` | How long a failure counts, and how long a refused address waits. Range 1 to 86400. |
 
 ## `[server]`
 
 Connection caps, read at startup. A changed value on reload is reported as needing a restart. Loopback addresses are exempt from the per-address caps.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `max_connections` | integer | `1024` | Open connections on the client listener. Range 1 to 100000. | 0.10.2 |
-| `max_connections_per_addr` | integer | `256` | Open connections on the client listener from one remote address. Range 1 to `max_connections`. | 0.10.2 |
-| `admin_max_connections` | integer | `64` | Open connections on the admin listener. Range 1 to 10000. | 0.10.2 |
-| `admin_max_connections_per_addr` | integer | `16` | Open connections on the admin listener from one address. Range 1 to `admin_max_connections`. | 0.10.2 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `max_connections` | integer | `1024` | Open connections on the client listener. Range 1 to 100000. |
+| `max_connections_per_addr` | integer | `256` | Open connections on the client listener from one remote address. Range 1 to `max_connections`. |
+| `admin_max_connections` | integer | `64` | Open connections on the admin listener. Range 1 to 10000. |
+| `admin_max_connections_per_addr` | integer | `16` | Open connections on the admin listener from one address. Range 1 to `admin_max_connections`. |
 
 ## `[service]`
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `shutdown_timeout_secs` | integer | `25` | After SIGTERM or SIGINT, time allowed for requests in flight before the listeners close. Range 1 to 300. Keep the unit's `TimeoutStopSec` above it. | 0.10.2 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `shutdown_timeout_secs` | integer | `25` | After SIGTERM or SIGINT, time allowed for requests in flight before the listeners close. Range 1 to 300. Keep the unit's `TimeoutStopSec` above it. |
 
 See [deploy](deploy.md).
 
 ## `[reload]`
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file (when the peer listener publishes), or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. | 0.7.5 |
-| `interval_secs` | integer | `5` | Seconds between checks. Range 1 to 3600. | 0.7.5 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file (when the peer listener publishes), or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. |
+| `interval_secs` | integer | `5` | Seconds between checks. Range 1 to 3600. |
 
 Reload also runs on SIGHUP and on `reiki reload`. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
 
@@ -102,44 +105,44 @@ Reload also runs on SIGHUP and on `reiki reload`. See [upgrades](upgrades.md#rel
 
 Reiki's own service log. The request log is a plugin; see [requestlog](requestlog.md).
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `level` | string | `"info"` | A level such as `info`, or a filter such as `info,reiki::tunnel=debug`. `RUST_LOG`, when set at startup, keeps overriding `level` after reload. | 0.4.2 |
-| `file` | string | unset | Also write lines to this absolute path. The service user must be able to write it. Enables rotation. | 0.4.2 |
-| `format` | `"text"` or `"json"` | `"text"` | Line layout for the file. | 0.4.2 |
-| `stderr` | bool | `true` | Keep writing to stderr. Must stay `true` when `file` is unset. | 0.4.2 |
-| `file_max_bytes` | integer | `52428800` (50 MiB) | Rotate when the next line would pass this size. `0` never rotates. | 0.4.2 |
-| `file_keep` | integer | `5` | Rotated files kept, `<file>.1` (newest) to `<file>.N`. At most 100. | 0.4.2 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `level` | string | `"info"` | A level such as `info`, or a filter such as `info,reiki::tunnel=debug`. `RUST_LOG`, when set at startup, keeps overriding `level` after reload. |
+| `file` | string | unset | Also write lines to this absolute path. The service user must be able to write it. Enables rotation. |
+| `format` | `"text"` or `"json"` | `"text"` | Line layout for the file. |
+| `stderr` | bool | `true` | Keep writing to stderr. Must stay `true` when `file` is unset. |
+| `file_max_bytes` | integer | `52428800` (50 MiB) | Rotate when the next line would pass this size. `0` never rotates. |
+| `file_keep` | integer | `5` | Rotated files kept, `<file>.1` (newest) to `<file>.N`. At most 100. |
 
 ## `[upstream.NAME]`
 
 One provider endpoint. Keys and streams refer to it by `NAME`. Fields marked as tables are covered in the subsections below.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `base_url` | string | required | Base URL of the provider. Must be `https://`, or `http://` on a loopback host. | |
-| `auth_header` | string | `"authorization"` | Header that carries the key. Must be a valid header name. | |
-| `auth_format` | string | `"Bearer {key}"` | Header value template. `{key}` must appear exactly once. | |
-| `model_aliases` | table of strings | `{}` | Replaces the request's top-level `model` value when it matches a key. Empty keys or values are refused. | |
-| `drop_params` | array of strings | `[]` | Top-level request fields removed before the request goes upstream. | |
-| `http2` | bool | `false` | Negotiate HTTP/2 when the provider offers it. Reverse-proxy routes only. | |
-| `forward_accept_encoding` | bool | `false` | Send the client's `Accept-Encoding` upstream instead of `identity`. Reverse-proxy routes only. | |
-| `max_decoded_bytes` | integer | `67108864` (64 MiB) | Largest response body after decoding. A larger buffered body becomes a 502. At least 1. | 0.8.1 |
-| `response_idle_timeout_secs` | integer | `300` | Longest gap between body chunks before the body is dropped. At least 1. | 0.8.1 |
-| `response_timeout_secs` | integer | unset | Longest total time for the body after the head arrives. Unset means 300 for a body that is not an event stream and no total limit for an event stream. An explicit value also applies to event streams. At least 1. | 0.8.1 |
-| `title_case_headers` | bool | `false` | Send header names in Title-Case on HTTP/1.1. Not allowed with `forward`. | 0.4.3 |
-| `send_keep_alive` | bool | `false` | Send `Connection: keep-alive` explicitly. Not allowed with `forward`. | 0.4.3 |
-| `pass_errors` | bool | `false` | Relay every upstream error status unchanged. No key is cooled, disabled or retried. Use it for upstreams that are not LLM providers. | 0.7.3 |
-| `confirm_quota` | bool | `false` | Re-send a quota 429 once on the same key after 3 seconds before cooling the key. | 0.7.1 |
-| `request_error_phrases` | array of strings | `[]` | Extra body phrases that make a 400, 402 or 413 pass through without changing the key. See [classification](classification.md#custom-response-phrases). | |
-| `quota_phrases` | array of strings | `[]` | Extra body phrases that cool the whole key as quota exhaustion. See [classification](classification.md#custom-response-phrases). | |
-| `rate_limit_phrases` | array of strings | `[]` | Extra body phrases that cool the route and model as a rate limit. See [classification](classification.md#custom-response-phrases). | |
-| `scope_escalate_after` | integer | `3` | Cool the whole key when this many models cool on it and another failure arrives. Range 2 to 16. | 0.10.0 |
-| `hold_unauthorized` | bool | `false` | Delay disabling the first key that answers 401 until a later key serves the same request. | 0.8.3 |
-| `passthrough` | bool | `false` | Plain reverse proxy. The client's own credentials go upstream unchanged. No Reiki token and no key from a chain. A passthrough upstream cannot have `fallback`. | 0.3.0 |
-| `fallback` | table | unset | Where requests go when no key of this upstream can serve them. See below. | 0.3.0 |
-| `forward` | table | unset | Run a command or talk to a socket instead of Reiki's HTTP client. See below. | 0.7.0 |
-| `limits` | table | unset | Outbound shaping for keys of this upstream. See below. | 0.10.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `base_url` | string | required | Base URL of the provider. Must be `https://`, or `http://` on a loopback host. |
+| `auth_header` | string | `"authorization"` | Header that carries the key. Must be a valid header name. |
+| `auth_format` | string | `"Bearer {key}"` | Header value template. `{key}` must appear exactly once. |
+| `model_aliases` | table of strings | `{}` | Replaces the request's top-level `model` value when it matches a key. Empty keys or values are refused. |
+| `drop_params` | array of strings | `[]` | Top-level request fields removed before the request goes upstream. |
+| `http2` | bool | `false` | Negotiate HTTP/2 when the provider offers it. Reverse-proxy routes only. |
+| `forward_accept_encoding` | bool | `false` | Send the client's `Accept-Encoding` upstream instead of `identity`. Reverse-proxy routes only. |
+| `max_decoded_bytes` | integer | `67108864` (64 MiB) | Largest response body after decoding. A larger buffered body becomes a 502. At least 1. |
+| `response_idle_timeout_secs` | integer | `300` | Longest gap between body chunks before the body is dropped. At least 1. |
+| `response_timeout_secs` | integer | unset | Longest total time for the body after the head arrives. Unset means 300 for a body that is not an event stream and no total limit for an event stream. An explicit value also applies to event streams. At least 1. |
+| `title_case_headers` | bool | `false` | Send header names in Title-Case on HTTP/1.1. Not allowed with `forward`. |
+| `send_keep_alive` | bool | `false` | Send `Connection: keep-alive` explicitly. Not allowed with `forward`. |
+| `pass_errors` | bool | `false` | Relay every upstream error status unchanged. No key is cooled, disabled or retried. Use it for upstreams that are not LLM providers. |
+| `confirm_quota` | bool | `false` | Re-send a quota 429 once on the same key after 3 seconds before cooling the key. |
+| `request_error_phrases` | array of strings | `[]` | Extra body phrases that make a 400, 402 or 413 pass through without changing the key. See [classification](classification.md#custom-response-phrases). |
+| `quota_phrases` | array of strings | `[]` | Extra body phrases that cool the whole key as quota exhaustion. See [classification](classification.md#custom-response-phrases). |
+| `rate_limit_phrases` | array of strings | `[]` | Extra body phrases that cool the route and model as a rate limit. See [classification](classification.md#custom-response-phrases). |
+| `scope_escalate_after` | integer | `3` | Cool the whole key when this many models cool on it and another failure arrives. Range 2 to 16. |
+| `hold_unauthorized` | bool | `false` | Delay disabling the first key that answers 401 until a later key serves the same request. |
+| `passthrough` | bool | `false` | Plain reverse proxy. The client's own credentials go upstream unchanged. No Reiki token and no key from a chain. A passthrough upstream cannot have `fallback`. |
+| `fallback` | table | unset | Where requests go when no key of this upstream can serve them. See below. |
+| `forward` | table | unset | Run a command or talk to a socket instead of Reiki's HTTP client. See below. |
+| `limits` | table | unset | Outbound shaping for keys of this upstream. See below. |
 
 Model and body rewrites run once, before a key is picked. Failover replays the same bytes. See [providers](providers.md).
 
@@ -156,17 +159,17 @@ Every stream whose chain uses this upstream must also hold a key for the fallbac
 
 Hands each request to a child command or to a Unix socket that speaks HTTP/1.1. Exactly one of `command` or `socket` must be set.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `command` | string | unset | Program run once per request. The API token and outbound headers go to its stdin, never argv. Not empty. | 0.7.0 |
-| `args` | array of strings | `[]` | Arguments for `command`. | 0.7.0 |
-| `pass_env` | array of strings | `[]` | Environment variables passed to `command`. | 0.7.0 |
-| `socket` | string | unset | Absolute path of a Unix socket, at most 103 bytes. | 0.7.0 |
-| `expect_uid` | integer | unset | User id that must own the socket's peer. Only for `socket`. Required when the socket's directory is writable by group or others and lacks the sticky bit. | 0.7.0 |
-| `max_concurrent` | integer | `16` | Copies of `command` running at once. Further requests get a 502. Only for `command`. At least 1. | 0.7.0 |
-| `streaming` | bool | `false` | Relay the body as it arrives instead of buffering it. | 0.7.1 |
-| `max_stream_bytes` | integer | `67108864` (64 MiB) | Largest streamed body relayed by a `streaming` forwarder. A stream past the cap ends. At least 1. | |
-| `stream_timeout_secs` | integer | `1800` | Longest total time for a streamed forwarder body after its head. At least 1. | |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `command` | string | unset | Program run once per request. The API token and outbound headers go to its stdin, never argv. Not empty. |
+| `args` | array of strings | `[]` | Arguments for `command`. |
+| `pass_env` | array of strings | `[]` | Environment variables passed to `command`. |
+| `socket` | string | unset | Absolute path of a Unix socket, at most 103 bytes. |
+| `expect_uid` | integer | unset | User id that must own the socket's peer. Only for `socket`. Required when the socket's directory is writable by group or others and lacks the sticky bit. |
+| `max_concurrent` | integer | `16` | Copies of `command` running at once. Further requests get a 502. Only for `command`. At least 1. |
+| `streaming` | bool | `false` | Relay the body as it arrives instead of buffering it. |
+| `max_stream_bytes` | integer | `67108864` (64 MiB) | Largest streamed body relayed by a `streaming` forwarder. A stream past the cap ends. At least 1. |
+| `stream_timeout_secs` | integer | `1800` | Longest total time for a streamed forwarder body after its head. At least 1. |
 
 See [providers](providers.md#forwarding).
 
@@ -191,11 +194,11 @@ See [providers](providers.md#outbound-limits).
 
 One upstream key. The file holds the key; the config holds only its path.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `upstream` | string | required | Upstream this key authenticates to. That upstream must not be `passthrough`. | |
-| `file` | string | required | Path to the file that holds the key. Read at startup and on reload. The contents are trimmed and must be at least 8 bytes. | |
-| `quota_resets` | string | unset | When a quota cooldown ends. `daily HH:MM ZONE` or `monthly D HH:MM ZONE`, where `D` is 1 to 28 and `ZONE` is `UTC` or `+HH:MM` / `-HH:MM`. Without it a quota cooldown lasts 5 hours. | 0.1.2 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `upstream` | string | required | Upstream this key authenticates to. That upstream must not be `passthrough`. |
+| `file` | string | required | Path to the file that holds the key. Read at startup and on reload. The contents are trimmed and must be at least 8 bytes. |
+| `quota_resets` | string | unset | When a quota cooldown ends. `daily HH:MM ZONE` or `monthly D HH:MM ZONE`, where `D` is 1 to 28 and `ZONE` is `UTC` or `+HH:MM` / `-HH:MM`. Without it a quota cooldown lasts 5 hours. |
 
 A quota 429 that carries `Retry-After` cools the key for that long. A `quota_resets` schedule takes precedence over both. See [providers](providers.md).
 
@@ -203,12 +206,12 @@ A quota 429 that carries `Retry-After` cools the key for that long. A `quota_res
 
 A stream is a client identity. Its token authenticates the client, and its chain is the keys the client may use, in order.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `token_sha256` | string | required | SHA-256 hex of the client token, 64 characters. Unique across streams. Make it with `reiki hash-token`, from a token of at least 16 characters. | |
-| `chain` | array of strings | required | Key names from `[keys.*]`, tried in order. Must not be empty. | |
-| `strategy` | `"sticky"` or `"round_robin"` | `"sticky"` | `sticky` keeps the current key until it cannot serve, then moves to the next usable key. `round_robin` starts each request on the key after the one the last request used. | |
-| `rate_limit_per_minute` | integer | unset | Requests per minute for this stream. Counted per attempt, so retries and fallback count too. At least 1. | 0.1.2 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `token_sha256` | string | required | SHA-256 hex of the client token, 64 characters. Unique across streams. Make it with `reiki hash-token`, from a token of at least 16 characters. |
+| `chain` | array of strings | required | Key names from `[keys.*]`, tried in order. Must not be empty. |
+| `strategy` | `"sticky"` or `"round_robin"` | `"sticky"` | `sticky` keeps the current key until it cannot serve, then moves to the next usable key. `round_robin` starts each request on the key after the one the last request used. |
+| `rate_limit_per_minute` | integer | unset | Requests per minute for this stream. Counted per attempt, so retries and fallback count too. At least 1. |
 
 The stream name `passthrough` is reserved for unauthenticated passthrough traffic. See [security](security.md).
 
@@ -216,14 +219,14 @@ The stream name `passthrough` is reserved for unauthenticated passthrough traffi
 
 A CONNECT-only forward proxy. It copies bytes without reading them, unless `intercept` is set.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `listen` | string | required | Tunnel listener address. Must differ from the client and admin listeners. | 0.3.0 |
-| `allow` | array of strings | required | Destinations a client may open. Each entry is `host`, `host:port` (port 443 when omitted), `*.host` for any subdomain, or `*`. Must not be empty. | 0.3.0 |
-| `connect_timeout_secs` | integer | `10` | Time allowed to open the upstream connection. At least 1. | |
-| `allow_loopback` | bool | `false` | Let the tunnel reach loopback addresses. For tests and local development only. | |
-| `deny_private` | bool | `false` | Refuse private addresses: RFC 1918, shared `100.64.0.0/10` and IPv6 unique-local. Use it with a broad `allow` list. | 0.7.2 |
-| `intercept` | table | unset | TLS interception. See below. | 0.4.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `listen` | string | required | Tunnel listener address. Must differ from the client and admin listeners. |
+| `allow` | array of strings | required | Destinations a client may open. Each entry is `host`, `host:port` (port 443 when omitted), `*.host` for any subdomain, or `*`. Must not be empty. |
+| `connect_timeout_secs` | integer | `10` | Time allowed to open the upstream connection. At least 1. |
+| `allow_loopback` | bool | `false` | Let the tunnel reach loopback addresses. For tests and local development only. |
+| `deny_private` | bool | `false` | Refuse private addresses: RFC 1918, shared `100.64.0.0/10` and IPv6 unique-local. Use it with a broad `allow` list. |
+| `intercept` | table | unset | TLS interception. See below. |
 
 See [tunnel](tunnel.md).
 
@@ -257,29 +260,29 @@ Health sharing between Reiki instances. The table is optional. Without it, or wi
 
 Scalar keys go in `[peers]`. Each `[peers.NAME]` sub-table is a peer to read. `[[peers.tokens]]` entries are read-only tokens that other instances may present.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `enabled` | bool | `false` | Master switch. | 0.9.0 |
-| `publish` | bool | `false` | Serve `GET /v1/health` on `listen` to holders of a peer token. Needs `enabled`. | 0.9.0 |
-| `listen` | string | unset | Address of the peer listener. Required when `publish` is on. Must differ from the client, admin and tunnel listeners. Must be a loopback address unless `tls_cert` and `tls_key` are set. | 0.9.0 |
-| `peer_token_sha256` | string | unset | Shorthand for one token named `default`. | 0.9.0 |
-| `tokens` | array of tables | `[]` | `[[peers.tokens]]` entries: `name` and `token_sha256`. Publishing needs at least one token. | 0.9.0 |
-| `instance` | string | `"reiki"` | Name published for this instance. Letters, digits, `-`, `_` and `.`, at most 64 characters. | 0.9.0 |
-| `poll_interval_secs` | integer | `30` | Period of the reader's polls. Data older than three periods counts as unknown. Range 1 to 86400. | 0.9.0 |
-| `expose_key_labels` | bool | `false` | Publish per-key labels and states, not only counts per upstream. | 0.9.0 |
-| `expose_host_stats` | bool | `false` | Publish load, memory, disk use and active sessions. | 0.9.0 |
-| `expose_usage` | bool | `true` | Publish per-upstream request and token counts for the last hour, without key or route names. | 0.10.3 |
-| `session_header` | string | `"x-opencode-session"` | Client header whose distinct values count as active sessions. Lowercase. Credential headers such as `authorization` are refused. | 0.9.0 |
-| `session_window_secs` | integer | `300` | How long a session stays active after its last request. Range 10 to 86400. | 0.9.0 |
-| `stream_interval_secs` | integer | `5` | Period of `host` events on `/v1/health/stream`. Range 1 to 3600. | 0.9.0 |
-| `max_subscribers` | integer | `16` | Open stream connections allowed in total. Range 1 to 256. | 0.9.0 |
-| `max_subscribers_per_peer` | integer | `4` | Open stream connections from one client address. Range 1 to `max_subscribers`. | 0.9.0 |
-| `max_subscribers_per_token` | integer | `8` | Open stream connections for one peer token. Range 1 to 256. | 0.9.0 |
-| `max_connections_per_addr` | integer | `4` | Open TCP connections from one address to the peer listener. Range 1 to 256. | 0.10.0 |
-| `cooldown_bucket_secs` | integer | `300` | Published cooldowns round up to a multiple of this. `0` publishes them exactly. Range 0 to 86400. | 0.9.0 |
-| `tls_cert` | string | unset | PEM certificate chain for HTTPS on the peer listener. Set together with `tls_key`. | 0.9.0 |
-| `tls_key` | string | unset | PEM private key for `tls_cert`. Keep it private to its owner. | 0.9.0 |
-| `tls_key_permissions` | `"error"` or `"warn"` | `"error"` | What to do when `tls_key` is readable by its group or by others. | 0.9.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master switch. |
+| `publish` | bool | `false` | Serve `GET /v1/health` on `listen` to holders of a peer token. Needs `enabled`. |
+| `listen` | string | unset | Address of the peer listener. Required when `publish` is on. Must differ from the client, admin and tunnel listeners. Must be a loopback address unless `tls_cert` and `tls_key` are set. |
+| `peer_token_sha256` | string | unset | Shorthand for one token named `default`. |
+| `tokens` | array of tables | `[]` | `[[peers.tokens]]` entries: `name` and `token_sha256`. Publishing needs at least one token. |
+| `instance` | string | `"reiki"` | Name published for this instance. Letters, digits, `-`, `_` and `.`, at most 64 characters. |
+| `poll_interval_secs` | integer | `30` | Period of the reader's polls. Data older than three periods counts as unknown. Range 1 to 86400. |
+| `expose_key_labels` | bool | `false` | Publish per-key labels and states, not only counts per upstream. |
+| `expose_host_stats` | bool | `false` | Publish load, memory, disk use and active sessions. |
+| `expose_usage` | bool | `true` | Publish per-upstream request and token counts for the last hour, without key or route names. |
+| `session_header` | string | `"x-opencode-session"` | Client header whose distinct values count as active sessions. Lowercase. Credential headers such as `authorization` are refused. |
+| `session_window_secs` | integer | `300` | How long a session stays active after its last request. Range 10 to 86400. |
+| `stream_interval_secs` | integer | `5` | Period of `host` events on `/v1/health/stream`. Range 1 to 3600. |
+| `max_subscribers` | integer | `16` | Open stream connections allowed in total. Range 1 to 256. |
+| `max_subscribers_per_peer` | integer | `4` | Open stream connections from one client address. Range 1 to `max_subscribers`. |
+| `max_subscribers_per_token` | integer | `8` | Open stream connections for one peer token. Range 1 to 256. |
+| `max_connections_per_addr` | integer | `4` | Open TCP connections from one address to the peer listener. Range 1 to 256. |
+| `cooldown_bucket_secs` | integer | `300` | Published cooldowns round up to a multiple of this. `0` publishes them exactly. Range 0 to 86400. |
+| `tls_cert` | string | unset | PEM certificate chain for HTTPS on the peer listener. Set together with `tls_key`. |
+| `tls_key` | string | unset | PEM private key for `tls_cert`. Keep it private to its owner. |
+| `tls_key_permissions` | `"error"` or `"warn"` | `"error"` | What to do when `tls_key` is readable by its group or by others. |
 
 Peer tokens are named `[a-z0-9-]`, at most 32 characters. Each token's hash must differ from every other token, the admin token and every stream token.
 
@@ -306,12 +309,12 @@ Each `[plugins.NAME]` table turns on a plugin that is compiled into the binary. 
 
 Keys that every plugin accepts:
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `enabled` | bool | `true` | Set `false` to keep the table and not run the plugin. | |
-| `on_error` | `"pass_through"` or `"reject"` | plugin-specific | What happens when the plugin fails, including a panic in `on_request`, `new_state` or a response hook. `pass_through` continues without it (and logs a warning when the plugin would otherwise fail closed). `reject` stops the request with a 503. Plugins that mask data reject by default, and so do detectors in `block` mode. | |
-| `dry_run` | bool | `false` where used | Accepted by every plugin. Plugins that use it validate settings without opening files, sockets or threads; `reiki check` adds `dry_run = true` to every plugin table. | |
-| `streams` | array of strings | all streams | Run only for requests on these streams. Each name is a configured stream or `passthrough`. | 0.8.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Set `false` to keep the table and not run the plugin. |
+| `on_error` | `"pass_through"` or `"reject"` | plugin-specific | What happens when the plugin fails, including a panic in `on_request`, `new_state` or a response hook. `pass_through` continues without it (and logs a warning when the plugin would otherwise fail closed). `reject` stops the request with a 503. Plugins that mask data reject by default, and so do detectors in `block` mode. |
+| `dry_run` | bool | `false` where used | Accepted by every plugin. Plugins that use it validate settings without opening files, sockets or threads; `reiki check` adds `dry_run = true` to every plugin table. |
+| `streams` | array of strings | all streams | Run only for requests on these streams. Each name is a configured stream or `passthrough`. |
 
 Plugin-specific keys are documented on each plugin's page:
 
@@ -323,8 +326,6 @@ Plugin-specific keys are documented on each plugin's page:
 | Finance | `[plugins.finance]` | [finance](finance.md) |
 | Controlled information | `[plugins.controlled]` | [controlled](controlled.md) |
 | Metrics | `[plugins.metrics]` | [monitoring](monitoring.md) |
-
-The former name `gov` was removed. A `[plugins.gov]` table is rejected with an error naming `controlled`; use `[plugins.controlled]`.
 
 ## Limit presets
 
@@ -350,22 +351,22 @@ The rules and the reasoning are in [hub](hub.md).
 
 A remote hub this instance reaches as an edge.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `url` | string | required | Hub base URL. `https://`, or `http://` on a loopback host. | 0.10.0 |
-| `token_file` | string | required | File that holds the raw token the hub issued to this instance. | 0.10.0 |
-| `ca_file` | string | unset | PEM CA certificates trusted for this hub instead of the built-in roots. | 0.10.0 |
-| `accounts` | array of strings | `[]` | Account labels whose traffic goes through this hub. Each must exist in `[accounts.LABEL]`. | 0.10.0 |
-| `timeout_secs` | integer | `300` | Longest one round trip to the hub. Range 1 to 3600. | 0.10.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `url` | string | required | Hub base URL. `https://`, or `http://` on a loopback host. |
+| `token_file` | string | required | File that holds the raw token the hub issued to this instance. |
+| `ca_file` | string | unset | PEM CA certificates trusted for this hub instead of the built-in roots. |
+| `accounts` | array of strings | `[]` | Account labels whose traffic goes through this hub. Each must exist in `[accounts.LABEL]`. |
+| `timeout_secs` | integer | `300` | Longest one round trip to the hub. Range 1 to 3600. |
 
 ### `[hub]` and `[hub.edges.NAME]`
 
 `[hub]` makes this instance a hub. Its edges are the streams it answers.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `listen` | string | required | Hub listener address. Must be a loopback IP and port, because no TLS is supported yet. | 0.10.0 |
-| `edges` | table | `{}` | Edge streams this hub answers, one `[hub.edges.NAME]` table each. | 0.10.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `listen` | string | required | Hub listener address. Must be a loopback IP and port, because no TLS is supported yet. |
+| `edges` | table | `{}` | Edge streams this hub answers, one `[hub.edges.NAME]` table each. |
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -378,12 +379,12 @@ A remote hub this instance reaches as an edge.
 
 One account: its key or keys on one upstream.
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `upstream` | string | required | Upstream the account's keys authenticate to. | 0.10.0 |
-| `keys` | array of strings | required | Key names from `[keys.*]`, tried in order. Non-empty. A key belongs to one account only. | 0.10.0 |
-| `shared` | bool | `false` | Whether edges share this account. | 0.10.0 |
-| `limits` | table | unset | Outbound shaping for this account; see below. | 0.10.0 |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `upstream` | string | required | Upstream the account's keys authenticate to. |
+| `keys` | array of strings | required | Key names from `[keys.*]`, tried in order. Non-empty. A key belongs to one account only. |
+| `shared` | bool | `false` | Whether edges share this account. |
+| `limits` | table | unset | Outbound shaping for this account; see below. |
 
 ### `[accounts.LABEL.limits]`
 

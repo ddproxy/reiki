@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-serde_yaml = "0.9"
+serde_norway = "0.9"
 
 [workspace]

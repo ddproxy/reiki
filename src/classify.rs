@@ -63,7 +63,7 @@ impl From<FailureClass> for reiki_plugin::FailureKind {
 
 impl FailureClass {
     /// The same name as the `class` label of `reiki_cooldowns_total`, so operators see one
-    /// vocabulary across `/status`, the peer view and metrics.
+    /// vocabulary across `/v1/status`, the peer view and metrics.
     pub fn name(self) -> &'static str {
         reiki_plugin::FailureKind::from(self).label()
     }

@@ -491,9 +491,10 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
         span(format!("{name}  "), Style::Title),
         span(format!("instance {}", peer.health.instance), Style::Plain),
     ];
-    if let Some(version) = &peer.health.reiki_version {
-        header.push(span(format!("  v{version}"), Style::Plain));
-    }
+    header.push(span(
+        format!("  v{}", peer.health.reiki_version),
+        Style::Plain,
+    ));
     for seg in host_segments(peer.health) {
         header.push(span(format!("  {seg}"), Style::Plain));
     }
@@ -1253,7 +1254,7 @@ impl<'a> Grid<'a> {
     }
 }
 
-/// A row's published version, clipped; `?` when the peer does not publish one.
+/// A row's published version, clipped; `?` when this host has never seen the peer.
 fn version_text(row: &Row) -> (String, Style) {
     match &row.version {
         Some(version) => (clip(version, VER_MAX), Style::Plain),
@@ -1463,28 +1464,106 @@ mod tests {
     }
 
     /// Two fresh peers with a spread of providers for the summary bar tests.
-    const MIX_DOC: &str = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-        {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-         "soonest_cooldown_seconds":300,"last_status_class":"4xx"},
-        {"name":"open","healthy_keys":2,"cooling_keys":0,"disabled_keys":0,
-         "soonest_cooldown_seconds":null,"last_status_class":"2xx"},
-        {"name":"gem","healthy_keys":0,"cooling_keys":0,"disabled_keys":3,
-         "soonest_cooldown_seconds":null,"last_status_class":"5xx"}]}"#;
+    const MIX_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 300
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 2,
+         "last_status_class" : "2xx",
+         "name" : "open",
+         "soonest_cooldown_seconds" : null
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 3,
+         "healthy_keys" : 0,
+         "last_status_class" : "5xx",
+         "name" : "gem",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
 
     const FULL_DOC: &str = r#"{
-        "instance": "peer-a",
-        "observed_at": "2026-11-13T09:30:00Z",
-        "upstreams": [{"name": "zen", "healthy_keys": 1, "cooling_keys": 0, "disabled_keys": 0,
-                       "soonest_cooldown_seconds": null, "last_status_class": "2xx"}],
-        "host": {"load_average": [0.52, 0.58, 0.59], "cores": 8,
-                 "disks": [{"roles": ["config", "state"], "total_bytes": 107374182400,
-                            "available_bytes": 53687091200, "used_percent": 50.0}]},
-        "sessions": {"window_seconds": 300, "active_sessions": 3}
-    }"#;
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "cores" : 8,
+      "disks" : [
+         {
+            "available_bytes" : 53687091200,
+            "roles" : [
+               "config",
+               "state"
+            ],
+            "total_bytes" : 107374182400,
+            "used_percent" : 50
+         }
+      ],
+      "load_average" : [
+         0.52,
+         0.58,
+         0.59
+      ]
+   },
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:30:00Z",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 3,
+      "window_seconds" : 300
+   },
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
 
-    const BARE_DOC: &str = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-        {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-         "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#;
+    const BARE_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
 
     fn keyed_doc(cooldown: Option<u64>, class: Option<&str>) -> String {
         let class = class
@@ -1492,9 +1571,10 @@ mod tests {
             .unwrap_or_default();
         let cooldown = cooldown.map(|s| s.to_string()).unwrap_or("null".into());
         format!(
-            r#"{{"instance":"peer-a","observed_at":"t","upstreams":[
+            r#"{{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "failures":{{}},"upstreams":[
             {{"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":{cooldown},"last_status_class":"4xx",
+             "cooling_combinations":0,"soonest_cooldown_seconds":{cooldown},"last_status_class":"4xx",
              "keys":[{{"name":"b","state":"cooling","cooldown_seconds":{cooldown}{class}}}]}}]}}"#
         )
     }
@@ -1506,32 +1586,106 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}],
-            "host":{"load_average":[0.4,0.5,0.6],"disks":[{"used_percent":30.0}]},
-            "sessions":{"active_sessions":1}}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "disks" : [
+         {
+            "used_percent" : 30
+         }
+      ],
+      "load_average" : [
+         0.4,
+         0.5,
+         0.6
+      ]
+   },
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 1
+   },
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-b",
-            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"openrouter","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":240,"last_status_class":"4xx"},
-            {"name":"gemini","healthy_keys":2,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "openrouter",
+         "soonest_cooldown_seconds" : 240
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 2,
+         "last_status_class" : "2xx",
+         "name" : "gemini",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-c",
-            r#"{"instance":"peer-c","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":45,"last_status_class":"4xx"},
-            {"name":"gemini","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-             "cooling_combinations":2}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-c",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 45
+      },
+      {
+         "cooling_combinations" : 2,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "gemini",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         (f, names(&["peer-a", "peer-b", "peer-c"]))
@@ -1562,20 +1716,56 @@ mod tests {
         positions(text, needle)[0]
     }
 
-    /// Two peers: one publishes its version, one is older and does not.
+    /// Two peers with different published versions.
     fn versioned_fleet(t0: Instant) -> (Fleet, Vec<String>) {
         let mut f = fleet();
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx"},
-            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "openrouter",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
-        add(&mut f, "peer-b", BARE_DOC, t0);
+        add(
+            &mut f,
+            "peer-b",
+            r#"{
+    "age_seconds" : 0,
+    "failures" : {},
+    "instance" : "peer-b",
+    "observed_at" : "t",
+    "reiki_version" : "0.9.9",
+    "upstreams" : []
+}
+"#,
+            t0,
+        );
         (f, names(&["peer-a", "peer-b"]))
     }
 
@@ -1589,8 +1779,12 @@ mod tests {
             "peer-a  instance peer-a  v0.10.3",
             "{card:?}"
         );
-        let bare = peer_detail(&f, "peer-b", t0, 100);
-        assert!(!bare[0].plain_text().contains(" v"), "{bare:?}");
+        let other = peer_detail(&f, "peer-b", t0, 100);
+        assert_eq!(
+            other[0].plain_text(),
+            "peer-b  instance peer-b  v0.9.9",
+            "{other:?}"
+        );
     }
 
     #[test]
@@ -1606,7 +1800,7 @@ mod tests {
         let a = rows.iter().find(|r| r.contains("peer-a")).unwrap();
         let b = rows.iter().find(|r| r.contains("peer-b")).unwrap();
         assert_eq!(positions(a, "0.10.3"), vec![ver], "{a:?}");
-        assert_eq!(b.chars().nth(ver), Some('?'), "an older peer: {b:?}");
+        assert_eq!(positions(b, "0.9.9"), vec![ver], "{b:?}");
     }
 
     #[test]
@@ -1687,10 +1881,14 @@ mod tests {
             .map(|n| n.trim().parse().unwrap_or(0))
             .sum();
         format!(
-            r#"{{"instance":"{peer}","observed_at":"t","upstreams":[
+            r#"{{"instance":"{peer}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "failures":{{}},"upstreams":[
             {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-             "requests_1h":{total},"limited_1h":0,"request_buckets":{buckets}}}]}}"#
+             "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
+             "requests_1h":{total},"limited_1h":0,"request_buckets":{buckets},
+             "tokens_1h":0,"token_buckets":[0,0,0,0,0,0,0,0,0,0,0,0],
+             "request_minutes":[0,0,0,0,0,0,0,0,0,0],
+             "token_minutes":[0,0,0,0,0,0,0,0,0,0]}}]}}"#
         )
     }
 
@@ -1763,7 +1961,7 @@ mod tests {
         );
         assert!(
             row_text(&lines, "peer-c").contains("■ ······"),
-            "an older publisher reads as no figures, not an error: {lines:?}"
+            "a publisher without expose_usage reads as no figures, not an error: {lines:?}"
         );
     }
 
@@ -1774,10 +1972,80 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":8,"limited_1h":2,
-                 "request_buckets":[1,1,1,1,1,1,1,1,1,1,1,1]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 2,
+         "name" : "zen",
+         "request_buckets" : [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 8,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
             t0,
         );
         let lines = matrix_lines(&f, &names(&["peer-a"]), t0, 100);
@@ -1797,10 +2065,80 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":120,"limited_1h":3,
-                 "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,3]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 3,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 120,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
             t0,
         );
         let card = peer_detail(&f, "peer-a", t0, 100);
@@ -2034,12 +2372,34 @@ mod tests {
         add(
             &mut f,
             &format!("p\u{1b}[2J{long}"),
-            r#"{"instance":"x","observed_at":"t","upstreams":[
-            {"name":"zé\u0007","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "soonest_cooldown_seconds":null,"last_status_class":null},
-            {"name":"名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前","healthy_keys":1,
-             "cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,
-             "last_status_class":null}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "zé\u0007",
+         "soonest_cooldown_seconds" : null
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前名前",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         let peers = vec![format!("p\u{1b}[2J{long}")];
@@ -2217,17 +2577,49 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":4800,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 4800
+      }
+   ]
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-b",
-            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":1,
-             "soonest_cooldown_seconds":null,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 1,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         let peers = names(&["peer-a", "peer-b"]);
@@ -2253,19 +2645,58 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"mix","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":60,"last_status_class":"4xx"},
-            {"name":"stale","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "mix",
+         "soonest_cooldown_seconds" : 60
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "stale",
+         "soonest_cooldown_seconds" : 60
+      }
+   ]
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-b",
-            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"stale","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":30,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "stale",
+         "soonest_cooldown_seconds" : 30
+      }
+   ]
+}
+"#,
             t0 - Duration::from_secs(120),
         );
         let peers = names(&["peer-a", "peer-b"]);
@@ -2288,11 +2719,12 @@ mod tests {
                 &mut f,
                 &format!("peer-{name}"),
                 &format!(
-                    r#"{{"instance":"peer-{name}","observed_at":"t","upstreams":[
-                    {{"name":"p0","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
-                    {{"name":"p1","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
-                    {{"name":"p2","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
-                    {{"name":"p3","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}}]}}"#,
+                    r#"{{"instance":"peer-{name}","reiki_version":"0.10.3","observed_at":"t",
+                    "age_seconds":0,"failures":{{}},"upstreams":[
+                    {{"name":"p0","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p1","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p2","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
+                    {{"name":"p3","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}}]}}"#,
                 ),
                 t0,
             );
@@ -2320,9 +2752,25 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":4800,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 4800
+      }
+   ]
+}
+"#,
             t0,
         );
         let peers = names(&["peer-a"]);
@@ -2375,11 +2823,34 @@ mod tests {
         add(
             &mut f,
             "peer-b",
-            r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":2,"disabled_keys":1,
-             "soonest_cooldown_seconds":300,"last_status_class":"4xx"},
-            {"name":"gem","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":300,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 2,
+         "disabled_keys" : 1,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 300
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "gem",
+         "soonest_cooldown_seconds" : 300
+      }
+   ]
+}
+"#,
             t0,
         );
         let lines = render(&f, &["peer-a".to_owned(), "peer-b".to_owned()], t0, 200);
@@ -2477,10 +2948,32 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":1,
-             "soonest_cooldown_seconds":null,"last_status_class":"4xx",
-             "keys":[{"name":"c","state":"out_of_rotation","cooldown_seconds":null}]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 1,
+         "healthy_keys" : 0,
+         "keys" : [
+            {
+               "cooldown_seconds" : null,
+               "name" : "c",
+               "state" : "out_of_rotation"
+            }
+         ],
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         let lines = render(&f, &["peer-a".to_owned()], t0, 200);
@@ -2496,7 +2989,10 @@ mod tests {
         add(&mut f, "peer-a", BARE_DOC, t0 - Duration::from_secs(40));
         let lines = render(&f, &["peer-a".to_owned()], t0, 200);
         let header = find(&lines, "instance");
-        assert_eq!(header.plain_text(), "peer-a  instance peer-a  stale 40s");
+        assert_eq!(
+            header.plain_text(),
+            "peer-a  instance peer-a  v0.10.3  stale 40s"
+        );
         assert_eq!(header.spans.last().unwrap().style, Style::Dim);
     }
 
@@ -2555,16 +3051,33 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t",
-            "upstreams":[],
-            "host": {"load_average": null, "disks": [{"roles": "oops", "used_percent": "high"}]},
-            "sessions": {"active_sessions": "three"}}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "disks" : [
+         {
+            "roles" : "oops",
+            "used_percent" : "high"
+         }
+      ],
+      "load_average" : null
+   },
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : "three"
+   },
+   "upstreams" : []
+}
+"#,
             t0,
         );
         let lines = render(&f, &["peer-a".to_owned()], t0, 200);
         assert_eq!(
             find(&lines, "instance").plain_text(),
-            "peer-a  instance peer-a"
+            "peer-a  instance peer-a  v0.10.3"
         );
     }
 
@@ -2614,7 +3127,25 @@ mod tests {
     fn bidi_and_zero_width_characters_in_names_are_replaced() {
         let mut f = fleet();
         let t0 = Instant::now();
-        let doc = r#"{"instance":"x","observed_at":"t","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
         add(&mut f, "peer\u{202E}evil\u{200B}\u{2066}x\u{FEFF}", doc, t0);
         let text = texts(&matrix_lines(
             &f,
@@ -2633,7 +3164,25 @@ mod tests {
     fn wide_names_clip_and_align_by_display_width() {
         let mut f = fleet();
         let t0 = Instant::now();
-        let doc = r#"{"instance":"x","observed_at":"t","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
         let wide = "\u{5BB6}".repeat(12);
         add(&mut f, &wide, doc, t0);
         add(&mut f, "peer-b", doc, t0);
@@ -2705,9 +3254,25 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "cooling_combinations":1,"last_status_class":"4xx"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 1,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "openrouter",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             t0,
         );
         let card = texts(&peer_detail(&f, "peer-a", t0, 100));
@@ -2720,14 +3285,81 @@ mod tests {
 
     /// One peer with every figure, so each metric and window draws its own gauge.
     fn gauge_doc() -> String {
-        r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "requests_1h":6,"limited_1h":0,
-             "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,6],
-             "request_minutes":[9,9,9,9,9,0,1,2,4,8],
-             "tokens_1h":10,"token_buckets":[10,0,0,0,0,0,0,0,0,0,0,0],
-             "token_minutes":[4,4,4,4,4,4,4,4,4,4]}]}"#
-            .to_owned()
+        r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            6
+         ],
+         "request_minutes" : [
+            9,
+            9,
+            9,
+            9,
+            9,
+            0,
+            1,
+            2,
+            4,
+            8
+         ],
+         "requests_1h" : 6,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            10,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4
+         ],
+         "tokens_1h" : 10
+      }
+   ]
+}
+"#
+        .to_owned()
     }
 
     fn gauge_row(mode: GaugeMode) -> (String, String) {
@@ -2803,38 +3435,17 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_without_the_needed_array_draws_dots_not_an_error() {
-        let t0 = Instant::now();
-        let mut f = fleet();
-        add(
-            &mut f,
-            "peer-a",
-            &usage_doc("peer-a", "[0,0,0,0,0,0,0,0,0,0,0,6]"),
-            t0,
-        );
-        let minutes = GaugeMode {
-            metric: GaugeMetric::Requests,
-            window: GaugeWindow::Minutes,
-        };
-        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
-        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, minutes);
-        assert!(row_text(&lines, "peer-a").contains("■ ·····"), "{lines:?}");
-        let tokens = GaugeMode {
-            metric: GaugeMetric::Tokens,
-            window: GaugeWindow::Hour,
-        };
-        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, tokens);
-        assert!(row_text(&lines, "peer-a").contains("■ ······"), "{lines:?}");
-    }
-
-    #[test]
     fn the_fleet_scale_follows_the_chosen_window() {
         let t0 = Instant::now();
         let minute_doc = |minutes: &str| {
             format!(
-                r#"{{"instance":"x","observed_at":"t","upstreams":[
+                r#"{{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                 "failures":{{}},"upstreams":[
                 {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":1,"limited_1h":0,"request_minutes":{minutes}}}]}}"#
+                 "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null,
+                 "requests_1h":1,"limited_1h":0,"request_buckets":[0,0,0,0,0,0,0,0,0,0,0,1],
+                 "tokens_1h":1,"token_buckets":[0,0,0,0,0,0,0,0,0,0,0,1],
+                 "request_minutes":{minutes},"token_minutes":[0,0,0,0,0,0,0,0,0,0]}}]}}"#
             )
         };
         let mut f = fleet();
@@ -2863,9 +3474,10 @@ mod tests {
             .unwrap_or_default();
         let secs = cooldown.map_or("null".to_owned(), |s| s.to_string());
         format!(
-            r#"{{"instance":"{peer}","observed_at":"t","upstreams":[
+            r#"{{"instance":"{peer}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "failures":{{}},"upstreams":[
             {{"name":"{provider}","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":{secs},"last_status_class":"{last}",
+             "cooling_combinations":0,"soonest_cooldown_seconds":{secs},"last_status_class":"{last}",
              "keys":[{{"name":"k","state":"cooling","cooldown_seconds":{secs}{class}}}]}}]}}"#
         )
     }
@@ -3006,8 +3618,18 @@ mod tests {
     fn a_card_shows_failure_counts_and_only_the_local_instance_gets_rows() {
         let t0 = Instant::now();
         let mut f = fleet();
-        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
-            "failures":{"rate_limited":2,"transient":1}}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {
+      "rate_limited" : 2,
+      "transient" : 1
+   },
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : []
+}
+"#;
         add(&mut f, "peer-a", doc, t0);
         let remote = texts(&peer_detail(&f, "peer-a", t0, 100));
         assert!(
@@ -3072,10 +3694,15 @@ mod tests {
         cooling: u32,
     ) -> String {
         format!(
-            r#"{{"instance":"{name}","observed_at":"t","upstreams":[
+            r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                 "failures":{{}},"upstreams":[
                 {{"name":"zen","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":0,
-                  "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-                  "requests_1h":{requests},"limited_1h":{limited}}}]}}"#
+                 "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                 "requests_1h":{requests},"limited_1h":{limited},
+                 "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,1],
+                 "tokens_1h":0,"token_buckets":[0,0,0,0,0,0,0,0,0,0,0,1],
+                 "request_minutes":[0,0,0,0,0,0,0,0,0,0],
+                 "token_minutes":[0,0,0,0,0,0,0,0,0,0]}}]}}"#
         )
     }
 

@@ -26,7 +26,7 @@ Other listeners, each optional and on its own socket:
 
 | Listener | Table | Serves |
 | --- | --- | --- |
-| admin | `[admin]` | `GET /status`, `GET /failures`, `POST /reload`, `POST /keys/enable`, plugin routes such as `GET /metrics`, and `GET /v1/openapi.json` (routes are also served under `/v1`) |
+| admin | `[admin]` | `GET /v1/status`, `GET /v1/failures`, `POST /v1/reload`, `POST /v1/keys/enable`, plugin routes such as `GET /v1/metrics`, and `GET /v1/openapi.json` |
 | peers | `[peers]` | `GET /v1/health` and `GET /v1/health/stream` with a read-only peer token |
 | tunnel | `[tunnel]` | CONNECT proxy with a destination allow-list; intercept for chosen hosts |
 | hub | `[hub]` | parsed and validated in this release; it does not open a hub listener yet |
@@ -66,12 +66,12 @@ Requests keep working when one key fails, and you can see what happened.
 - Failover: a stream's chain, and an optional fallback upstream, take over on a rate limit, an exhausted quota or a disabled key. See [failover](failover.md).
 - Traffic shaping: outbound budgets per key, so a key is not sent past its limits. See [shaping](shaping.md).
 - Request log: what the client sent and what came back, with credentials masked. See [requestlog](requestlog.md).
-- Fleet view: `reiki top` shows key health across instances, peers publish that health, and `/metrics` exports it. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
+- Fleet view: `reiki top` shows key health across instances, peers publish that health, and `/v1/metrics` exports it. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
 
 ## Where to go next
 
 - [Architecture](architecture.md): request path, key states and source map.
-- [Glossary](glossary.md): terms and CLI/status vocabulary.
+- [Glossary](glossary.md): terms and CLI/v1/status vocabulary.
 - [Configuration](configuration.md): every table and field.
 - [CLI](cli.md): every subcommand.
 - [Keys and streams](keys.md): key files, token hashes, chains and rotation.
@@ -79,4 +79,4 @@ Requests keep working when one key fails, and you can see what happened.
 - [Failover](failover.md) and [shaping](shaping.md): how keys are chosen, cooled and budgeted.
 - [Monitoring](monitoring.md) and [troubleshooting](troubleshooting.md): what to check when something fails.
 - [Deploy](deploy.md): install paths, directory layout, listeners and a service unit.
-- [Upgrades](upgrades.md): reload and restart rules, state compatibility and rollback.
+- [Upgrades](upgrades.md): reload and restart rules and rollback.

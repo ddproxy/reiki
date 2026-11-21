@@ -167,7 +167,7 @@ async fn a_changed_plugin_setting_applies_to_the_next_request() {
 async fn a_plugin_that_did_not_change_keeps_its_counters() {
     let rig = Rig::new("[plugins.metrics]\n[plugins.phi]\nmode = \"report\"\n").await;
     assert_eq!(rig.send("{\"q\":\"hello\"}").await, 200);
-    let before = rig.admin_get("/metrics").await;
+    let before = rig.admin_get("/v1/metrics").await;
     assert!(
         before.contains("reiki_requests_total{stream=\"s\",upstream=\"zen\",status=\"success\"} 1"),
         "{before}"
@@ -180,7 +180,7 @@ async fn a_plugin_that_did_not_change_keeps_its_counters() {
         .unwrap()
         .unwrap();
     assert_eq!(report.changed, ["plugins phi"], "metrics was not rebuilt");
-    let after = rig.admin_get("/metrics").await;
+    let after = rig.admin_get("/v1/metrics").await;
     assert!(
         after.contains("reiki_requests_total{stream=\"s\",upstream=\"zen\",status=\"success\"} 1"),
         "the counter survived: {after}"
@@ -202,7 +202,7 @@ async fn a_bad_config_changes_nothing_and_the_status_says_why() {
         422,
         "the running block mode is untouched"
     );
-    let status = rig.admin_get("/status").await;
+    let status = rig.admin_get("/v1/status").await;
     assert!(status.contains("\"generation\":0"), "{status}");
     assert!(status.contains("\"ok\":false"), "{status}");
 
@@ -263,7 +263,7 @@ async fn a_request_log_setting_change_keeps_the_running_log_and_asks_for_a_resta
 #[tokio::test]
 async fn post_reload_needs_the_admin_token_and_reports_the_generation() {
     let rig = Rig::new("[plugins.phi]\nmode = \"report\"\n").await;
-    let url = format!("{}/reload", rig.admin);
+    let url = format!("{}/v1/reload", rig.admin);
     let anonymous = rig.client.post(&url).send().await.unwrap();
     assert_eq!(anonymous.status(), 401);
     let wrong = rig
@@ -290,7 +290,10 @@ async fn post_reload_needs_the_admin_token_and_reports_the_generation() {
         "{body}"
     );
     assert!(body.contains("\"changed\":[\"plugins phi\"]"), "{body}");
-    assert!(rig.admin_get("/status").await.contains("\"generation\":1"));
+    assert!(rig
+        .admin_get("/v1/status")
+        .await
+        .contains("\"generation\":1"));
     assert_eq!(rig.send(SSN_BODY).await, 422);
 
     std::fs::write(&rig.config, "broken [").unwrap();
@@ -384,12 +387,15 @@ async fn the_watcher_reloads_when_the_config_file_changes() {
         }
     }
     assert_eq!(status, 422, "the watcher applied the edit on its own");
-    assert!(rig.admin_get("/status").await.contains("\"generation\":1"));
+    assert!(rig
+        .admin_get("/v1/status")
+        .await
+        .contains("\"generation\":1"));
 
     // A bad edit is tried once and left alone until the file changes again.
     std::fs::write(&rig.config, "broken [").unwrap();
     tokio::time::sleep(Duration::from_millis(3500)).await;
-    let status_json = rig.admin_get("/status").await;
+    let status_json = rig.admin_get("/v1/status").await;
     assert!(
         status_json.contains("\"generation\":1") && status_json.contains("\"ok\":false"),
         "{status_json}"
@@ -420,7 +426,7 @@ async fn a_preview_reports_the_change_but_applies_and_records_nothing() {
     ));
     let answer = rig
         .client
-        .post(format!("{}/reload?dry_run=true", rig.admin))
+        .post(format!("{}/v1/reload?dry_run=true", rig.admin))
         .bearer_auth(ADMIN_TOKEN)
         .send()
         .await
@@ -437,7 +443,7 @@ async fn a_preview_reports_the_change_but_applies_and_records_nothing() {
         "the running mode is untouched"
     );
     assert!(!log.exists(), "a preview must not open the log file");
-    let status = rig.admin_get("/status").await;
+    let status = rig.admin_get("/v1/status").await;
     assert!(
         status.contains("\"generation\":0") && status.contains("\"last_reload\":null"),
         "{status}"
@@ -445,7 +451,7 @@ async fn a_preview_reports_the_change_but_applies_and_records_nothing() {
 
     let failing = rig
         .client
-        .post(format!("{}/reload?dry_run=1", rig.admin))
+        .post(format!("{}/v1/reload?dry_run=1", rig.admin))
         .send()
         .await
         .unwrap();
@@ -555,7 +561,7 @@ async fn an_unreadable_dry_run_value_is_refused_and_applies_nothing() {
     ] {
         let answer = rig
             .client
-            .post(format!("{}/reload?{query}", rig.admin))
+            .post(format!("{}/v1/reload?{query}", rig.admin))
             .bearer_auth(ADMIN_TOKEN)
             .send()
             .await
@@ -563,7 +569,7 @@ async fn an_unreadable_dry_run_value_is_refused_and_applies_nothing() {
         assert_eq!(answer.status(), 400, "{query}");
     }
     assert_eq!(rig.send(SSN_BODY).await, 200, "nothing was applied");
-    let status = rig.admin_get("/status").await;
+    let status = rig.admin_get("/v1/status").await;
     assert!(status.contains("\"generation\":0"), "{status}");
 }
 

@@ -1,4 +1,4 @@
-//! Prometheus metrics for the relay, served on the admin listener at `/metrics`.
+//! Prometheus metrics for the relay, served on the admin listener at `/v1/metrics`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,7 +20,7 @@ pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
     Ok(Box::new(MetricsPlugin::default()))
 }
 
-/// Counts events and renders them for the admin `/metrics` path.
+/// Counts events and renders them for the admin `/v1/metrics` path.
 #[derive(Debug, Default)]
 pub struct MetricsPlugin {
     metrics: Arc<Metrics>,
@@ -326,7 +326,7 @@ struct Inner {
     usage_requests: BTreeMap<(String, String), u64>,
 }
 
-/// In-memory counters for the admin `/metrics` endpoint. Bounded by the number
+/// In-memory counters for the admin `/v1/metrics` endpoint. Bounded by the number
 /// of configured streams and keys, never by request volume.
 #[derive(Debug, Default)]
 pub struct Metrics {

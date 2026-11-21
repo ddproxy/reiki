@@ -54,11 +54,11 @@ A passthrough upstream has no Reiki token, no Reiki key and no failover. It stil
 
 ## Prove one request used Reiki
 
-`[plugins.metrics]` serves `/metrics` on the admin listener. Send one message from Claude Code, then read the counter:
+`[plugins.metrics]` serves `/v1/metrics` on the admin listener. Send one message from Claude Code, then read the counter:
 
 ```bash
 curl -s -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
-  http://127.0.0.1:4098/metrics | grep reiki_requests_total
+  http://127.0.0.1:4098/v1/metrics | grep reiki_requests_total
 ```
 
 One successful request on this stream produces a line like:
@@ -67,7 +67,7 @@ One successful request on this stream produces a line like:
 reiki_requests_total{stream="client-a",upstream="anthropic",status="success"} 1
 ```
 
-The counter proves that request reached that Reiki route. Request-log records carry the same `id`, the stream, the upstream, the serving key name and the attempts; `id` joins them to the service log. Enable `[plugins.requestlog]` with a `file` or `socket` before the test request. See [request log](requestlog.md#records) and [monitoring](monitoring.md#get-metrics).
+The counter proves that request reached that Reiki route. Request-log records carry the same `id`, the stream, the upstream, the serving key name and the attempts; `id` joins them to the service log. Enable `[plugins.requestlog]` with a `file` or `socket` before the test request. See [request log](requestlog.md#records) and [monitoring](monitoring.md#get-v1metrics).
 
 With `[plugins.placeholders]`, text, tool results and stop sequences are masked on the way out and restored on the way back. Thinking blocks, signatures and base64 images or PDFs pass byte for byte and are not scanned; see [placeholders](placeholders.md#what-it-does) and [limits](limits.md).
 

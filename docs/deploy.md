@@ -46,7 +46,7 @@ Before binding listeners, Reiki creates and removes an unpredictably named probe
 | Listener | Config | Default | Authentication and use |
 | --- | --- | --- | --- |
 | Client | top-level `listen` | `127.0.0.1:4097` | Stream token on proxied requests. `GET /__reiki/healthz` needs no token. `--listen` wins over `REIKI_LISTEN`, which wins over config. Plain HTTP. |
-| Admin | `[admin].listen` and `token_sha256` | none; optional table | Bearer admin token. Serves `/status`, `/failures`, `/reload`, `/keys/enable`, `/metrics` and their `/v1` forms. Must be a literal loopback IP and port and differ from the client listener; hostnames are refused. |
+| Admin | `[admin].listen` and `token_sha256` | none; optional table | Bearer admin token. Serves `/v1/status`, `/v1/failures`, `/v1/reload`, `/v1/keys/enable` and `/v1/metrics`. Must be a literal loopback IP and port and differ from the client listener; hostnames are refused. |
 | Peers | `[peers].enabled`, `publish`, `listen` and a token | none; optional table | Read-only `/v1/health` and `/v1/health/stream` with a peer token. Needs the `peers` feature. A non-loopback address needs TLS. |
 | Tunnel | `[tunnel].listen` and `allow` | none; optional table | Opaque CONNECT on an allow-list. No token on the socket, so restrict network access. `[tunnel.intercept]` adds TLS termination for listed hosts. |
 | Hub | `[hub].listen` | none; optional table | Parsed and validated only in this release. No listener is bound and no hub is contacted. The `hub` feature is not in release builds. |
@@ -59,7 +59,7 @@ Every bound listener must have a distinct address. Docs examples use `4099` for 
 | --- | --- |
 | `SIGTERM`, `SIGINT` | All listeners stop accepting. Idle keep-alive connections close. Requests in flight get `[service] shutdown_timeout_secs` (default 25, range 1 to 300) to finish. Then the request log and state file are written and Reiki exits 0. |
 | A second `SIGTERM` or `SIGINT` | Exits at once with status `128 + signal`: 143 or 130. |
-| `SIGHUP` | Reloads config, key files, plugin settings, interception CA files and peer TLS files, like `POST /reload`. See [upgrades](upgrades.md#reload-vs-restart). |
+| `SIGHUP` | Reloads config, key files, plugin settings, interception CA files and peer TLS files, like `POST /v1/reload`. See [upgrades](upgrades.md#reload-vs-restart). |
 
 A streamed response still running when the drain ends is cut. Open tunnel connections get the same drain time. Keep `TimeoutStopSec` above `shutdown_timeout_secs`.
 
@@ -171,7 +171,7 @@ WantedBy=multi-user.target
    ```bash
    curl -s http://127.0.0.1:4097/__reiki/healthz
    curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-     http://127.0.0.1:4098/status
+     http://127.0.0.1:4098/v1/status
    ```
 
 6. Stop the foreground process with `SIGTERM`, install the unit, then start the service.
@@ -196,14 +196,14 @@ flowchart TD
 ```
 
 1. Install and configure each instance on its own host. Give every listener a unique address.
-2. Start each instance with its client and admin listeners. Confirm `/__reiki/healthz`, `/status` and `reiki keys` before adding peers.
+2. Start each instance with its client and admin listeners. Confirm `/__reiki/healthz`, `/v1/status` and `reiki keys` before adding peers.
 3. Bring up peer publishers: `[peers] enabled = true`, `publish = true`, `listen`, and at least one token hash. Adding or moving the peer listener needs a restart. A non-loopback listener needs `tls_cert` and `tls_key`.
 4. Configure readers with `[peers.NAME] url`, `token_file` and, for HTTPS, `ca_file`. Token and reader changes apply on reload. `reiki peers` and `reiki top` then show the fleet.
 5. Start tunnel clients after the tunnel listener and allow-list are in place. Create the CA with `reiki ca-init` before enabling interception; distribute only `ca.pem`. Keep `deny_private = true` with a broad allow-list.
-6. Use `reiki top` and `/metrics` once admin and peer listeners are healthy. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
+6. Use `reiki top` and `/v1/metrics` once admin and peer listeners are healthy. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
 
 Forwarders run as child commands or Unix sockets and inherit the service limits. A socket in a group- or other-writable directory needs `expect_uid`. See [providers](providers.md#forwarding). Hub configuration cannot be brought up in this release.
 
 ## Upgrade and rollback
 
-Use `SIGHUP`, `reiki reload` or `POST /reload` for config, key and plugin settings that apply live. Restart for listener moves, connection caps and log file settings. The state file sits beside the config and is compatible with older files; unknown fields are ignored and missing fields use defaults. See [upgrades](upgrades.md) and [troubleshooting](troubleshooting.md#reload).
+Use `SIGHUP`, `reiki reload` or `POST /v1/reload` for config, key and plugin settings that apply live. Restart for listener moves, connection caps and log file settings. The state file sits beside the config; Reiki ignores it and starts fresh when it is missing, unreadable or not in the current format. See [upgrades](upgrades.md) and [troubleshooting](troubleshooting.md#reload).

@@ -83,10 +83,6 @@ pub enum ConfigError {
         name: String,
         known: Vec<String>,
     },
-    RemovedPlugin {
-        old: String,
-        new: String,
-    },
     PluginConfig {
         name: String,
         message: String,
@@ -208,10 +204,6 @@ impl fmt::Display for ConfigError {
                     )
                 }
             }
-            Self::RemovedPlugin { old, new } => write!(
-                f,
-                "plugin `{old}` was removed; use `{new}` instead (feature `plugin-{new}`)"
-            ),
             Self::PluginConfig { name, message } => {
                 write!(f, "plugin `{name}`: {message}")
             }
@@ -220,9 +212,6 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
-
-/// Plugin names that were removed, as (old, replacement).
-const REMOVED_PLUGINS: &[(&str, &str)] = &[("gov", "controlled")];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1172,7 +1161,7 @@ impl From<StrategyConfig> for Strategy {
 }
 
 /// Line/column plus message; the source line and any quoted value are dropped because errors
-/// reach HTTP bodies, `/status` and logs. Relies on toml's message wording (`expected`, quote
+/// reach HTTP bodies, `/v1/status` and logs. Relies on toml's message wording (`expected`, quote
 /// delimiters); the sentinel test guards it.
 fn describe_parse_error(text: &str, error: &toml::de::Error) -> String {
     let message = error.message();
@@ -1238,7 +1227,7 @@ pub fn check_admin_listen(listen: &str) -> Result<std::net::SocketAddr, String> 
 }
 
 impl Config {
-    /// Whether per-upstream usage is kept, for the peer document and `/metrics`: `[peers]
+    /// Whether per-upstream usage is kept, for the peer document and `/v1/metrics`: `[peers]
     /// expose_usage`, which is on when there is no `[peers]` table.
     pub fn exposes_usage(&self) -> bool {
         self.peers.as_ref().is_none_or(|peers| peers.expose_usage)
@@ -1252,32 +1241,11 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        Self::parse_with_warnings(text).map(|(config, _)| config)
-    }
-
-    /// Like [`Config::parse`], but hands back warnings instead of logging them, for a caller that
-    /// starts logging only after it has read the config. No config warnings are emitted today.
-    pub fn parse_with_warnings(text: &str) -> Result<(Self, Vec<String>), ConfigError> {
         let mut config: Config =
             toml::from_str(text).map_err(|e| ConfigError::Parse(describe_parse_error(text, &e)))?;
-        config.check_removed_plugins()?;
         config.resolve_quota_resets()?;
         config.validate()?;
-        Ok((config, Vec::new()))
-    }
-
-    /// A removed name is an error, not an alias: silently renaming it would hide a stale config.
-    fn check_removed_plugins(&self) -> Result<(), ConfigError> {
-        if let Some((old, new)) = REMOVED_PLUGINS
-            .iter()
-            .find(|(old, _)| self.plugins.contains_key(*old))
-        {
-            return Err(ConfigError::RemovedPlugin {
-                old: (*old).to_owned(),
-                new: (*new).to_owned(),
-            });
-        }
-        Ok(())
+        Ok(config)
     }
 
     /// The parsed reset schedule for a key, if it has one.
@@ -3895,14 +3863,15 @@ socket = "/run/forwarder.sock"
     }
 
     #[test]
-    fn a_removed_plugin_name_is_rejected_with_its_replacement() {
-        let err = Config::parse(&base("[plugins.gov]\nmode = \"report\"\n"))
+    fn an_unknown_plugin_name_is_rejected_by_the_registry() {
+        let config = Config::parse(&base("[plugins.unknown]\nmode = \"report\"\n")).unwrap();
+        let err = crate::plugins::PluginChain::build(&config.plugins, &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("gov") && err.contains("controlled"), "{err}");
-        assert!(err.contains("plugin-controlled"), "{err}");
-        let (_, warnings) = Config::parse_with_warnings(&base("")).unwrap();
-        assert!(warnings.is_empty());
+        assert!(
+            err.contains("unknown") && err.contains("not compiled in"),
+            "{err}"
+        );
     }
 
     #[test]

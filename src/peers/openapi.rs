@@ -7,6 +7,7 @@ use crate::config::Config;
 fn upstream_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "healthy_keys", "cooling_keys", "disabled_keys",
                      "cooling_combinations",
                      "soonest_cooldown_seconds", "last_status_class"],
@@ -57,11 +58,12 @@ fn upstream_schema() -> Value {
 fn health_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["instance", "observed_at", "upstreams"],
+        "additionalProperties": false,
+        "required": ["instance", "reiki_version", "observed_at", "age_seconds", "failures", "upstreams"],
         "properties": {
             "instance": {"type": "string"},
             "reiki_version": {"type": "string", "maxLength": 32,
-                "description": "The publisher's version; older publishers omit it"},
+                "description": "The publisher's version, sanitised for terminal display"},
             "observed_at": {"type": "string", "format": "date-time"},
             "age_seconds": {"type": "integer", "minimum": 0,
                 "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},
@@ -145,7 +147,7 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
         "servers": servers,
         "get": {
             "summary": "Server-Sent Events: a snapshot, then key, sessions and host events",
-            "description": "event: snapshot carries the /v1/health document; event: key carries {observed_at, upstream} for one upstream whose key counts or states changed; event: sessions and event: host carry {observed_at, sessions|host} with expose_host_stats; a `: heartbeat` comment comes every 15 s",
+            "description": "event: snapshot carries the /v1/health document; event: key carries {observed_at, age_seconds, upstream} for one upstream whose key counts or states changed; event: sessions and event: host carry {observed_at, sessions|host} with expose_host_stats; a `: heartbeat` comment comes every 15 s",
             "security": [{"peerAuth": []}],
             "responses": {
                 "200": {"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}},

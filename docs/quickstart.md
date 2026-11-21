@@ -96,10 +96,10 @@ From another terminal:
 curl -s http://127.0.0.1:4097/__reiki/healthz
 export REIKI_ADMIN_TOKEN="$(cat /etc/reiki/admin.token)"
 curl -s -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
-  http://127.0.0.1:4098/status
+  http://127.0.0.1:4098/v1/status
 ```
 
-The health probe needs no token and answers `ok` while Reiki is up. `/status` returns key health, stream chains and reload state; it carries key names, never key values. See [monitoring](monitoring.md#get-status).
+The health probe needs no token and answers `ok` while Reiki is up. `/v1/status` returns key health, stream chains and reload state; it carries key names, never key values. See [monitoring](monitoring.md#get-v1status).
 
 ## 5. Negative test: a wrong stream token
 

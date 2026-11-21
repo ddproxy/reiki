@@ -539,7 +539,7 @@ pub fn socket_warnings(_config: &crate::config::Config) -> Vec<String> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs as unixfs;
+    use std::os::unix::fs::{self as unixfs, PermissionsExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -579,6 +579,27 @@ file = "/etc/reiki/keys/zen-a"
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn a_bare_forward_command_resolves_against_the_child_path() {
+        // `env_clear` is applied before spawn, and Rust resolves a bare program name using the
+        // child's PATH, not the one Reiki inherited. The command forwarder therefore cannot run
+        // a binary from the inherited PATH that the sanitised child environment does not name.
+        let dir = temp_dir();
+        let name = format!("reiki-path-probe-{}", std::process::id());
+        let script = dir.join(&name);
+        fs::write(&script, "#!/bin/sh\nprintf child-path\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = tokio::process::Command::new(&name)
+            .env_clear()
+            .env("PATH", &dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"child-path");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

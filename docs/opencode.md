@@ -42,11 +42,11 @@ provider.opencode.options.apiKey   = "<client token>"
 
 ## Prove one request used Reiki
 
-`[plugins.metrics]` serves `/metrics` on the admin listener. Send one request from OpenCode, then read the counter:
+`[plugins.metrics]` serves `/v1/metrics` on the admin listener. Send one request from OpenCode, then read the counter:
 
 ```bash
 curl -s -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
-  http://127.0.0.1:4098/metrics | grep reiki_requests_total
+  http://127.0.0.1:4098/v1/metrics | grep reiki_requests_total
 ```
 
 One successful request on this stream produces a line like:
@@ -55,7 +55,7 @@ One successful request on this stream produces a line like:
 reiki_requests_total{stream="client-a",upstream="zen",status="success"} 1
 ```
 
-The counter is one per request, labelled by stream, serving upstream and client-visible status. It proves that request reached that Reiki route. It does not prove that every OpenCode request used Reiki. See [monitoring](monitoring.md#get-metrics).
+The counter is one per request, labelled by stream, serving upstream and client-visible status. It proves that request reached that Reiki route. It does not prove that every OpenCode request used Reiki. See [monitoring](monitoring.md#get-v1metrics).
 
 Two more checks agree with it:
 

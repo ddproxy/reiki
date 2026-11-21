@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, State};
+use axum::http::Method;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{get, post, MethodRouter};
 use axum::Router;
+use serde_json::Value;
 
 use crate::auth::{bearer_token, constant_time_eq, sha256_hex, Peer};
 use crate::chain::{KeyState, KeyStatus};
@@ -17,11 +19,11 @@ use reiki_plugin::KeyCounts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Prefix of the versioned copy of every admin route. v1 only gains fields.
+/// Prefix of every admin route.
 const V1: &str = "/v1";
 
-/// The routes this file serves itself. Each is mounted bare and under [`V1`], and the OpenAPI
-/// document is built from this table, so the two cannot drift.
+/// The routes this file serves itself, under [`V1`]. The OpenAPI document is built from this
+/// table, so the two cannot drift.
 const ROUTES: &[(&str, &str, &str)] = &[
     ("/status", "get", "Key, stream and config status"),
     (
@@ -37,14 +39,15 @@ const ROUTES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// True when the admin listener serves this path itself, bare or under [`V1`].
+/// True when a plugin path would collide with a route the admin listener serves itself.
+///
+/// Plugins declare bare paths; the router mounts them under [`V1`], so both forms are checked.
 pub(crate) fn is_reserved_path(path: &str) -> bool {
-    if path == format!("{V1}/openapi.json") {
-        return true;
-    }
-    ROUTES.iter().any(|(route, _, _)| {
-        path == *route || path.strip_prefix(V1).is_some_and(|rest| rest == *route)
-    })
+    let bare = path
+        .strip_prefix(V1)
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path);
+    bare == "/openapi.json" || ROUTES.iter().any(|(route, _, _)| bare == *route)
 }
 
 fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
@@ -61,14 +64,11 @@ fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
 pub fn router(app: Arc<App>) -> Router {
     let mut router = Router::new();
     for (path, method, _) in ROUTES {
-        let route = handler(path, method);
-        router = router
-            .route(path, route.clone())
-            .route(&format!("{V1}{path}"), route);
+        router = router.route(&format!("{V1}{path}"), handler(path, method));
     }
     router
         .route(&format!("{V1}/openapi.json"), get(openapi))
-        .fallback(get(plugin_route))
+        .fallback(plugin_route)
         .layer(axum::middleware::map_response(with_version))
         .with_state(app)
 }
@@ -193,24 +193,28 @@ async fn status(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         build_status(&snapshot, &mut health, now)
     };
-    let body = {
-        let mut body = body;
-        body.pop();
-        format!("{body},\"config\":{}}}", app.reload_status_json())
+    let config = app.reload_status_json();
+    let intercept = app.ca_not_after().map(|not_after| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let days_left = (not_after - now).div_euclid(86_400);
+        format!("{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}")
+    });
+    let log = format!(r#"{{"write_errors":{}}}"#, app.file_write_errors());
+    let mut fields: Vec<(&str, &str)> = vec![("config", &config)];
+    if let Some(intercept) = &intercept {
+        fields.push(("intercept", intercept));
+    }
+    fields.push(("log", &log));
+    let Some(body) = merge_status_objects(&body, &fields) else {
+        // An unmergeable status must not become a corrupt JSON document on the wire.
+        return text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            r#"{"error":"status_unavailable"}"#.to_owned(),
+        );
     };
-    let body = match app.ca_not_after() {
-        Some(not_after) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            let days_left = (not_after - now).div_euclid(86_400);
-            let mut body = body;
-            body.pop();
-            format!("{body},\"intercept\":{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}}}")
-        }
-        None => body,
-    };
-    let body = with_log_status(body, app.file_write_errors());
     text_response(StatusCode::OK, "application/json", body)
 }
 
@@ -469,9 +473,15 @@ fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static
 async fn plugin_route(
     State(app): State<Arc<App>>,
     peer: Option<Extension<Peer>>,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
+    // Plugins answer GET only. Other methods on an unknown path are still a 404, not a 405 from
+    // a GET-only fallback.
+    if method != Method::GET {
+        return text_response(StatusCode::NOT_FOUND, "text/plain", String::new());
+    }
     let peer = peer.map(|Extension(peer)| peer.0);
     if let Err(refusal) = authorize(&app, peer, uri.path(), &headers) {
         return *refusal;
@@ -493,11 +503,13 @@ async fn plugin_route(
         }
         counts
     };
-    let path = uri.path();
-    let path = path
+    let Some(path) = uri
+        .path()
         .strip_prefix(V1)
         .filter(|rest| rest.starts_with('/'))
-        .unwrap_or(path);
+    else {
+        return text_response(StatusCode::NOT_FOUND, "text/plain", String::new());
+    };
     let usage = snapshot
         .config
         .exposes_usage()
@@ -591,10 +603,28 @@ pub(crate) fn text_response(
     response
 }
 
-/// Adds the service-log counters to a status document.
-fn with_log_status(mut body: String, write_errors: u64) -> String {
-    body.pop();
-    format!("{body},\"log\":{{\"write_errors\":{write_errors}}}}}")
+/// Merges JSON object fragments into a status document without mutating its text. Every fragment
+/// is parsed before it is appended, so an invalid fragment fails closed instead of producing a
+/// corrupt document. The original text is kept verbatim to preserve the status field order.
+fn merge_status_objects(body: &str, fields: &[(&str, &str)]) -> Option<String> {
+    let document: Value = serde_json::from_str(body).ok()?;
+    document.as_object()?;
+    let base = body.trim_end().strip_suffix('}')?;
+    let mut out =
+        String::with_capacity(body.len() + fields.iter().map(|(_, f)| f.len()).sum::<usize>());
+    out.push_str(base);
+    for (name, fragment) in fields {
+        let value: Value = serde_json::from_str(fragment).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+        out.push(',');
+        out.push_str(&json_string(name));
+        out.push(':');
+        out.push_str(fragment.trim());
+    }
+    out.push('}');
+    Some(out)
 }
 
 /// Snapshot of key health and stream routing for operators. Carries no key
@@ -629,28 +659,26 @@ fn build_status(snapshot: &Snapshot, health: &mut KeyState, now: Instant) -> Str
                 }
             }
         }
-        // Soonest first. A field that is absent for a healthy key keeps the old output byte-identical.
+        // Soonest first; always present, including an empty list for a healthy key.
         let scopes = health.cooling_scopes(name, now);
-        if !scopes.is_empty() {
-            out.push_str(",\"scopes\":[");
-            for (index, cooling) in scopes.iter().take(16).enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str("{\"route\":");
-                out.push_str(&json_string(&cooling.scope.route));
-                out.push_str(",\"model\":");
-                out.push_str(&json_string(&cooling.scope.model));
-                out.push_str(",\"retry_after_seconds\":");
-                let secs =
-                    cooling.remaining.as_secs() + u64::from(cooling.remaining.subsec_nanos() > 0);
-                out.push_str(&secs.max(1).to_string());
-                out.push_str(",\"cooldown_class\":\"");
-                out.push_str(cooling.class.name());
-                out.push_str("\"}");
+        out.push_str(",\"scopes\":[");
+        for (index, cooling) in scopes.iter().take(16).enumerate() {
+            if index > 0 {
+                out.push(',');
             }
-            out.push(']');
+            out.push_str("{\"route\":");
+            out.push_str(&json_string(&cooling.scope.route));
+            out.push_str(",\"model\":");
+            out.push_str(&json_string(&cooling.scope.model));
+            out.push_str(",\"retry_after_seconds\":");
+            let secs =
+                cooling.remaining.as_secs() + u64::from(cooling.remaining.subsec_nanos() > 0);
+            out.push_str(&secs.max(1).to_string());
+            out.push_str(",\"cooldown_class\":\"");
+            out.push_str(cooling.class.name());
+            out.push_str("\"}");
         }
+        out.push(']');
         out.push('}');
     }
 
@@ -802,9 +830,60 @@ mod tests {
     }
 
     #[test]
-    fn status_exposes_the_service_log_write_error_count() {
-        let body = with_log_status(r#"{"keys":[]}"#.to_owned(), 3);
-        assert_eq!(body, r#"{"keys":[],"log":{"write_errors":3}}"#);
+    fn status_merges_json_fields_without_trimming_the_document() {
+        let body = r#"{ "keys":[] }  "#;
+        let merged = merge_status_objects(
+            body,
+            &[
+                ("config", r#"{"generation":2}"#),
+                ("log", r#"{"write_errors":3}"#),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&merged).unwrap(),
+            serde_json::json!({
+                "keys": [],
+                "config": {"generation": 2},
+                "log": {"write_errors": 3},
+            })
+        );
+        assert!(
+            merge_status_objects(r#"{"keys":[]}"#, &[("log", "not json")]).is_none(),
+            "an unmergeable field must fail closed"
+        );
+        assert!(merge_status_objects("[]", &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_admin_path_is_404_for_every_method() {
+        use axum::extract::Request;
+        use tower_service::Service as _;
+
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{}\"\n",
+            sha256_hex("admin-token-for-tests")
+        );
+        let app = App::new(
+            crate::config::Config::parse(&text).unwrap(),
+            std::collections::HashMap::new(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let mut router = router(app);
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri("/v1/no-such-route")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", "admin-token-for-tests"),
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response = router.call(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        }
     }
 
     #[test]

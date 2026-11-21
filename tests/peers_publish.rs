@@ -143,7 +143,7 @@ impl Rig {
 
     async fn admin_metrics(&self) -> String {
         self.client
-            .get(format!("{}/metrics", self.admin))
+            .get(format!("{}/v1/metrics", self.admin))
             .bearer_auth(ADMIN_TOKEN)
             .send()
             .await
@@ -205,7 +205,7 @@ async fn the_peer_token_works_nowhere_else() {
         "/status",
         "/v1/status",
         "/v1/openapi.json",
-        "/metrics",
+        "/v1/metrics",
         "/v1/usage",
     ] {
         let res = rig
@@ -217,7 +217,7 @@ async fn the_peer_token_works_nowhere_else() {
             .unwrap();
         assert_eq!(res.status(), 401, "admin {path}");
     }
-    for path in ["/reload?dry_run=true", "/keys/enable?key=zen-a"] {
+    for path in ["/v1/reload?dry_run=true", "/v1/keys/enable?key=zen-a"] {
         let res = rig
             .client
             .post(format!("{}{path}", rig.admin))
@@ -262,7 +262,7 @@ async fn every_other_path_and_method_on_the_peer_listener_is_404() {
         "/status",
         "/v1/status",
         "/v1/openapi.json",
-        "/metrics",
+        "/v1/metrics",
         "/v1/usage",
         "/reload",
         "/__reiki/healthz",
@@ -603,14 +603,13 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
     );
     let top = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"];
     assert_eq!(top["properties"]["reiki_version"]["type"], "string");
-    assert!(
-        !top["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|name| name == "reiki_version"),
-        "reiki_version stays optional for readers of older publishers"
-    );
+    let required = top["required"].as_array().unwrap();
+    for field in ["reiki_version", "age_seconds", "failures"] {
+        assert!(
+            required.iter().any(|name| name == field),
+            "{field} is required in the current wire shape"
+        );
+    }
     let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]
         ["properties"]["upstreams"]["items"];
     for field in [

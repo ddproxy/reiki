@@ -1,4 +1,4 @@
-//! What a config reload did, and the record of the last ones for `/status`.
+//! What a config reload did, and the record of the last ones for `/v1/status`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ struct Last {
     error: Option<String>,
 }
 
-/// Counts successful reloads and remembers the last attempt, for `/status`.
+/// Counts successful reloads and remembers the last attempt, for `/v1/status`.
 pub struct ReloadState {
     generation: u64,
     loaded_at: SystemTime,

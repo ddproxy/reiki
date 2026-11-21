@@ -1,10 +1,13 @@
 //! `reiki peers`: read each configured peer's `/v1/health` with a client of its own, trusting
 //! only that peer's CA, and report anything unanswered or old as unknown.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::config::{PeerEntry, PeersConfig};
@@ -14,16 +17,16 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest `/v1/health` body read; a bigger one is refused, not truncated.
 pub const MAX_BODY: usize = 64 * 1024;
 
-/// One upstream as a peer publishes it.
+/// One upstream as a peer publishes it. The wire shape is validated by [`UpstreamWire`]; this is
+/// only the part `reiki peers` displays.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamHealth {
     pub name: String,
     pub healthy_keys: u32,
     pub cooling_keys: u32,
     pub disabled_keys: u32,
-    #[serde(default)]
     pub soonest_cooldown_seconds: Option<u64>,
-    #[serde(default)]
     pub last_status_class: Option<String>,
 }
 
@@ -42,14 +45,119 @@ impl UpstreamHealth {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// The current `/v1/health` wire shape. Every required figure must be present; fields a
+/// publisher omits by configuration are optional, and unknown fields are an error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct HealthDocWire {
+    instance: String,
+    reiki_version: String,
+    observed_at: String,
+    age_seconds: u64,
+    upstreams: Vec<UpstreamWire>,
+    failures: BTreeMap<String, u64>,
+    #[serde(default)]
+    host: Option<Value>,
+    #[serde(default)]
+    sessions: Option<Value>,
+}
+
+/// An `Option` that must be present in JSON; `null` is still a valid value. Serde would otherwise
+/// accept a missing `Option` field as `None`, making an absent field read as `null`.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RequiredNullable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `Option::deserialize` would also accept serde's missing-field deserializer, making an
+        // absent field look like `null`. Reading a `Value` first keeps absence an error.
+        let value = Value::deserialize(deserializer)?;
+        let inner = if value.is_null() {
+            None
+        } else {
+            Some(T::deserialize(value).map_err(D::Error::custom)?)
+        };
+        Ok(Self(inner))
+    }
+}
+
+/// One upstream in the current wire shape, including fields this reader does not display.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct UpstreamWire {
+    name: String,
+    healthy_keys: u32,
+    cooling_keys: u32,
+    disabled_keys: u32,
+    cooling_combinations: u32,
+    soonest_cooldown_seconds: RequiredNullable<u64>,
+    last_status_class: RequiredNullable<String>,
+    #[serde(default)]
+    keys: Option<Value>,
+    #[serde(default)]
+    requests_1h: Option<Value>,
+    #[serde(default)]
+    limited_1h: Option<Value>,
+    #[serde(default)]
+    request_buckets: Option<Value>,
+    #[serde(default)]
+    tokens_1h: Option<Value>,
+    #[serde(default)]
+    token_buckets: Option<Value>,
+    #[serde(default)]
+    request_minutes: Option<Value>,
+    #[serde(default)]
+    token_minutes: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct HealthDoc {
     pub(crate) instance: String,
     pub(crate) observed_at: String,
-    /// How old the figures were when the peer sent them; absent from older publishers.
-    #[serde(default)]
-    pub(crate) age_seconds: Option<u64>,
+    pub(crate) age_seconds: u64,
     pub(crate) upstreams: Vec<UpstreamHealth>,
+}
+
+impl From<UpstreamWire> for UpstreamHealth {
+    fn from(wire: UpstreamWire) -> Self {
+        Self {
+            name: wire.name,
+            healthy_keys: wire.healthy_keys,
+            cooling_keys: wire.cooling_keys,
+            disabled_keys: wire.disabled_keys,
+            soonest_cooldown_seconds: wire.soonest_cooldown_seconds.0,
+            last_status_class: wire.last_status_class.0,
+        }
+    }
+}
+
+/// Keeps an uncontrolled peer version out of logs and tables, as in `reiki top`.
+fn check_version(text: &str) -> Result<(), String> {
+    let clean: String = text
+        .chars()
+        .filter(|c| (' '..='~').contains(c))
+        .take(32)
+        .collect();
+    if clean.is_empty() {
+        return Err("reiki_version has no printable characters".to_owned());
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for HealthDoc {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HealthDocWire::deserialize(deserializer)?;
+        check_version(&wire.reiki_version).map_err(D::Error::custom)?;
+        Ok(Self {
+            instance: wire.instance,
+            observed_at: wire.observed_at,
+            age_seconds: wire.age_seconds,
+            upstreams: wire.upstreams.into_iter().map(Into::into).collect(),
+        })
+    }
 }
 
 /// What `reiki peers` knows about one peer.
@@ -60,8 +168,7 @@ pub struct PeerReport {
     pub state: &'static str,
     pub error: Option<String>,
     pub instance: Option<String>,
-    /// How old the data is: the age the peer reported plus the time since this host received
-    /// it, or, from a peer that reports no age, `observed_at` against this host's clock.
+    /// How old the data is: the age the peer reported plus the time since this host received it.
     pub age_seconds: Option<u64>,
     /// Empty unless `state` is `fresh`, so old data never reads as healthy.
     pub upstreams: Vec<UpstreamHealth>,
@@ -84,53 +191,20 @@ impl PeerReport {
     }
 }
 
-/// Whole seconds since the Unix epoch of an RFC 3339 time: fractional seconds, a lowercase
-/// `t` or `z` and a numeric offset are all accepted.
-pub(crate) fn parse_rfc3339(text: &str) -> Option<i64> {
-    // The parser also takes a space between date and time; Reiki never sends one, so refuse it.
-    if !matches!(text.as_bytes().get(10), Some(b'T' | b't')) {
-        return None;
-    }
-    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
-        .ok()
-        .map(time::OffsetDateTime::unix_timestamp)
-}
-
-fn unix_now(now: SystemTime) -> i64 {
-    now.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
-/// Judges a document received just now: data more than three poll intervals old is unknown.
-/// The age is the one the peer reports, which needs no agreement between the two clocks; only a
-/// peer that reports none is judged by `observed_at` against this host's clock, and then data
-/// that far in the future is unknown too.
-pub(crate) fn assess(name: &str, doc: HealthDoc, poll: Duration, now: SystemTime) -> PeerReport {
-    let limit = i64::try_from(poll.as_secs().saturating_mul(3)).unwrap_or(i64::MAX);
-    let age = match doc.age_seconds {
-        Some(age) => i64::try_from(age).unwrap_or(i64::MAX),
-        None => match parse_rfc3339(&doc.observed_at) {
-            Some(observed) => unix_now(now) - observed,
-            None => {
-                return PeerReport::unknown(name, "observed_at is not an RFC 3339 time".to_owned());
-            }
-        },
-    };
+/// Judges a document received just now: data more than three poll intervals old is unknown. The
+/// age comes from the current wire shape, so the two clocks do not have to agree.
+pub(crate) fn assess(name: &str, doc: HealthDoc, poll: Duration) -> PeerReport {
+    let limit = poll.as_secs().saturating_mul(3);
+    let age = doc.age_seconds;
     if age > limit {
         return PeerReport::unknown(name, format!("stale data, {age}s old"));
-    }
-    if -age > limit {
-        return PeerReport::unknown(
-            name,
-            format!("observed_at is {}s ahead of this clock", -age),
-        );
     }
     PeerReport {
         name: name.to_owned(),
         state: "fresh",
         error: None,
         instance: Some(doc.instance),
-        age_seconds: Some(u64::try_from(age.max(0)).unwrap_or(0)),
+        age_seconds: Some(age),
         upstreams: doc.upstreams,
     }
 }
@@ -284,7 +358,7 @@ pub async fn poll(peers: &PeersConfig) -> Vec<PeerReport> {
             let (name, peer) = (name.clone(), peer.clone());
             tokio::spawn(async move {
                 match fetch(&peer).await {
-                    Ok(doc) => assess(&name, doc, poll, SystemTime::now()),
+                    Ok(doc) => assess(&name, doc, poll),
                     Err(error) => PeerReport::unknown(&name, error),
                 }
             })
@@ -559,11 +633,11 @@ impl SseParser {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyEvent {
     observed_at: String,
-    #[serde(default)]
-    age_seconds: Option<u64>,
-    upstream: UpstreamHealth,
+    age_seconds: u64,
+    upstream: UpstreamWire,
 }
 
 enum Watched {
@@ -593,9 +667,10 @@ fn apply_key_event(doc: &mut HealthDoc, key: KeyEvent, drops: &mut u64) -> bool 
     }
     doc.observed_at = key.observed_at;
     doc.age_seconds = key.age_seconds;
+    let upstream = key.upstream.into();
     match existing {
-        Some(index) => doc.upstreams[index] = key.upstream,
-        None => doc.upstreams.push(key.upstream),
+        Some(index) => doc.upstreams[index] = upstream,
+        None => doc.upstreams.push(upstream),
     }
     true
 }
@@ -701,9 +776,7 @@ async fn follow_stream(
                 },
             };
             let message = match (&doc, changed) {
-                (Some(doc), true) => {
-                    Watched::Report(assess(name, doc.clone(), poll, SystemTime::now()))
-                }
+                (Some(doc), true) => Watched::Report(assess(name, doc.clone(), poll)),
                 _ => Watched::Alive,
             };
             if tx.send(message).await.is_err() {
@@ -718,7 +791,7 @@ async fn follow(name: String, peer: PeerEntry, poll: Duration, tx: mpsc::Sender<
     loop {
         let reason = follow_stream(&name, &peer, poll, &tx).await;
         let report = match fetch(&peer).await {
-            Ok(doc) => assess(&name, doc, poll, SystemTime::now()),
+            Ok(doc) => assess(&name, doc, poll),
             Err(error) => PeerReport::unknown(&name, format!("stream: {reason}; poll: {error}")),
         };
         if tx.send(Watched::Report(report)).await.is_err() || tx.is_closed() {
@@ -914,7 +987,7 @@ mod tests {
         HealthDoc {
             instance: "peer-a".to_owned(),
             observed_at: observed_at.to_owned(),
-            age_seconds: None,
+            age_seconds: 0,
             upstreams: vec![UpstreamHealth {
                 name: "zen".to_owned(),
                 healthy_keys: 0,
@@ -924,11 +997,6 @@ mod tests {
                 last_status_class: Some("4xx".to_owned()),
             }],
         }
-    }
-
-    fn at(text: &str) -> SystemTime {
-        SystemTime::UNIX_EPOCH
-            + Duration::from_secs(u64::try_from(parse_rfc3339(text).unwrap()).unwrap())
     }
 
     #[test]
@@ -941,6 +1009,23 @@ mod tests {
             soonest_cooldown_seconds: None,
             last_status_class: None,
         };
+        let wire = |name: &str| UpstreamWire {
+            name: name.to_owned(),
+            healthy_keys: 1,
+            cooling_keys: 0,
+            disabled_keys: 0,
+            cooling_combinations: 0,
+            soonest_cooldown_seconds: RequiredNullable(None),
+            last_status_class: RequiredNullable(None),
+            keys: None,
+            requests_1h: None,
+            limited_1h: None,
+            request_buckets: None,
+            tokens_1h: None,
+            token_buckets: None,
+            request_minutes: None,
+            token_minutes: None,
+        };
         let mut watched = doc("2026-11-13T09:59:58Z");
         for n in 1..MAX_KEY_UPSTREAMS {
             watched.upstreams.push(upstream(&format!("u{n}")));
@@ -949,19 +1034,19 @@ mod tests {
         let mut drops = 0;
         let new = KeyEvent {
             observed_at: "2026-11-13T10:00:00Z".to_owned(),
-            age_seconds: Some(0),
-            upstream: upstream("one-too-many"),
+            age_seconds: 0,
+            upstream: wire("one-too-many"),
         };
         assert!(!apply_key_event(&mut watched, new, &mut drops));
         assert_eq!(drops, 1);
         assert_eq!(watched.upstreams.len(), MAX_KEY_UPSTREAMS);
         assert_eq!(watched.observed_at, "2026-11-13T09:59:58Z");
 
-        let mut known = upstream("zen");
+        let mut known = wire("zen");
         known.healthy_keys = 7;
         let update = KeyEvent {
             observed_at: "2026-11-13T10:00:00Z".to_owned(),
-            age_seconds: Some(0),
+            age_seconds: 0,
             upstream: known,
         };
         assert!(apply_key_event(&mut watched, update, &mut drops));
@@ -971,97 +1056,176 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_round_trips_with_the_reload_formatter() {
-        for secs in [0u64, 86_399, 1_763_026_200, 4_102_444_800] {
-            let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            let text = crate::reload::rfc3339(time);
-            assert_eq!(
-                parse_rfc3339(&text),
-                Some(i64::try_from(secs).unwrap()),
-                "{text}"
-            );
-        }
-        for bad in [
-            "",
-            "2026-11-13 09:30:00Z",
-            "2026-11-13T09:30:00",
-            "2026-13-13T09:30:00Z",
-            "2026-11-13T24:30:00Z",
-            "+026-11-13T09:30:00Z",
-            "2026-11-13T09:30:00+0100",
-            "2026-11-13T09:30:00.Z",
-        ] {
-            assert_eq!(parse_rfc3339(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn rfc3339_accepts_fractions_lowercase_and_offsets() {
-        let base = parse_rfc3339("2026-11-13T09:30:00Z").unwrap();
-        for (text, expected) in [
-            ("2026-11-13T09:30:00.5Z", base),
-            ("2026-11-13T09:30:00.123456789Z", base),
-            ("2026-11-13t09:30:00z", base),
-            ("2026-11-13T10:30:00+01:00", base),
-            ("2026-11-13T04:00:00-05:30", base),
-            ("2026-11-13T09:30:00+00:00", base),
-            ("2026-11-13T09:30:00-00:00", base),
-            ("2026-11-13T10:30:00.25+01:00", base),
-        ] {
-            assert_eq!(parse_rfc3339(text), Some(expected), "{text}");
-        }
-    }
-
-    #[test]
     fn a_reported_age_decides_freshness_whatever_the_clocks_say() {
         let poll = Duration::from_secs(30);
-        let now = at("2026-11-13T10:00:00Z");
         let aged = |observed_at: &str, age: u64| HealthDoc {
-            age_seconds: Some(age),
+            age_seconds: age,
             ..doc(observed_at)
         };
         for skewed in ["2026-11-13T07:00:00Z", "2026-11-13T13:00:00Z"] {
-            let report = assess("peer-a", aged(skewed, 0), poll, now);
+            let report = assess("peer-a", aged(skewed, 0), poll);
             assert!(report.is_fresh(), "a peer clock off by hours: {report:?}");
             assert_eq!(report.age_seconds, Some(0));
         }
-        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 90), poll, now);
+        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 90), poll);
         assert!(report.is_fresh());
         assert_eq!(report.age_seconds, Some(90));
-        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 91), poll, now);
+        let report = assess("peer-a", aged("2026-11-13T10:00:00Z", 91), poll);
         assert_eq!(report.state, "unknown", "too old by its own account");
         assert!(report.error.unwrap().contains("stale"));
-        let report = assess("peer-a", aged("not a time", 0), poll, now);
-        assert!(report.is_fresh(), "observed_at is not needed with an age");
+        let report = assess("peer-a", aged("not a time", 0), poll);
+        assert!(report.is_fresh(), "observed_at is not parsed for freshness");
     }
 
     #[test]
-    fn data_older_or_newer_than_three_intervals_is_unknown() {
+    fn data_older_than_three_intervals_is_unknown() {
         let poll = Duration::from_secs(30);
-        let now = at("2026-11-13T10:00:00Z");
-        let fresh = assess("peer-a", doc("2026-11-13T09:58:31Z"), poll, now);
+        let aged = |age: u64| HealthDoc {
+            age_seconds: age,
+            ..doc("2026-11-13T10:00:00Z")
+        };
+        let fresh = assess("peer-a", aged(90), poll);
         assert!(fresh.is_fresh());
-        assert_eq!(fresh.age_seconds, Some(89));
+        assert_eq!(fresh.age_seconds, Some(90));
         assert_eq!(fresh.upstreams.len(), 1);
-        let stale = assess("peer-a", doc("2026-11-13T09:58:29Z"), poll, now);
+        let stale = assess("peer-a", aged(91), poll);
         assert_eq!(stale.state, "unknown");
         assert!(
             stale.upstreams.is_empty(),
             "stale data is never shown as health"
         );
         assert!(stale.error.unwrap().contains("stale"));
-        let ahead = assess("peer-a", doc("2026-11-13T10:05:00Z"), poll, now);
-        assert_eq!(ahead.state, "unknown");
-        let garbled = assess("peer-a", doc("yesterday"), poll, now);
-        assert_eq!(garbled.state, "unknown");
+    }
+
+    #[test]
+    fn the_current_wire_shape_is_required() {
+        type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
+        let base = || {
+            serde_json::json!({
+                "instance": "peer-a",
+                "reiki_version": "0.12.0",
+                "observed_at": "2026-11-13T10:00:00Z",
+                "age_seconds": 0,
+                "failures": {},
+                "upstreams": [{
+                    "name": "zen",
+                    "healthy_keys": 1,
+                    "cooling_keys": 0,
+                    "disabled_keys": 0,
+                    "cooling_combinations": 0,
+                    "soonest_cooldown_seconds": null,
+                    "last_status_class": null,
+                }],
+            })
+        };
+        serde_json::from_value::<HealthDoc>(base()).expect("the current document parses");
+
+        let config_gated = {
+            let mut doc = base();
+            doc["host"] = serde_json::json!({"cores": 8});
+            doc["sessions"] = serde_json::json!({"active_sessions": 2});
+            doc["upstreams"][0]["keys"] = serde_json::json!([]);
+            doc["upstreams"][0]["requests_1h"] = serde_json::json!(1);
+            doc["upstreams"][0]["limited_1h"] = serde_json::json!(0);
+            doc["upstreams"][0]["request_buckets"] = serde_json::json!(vec![0; 12]);
+            doc["upstreams"][0]["tokens_1h"] = serde_json::json!(0);
+            doc["upstreams"][0]["token_buckets"] = serde_json::json!(vec![0; 12]);
+            doc["upstreams"][0]["request_minutes"] = serde_json::json!(vec![0; 10]);
+            doc["upstreams"][0]["token_minutes"] = serde_json::json!(vec![0; 10]);
+            doc
+        };
+        serde_json::from_value::<HealthDoc>(config_gated)
+            .expect("fields published by configuration are accepted");
+
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "reiki_version",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc.as_object_mut().unwrap().remove("reiki_version");
+                }) as Box<dyn Fn(&mut serde_json::Value)>,
+            ),
+            (
+                "age_seconds",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc.as_object_mut().unwrap().remove("age_seconds");
+                }),
+            ),
+            (
+                "failures",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc.as_object_mut().unwrap().remove("failures");
+                }),
+            ),
+            (
+                "cooling_combinations",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc["upstreams"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("cooling_combinations");
+                }),
+            ),
+            (
+                "soonest_cooldown_seconds",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc["upstreams"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("soonest_cooldown_seconds");
+                }),
+            ),
+            (
+                "last_status_class",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc["upstreams"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("last_status_class");
+                }),
+            ),
+            (
+                "unknown field",
+                Box::new(|doc: &mut serde_json::Value| {
+                    doc["future_field"] = serde_json::json!(1);
+                }),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut doc = base();
+            mutate(&mut doc);
+            let error = serde_json::from_value::<HealthDoc>(doc)
+                .expect_err(&format!("{name} is not accepted"))
+                .to_string();
+            assert!(error.contains(name), "the error names {name}: {error}");
+        }
+    }
+
+    #[test]
+    fn key_events_need_the_current_shape() {
+        let current = r#"{"observed_at":"2026-11-13T10:00:00Z","age_seconds":0,
+            "upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+            "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null}}"#;
+        serde_json::from_str::<KeyEvent>(current).expect("the current key event parses");
+        for old in [
+            r#"{"observed_at":"t","upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null}}"#,
+            r#"{"observed_at":"t","age_seconds":0,"upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":null}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<KeyEvent>(old).is_err(),
+                "{old} is not a current key event"
+            );
+        }
     }
 
     #[test]
     fn the_table_shows_unknown_peers_without_numbers() {
         let poll = Duration::from_secs(30);
-        let now = at("2026-11-13T10:00:00Z");
+        let two_seconds_old = HealthDoc {
+            age_seconds: 2,
+            ..doc("2026-11-13T09:59:58Z")
+        };
         let reports = vec![
-            assess("peer-a", doc("2026-11-13T09:59:58Z"), poll, now),
+            assess("peer-a", two_seconds_old, poll),
             PeerReport::unknown("peer-b", "cannot connect".to_owned()),
         ];
         let table = render_table(&reports);

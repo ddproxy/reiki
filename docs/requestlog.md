@@ -48,7 +48,7 @@ Stopping Reiki with a signal leaves the socket file behind; the next start repla
 
 Every JSON record carries `"v":1`, written by `crates/reiki-requestlog/src/writer.rs` on `request`, `response`, `finding` and `dropped` records. OCSF output has no `v`; it sets `metadata.version` to the external schema version `1.3.0` (`crates/reiki-requestlog/src/ocsf.rs`). Syslog `VERSION 1` is the RFC 5424 protocol version.
 
-> **Limit:** `v:1` is a marker, not a compatibility contract. No code checks it, there is no `v:2` path, and no stability policy for log fields is written in this repository. The only stated stability promise is for the versioned admin API (`/v1`), not the request log.
+> **Limit:** `v:1` is a marker only. No code checks it, there is no `v:2` path, and no stability policy for log fields is written in this repository. The only stated stability promise is for the versioned admin API (`/v1`), not the request log.
 
 These fields are written by the renderer; most are also asserted by `tests/requestlog.rs` or the writer's unit tests. They describe current behaviour, not a promise that fields never change.
 

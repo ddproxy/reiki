@@ -647,9 +647,11 @@ mod tests {
         state.restore("a", loaded["a"], Instant::now());
         assert!(state.cooling_remaining("a", Instant::now()).is_some());
 
-        // A value beyond TOML's integer range is rejected with the whole file.
+        // A u64 beyond i64 is rejected or capped, never an unbounded cooldown.
         write("18446744073709551615");
-        assert!(load(&path, &config).is_empty());
+        assert!(load(&path, &config)
+            .get("a")
+            .is_none_or(|s| s.cooling == Some(MAX_RESTORED_COOLDOWN)));
 
         // Zero and a deadline that has already passed never become a cooldown.
         write("0");

@@ -8,6 +8,7 @@
 - Body capture requires `capture_bodies = true`: `body = "full"` and `response = "body"` are config errors without it, and enabling it logs a startup warning. Every captured request, response and failed-attempt body is masked and capped by `max_capture_bytes` and `max_body_bytes`, and the live socket feed follows the same rules as the file and syslog sinks.
 ### Added
 
+- `requestlog` gains a summary-only export for log collectors at `[plugins.requestlog.export]`: rotating JSON Lines or RFC 5424 syslog over UDP/Unix datagram, with a bounded non-blocking queue and an allow-listed `request_summary` field set. Drops are counted as `reiki_requestlog_export_dropped_total`, exposed at `GET /v1/requestlog/metrics`, in `GET /v1/status` and in `reiki top`. See [summary export](docs/requestlog.md#summary-export).
 - New `toolpolicy` plugin inspects tool calls in OpenAI Chat and Anthropic Messages responses, in whole bodies and streams. It checks declared tools, user/system host provenance and command tripwires; `report` is the default and `block` replaces flagged calls with a plain-text notice. See [tool policy](docs/toolpolicy.md).
 - `toolpolicy` writes a rotating owner-only JSONL journal and serves counters at `GET /v1/toolpolicy/metrics` on the admin listener.
 ### Added

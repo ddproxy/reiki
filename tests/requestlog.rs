@@ -1,8 +1,10 @@
 #![cfg(all(feature = "plugin-requestlog", unix))]
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -20,6 +22,7 @@ mod common;
 use common::serve;
 
 const CLIENT_TOKEN: &str = "client-token-do-not-log";
+const ADMIN_TOKEN: &str = "admin-token-do-not-log";
 const KEY_A: &str = "upstream-key-a-do-not-log";
 const KEY_B: &str = "upstream-key-b-do-not-log";
 
@@ -61,6 +64,7 @@ async fn upstream(req: Request) -> Response {
 
 struct Rig {
     relay: String,
+    admin: String,
     client: reqwest::Client,
     dir: PathBuf,
 }
@@ -74,12 +78,15 @@ impl Rig {
         let plugin_table = plugin_table.replace("{dir}", &dir.display().to_string());
         let mock = serve(Router::new().fallback(upstream)).await;
         let text = format!(
-            "[upstream.zen]\nbase_url = \"{mock}/v1\"\n\
+            "listen = \"127.0.0.1:41097\"\n\
+             [upstream.zen]\nbase_url = \"{mock}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
              [keys.b]\nupstream = \"zen\"\nfile = \"/unused/b\"\n\
              [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"a\", \"b\"]\n\
+             [admin]\nlisten = \"127.0.0.1:41098\"\ntoken_sha256 = \"{}\"\n\
              [plugins.requestlog]\n{plugin_table}\n",
-            reiki::auth::sha256_hex(CLIENT_TOKEN)
+            reiki::auth::sha256_hex(CLIENT_TOKEN),
+            reiki::auth::sha256_hex(ADMIN_TOKEN)
         );
         let config = Config::parse(&text).unwrap();
         let chain = PluginChain::build(&config.plugins, &builtin()).unwrap();
@@ -94,8 +101,10 @@ impl Rig {
             Duration::from_secs(120),
             chain,
         );
+        let admin = serve(reiki::admin::router(Arc::clone(&app))).await;
         Self {
             relay: serve(router(app)).await,
+            admin,
             client: reqwest::Client::new(),
             dir,
         }
@@ -107,6 +116,18 @@ impl Rig {
             .bearer_auth(CLIENT_TOKEN)
             .header("user-agent", "client/1.0")
             .body(body.to_owned())
+    }
+
+    async fn admin_get(&self, path: &str) -> String {
+        self.client
+            .get(format!("{}{path}", self.admin))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
     }
 }
 
@@ -363,5 +384,77 @@ async fn an_exhausted_chain_logs_every_attempt_and_no_serving_key() {
             {"key": "b", "status": 429},
         ])
     );
+    let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+#[tokio::test]
+async fn an_export_only_config_writes_allow_listed_summaries_and_publishes_its_metric() {
+    let rig = Rig::start(
+        "export",
+        "\n[plugins.requestlog.export]\nfile = \"{dir}/export.jsonl\"\nmax_bytes = 1024\nmax_files = 2\n",
+    )
+    .await;
+    let path = rig.dir.join("export.jsonl");
+
+    let response = rig
+        .post(
+            "/zen/chat/completions?token=query-secret",
+            r#"{"model":"m","messages":[{"role":"user","content":"prompt-secret"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let records = records_when(&path, 1);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    let expected: BTreeSet<&str> = [
+        "v",
+        "event",
+        "ts",
+        "id",
+        "method",
+        "route",
+        "upstream",
+        "status",
+        "duration_ms",
+        "head_ms",
+        "input_tokens",
+        "output_tokens",
+        "key",
+        "failure_class",
+    ]
+    .into_iter()
+    .collect();
+    let actual: BTreeSet<&str> = record
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(actual, expected, "unexpected export fields: {record}");
+    assert_eq!(record["v"], 1);
+    assert_eq!(record["event"], "request_summary");
+    assert_eq!(record["route"], "/zen/chat/completions");
+    assert_eq!(record["upstream"], "zen");
+    assert_eq!(record["status"], 200);
+    assert_eq!(record["key"], "b");
+    assert_eq!(record["input_tokens"], 0);
+    assert_eq!(record["output_tokens"], 0);
+    assert!(record["failure_class"].is_null(), "{record}");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    for secret in [CLIENT_TOKEN, KEY_A, KEY_B, "query-secret", "prompt-secret"] {
+        assert!(!text.contains(secret), "{secret} leaked into the export");
+    }
+
+    let metrics = rig.admin_get("/v1/requestlog/metrics").await;
+    assert!(
+        metrics.contains("reiki_requestlog_export_dropped_total 0"),
+        "{metrics}"
+    );
+    let status: Value = serde_json::from_str(&rig.admin_get("/v1/status").await).unwrap();
+    assert_eq!(status["requestlog"]["export_dropped_total"], 0);
     let _ = std::fs::remove_dir_all(&rig.dir);
 }

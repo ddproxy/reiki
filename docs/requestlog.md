@@ -1,6 +1,6 @@
 # Request log plugin
 
-The `requestlog` plugin records the requests that pass through Reiki as JSON lines. It writes them to a file, streams them live over a Unix socket, sends them to a syslog collector, or any mix of these.
+The `requestlog` plugin records the requests that pass through Reiki as JSON lines. It writes them to a file, streams them live over a Unix socket, sends them to a syslog collector, or any mix of these. It can also run a separate summary-only export for a log collector, with or without any of those main sinks.
 
 Compiled in by the default `plugin-requestlog` feature; inactive until a `[plugins.requestlog]` table exists.
 
@@ -16,7 +16,7 @@ body = "summary"                            # "summary", "full" or "none"
 headers = ["user-agent", "x-session-id"]
 ```
 
-At least one of `file`, `socket` and `syslog` is required. File and socket paths are absolute. At startup, a bad value, an unknown key or an unwritable path stops Reiki from starting.
+At least one of `file`, `socket`, `syslog` and `[plugins.requestlog.export]` is required. File and socket paths are absolute. At startup, a bad value, an unknown key or an unwritable path stops Reiki from starting.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -45,6 +45,103 @@ At least one of `file`, `socket` and `syslog` is required. File and socket paths
 `enabled` and `on_error` are handled by Reiki itself, as for every plugin. `reiki check` validates this table without creating the file or the socket.
 
 Stopping Reiki with a signal leaves the socket file behind; the next start replaces it.
+
+## Summary export
+
+`[plugins.requestlog.export]` runs a second, independent writer for log collectors. It is off when the table is absent. The main sinks keep their own format and body settings; the export always writes the fixed `request_summary` shape below, with no body text, header values, query strings or credential values. An export-only config is valid: no `file`, `socket` or `syslog` is needed at the `[plugins.requestlog]` level.
+
+Rotating JSON Lines file:
+
+```toml
+[plugins.requestlog.export]
+format = "jsonl"                                # default
+file = "/var/lib/reiki/export.jsonl"
+max_bytes = 10485760                            # default
+max_files = 3                                   # default
+queue = 256                                     # default
+```
+
+RFC 5424 syslog over a datagram transport:
+
+```toml
+[plugins.requestlog.export]
+format = "syslog"
+syslog = "udp://collector.example.com:514"      # or unix:///dev/log
+syslog_facility = "local0"                      # default
+syslog_app_name = "reiki-export"                # default
+queue = 256
+```
+
+`tcp://` is refused for the export: only `udp://host:port` and `unix:///absolute/path` are accepted, because the writer must never block a request. `file` and `syslog` are mutually exclusive and each format needs its own target. Unknown keys under the export table are a config error.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `format` | `jsonl` | `jsonl` writes one JSON object per line; `syslog` writes an RFC 5424 message per summary. |
+| `file` | none | Absolute path to the rotating export file. Required by `jsonl`, refused by `syslog`. Created with mode 0600, like the main log file. |
+| `max_bytes` | 10485760 | Rotate the export file when the next line would pass this size. |
+| `max_files` | 3 | Rotated files kept as `<file>.1` (newest) to `<file>.N`. `0` discards the old file at rotation instead of keeping a numbered copy. |
+| `syslog` | none | `udp://host:port` or `unix:///absolute/path`. Required by `syslog`, refused by `jsonl`. TCP is rejected with a config error. |
+| `syslog_facility` | `local0` | RFC 5424 facility name, as for the main syslog sink. |
+| `syslog_app_name` | `reiki-export` | APP-NAME: 1 to 48 printable ASCII characters, no spaces, not `-`. |
+| `queue` | 256 | Summary records buffered for the export writer (1 to 65536). A full queue drops the newest summary; it never delays the request. |
+
+The export has its own bounded queue. A record that cannot be queued, or a syslog datagram that cannot be sent, increments `reiki_requestlog_export_dropped_total`. The counter is exposed at `GET /v1/requestlog/metrics` on the admin listener, as `requestlog.export_dropped_total` in `GET /v1/status`, and as `requestlog_export_dropped_total` in `/v1/health` for `reiki top`. See [monitoring](monitoring.md#get-v1requestlogmetrics).
+
+### Export fields
+
+Every summary has exactly these fields; extra fields will be added only in a documented changelog entry.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | integer | Export shape version, currently `1`. |
+| `event` | string | Always `request_summary`. |
+| `ts` | string | UTC time when the request finished, RFC 3339 with milliseconds. |
+| `id` | string | The request id Reiki uses in its own logs; 32 hex digits. |
+| `method` | string | HTTP method. |
+| `route` | string | Redacted request path without the query string or fragment. |
+| `upstream` | string | Provider name from the config, not its base URL. |
+| `status` | integer or `null` | Client-visible status, or `null` when Reiki answered without an upstream response. |
+| `duration_ms` | integer | Total request duration in milliseconds. |
+| `head_ms` | integer | Time to the response head in milliseconds, `0` when no head arrived. |
+| `input_tokens` | integer | Provider-reported input tokens, `0` when absent or over the parse cap. |
+| `output_tokens` | integer | Provider-reported output tokens, `0` when absent or over the parse cap. |
+| `key` | string or `null` | Config name of the serving key, never its value; `null` when Reiki answered itself. |
+| `failure_class` | string or `null` | `rate_limited`, `quota_exhausted`, `unauthorized`, `transient`, `request_error` or `transport_error`; `null` for a success. |
+
+Token counts come from `usage` objects in JSON or server-sent responses, accepting both `prompt_tokens`/`completion_tokens` and `input_tokens`/`output_tokens`. Only the numbers are kept; no response text is inspected beyond the bounded buffer.
+
+### Shipping summaries
+
+For the syslog export, an rsyslog listener can place summaries in their own file, filtered by APP-NAME so the main request log stays separate:
+
+```
+module(load="imudp")
+input(type="imudp" port="5514")
+
+if $programname == 'reiki-export' then {
+    action(type="omfile" file="/var/log/reiki/summaries.log")
+    stop
+}
+```
+
+For the JSONL export, a Fluent Bit tail input can forward the same allow-listed fields:
+
+```ini
+[INPUT]
+    Name             tail
+    Path             /var/lib/reiki/export.jsonl
+    Tag              reiki.summary
+    Read_from_Head   true
+
+[OUTPUT]
+    Name             es
+    Match            reiki.summary
+    Host             collector.example.com
+    Port             9200
+    Index            reiki-summaries
+```
+
+Open the collector port only to senders you control. The summary never carries prompts, response bodies, header values, query strings or key values, and the export file is owner-only.
 
 ## Stability of records
 

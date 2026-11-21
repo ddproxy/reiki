@@ -32,6 +32,9 @@ pub struct Health {
     /// Counts of recent key failures by class over the peer's bounded ring. Counts only: the
     /// bodies behind them never leave the peer.
     pub failures: BTreeMap<String, u64>,
+    /// Total request-summary exports dropped by the peer's bounded queue or failed syslog sends.
+    #[serde(default)]
+    pub requestlog_export_dropped_total: u64,
     /// Only present when the peer sets `expose_host_stats`.
     #[serde(default)]
     pub host: Option<Value>,

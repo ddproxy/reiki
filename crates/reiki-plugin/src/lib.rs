@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
+use serde_json::Value;
 
 /// Keys every plugin table accepts. The host reads them, so a plugin must not reject them as unknown.
 pub const HOST_KEYS: &[&str] = &["enabled", "on_error", "dry_run", "streams"];
@@ -116,6 +117,18 @@ pub trait Plugin: Send + Sync {
 
     /// Answers a GET for one of [`Plugin::admin_paths`], after the caller is authenticated.
     fn on_admin(&self, _ctx: &AdminCtx<'_>) -> Option<AdminReply> {
+        None
+    }
+
+    /// A JSON object merged into `/v1/status`. Return `None` when the plugin has
+    /// no counters to publish; the returned value must be an object.
+    fn status_fragment(&self) -> Option<Value> {
+        None
+    }
+
+    /// One monotonic counter published in `/v1/health` as `name`. The health
+    /// document is shared with peers, so the value must not carry request data.
+    fn health_gauge(&self) -> Option<(&'static str, u64)> {
         None
     }
 }

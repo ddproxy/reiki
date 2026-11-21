@@ -202,7 +202,23 @@ async fn status(
         format!("{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}")
     });
     let log = format!(r#"{{"write_errors":{}}}"#, app.file_write_errors());
-    let mut fields: Vec<(&str, &str)> = vec![("config", &config)];
+    let plugin_fields: Vec<(String, String)> = app
+        .plugins()
+        .status_fragments()
+        .into_iter()
+        .flat_map(|fragment| match fragment.as_object() {
+            Some(object) => object
+                .iter()
+                .map(|(name, value)| (name.clone(), value.to_string()))
+                .collect(),
+            None => Vec::new(),
+        })
+        .collect();
+    let mut fields: Vec<(&str, &str)> = Vec::new();
+    for (name, value) in &plugin_fields {
+        fields.push((name.as_str(), value.as_str()));
+    }
+    fields.push(("config", &config));
     if let Some(intercept) = &intercept {
         fields.push(("intercept", intercept));
     }

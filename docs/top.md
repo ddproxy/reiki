@@ -91,6 +91,8 @@ Inside the Peers panel:
 
 Every peer's health document carries a `failures` object: counts of recent key failures by class over an in-memory ring of at most 64. The detail card prints those counts as `failures: rate_limited 2  transient 1`; names, streams and bodies are never published, so a remote peer can only be compared, not investigated.
 
+A peer with summary export enabled also publishes `requestlog_export_dropped_total`. When it is above zero, the detail card prints it as `export drops: N`; older peers without the field count as zero. See [summary export](requestlog.md#summary-export).
+
 The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_TOKEN` holds its admin token (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, cooldown left and the scrubbed body snippet. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
 
 See [`GET /v1/failures`](monitoring.md#get-v1failures) for the fields and the `reiki failures` command.

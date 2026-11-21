@@ -45,6 +45,8 @@ The final `on_response_chunk` call with `is_last = true` happens on normal end o
 | `uses_bodies(&self) -> bool` | `true` | `false` leaves response streaming and `content-length` alone. |
 | `admin_paths(&self) -> Vec<&'static str>` | empty | Admin GET paths this plugin serves. |
 | `on_admin(&self, &AdminCtx) -> Option<AdminReply>` | `None` | Answer for one of those paths. |
+| `status_fragment(&self) -> Option<serde_json::Value>` | `None` | JSON object merged into `GET /v1/status`; a panic or a non-object is skipped. |
+| `health_gauge(&self) -> Option<(&'static str, u64)>` | `None` | One monotonic count published in `/v1/health` for peers and `reiki top`. |
 
 `HOST_KEYS` is `["enabled", "on_error", "dry_run", "streams"]`. The host passes the whole config table to `build`, including these keys. A plugin should accept and ignore them; `HOST_KEYS` helps reject only unknown plugin settings. `reiki check` adds `dry_run = true` to every plugin table, so a build should validate settings without opening files, sockets or threads.
 

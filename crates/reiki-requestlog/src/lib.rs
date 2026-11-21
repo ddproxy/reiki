@@ -5,6 +5,7 @@
 //! writer thread parses, masks and writes them, so logging never delays a request.
 
 mod config;
+mod export;
 mod ocsf;
 mod redact;
 mod shape;
@@ -21,7 +22,9 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
-use reiki_plugin::{AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
+use reiki_plugin::{
+    AdminCtx, AdminReply, AttemptCtx, ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx,
+};
 
 pub use config::{
     BodyMode, Config, LogFormat, ResponseMode, SseMode, SyslogTarget, DENIED_HEADERS,
@@ -33,6 +36,7 @@ pub mod fuzzing {
     pub use crate::redact::{form, header, json, path, secrets, secrets_cut, stream_deltas};
     pub use crate::shape::sse_events;
 }
+use export::{Export, Item, Summary, Usage};
 use sink::FileSink;
 #[cfg(unix)]
 use sink::SocketHub;
@@ -41,6 +45,9 @@ use writer::{AttemptEvent, Event, FindingEvent, RequestEvent, ResponseEvent, Sin
 
 /// The `[plugins.requestlog]` table this plugin reads.
 pub const NAME: &str = "requestlog";
+
+/// Admin path serving the summary export's drop counter.
+const EXPORT_METRICS_PATH: &str = "/requestlog/metrics";
 
 /// Builds the plugin from its config table.
 pub fn build(table: &toml::Table) -> Result<Box<dyn Plugin>, String> {
@@ -57,6 +64,8 @@ pub struct RequestLog {
     /// Set once when the first record is dropped, so the warning is not repeated.
     warned: Arc<AtomicBool>,
     writer: Option<JoinHandle<()>>,
+    /// Summary-only export, separate from the main request log queue.
+    export: Option<Export>,
 }
 
 /// Per-request data. Dropping it is the one reliable end-of-response signal: with a
@@ -74,19 +83,68 @@ struct RequestState {
     attempts: Vec<AttemptEvent>,
     body: Vec<u8>,
     body_truncated: bool,
-    tx: SyncSender<Event>,
+    /// Main-log queue; absent when only the summary export is configured.
+    tx: Option<SyncSender<Event>>,
     dropped: Arc<AtomicU64>,
     queued_bytes: Arc<AtomicU64>,
     queue_max_bytes: u64,
     warned: Arc<AtomicBool>,
+    /// Export fields copied from the request before any body is read.
+    method: String,
+    route: String,
+    request_upstream: String,
+    head_at: Option<Instant>,
+    usage: Usage,
+    export: Option<SyncSender<Item>>,
+    export_dropped: Option<Arc<AtomicU64>>,
+    export_warned: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for RequestState {
     fn drop(&mut self) {
-        if !self.requested || self.response == ResponseMode::None {
+        if !self.requested {
             return;
         }
         let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let (Some(tx), Some(dropped), Some(warned)) =
+            (&self.export, &self.export_dropped, &self.export_warned)
+        {
+            let head_ms = self
+                .head_at
+                .map(|at| {
+                    u64::try_from(at.duration_since(self.started).as_millis()).unwrap_or(u64::MAX)
+                })
+                .unwrap_or(0);
+            let (input_tokens, output_tokens) = self.usage.finish();
+            let attempts: Vec<Option<u16>> = self.attempts.iter().map(|a| a.status).collect();
+            let status = self.status;
+            let failure_class = export::failure_class(status, &attempts);
+            export::send(
+                tx,
+                dropped,
+                warned,
+                Summary {
+                    at: SystemTime::now(),
+                    id: self.id.clone(),
+                    method: self.method.clone(),
+                    route: self.route.clone(),
+                    upstream: self.request_upstream.clone(),
+                    status,
+                    duration_ms,
+                    head_ms,
+                    input_tokens,
+                    output_tokens,
+                    key: self.key.clone(),
+                    failure_class,
+                },
+            );
+        }
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        if self.response == ResponseMode::None {
+            return;
+        }
         let event = Event::Response(ResponseEvent {
             id: std::mem::take(&mut self.id),
             at: SystemTime::now(),
@@ -99,7 +157,7 @@ impl Drop for RequestState {
             body_truncated: self.body_truncated,
         });
         enqueue(
-            &self.tx,
+            tx,
             &self.queued_bytes,
             self.queue_max_bytes,
             &self.dropped,
@@ -178,6 +236,7 @@ impl RequestLog {
                 queued_bytes: Arc::new(AtomicU64::new(0)),
                 warned: Arc::new(AtomicBool::new(false)),
                 writer: None,
+                export: None,
             });
         }
         let file = match &config.file {
@@ -212,6 +271,7 @@ impl RequestLog {
                 config.syslog_app_name.clone(),
             )
         });
+        let export = config.export.as_ref().map(Export::new).transpose()?;
 
         let config = Arc::new(config);
         let (tx, rx) = sync_channel(config.queue);
@@ -239,6 +299,7 @@ impl RequestLog {
             queued_bytes,
             warned,
             writer: Some(writer),
+            export,
         })
     }
 
@@ -260,12 +321,14 @@ impl RequestLog {
 impl Drop for RequestLog {
     fn drop(&mut self) {
         let tx = self.tx.take();
+        let export = self.export.take();
         if let Some(handle) = self.writer.take() {
             if let Some(tx) = tx {
                 let _ = tx.send(Event::Shutdown);
             }
             let _ = handle.join();
         }
+        drop(export);
     }
 }
 
@@ -278,9 +341,47 @@ impl Plugin for RequestLog {
         false
     }
 
+    fn admin_paths(&self) -> Vec<&'static str> {
+        vec![EXPORT_METRICS_PATH]
+    }
+
+    fn on_admin(&self, ctx: &AdminCtx<'_>) -> Option<AdminReply> {
+        if ctx.path != EXPORT_METRICS_PATH {
+            return None;
+        }
+        let metrics = self
+            .export
+            .as_ref()
+            .map_or_else(export::empty_metrics, Export::metrics);
+        Some(AdminReply {
+            content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body: metrics,
+        })
+    }
+
+    fn status_fragment(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "requestlog": {
+                "export_dropped_total": self.export.as_ref().map_or(0, Export::dropped)
+            }
+        }))
+    }
+
+    fn health_gauge(&self) -> Option<(&'static str, u64)> {
+        self.export.as_ref().map(|_| {
+            (
+                "requestlog_export_dropped_total",
+                self.export.as_ref().map_or(0, Export::dropped),
+            )
+        })
+    }
+
     /// Asks the writer to write out what is queued and waits for it, for a few seconds at most.
     /// The process exits without dropping the plugin, so this is the only chance to flush.
     fn on_shutdown(&self) {
+        if let Some(export) = &self.export {
+            export.flush();
+        }
         let (Some(tx), Some(writer)) = (self.tx.as_ref(), self.writer.as_ref()) else {
             return;
         };
@@ -326,9 +427,19 @@ impl Plugin for RequestLog {
     }
 
     fn new_state(&self) -> Box<dyn Any + Send> {
-        let Some(tx) = self.tx.clone() else {
+        let export = self.export.as_ref().map(|export| {
+            (
+                Some(export.tx.clone()),
+                Some(Arc::clone(&export.dropped)),
+                Some(Arc::clone(&export.warned)),
+            )
+        });
+        let tx = self.tx.clone();
+        if tx.is_none() && export.is_none() {
             return Box::new(());
-        };
+        }
+        let (export, export_dropped, export_warned) =
+            export.unwrap_or((None::<SyncSender<Item>>, None, None));
         Box::new(RequestState {
             id: reiki_plugin::new_request_id(),
             started: Instant::now(),
@@ -349,6 +460,14 @@ impl Plugin for RequestLog {
             queued_bytes: Arc::clone(&self.queued_bytes),
             queue_max_bytes: self.config.queue_max_bytes,
             warned: Arc::clone(&self.warned),
+            method: String::new(),
+            route: String::new(),
+            request_upstream: String::new(),
+            head_at: None,
+            usage: Usage::new(),
+            export,
+            export_dropped,
+            export_warned,
         })
     }
 
@@ -359,6 +478,11 @@ impl Plugin for RequestLog {
         state.requested = true;
         if !ctx.id.is_empty() {
             state.id = ctx.id.to_owned();
+        }
+        if state.export.is_some() {
+            state.method = ctx.method.as_str().to_owned();
+            state.route = export::route(ctx.path);
+            state.request_upstream = ctx.upstream.to_owned();
         }
         let id = state.id.clone();
         let headers = self
@@ -419,12 +543,22 @@ impl Plugin for RequestLog {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
             state.status = Some(ctx.status.as_u16());
             state.key = Some(ctx.key.to_owned());
+            state.head_at = Some(Instant::now());
+            if !ctx.upstream.is_empty() {
+                state.request_upstream = ctx.upstream.to_owned();
+            }
+            if state.export.is_some() {
+                state.usage.set_sse(export::is_event_stream(ctx.headers));
+            }
         }
     }
 
     fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<RequestState>() {
             state.bytes += ctx.chunk.len() as u64;
+            if state.export.is_some() {
+                state.usage.feed(ctx.chunk.as_ref());
+            }
             if self.config.capture_bodies && state.response == ResponseMode::Body {
                 let room = state.max_body.saturating_sub(state.body.len());
                 let take = ctx.chunk.len().min(room);
@@ -722,6 +856,7 @@ mod tests {
             queued_bytes: Arc::new(AtomicU64::new(0)),
             warned: Arc::new(AtomicBool::new(false)),
             writer: None,
+            export: None,
         };
         let started = Instant::now();
         for _ in 0..200 {
@@ -874,6 +1009,7 @@ mod tests {
             queued_bytes: Arc::clone(&queued),
             warned: Arc::new(AtomicBool::new(false)),
             writer: None,
+            export: None,
         };
         let body = format!(r#"{{"content":"{}"}}"#, "y".repeat(300_000));
         let started = Instant::now();

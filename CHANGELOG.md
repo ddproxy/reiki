@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.0
+
 ### Changed
 
 - `requestlog` now records summaries only by default. `body` defaults to `summary`, and a new `capture_bodies` option defaults to `false`; no prompt, response or tool-argument text is written to the file, socket or syslog unless body capture is explicitly enabled. The summary still records method, route, status, durations, byte counts, token-setting counts, key names, attempts and failure findings.

@@ -13,7 +13,7 @@ reiki-redact = { path = "../reiki-redact" }
 bytes = "1"
 http = "1"
 serde_json = "1"
-toml = "0.8"
+toml = "1.2"
 tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]

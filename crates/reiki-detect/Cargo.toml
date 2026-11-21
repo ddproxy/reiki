@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 reiki-plugin = { path = "../reiki-plugin" }
 http = "1"
-toml = "0.8"
+toml = "1.2"
 tracing = "0.1"
 
 [dev-dependencies]

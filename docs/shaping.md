@@ -165,7 +165,7 @@ No key is cooled or disabled. The fallback is not tried unless a refusal was rec
 
 A chain with some keys cooling and the rest shaped out gets this 429, not the `503`.
 
-Shaper state does not appear in `GET /status`, `reiki keys` or `reiki top`. The logs record `key is shaped out, trying the next key` and `every key is shaped out`.
+Shaper state does not appear in `GET /v1/status`, `reiki keys` or `reiki top`. The logs record `key is shaped out, trying the next key` and `every key is shaped out`.
 
 ## Not part of key shaping
 

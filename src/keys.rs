@@ -4,11 +4,13 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::Config;
 
 /// One cooling route-and-model combination on a key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyScope {
     pub route: String,
     pub model: String,
@@ -27,21 +29,30 @@ pub struct KeyHealth {
     pub streams: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_class: Option<String>,
-    /// Cooling combinations, soonest first; omitted when there are none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Cooling combinations, soonest first; empty when there are none.
     pub scopes: Vec<KeyScope>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Status {
     keys: Vec<StatusKey>,
     streams: Vec<StatusStream>,
+    #[serde(rename = "config")]
+    _config: Value,
+    #[serde(default, rename = "intercept")]
+    _intercept: Option<Value>,
+    #[serde(rename = "log")]
+    _log: Value,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StatusKey {
     name: String,
     upstream: String,
+    #[serde(rename = "consecutive_failures")]
+    _consecutive_failures: u32,
     state: String,
     #[serde(default)]
     retry_after_seconds: Option<u64>,
@@ -49,27 +60,33 @@ struct StatusKey {
     last_status_code: Option<u16>,
     #[serde(default)]
     cooldown_class: Option<String>,
-    #[serde(default)]
     scopes: Vec<KeyScope>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StatusStream {
     name: String,
+    #[serde(rename = "strategy")]
+    _strategy: String,
     chain: Vec<String>,
+    #[serde(rename = "current_key")]
+    _current_key: Value,
+    #[serde(rename = "rate_limit_per_minute")]
+    _rate_limit_per_minute: Value,
 }
 
-/// Turns a `/status` answer into the rows `reiki keys` shows.
+/// Turns a `/v1/status` answer into the rows `reiki keys` shows.
 pub fn parse_status(body: &str) -> Result<Vec<KeyHealth>, String> {
     let status: Status =
-        serde_json::from_str(body).map_err(|e| format!("cannot read /status: {e}"))?;
+        serde_json::from_str(body).map_err(|e| format!("cannot read /v1/status: {e}"))?;
     let mut keys = Vec::with_capacity(status.keys.len());
     for key in status.keys {
         let (state, cooldown_seconds) = match key.state.as_str() {
             "available" => ("ok".to_owned(), None),
             "cooling" => ("cooling".to_owned(), key.retry_after_seconds),
             "out_of_rotation" => ("disabled".to_owned(), None),
-            other => return Err(format!("unknown key state `{other}` in /status")),
+            other => return Err(format!("unknown key state `{other}` in /v1/status")),
         };
         let streams = status
             .streams
@@ -310,10 +327,10 @@ mod tests {
     #[test]
     fn parse_status_keeps_key_order_and_lists_streams_in_status_order() {
         let body = r#"{"keys":[
-            {"name":"b","upstream":"zen","state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429},
-            {"name":"a","upstream":"zen","state":"out_of_rotation"},
-            {"name":"c","upstream":"zen","state":"available","scopes":[{"route":"/responses","model":"gpt-big","retry_after_seconds":9,"cooldown_class":"quota_exhausted"}]}],
-          "streams":[{"name":"s2","chain":["a","b"]},{"name":"s1","chain":["b"]}]}"#;
+            {"name":"b","upstream":"zen","consecutive_failures":2,"state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429,"scopes":[]},
+            {"name":"a","upstream":"zen","consecutive_failures":0,"state":"out_of_rotation","scopes":[]},
+            {"name":"c","upstream":"zen","consecutive_failures":0,"state":"available","scopes":[{"route":"/responses","model":"gpt-big","retry_after_seconds":9,"cooldown_class":"quota_exhausted"}]}],
+          "streams":[{"name":"s2","strategy":"sticky","chain":["a","b"],"current_key":"a","rate_limit_per_minute":null},{"name":"s1","strategy":"round_robin","chain":["b"],"current_key":null,"rate_limit_per_minute":10}],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
         let keys = parse_status(body).unwrap();
         let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(names, ["b", "a", "c"]);
@@ -328,9 +345,22 @@ mod tests {
         assert_eq!(keys[1].state, "disabled");
         assert!(keys[2].streams.is_empty());
         assert!(parse_status(
-            r#"{"keys":[{"name":"a","upstream":"u","state":"weird"}],"streams":[]}"#
+            r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"weird","scopes":[]}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_status_document_without_scopes_or_with_unknown_fields_is_rejected() {
+        let missing = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available"}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
+        assert!(parse_status(missing)
+            .unwrap_err()
+            .contains("cannot read /v1/status"));
+
+        let unknown = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available","scopes":[],"old":1}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
+        assert!(parse_status(unknown)
+            .unwrap_err()
+            .contains("cannot read /v1/status"));
     }
 
     #[test]

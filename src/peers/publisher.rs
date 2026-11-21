@@ -1,7 +1,6 @@
 //! The peer listener: `GET /v1/health` for holders of the peer token, 404 for everything else.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -47,10 +46,17 @@ pub struct Publisher {
     logins: LoginThrottle,
     sessions: Sessions,
     hub: Arc<Hub>,
-    /// The running listener's mode, updated on every start so an HTTP/HTTPS switch is seen.
-    listener_tls: AtomicU8,
+    /// Listener mode and active TLS config change together, so a reload never sees a mode
+    /// without the certificate that mode is serving.
+    listener: RwLock<ListenerState>,
+}
+
+/// State of the running peer listener, protected by one lock.
+struct ListenerState {
+    /// `LISTENER_NONE`, `LISTENER_PLAIN` or `LISTENER_TLS`.
+    mode: u8,
     /// The certificate the HTTPS listener hands each new connection, and its fingerprint.
-    tls: RwLock<Option<(String, Arc<rustls::ServerConfig>)>>,
+    tls: Option<(String, Arc<rustls::ServerConfig>)>,
 }
 
 /// What a reload does to the peer listener's TLS.
@@ -73,43 +79,65 @@ impl Publisher {
             logins: LoginThrottle::new(throttle),
             sessions: Sessions::new(),
             hub: Hub::new(),
-            listener_tls: AtomicU8::new(LISTENER_NONE),
-            tls: RwLock::new(None),
+            listener: RwLock::new(ListenerState {
+                mode: LISTENER_NONE,
+                tls: None,
+            }),
         })
     }
 
-    fn running_tls(&self) -> Option<bool> {
-        match self.listener_tls.load(Ordering::Acquire) {
+    /// The running mode and certificate fingerprint, read from one consistent state.
+    fn listener_state(&self) -> (Option<bool>, Option<String>) {
+        let state = self.listener.read().unwrap_or_else(PoisonError::into_inner);
+        let mode = match state.mode {
             LISTENER_NONE => None,
             LISTENER_TLS => Some(true),
             _ => Some(false),
-        }
+        };
+        (
+            mode,
+            state
+                .tls
+                .as_ref()
+                .map(|(fingerprint, _)| fingerprint.clone()),
+        )
     }
 
-    /// Records the mode of a listener as it starts, replacing the mode of any previous one.
-    fn set_listener_tls(&self, tls: bool) {
-        self.listener_tls.store(
-            if tls { LISTENER_TLS } else { LISTENER_PLAIN },
-            Ordering::Release,
-        );
+    /// Records the mode and certificate of a listener as it starts, replacing any previous one.
+    fn start_listener(&self, loaded: Option<super::tls::Loaded>) {
+        let mut state = self
+            .listener
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.mode = if loaded.is_some() {
+            LISTENER_TLS
+        } else {
+            LISTENER_PLAIN
+        };
+        state.tls = loaded.map(|loaded| (loaded.fingerprint, loaded.config));
     }
 
     fn current_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
-        self.tls
+        self.listener
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .tls
             .as_ref()
             .map(|(_, config)| Arc::clone(config))
     }
 
     fn set_tls(&self, loaded: super::tls::Loaded) {
-        *self.tls.write().unwrap_or_else(PoisonError::into_inner) =
-            Some((loaded.fingerprint, loaded.config));
+        let mut state = self
+            .listener
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.tls = Some((loaded.fingerprint, loaded.config));
     }
 
     /// Loads the TLS files a reload asks for, without applying them; an error fails the reload.
     pub(crate) fn plan_tls(&self, next: Option<&PeersConfig>) -> Result<TlsReload, String> {
-        let Some(running) = self.running_tls() else {
+        let (running, fingerprint) = self.listener_state();
+        let Some(running) = running else {
             return Ok(TlsReload::default());
         };
         // Stopping or moving the listener is a `peers.listen` restart already.
@@ -125,12 +153,7 @@ impl Publisher {
         let Some(loaded) = super::tls::load(peers)? else {
             return Ok(TlsReload::default());
         };
-        let same = self
-            .tls
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|(fingerprint, _)| *fingerprint == loaded.fingerprint);
+        let same = fingerprint.is_some_and(|current| current == loaded.fingerprint);
         Ok(TlsReload {
             restart: false,
             swap: (!same).then_some(loaded),
@@ -190,10 +213,12 @@ pub fn serve_with_per_addr(
         None => None,
     };
     let publisher = Arc::clone(app.peer_publisher());
-    publisher.set_listener_tls(loaded.is_some());
+    let fallback = loaded.as_ref().map(|loaded| Arc::clone(&loaded.config));
+    // Mode and certificate are published together, so a concurrent reload sees a whole state.
+    publisher.start_listener(loaded);
     let routes = router(app);
     let shutdown = crate::lifecycle::stopped();
-    let Some(loaded) = loaded else {
+    let Some(fallback) = fallback else {
         return Ok(Box::pin(crate::serve::serve_per_addr(
             listener,
             routes,
@@ -202,8 +227,6 @@ pub fn serve_with_per_addr(
             shutdown,
         )));
     };
-    let fallback = Arc::clone(&loaded.config);
-    publisher.set_tls(loaded);
     let source: crate::serve::TlsSource = Arc::new(move || {
         publisher
             .current_tls()
@@ -548,13 +571,19 @@ mod tests {
         let plan = publisher.plan_tls(Some(&peers(true))).unwrap();
         assert!(!plan.restart && !plan.swaps(), "no listener running yet");
 
-        publisher.set_listener_tls(false); // plain HTTP starts
+        publisher.start_listener(None); // plain HTTP starts
+        assert_eq!(publisher.listener_state(), (Some(false), None));
         assert!(!publisher.plan_tls(Some(&peers(false))).unwrap().restart);
         assert!(publisher.plan_tls(Some(&peers(true))).unwrap().restart);
 
-        publisher.set_listener_tls(true); // the listener switches to HTTPS
         let loaded = crate::peers::tls::load(&peers(true)).unwrap().unwrap();
-        publisher.set_tls(loaded);
+        publisher.start_listener(Some(loaded)); // the listener switches to HTTPS atomically
+        let (running, fingerprint) = publisher.listener_state();
+        assert_eq!(running, Some(true));
+        assert!(
+            fingerprint.is_some(),
+            "the mode must never outrun its certificate"
+        );
         let plan = publisher.plan_tls(Some(&peers(true))).unwrap();
         assert!(!plan.restart, "the switch must not stick at restart: true");
         assert!(!plan.swaps(), "the same certificate needs no swap");
@@ -566,7 +595,7 @@ mod tests {
         publisher.apply_tls(plan);
         assert!(!publisher.plan_tls(Some(&peers(true))).unwrap().swaps());
 
-        publisher.set_listener_tls(false); // switched back to HTTP
+        publisher.start_listener(None); // switched back to HTTP
         assert!(!publisher.plan_tls(Some(&peers(false))).unwrap().restart);
         assert!(publisher.plan_tls(Some(&peers(true))).unwrap().restart);
 

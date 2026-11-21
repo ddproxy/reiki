@@ -59,7 +59,7 @@ Create the CA, name-constrained to the hosts it may sign for, and give only `ca.
 reiki ca-init --dir /etc/reiki/ca --host api.example.com --days 365
 ```
 
-A CA is limited to the hosts it was created with, so adding a host means creating a new one with `--replace`, giving clients the new `ca.pem`, and reloading. `reiki check` prints the days the CA has left, startup logs a warning within 30 days of expiry, and `GET /status` reports `intercept.ca_days_left`.
+A CA is limited to the hosts it was created with, so adding a host means creating a new one with `--replace`, giving clients the new `ca.pem`, and reloading. `reiki check` prints the days the CA has left, startup logs a warning within 30 days of expiry, and `GET /v1/status` reports `intercept.ca_days_left`.
 
 Clients must trust that certificate: add it to the system store, or point the runtime at it with `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS`, whichever the client reads.
 
@@ -67,6 +67,7 @@ Clients must trust that certificate: add it to the system store, or point the ru
 - Each intercepted host must be allowed by `allow` on port 443 and map to an upstream on that same host.
 - Only requests under the upstream's base path are relayed. Others get 403, and a `Host` header that differs from the tunnel destination gets 421.
 - Request paths with `.` or `..` segments (also percent-encoded as `%2e`), an encoded `/` (`%2f`), or a backslash are refused with 400 before any path check.
+- Request paths with `.` or `..` segments (also percent-encoded as `%2e`), an encoded `/` (`%2f`), or a backslash are refused with 400 before any path check. Encoding is decoded up to eight times, so double-encoded forms such as `%252e%252e` are refused too, as are malformed escapes.
 - A CONNECT to an intercepted host served from a stream must carry that stream's token in `Proxy-Authorization`, as a bearer token or as the password of a basic credential, so `HTTPS_PROXY=http://user:TOKEN@host:port` works. Without it the tunnel answers 407 with `Proxy-Authenticate: Basic realm="reiki"`. Bad tokens count towards `[auth]`'s failed-login limit for that address (shared with the client listener): after `max_failures` the tunnel answers 429 with `Retry-After`, and a valid token clears the count. Hosts on a `passthrough` upstream need none, because they spend no key.
 - `require_auth = false` in `[tunnel.intercept]` turns this off (default true). Do that only when every client that can reach the tunnel listener is trusted; Reiki logs a warning at startup when it is off.
 - When an API spans several path prefixes on one host, list them with `paths = ["/v1", "/other"]`. Matching prefixes (whole segments) are sent to the host exactly as the client sent them, and the upstream's `base_url` then supplies only the host and the credential format.

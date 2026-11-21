@@ -1297,7 +1297,7 @@ async fn a_wait_beyond_max_wait_is_shed_without_touching_key_health() {
     let admin = h.admin.as_ref().unwrap();
     let metrics = h
         .client
-        .get(format!("{admin}/metrics"))
+        .get(format!("{admin}/v1/metrics"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2272,7 +2272,7 @@ async fn an_in_flight_request_finishes_against_the_snapshot_it_started_with() {
 async fn admin_endpoints_require_the_bearer_token() {
     let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
     let admin = h.admin.as_ref().unwrap();
-    for path in ["/status", "/metrics"] {
+    for path in ["/v1/status", "/v1/metrics"] {
         let no_auth = h.client.get(format!("{admin}{path}")).send().await.unwrap();
         assert_eq!(no_auth.status(), 401, "{path} without a token");
         let wrong = h
@@ -2299,7 +2299,7 @@ async fn metrics_is_absent_unless_the_plugin_is_configured() {
     let h = harness_with_admin_opts(&one_stream(), "admin-secret", Policy::default(), false).await;
     let admin = h.admin.as_ref().unwrap();
     let get = |token: Option<&'static str>| {
-        let mut req = h.client.get(format!("{admin}/metrics"));
+        let mut req = h.client.get(format!("{admin}/v1/metrics"));
         if let Some(token) = token {
             req = req.bearer_auth(token);
         }
@@ -2309,7 +2309,7 @@ async fn metrics_is_absent_unless_the_plugin_is_configured() {
     assert_eq!(get(Some("admin-secret")).await.unwrap().status(), 404);
     let status = h
         .client
-        .get(format!("{admin}/status"))
+        .get(format!("{admin}/v1/status"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2352,7 +2352,7 @@ async fn admin_status_reports_key_and_stream_state_without_secrets() {
     let admin = h.admin.as_ref().unwrap();
     let body = h
         .client
-        .get(format!("{admin}/status"))
+        .get(format!("{admin}/v1/status"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2405,7 +2405,7 @@ async fn admin_metrics_increment_after_a_failover_without_leaking() {
     let admin = h.admin.as_ref().unwrap();
     let text = h
         .client
-        .get(format!("{admin}/metrics"))
+        .get(format!("{admin}/v1/metrics"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2488,7 +2488,7 @@ async fn a_restart_keeps_a_cooling_key_cooling() {
     let admin = h2.admin.as_ref().unwrap();
     let body = h2
         .client
-        .get(format!("{admin}/status"))
+        .get(format!("{admin}/v1/status"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2536,7 +2536,7 @@ async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
     let admin = h.admin.as_ref().unwrap();
     let body = h
         .client
-        .get(format!("{admin}/status"))
+        .get(format!("{admin}/v1/status"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -2855,7 +2855,7 @@ async fn a_403_naming_an_invalid_key_still_disables_it() {
 async fn admin_routes_answer_under_v1_and_carry_the_version_header() {
     let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
     let admin = h.admin.as_ref().unwrap();
-    for path in ["/status", "/v1/status", "/metrics", "/v1/metrics"] {
+    for path in ["/v1/status", "/v1/metrics"] {
         let res = h
             .client
             .get(format!("{admin}{path}"))
@@ -2869,6 +2869,16 @@ async fn admin_routes_answer_under_v1_and_carry_the_version_header() {
             env!("CARGO_PKG_VERSION"),
             "{path}"
         );
+    }
+    for path in ["/status", "/metrics"] {
+        let bare = h
+            .client
+            .get(format!("{admin}{path}"))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), 404, "{path}");
     }
     let refused = h
         .client
@@ -2935,7 +2945,7 @@ async fn admin_key_state(h: &Harness, name: &str) -> String {
     let admin = h.admin.as_ref().unwrap();
     let body = h
         .client
-        .get(format!("{admin}/status"))
+        .get(format!("{admin}/v1/status"))
         .bearer_auth("admin-secret")
         .send()
         .await
@@ -3045,17 +3055,28 @@ async fn admin_keys_enable_re_enables_a_disabled_key() {
 async fn usage_needs_the_admin_token_and_answers_under_v1() {
     let h = harness_with_admin(&one_stream(), "admin-secret", Policy::default()).await;
     let admin = h.admin.as_ref().unwrap();
-    for path in ["/usage", "/v1/usage"] {
-        let refused = h.client.get(format!("{admin}{path}")).send().await.unwrap();
-        assert_eq!(refused.status(), 401, "{path}");
-        let ok = h
-            .client
-            .get(format!("{admin}{path}"))
-            .bearer_auth("admin-secret")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(ok.status(), 200, "{path}");
-        assert_eq!(ok.headers()["content-type"], "application/json");
-    }
+    let refused = h
+        .client
+        .get(format!("{admin}/v1/usage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+    let ok = h
+        .client
+        .get(format!("{admin}/v1/usage"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.headers()["content-type"], "application/json");
+    let bare = h
+        .client
+        .get(format!("{admin}/usage"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 404);
 }

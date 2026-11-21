@@ -20,6 +20,8 @@ Reiki's documentation is one page per subsystem. Commands and flags are checked 
 | Reliability | [Failover](failover.md), [classification](classification.md), [shaping](shaping.md), [providers](providers.md) |
 | Security and data | [Security](security.md), [security scanning](security-scanning.md), [redaction reference](redaction.md), [plugins](plugins.md), [plugin authoring](plugin-authoring.md), [placeholders](placeholders.md), [PHI and NPPI](phi.md), [finance](finance.md), [controlled information](controlled.md), [tunnel](tunnel.md), [request log](requestlog.md) |
 | Operate | [Deploy](deploy.md), [service redirect](service.md), [upgrades](upgrades.md), [monitoring](monitoring.md), [peers](peers.md), [peers publishing](peers-publishing.md), [reiki top](top.md), [troubleshooting](troubleshooting.md), [hub](hub.md) |
+| Security and data | [Security](security.md), [redaction reference](redaction.md), [plugins](plugins.md), [plugin authoring](plugin-authoring.md), [placeholders](placeholders.md), [PHI and NPPI](phi.md), [finance](finance.md), [controlled information](controlled.md), [tunnel](tunnel.md), [request log](requestlog.md) |
+| Operate | [Deploy](deploy.md), [upgrades](upgrades.md), [monitoring](monitoring.md), [peers](peers.md), [peers publishing](peers-publishing.md), [reiki top](top.md), [troubleshooting](troubleshooting.md), [hub](hub.md) |
 | Help | [Examples](examples.md), [FAQ](faq.md) |
 
 The [changelog](../CHANGELOG.md) announces behaviour changes by version heading and subsection. There is no separate schema version for the request log; see its [stability note](requestlog.md#stability-of-records).

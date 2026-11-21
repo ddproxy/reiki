@@ -53,7 +53,7 @@ enum Command {
     },
     /// Ask the running Reiki to reload its config, or preview what a reload would change.
     ///
-    /// Calls `POST /reload` on the admin listener and prints the JSON answer. Exits 0 when the
+    /// Calls `POST /v1/reload` on the admin listener and prints the JSON answer. Exits 0 when the
     /// reload (or preview) succeeded and 1 when it was refused or failed.
     Reload {
         /// Only report what would change; apply nothing.
@@ -68,7 +68,7 @@ enum Command {
     },
     /// Show each key's health from the running instance, or check key files offline.
     ///
-    /// Calls `GET /status` on the admin listener and prints a table. Exits 0 when the request
+    /// Calls `GET /v1/status` on the admin listener and prints a table. Exits 0 when the request
     /// succeeded, 1 when the instance refused it and 2 when it could not be reached.
     Keys {
         /// Check the configured key files without contacting a running instance.
@@ -221,7 +221,7 @@ async fn run_reload(
     };
     let query = if dry_run { "?dry_run=true" } else { "" };
     let response = reqwest::Client::new()
-        .post(format!("{}/reload{query}", target.base))
+        .post(format!("{}/v1/reload{query}", target.base))
         .bearer_auth(&target.token)
         .send()
         .await;
@@ -243,7 +243,7 @@ async fn run_reload(
     }
 }
 
-/// The `reiki keys` command: reads health from the running instance's `/status`.
+/// The `reiki keys` command: reads health from the running instance's `/v1/status`.
 async fn run_keys(
     config: &std::path::Path,
     url: Option<&str>,
@@ -258,7 +258,7 @@ async fn run_keys(
         }
     };
     let response = reqwest::Client::new()
-        .get(format!("{}/status", target.base))
+        .get(format!("{}/v1/status", target.base))
         .bearer_auth(&target.token)
         .send()
         .await;
@@ -643,15 +643,11 @@ async fn main() {
 
     let text = std::fs::read_to_string(&cli.config)
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
-    let (config, warnings) =
-        Config::parse_with_warnings(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
+    let config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let checking = matches!(cli.command, Some(Command::Check));
     let logging =
         Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
     reiki::logging::install_panic_hook();
-    for warning in &warnings {
-        tracing::warn!("{warning}");
-    }
     let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
     let plugin_tables = if checking {
         with_dry_run(&config.plugins)

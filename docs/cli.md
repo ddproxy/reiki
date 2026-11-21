@@ -110,7 +110,7 @@ reiki scan [--plugin NAME]... [--kinds K1,K2 | --all] [--json] [FILE]...
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--plugin NAME` | every compiled-in plugin | Run only this plugin. Repeat for several. Names: `phi`, `finance`, `controlled`. The former name `gov` is rejected. |
+| `--plugin NAME` | every compiled-in plugin | Run only this plugin. Repeat for several. Names: `phi`, `finance`, `controlled`. |
 | `--kinds K1,K2` | each plugin's default set | Kinds to look for, comma separated. A kind is matched only by the selected plugins that know it. Conflicts with `--all`. |
 | `--all` | off | Look for every kind, including the ones that are off by default. |
 | `--json` | off | One JSON object per finding. |
@@ -160,7 +160,7 @@ A named kind that the selected plugin does not know exits `2`. For example, `--p
 
 ## reload
 
-Asks the running instance to reload its config over the admin listener. Posts to `/reload`. Use `--dry-run` to see what a reload would change without applying it. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
+Asks the running instance to reload its config over the admin listener. Posts to `/v1/reload`. Use `--dry-run` to see what a reload would change without applying it. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
 
 ```
 reiki reload [--dry-run] [--url URL] [--token-file PATH]
@@ -172,7 +172,7 @@ reiki reload [--dry-run] [--url URL] [--token-file PATH]
 | `--url URL` | `http://` plus `[admin] listen` from the config | Admin address. An unspecified address such as `0.0.0.0` is sent as `127.0.0.1`. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | File that holds the admin token. Leading and trailing whitespace is removed. |
 
-Output is the JSON answer from `/reload`, printed to stdout for both success and refusal:
+Output is the JSON answer from `/v1/reload`, printed to stdout for both success and refusal:
 
 ```
 {"ok":true,"dry_run":false,"generation":1,"keys":1,"streams":1,"changed":[],"restart_needed":[]}
@@ -216,7 +216,7 @@ reiki keys --check
 
 ### Health table
 
-Reads `/status` on the admin listener:
+Reads `/v1/status` on the admin listener:
 
 ```
 KEY    UPSTREAM  STATE  COOLDOWN  LAST  STREAMS
@@ -260,7 +260,7 @@ Exit codes:
 
 | Mode | `0` | `1` | `2` |
 | --- | --- | --- | --- |
-| Health table or JSON | Answer received and parsed. | Admin listener answered with an error status, or the answer is not valid `/status` JSON. | No admin token, no admin address, the listener could not be reached, or the answer could not be read. |
+| Health table or JSON | Answer received and parsed. | Admin listener answered with an error status, or the answer is not valid `/v1/status` JSON. | No admin token, no admin address, the listener could not be reached, or the answer could not be read. |
 | `--enable` | Key re-enabled. | Refused, such as an unknown key (`404`). | As above. |
 | `--check` | Every key OK. | Any error or warning. | Config unreadable or does not parse. |
 

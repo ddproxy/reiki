@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -13,24 +14,23 @@ pub mod matrix;
 pub mod ui;
 pub mod view;
 
-/// The whole `/v1/health` document. Unknown fields are ignored; missing optional fields are
-/// `None`.
+/// The whole `/v1/health` document in the current wire shape. Unknown fields are an error; only
+/// the config-gated fields may be absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Health {
     /// The published instance name, or the fixed `reiki`.
     pub instance: String,
-    /// The publisher's version, cleaned by [`version_field`]; older publishers omit it.
-    #[serde(default, deserialize_with = "version_field")]
-    pub reiki_version: Option<String>,
+    /// The publisher's version, cleaned by [`version_field`].
+    #[serde(deserialize_with = "version_field")]
+    pub reiki_version: String,
     /// The publisher's UTC clock when the answer was built; for people and logs.
     pub observed_at: String,
-    /// How old the figures were when the peer sent them; older publishers omit it.
-    #[serde(default)]
-    pub age_seconds: Option<u64>,
+    /// How old the figures were when the peer sent them.
+    pub age_seconds: u64,
     pub upstreams: Vec<Upstream>,
     /// Counts of recent key failures by class over the peer's bounded ring. Counts only: the
     /// bodies behind them never leave the peer.
-    #[serde(default)]
     pub failures: BTreeMap<String, u64>,
     /// Only present when the peer sets `expose_host_stats`.
     #[serde(default)]
@@ -51,60 +51,79 @@ impl Health {
 /// One recent key failure, as `/v1/failures` returns it. Only the local instance's admin
 /// listener supplies these; a remote peer publishes counts only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Failure {
     /// Unix seconds.
     pub time: u64,
     pub stream: String,
     pub key: String,
-    #[serde(default)]
     pub status: Option<u16>,
     pub class: String,
-    #[serde(default)]
     pub retry_after: Option<String>,
-    #[serde(default)]
     pub cooled: bool,
-    #[serde(default)]
     pub cooling_seconds: Option<u64>,
-    #[serde(default)]
     pub note: String,
 }
 
 /// Printable ASCII, at most 32 characters, so a peer's version cannot spoof a terminal line.
-fn version_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    Ok(match Option::<Value>::deserialize(deserializer)? {
-        Some(Value::String(text)) => {
-            let clean: String = text
-                .chars()
-                .filter(|c| (' '..='~').contains(c))
-                .take(32)
-                .collect();
-            (!clean.is_empty()).then_some(clean)
-        }
-        _ => None,
-    })
+/// A missing, null or non-string version is an error: the current wire shape always has one.
+fn version_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let Value::String(text) = Value::deserialize(deserializer)? else {
+        return Err(D::Error::custom("reiki_version must be a string"));
+    };
+    let clean: String = text
+        .chars()
+        .filter(|c| (' '..='~').contains(c))
+        .take(32)
+        .collect();
+    if clean.is_empty() {
+        return Err(D::Error::custom(
+            "reiki_version has no printable characters",
+        ));
+    }
+    Ok(clean)
+}
+
+/// An `Option` that must actually be present in JSON; `null` remains a valid value. Serde treats
+/// a missing field of type `Option<T>` as `None`, so nullable required fields need this wrapper on
+/// the wire type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RequiredNullable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Going through `Option::deserialize` would also succeed on serde's missing-field
+        // deserializer, so an absent key would look like `null`. Reading a `Value` first keeps
+        // absence an error while still accepting an explicit JSON null.
+        let value = Value::deserialize(deserializer)?;
+        let inner = if value.is_null() {
+            None
+        } else {
+            Some(T::deserialize(value).map_err(D::Error::custom)?)
+        };
+        Ok(Self(inner))
+    }
 }
 
 /// One upstream entry: counts by key state, never key material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "UpstreamWire")]
 pub struct Upstream {
     pub name: String,
     pub healthy_keys: u32,
     pub cooling_keys: u32,
     pub disabled_keys: u32,
     /// How many (route, model) combinations are cooling on this upstream's keys. A count only:
-    /// the names behind it are never published. Older publishers omit it.
-    #[serde(default)]
+    /// the names behind it are never published.
     pub cooling_combinations: u32,
     /// The shortest wait among the cooling keys, or `null` when none is cooling.
-    #[serde(default)]
     pub soonest_cooldown_seconds: Option<u64>,
     /// `2xx`, `4xx` or `5xx` for the latest attempt, or `null` before one.
-    #[serde(default)]
     pub last_status_class: Option<String>,
     /// Labelled keys, only when the peer sets `expose_key_labels`.
     #[serde(default)]
     pub keys: Option<Vec<KeyView>>,
-    /// Attempts in the last hour; absent from an older publisher or with `expose_usage = false`.
+    /// Attempts in the last hour; absent with `expose_usage = false`.
     #[serde(default, deserialize_with = "usage_u64")]
     pub requests_1h: Option<u64>,
     /// Attempts that were rate-limited or began a cooldown in the last hour.
@@ -113,7 +132,7 @@ pub struct Upstream {
     /// Twelve five-minute attempt counts, oldest first; extra buckets are dropped.
     #[serde(default, deserialize_with = "usage_buckets")]
     pub request_buckets: Option<[u32; 12]>,
-    /// Input plus output tokens in the last hour; absent from an older publisher.
+    /// Input plus output tokens in the last hour; absent with `expose_usage = false`.
     #[serde(default, deserialize_with = "usage_u64")]
     pub tokens_1h: Option<u64>,
     /// Twelve five-minute token counts, oldest first; extra buckets are dropped.
@@ -125,6 +144,58 @@ pub struct Upstream {
     /// Ten one-minute token counts, oldest first and newest last; extra minutes are dropped.
     #[serde(default, deserialize_with = "token_minutes")]
     pub token_minutes: Option<[u32; 10]>,
+}
+
+/// The wire form of [`Upstream`]. `deny_unknown_fields` and the required nullable pair are
+/// enforced here; the public struct keeps plain `Option` fields for callers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamWire {
+    name: String,
+    healthy_keys: u32,
+    cooling_keys: u32,
+    disabled_keys: u32,
+    cooling_combinations: u32,
+    soonest_cooldown_seconds: RequiredNullable<u64>,
+    last_status_class: RequiredNullable<String>,
+    #[serde(default)]
+    keys: Option<Vec<KeyView>>,
+    #[serde(default, deserialize_with = "usage_u64")]
+    requests_1h: Option<u64>,
+    #[serde(default, deserialize_with = "usage_u32")]
+    limited_1h: Option<u32>,
+    #[serde(default, deserialize_with = "usage_buckets")]
+    request_buckets: Option<[u32; 12]>,
+    #[serde(default, deserialize_with = "usage_u64")]
+    tokens_1h: Option<u64>,
+    #[serde(default, deserialize_with = "token_buckets")]
+    token_buckets: Option<[u64; 12]>,
+    #[serde(default, deserialize_with = "request_minutes")]
+    request_minutes: Option<[u32; 10]>,
+    #[serde(default, deserialize_with = "token_minutes")]
+    token_minutes: Option<[u32; 10]>,
+}
+
+impl From<UpstreamWire> for Upstream {
+    fn from(wire: UpstreamWire) -> Self {
+        Self {
+            name: wire.name,
+            healthy_keys: wire.healthy_keys,
+            cooling_keys: wire.cooling_keys,
+            disabled_keys: wire.disabled_keys,
+            cooling_combinations: wire.cooling_combinations,
+            soonest_cooldown_seconds: wire.soonest_cooldown_seconds.0,
+            last_status_class: wire.last_status_class.0,
+            keys: wire.keys,
+            requests_1h: wire.requests_1h,
+            limited_1h: wire.limited_1h,
+            request_buckets: wire.request_buckets,
+            tokens_1h: wire.tokens_1h,
+            token_buckets: wire.token_buckets,
+            request_minutes: wire.request_minutes,
+            token_minutes: wire.token_minutes,
+        }
+    }
 }
 
 /// A JSON number as a clamped count: other types read as absent, never as a parse error.
@@ -204,14 +275,36 @@ fn token_minutes<'de, D: Deserializer<'de>>(
 
 /// One labelled key. `cooldown_class` is set only for a cooling key whose class is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "KeyViewWire")]
 pub struct KeyView {
     pub name: String,
     /// `available`, `cooling` or `out_of_rotation`.
     pub state: String,
-    #[serde(default)]
     pub cooldown_seconds: Option<u64>,
+    /// Only published for a cooling key whose class is known, so absence is valid.
     #[serde(default)]
     pub cooldown_class: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyViewWire {
+    name: String,
+    state: String,
+    cooldown_seconds: RequiredNullable<u64>,
+    #[serde(default)]
+    cooldown_class: Option<String>,
+}
+
+impl From<KeyViewWire> for KeyView {
+    fn from(wire: KeyViewWire) -> Self {
+        Self {
+            name: wire.name,
+            state: wire.state,
+            cooldown_seconds: wire.cooldown_seconds.0,
+            cooldown_class: wire.cooldown_class,
+        }
+    }
 }
 
 /// One peer's health plus when this host received it.
@@ -359,48 +452,20 @@ impl Fleet {
         }
     }
 
-    /// Patches one upstream of one peer from a `key` event, whose upstream entry is complete.
+    /// Replaces one upstream of one peer from a `key` event. The event carries the whole upstream
+    /// entry, so a removed key does not linger until the next snapshot.
     fn apply_key_event(&mut self, name: &str, data: &str) -> Result<(), String> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Event {
-            upstream: Option<EventUpstream>,
-        }
-        #[derive(Deserialize)]
-        struct EventUpstream {
-            name: String,
-            #[serde(default)]
-            healthy_keys: Option<u32>,
-            #[serde(default)]
-            cooling_keys: Option<u32>,
-            #[serde(default)]
-            disabled_keys: Option<u32>,
-            #[serde(default)]
-            cooling_combinations: Option<u32>,
-            #[serde(default)]
-            soonest_cooldown_seconds: Option<u64>,
-            #[serde(default)]
-            last_status_class: Option<String>,
-            #[serde(default)]
-            keys: Option<Vec<KeyView>>,
-            #[serde(default, deserialize_with = "usage_u64")]
-            requests_1h: Option<u64>,
-            #[serde(default, deserialize_with = "usage_u32")]
-            limited_1h: Option<u32>,
-            #[serde(default, deserialize_with = "usage_buckets")]
-            request_buckets: Option<[u32; 12]>,
-            #[serde(default, deserialize_with = "usage_u64")]
-            tokens_1h: Option<u64>,
-            #[serde(default, deserialize_with = "token_buckets")]
-            token_buckets: Option<[u64; 12]>,
-            #[serde(default, deserialize_with = "request_minutes")]
-            request_minutes: Option<[u32; 10]>,
-            #[serde(default, deserialize_with = "token_minutes")]
-            token_minutes: Option<[u32; 10]>,
+            /// Accepted for shape validation; freshness comes from when this host received it.
+            #[allow(dead_code)]
+            observed_at: String,
+            #[allow(dead_code)]
+            age_seconds: u64,
+            upstream: Upstream,
         }
         let event: Event = serde_json::from_str(data).map_err(|e| e.to_string())?;
-        let Some(event) = event.upstream else {
-            return Err("key event has no upstream".to_owned());
-        };
         let Some(peer) = self.peers.get_mut(name) else {
             return Ok(());
         };
@@ -408,54 +473,11 @@ impl Fleet {
             .health
             .upstreams
             .iter_mut()
-            .find(|u| u.name == event.name)
+            .find(|u| u.name == event.upstream.name)
         else {
             return Ok(());
         };
-        if let Some(n) = event.healthy_keys {
-            upstream.healthy_keys = n;
-        }
-        if let Some(n) = event.cooling_keys {
-            upstream.cooling_keys = n;
-        }
-        if let Some(n) = event.disabled_keys {
-            upstream.disabled_keys = n;
-        }
-        if let Some(n) = event.cooling_combinations {
-            upstream.cooling_combinations = n;
-        }
-        if let Some(n) = event.soonest_cooldown_seconds {
-            upstream.soonest_cooldown_seconds = Some(n);
-        }
-        if let Some(class) = event.last_status_class {
-            upstream.last_status_class = Some(class);
-        }
-        // The event carries the whole upstream entry, so its key list replaces ours and a
-        // removed key does not linger until the next snapshot.
-        if let Some(incoming) = event.keys {
-            upstream.keys = Some(incoming);
-        }
-        if let Some(n) = event.requests_1h {
-            upstream.requests_1h = Some(n);
-        }
-        if let Some(n) = event.limited_1h {
-            upstream.limited_1h = Some(n);
-        }
-        if let Some(buckets) = event.request_buckets {
-            upstream.request_buckets = Some(buckets);
-        }
-        if let Some(n) = event.tokens_1h {
-            upstream.tokens_1h = Some(n);
-        }
-        if let Some(buckets) = event.token_buckets {
-            upstream.token_buckets = Some(buckets);
-        }
-        if let Some(minutes) = event.request_minutes {
-            upstream.request_minutes = Some(minutes);
-        }
-        if let Some(minutes) = event.token_minutes {
-            upstream.token_minutes = Some(minutes);
-        }
+        *upstream = event.upstream;
         Ok(())
     }
 
@@ -534,42 +556,189 @@ mod tests {
 
     /// A full document, with host stats and sessions, as a publisher with everything on sends.
     const FULL_DOC: &str = r#"{
-        "instance": "peer-a",
-        "observed_at": "2026-11-13T09:30:00Z",
-        "age_seconds": 0,
-        "upstreams": [
-            {"name": "zen", "healthy_keys": 1, "cooling_keys": 1, "disabled_keys": 0,
-             "cooling_combinations": 2,
-             "soonest_cooldown_seconds": 42, "last_status_class": "4xx"}
-        ],
-        "host": {"load_average": [0.52, 0.58, 0.59], "cores": 8,
-                 "memory": {"total_bytes": 16384000000, "available_bytes": 8192000000,
-                            "swap_total_bytes": 2048000000, "swap_free_bytes": 2048000000},
-                 "disks": [{"roles": ["config", "state"], "total_bytes": 107374182400,
-                            "available_bytes": 53687091200, "used_percent": 50.0}]},
-        "sessions": {"window_seconds": 300, "active_sessions": 3}
-    }"#;
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "cores" : 8,
+      "disks" : [
+         {
+            "available_bytes" : 53687091200,
+            "roles" : [
+               "config",
+               "state"
+            ],
+            "total_bytes" : 107374182400,
+            "used_percent" : 50
+         }
+      ],
+      "load_average" : [
+         0.52,
+         0.58,
+         0.59
+      ],
+      "memory" : {
+         "available_bytes" : 8192000000,
+         "swap_free_bytes" : 2048000000,
+         "swap_total_bytes" : 2048000000,
+         "total_bytes" : 16384000000
+      }
+   },
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:30:00Z",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 3,
+      "window_seconds" : 300
+   },
+   "upstreams" : [
+      {
+         "cooling_combinations" : 2,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 42
+      }
+   ]
+}
+"#;
 
     /// The same document from a publisher with host stats and labels off.
-    const BARE_DOC: &str = r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z","upstreams":[
-        {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-         "soonest_cooldown_seconds":42,"last_status_class":"4xx"}]}"#;
+    const BARE_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:30:00Z",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 42
+      }
+   ]
+}
+"#;
 
     /// A document carrying the last hour of attempts.
-    const USAGE_DOC: &str = r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z",
-        "upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-        "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-        "requests_1h":120,"limited_1h":3,
-        "request_buckets":[1,2,3,4,5,6,7,8,9,10,11,12]}]}"#;
+    const USAGE_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:30:00Z",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "limited_1h" : 3,
+         "name" : "zen",
+         "request_buckets" : [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 120,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#;
 
     /// A labelled view whose cooling key carries the quota class.
-    const LABELLED_DOC: &str = r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z",
-        "upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-        "soonest_cooldown_seconds":300,"last_status_class":"4xx",
-        "keys":[{"name":"a","state":"available","cooldown_seconds":null},
-                {"name":"b","state":"cooling","cooldown_seconds":300,
-                 "cooldown_class":"quota_exhausted"},
-                {"name":"c","state":"out_of_rotation","cooldown_seconds":null}]}]}"#;
+    const LABELLED_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:30:00Z",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "keys" : [
+            {
+               "cooldown_seconds" : null,
+               "name" : "a",
+               "state" : "available"
+            },
+            {
+               "cooldown_class" : "quota_exhausted",
+               "cooldown_seconds" : 300,
+               "name" : "b",
+               "state" : "cooling"
+            },
+            {
+               "cooldown_seconds" : null,
+               "name" : "c",
+               "state" : "out_of_rotation"
+            }
+         ],
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 300
+      }
+   ]
+}
+"#;
 
     fn fleet() -> Fleet {
         Fleet::new(Duration::from_secs(90))
@@ -577,8 +746,18 @@ mod tests {
 
     #[test]
     fn failure_counts_parse_and_default_to_empty() {
-        let with = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
-            "failures":{"rate_limited":2,"transient":1}}"#;
+        let with = r#"{
+   "age_seconds" : 0,
+   "failures" : {
+      "rate_limited" : 2,
+      "transient" : 1
+   },
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : []
+}
+"#;
         let health = Health::from_json(with).unwrap();
         assert_eq!(health.failures.get("rate_limited"), Some(&2));
         assert_eq!(health.failures.get("transient"), Some(&1));
@@ -612,7 +791,7 @@ mod tests {
         let health = Health::from_json(FULL_DOC).expect("a full document parses");
         assert_eq!(health.instance, "peer-a");
         assert_eq!(health.observed_at, "2026-11-13T09:30:00Z");
-        assert_eq!(health.age_seconds, Some(0));
+        assert_eq!(health.age_seconds, 0);
         assert_eq!(health.upstreams.len(), 1);
         assert_eq!(
             health.upstreams[0],
@@ -639,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_fields_parse_and_an_older_document_has_none() {
+    fn usage_fields_parse_absent_figures_stay_none() {
         let health = Health::from_json(USAGE_DOC).expect("a usage document parses");
         let upstream = &health.upstreams[0];
         assert_eq!(upstream.requests_1h, Some(120));
@@ -648,20 +827,92 @@ mod tests {
             upstream.request_buckets,
             Some([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
         );
-        let old = Health::from_json(BARE_DOC).expect("an old document parses");
-        assert_eq!(old.upstreams[0].requests_1h, None);
-        assert_eq!(old.upstreams[0].limited_1h, None);
-        assert_eq!(old.upstreams[0].request_buckets, None);
+        let bare = Health::from_json(BARE_DOC).expect("a bare document parses");
+        assert_eq!(bare.upstreams[0].requests_1h, None);
+        assert_eq!(bare.upstreams[0].limited_1h, None);
+        assert_eq!(bare.upstreams[0].request_buckets, None);
     }
 
     #[test]
     fn hostile_usage_numbers_are_clamped_not_rejected() {
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":18446744073709551615,
-                 "limited_1h":18446744073709551615,
-                 "request_buckets":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 18446744073709551615,
+         "name" : "zen",
+         "request_buckets" : [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 18446744073709551615,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
         )
         .expect("large numbers parse");
         let upstream = &health.upstreams[0];
@@ -674,10 +925,80 @@ mod tests {
         );
 
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":-5,"limited_1h":1.9,
-                 "request_buckets":[-1,1.9,"x",3,4,5,6,7,8,9,10,11]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 1.9,
+         "name" : "zen",
+         "request_buckets" : [
+            -1,
+            1.9,
+            "x",
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : -5,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
         )
         .expect("negative, float and string numbers parse");
         let upstream = &health.upstreams[0];
@@ -690,9 +1011,67 @@ mod tests {
         );
 
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "requests_1h":"many","limited_1h":{},"request_buckets":"not an array"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : {},
+         "name" : "zen",
+         "request_buckets" : "not an array",
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : "many",
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
         )
         .expect("wrong types do not reject the document");
         let upstream = &health.upstreams[0];
@@ -702,12 +1081,83 @@ mod tests {
     }
 
     #[test]
-    fn token_fields_parse_clamp_and_stay_absent_from_older_documents() {
+    fn token_fields_parse_clamp_and_stay_absent_without_exposure() {
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "tokens_1h":18446744073709551615,
-                 "token_buckets":[1,2,3,4,5,6,7,8,9,10,11,12,13]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 18446744073709551615
+      }
+   ]
+}
+"#,
         )
         .expect("a document with tokens parses");
         let upstream = &health.upstreams[0];
@@ -719,9 +1169,80 @@ mod tests {
         );
 
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "tokens_1h":-5,"token_buckets":[-1,1.9,"x",3,4,5,6,7,8,9,10,11]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            -1,
+            1.9,
+            "x",
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : -5
+      }
+   ]
+}
+"#,
         )
         .expect("negative, float and string numbers parse");
         let upstream = &health.upstreams[0];
@@ -732,26 +1253,156 @@ mod tests {
         );
 
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "tokens_1h":"many","token_buckets":"not an array"}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : "not an array",
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : "many"
+      }
+   ]
+}
+"#,
         )
         .expect("wrong types do not reject the document");
         assert_eq!(health.upstreams[0].tokens_1h, None);
         assert_eq!(health.upstreams[0].token_buckets, None);
 
-        let old = Health::from_json(BARE_DOC).expect("an old document parses");
-        assert_eq!(old.upstreams[0].tokens_1h, None);
-        assert_eq!(old.upstreams[0].token_buckets, None);
+        let bare = Health::from_json(BARE_DOC).expect("a bare document parses");
+        assert_eq!(bare.upstreams[0].tokens_1h, None);
+        assert_eq!(bare.upstreams[0].token_buckets, None);
     }
 
     #[test]
-    fn minute_fields_parse_clamp_and_stay_absent_from_older_documents() {
+    fn minute_fields_parse_clamp_and_stay_absent_without_exposure() {
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "request_minutes":[1,2,3,4,5,6,7,8,9,10,11,12],
-                 "token_minutes":[1,"x",-1,1.9,4,5,6,7,8,18446744073709551615]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+         ],
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            1,
+            "x",
+            -1,
+            1.9,
+            4,
+            5,
+            6,
+            7,
+            8,
+            18446744073709551615
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
         )
         .expect("minute arrays parse");
         let upstream = &health.upstreams[0];
@@ -767,17 +1418,68 @@ mod tests {
         );
 
         let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                 "request_minutes":"many","token_minutes":{"a":1}}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : "many",
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : {
+            "a" : 1
+         },
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#,
         )
         .expect("wrong types do not reject the document");
         assert_eq!(health.upstreams[0].request_minutes, None);
         assert_eq!(health.upstreams[0].token_minutes, None);
 
-        let old = Health::from_json(BARE_DOC).expect("an old document parses");
-        assert_eq!(old.upstreams[0].request_minutes, None);
-        assert_eq!(old.upstreams[0].token_minutes, None);
+        let bare = Health::from_json(BARE_DOC).expect("a bare document parses");
+        assert_eq!(bare.upstreams[0].request_minutes, None);
+        assert_eq!(bare.upstreams[0].token_minutes, None);
     }
 
     #[test]
@@ -789,12 +1491,75 @@ mod tests {
             .apply_event(
                 "peer-a",
                 "key",
-                r#"{"upstream":{"name":"zen","healthy_keys":1,"cooling_keys":0,
-                    "disabled_keys":0,"requests_1h":7,"limited_1h":1,
-                    "request_buckets":[0,0,0,0,0,0,0,0,0,0,1,6],
-                    "tokens_1h":99,"token_buckets":[0,0,0,0,0,0,0,0,0,0,9,90],
-                    "request_minutes":[0,0,0,0,0,0,0,0,0,4],
-                    "token_minutes":[0,0,0,0,0,0,0,0,0,90]}}"#,
+                r#"{
+   "age_seconds" : 0,
+   "observed_at" : "2026-11-13T09:30:05Z",
+   "upstream" : {
+      "cooling_combinations" : 0,
+      "cooling_keys" : 0,
+      "disabled_keys" : 0,
+      "healthy_keys" : 1,
+      "last_status_class" : null,
+      "limited_1h" : 1,
+      "name" : "zen",
+      "request_buckets" : [
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         1,
+         6
+      ],
+      "request_minutes" : [
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         4
+      ],
+      "requests_1h" : 7,
+      "soonest_cooldown_seconds" : null,
+      "token_buckets" : [
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         9,
+         90
+      ],
+      "token_minutes" : [
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         0,
+         90
+      ],
+      "tokens_1h" : 99
+   }
+}
+"#,
                 now,
             )
             .expect("a key event applies");
@@ -821,17 +1586,28 @@ mod tests {
     }
 
     #[test]
-    fn a_document_without_cooling_combinations_parses_as_zero() {
-        let health = Health::from_json(BARE_DOC).expect("an old document parses");
-        assert_eq!(health.upstreams[0].cooling_combinations, 0);
-    }
-
-    #[test]
     fn a_document_without_host_and_sessions_parses() {
         let health = Health::from_json(BARE_DOC).expect("a bare document parses");
         assert!(health.host.is_none());
         assert!(health.sessions.is_none());
-        assert!(health.age_seconds.is_none(), "age_seconds is optional");
+        assert_eq!(health.age_seconds, 0);
+        assert!(health.failures.is_empty());
+    }
+
+    #[test]
+    fn nullable_fields_accept_explicit_null() {
+        let health = Health::from_json(
+            r#"{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t",
+                "age_seconds":0,"failures":{},"upstreams":[
+                {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
+                 "cooling_combinations":0,"soonest_cooldown_seconds":null,
+                 "last_status_class":null}]}"#,
+        )
+        .expect("null is a value, not an absent field");
+        let upstream = &health.upstreams[0];
+        assert_eq!(upstream.soonest_cooldown_seconds, None);
+        assert_eq!(upstream.last_status_class, None);
+        assert_eq!(upstream.keys, None);
     }
 
     #[test]
@@ -848,22 +1624,63 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_ignored_and_nulls_stay_none() {
-        let health = Health::from_json(
-            r#"{"instance":"peer-a","observed_at":"2026-11-13T09:30:00Z","future_field":42,
-                "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
-                "soonest_cooldown_seconds":null,"last_status_class":null,"extra":true}]}"#,
-        )
-        .expect("unknown fields are ignored");
-        let upstream = &health.upstreams[0];
-        assert_eq!(upstream.soonest_cooldown_seconds, None);
-        assert_eq!(upstream.last_status_class, None);
-        assert_eq!(upstream.keys, None);
+    fn unknown_fields_are_rejected() {
+        let docs = [
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
+                 "failures":{},"upstreams":[],"future_field":42}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
+                 "failures":{},"upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,
+                 "disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":null,
+                 "last_status_class":null,"extra":true}]}"#,
+        ];
+        for doc in docs {
+            assert!(Health::from_json(doc).is_err(), "{doc}");
+        }
+    }
+
+    #[test]
+    fn required_fields_are_enforced() {
+        let docs = [
+            // Missing top-level figures.
+            r#"{"instance":"p","observed_at":"t","age_seconds":0,"failures":{},"upstreams":[]}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","failures":{},"upstreams":[]}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"upstreams":[]}"#,
+            // Missing upstream figures, including the required nullable pair.
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+                 "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
+                 "soonest_cooldown_seconds":null,"last_status_class":null}]}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+                 "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
+                 "cooling_combinations":0,"last_status_class":null}]}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+                 "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
+                 "cooling_combinations":0,"soonest_cooldown_seconds":null}]}"#,
+            // A labelled key must carry its nullable cooldown too.
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+                 "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
+                 "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null,
+                 "keys":[{"name":"k","state":"cooling"}]}]}"#,
+        ];
+        for doc in docs {
+            assert!(Health::from_json(doc).is_err(), "{doc}");
+        }
     }
 
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
-        for text in ["", "{", "not json", r#"{"instance":1,"upstreams":[]}"#] {
+        for text in [
+            "",
+            "{",
+            "not json",
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : 1,
+   "reiki_version" : "0.10.3",
+   "upstreams" : []
+}
+"#,
+        ] {
             let err = Health::from_json(text).expect_err("malformed input errors");
             assert!(!err.is_empty());
         }
@@ -909,8 +1726,20 @@ mod tests {
             .apply_event(
                 "peer-a",
                 "key",
-                r#"{"upstream":{"name":"gone","healthy_keys":1,"cooling_keys":0,
-                    "disabled_keys":0,"last_status_class":"2xx"}}"#,
+                r#"{
+   "age_seconds" : 0,
+   "observed_at" : "2026-11-13T09:30:05Z",
+   "upstream" : {
+      "cooling_combinations" : 0,
+      "cooling_keys" : 0,
+      "disabled_keys" : 0,
+      "healthy_keys" : 1,
+      "last_status_class" : "2xx",
+      "name" : "gone",
+      "soonest_cooldown_seconds" : null
+   }
+}
+"#,
                 now,
             )
             .expect("an unknown upstream is not an error");
@@ -926,7 +1755,10 @@ mod tests {
             .apply_event(
                 "peer-d",
                 "key",
-                r#"{"upstream":{"name":"zen","healthy_keys":1}}"#,
+                r#"{"observed_at":"t","age_seconds":0,"upstream":{
+                    "name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    "cooling_combinations":0,"soonest_cooldown_seconds":null,
+                    "last_status_class":null}}"#,
                 now,
             )
             .expect("an unknown peer is not an error");
@@ -944,7 +1776,7 @@ mod tests {
         assert!(!err.is_empty());
         let err = fleet
             .apply_event("peer-a", "key", r#"{"observed_at":"x"}"#, now)
-            .expect_err("a key event without an upstream errors");
+            .expect_err("a partial key event errors");
         assert!(!err.is_empty());
     }
 
@@ -957,10 +1789,25 @@ mod tests {
             .apply_event(
                 "peer-a",
                 "snapshot",
-                r#"{"instance":"peer-a","observed_at":"2026-11-13T09:31:00Z",
-                    "upstreams":[{"name":"spare","healthy_keys":0,"cooling_keys":0,
-                    "disabled_keys":1,"soonest_cooldown_seconds":null,
-                    "last_status_class":"5xx"}]}"#,
+                r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "2026-11-13T09:31:00Z",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 1,
+         "healthy_keys" : 0,
+         "last_status_class" : "5xx",
+         "name" : "spare",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
                 now + Duration::from_secs(1),
             )
             .expect("a snapshot event applies");
@@ -1005,11 +1852,34 @@ mod tests {
         fleet.apply_snapshot(
             "peer-a",
             Health::from_json(
-                r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-                    {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-                     "soonest_cooldown_seconds":42,"last_status_class":"4xx"},
-                    {"name":"open","healthy_keys":2,"cooling_keys":0,"disabled_keys":0,
-                     "soonest_cooldown_seconds":null,"last_status_class":null}]}"#,
+                r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 42
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 2,
+         "last_status_class" : null,
+         "name" : "open",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             )
             .unwrap(),
             now,
@@ -1017,11 +1887,34 @@ mod tests {
         fleet.apply_snapshot(
             "peer-b",
             Health::from_json(
-                r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-                    {"name":"zen","healthy_keys":0,"cooling_keys":2,"disabled_keys":1,
-                     "soonest_cooldown_seconds":300,"last_status_class":"4xx"},
-                    {"name":"gem","healthy_keys":3,"cooling_keys":0,"disabled_keys":0,
-                     "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#,
+                r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 2,
+         "disabled_keys" : 1,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 300
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 3,
+         "last_status_class" : "2xx",
+         "name" : "gem",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#,
             )
             .unwrap(),
             now,
@@ -1107,10 +2000,32 @@ mod tests {
     fn cooldowns_count_down_between_snapshots_and_never_below_zero() {
         let t0 = Instant::now();
         let mut fleet = Fleet::new(Duration::from_secs(30));
-        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-             "soonest_cooldown_seconds":90,
-             "keys":[{"name":"k","state":"cooling","cooldown_seconds":90}]}]}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "keys" : [
+            {
+               "cooldown_seconds" : 90,
+               "name" : "k",
+               "state" : "cooling"
+            }
+         ],
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 90
+      }
+   ]
+}
+"#;
         fleet.apply_snapshot("peer-a", Health::from_json(doc).unwrap(), t0);
         fleet.advance(t0 + Duration::from_millis(1500));
         let left = |f: &Fleet, at| f.peer("peer-a", at).unwrap().health.upstreams[0].clone();
@@ -1127,45 +2042,37 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_read_when_present_and_none_when_an_older_peer_omits_it() {
-        let with =
-            r#"{"instance":"peer-a","observed_at":"t","reiki_version":"0.10.3","upstreams":[]}"#;
-        assert_eq!(
-            Health::from_json(with).unwrap().reiki_version.as_deref(),
-            Some("0.10.3")
-        );
-        assert_eq!(
-            Health::from_json(BARE_DOC).unwrap().reiki_version,
-            None,
-            "an older peer"
-        );
+    fn the_version_is_required_and_read() {
+        assert_eq!(Health::from_json(BARE_DOC).unwrap().reiki_version, "0.10.3");
     }
 
     #[test]
     fn a_hostile_version_keeps_printable_ascii_and_at_most_32_chars() {
         let doc = |value: &str| {
             format!(
-                r#"{{"instance":"p","observed_at":"t","reiki_version":{value},"upstreams":[]}}"#
+                r#"{{"instance":"p","reiki_version":{value},"observed_at":"t","age_seconds":0,
+                    "failures":{{}},"upstreams":[]}}"#
             )
         };
         let long = format!("\"{}\"", "9".repeat(40));
         let cases = [
-            (
-                r#""0.10.3\u0007\u202e""#.to_owned(),
-                Some("0.10.3".to_owned()),
-            ),
-            (r#""héllo-1""#.to_owned(), Some("hllo-1".to_owned())),
-            (long, Some("9".repeat(32))),
-            (r#""\u0001\n""#.to_owned(), None),
-            (r#""""#.to_owned(), None),
-            ("42".to_owned(), None),
-            ("null".to_owned(), None),
-            (r#"["0.10.3"]"#.to_owned(), None),
+            (r#""0.10.3\u0007\u202e""#.to_owned(), "0.10.3".to_owned()),
+            (r#""héllo-1""#.to_owned(), "hllo-1".to_owned()),
+            (long, "9".repeat(32)),
         ];
         for (value, expected) in cases {
             let health = Health::from_json(&doc(&value))
                 .unwrap_or_else(|e| panic!("{value} is not an error: {e}"));
             assert_eq!(health.reiki_version, expected, "{value}");
+        }
+        for value in [
+            r#""\u0001\n""#.to_owned(),
+            r#""""#.to_owned(),
+            "42".to_owned(),
+            "null".to_owned(),
+            r#"["0.10.3"]"#.to_owned(),
+        ] {
+            Health::from_json(&doc(&value)).expect_err(&format!("{value} is not a version"));
         }
     }
 }

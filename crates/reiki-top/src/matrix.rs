@@ -117,11 +117,11 @@ pub struct Pressure {
     pub tokens_1h: u64,
     /// Twelve five-minute request counts, oldest first, newest last.
     pub buckets: [u32; 12],
-    /// Ten one-minute request counts, oldest first; `None` from an older publisher.
+    /// Ten one-minute request counts, oldest first; `None` when usage is not exposed.
     pub minutes: Option<[u32; MINUTE_SLOTS]>,
-    /// Twelve five-minute token counts, oldest first; `None` from an older publisher.
+    /// Twelve five-minute token counts, oldest first; `None` when usage is not exposed.
     pub token_buckets: Option<[u64; 12]>,
-    /// Ten one-minute token counts, oldest first; `None` from an older publisher.
+    /// Ten one-minute token counts, oldest first; `None` when usage is not exposed.
     pub token_minutes: Option<[u32; MINUTE_SLOTS]>,
 }
 
@@ -133,12 +133,12 @@ pub struct Row {
     /// Cooling combinations per column, in column order; 0 where the peer has no such upstream
     /// or its data is stale.
     pub combos: Vec<u32>,
-    /// Attempt counts per column, in column order; `None` without them, for an older publisher
-    /// or a stale or absent upstream.
+    /// Attempt counts per column, in column order; `None` when usage is not exposed, or for a
+    /// stale or absent upstream.
     pub pressure: Vec<Option<Pressure>>,
     pub host: HostSummary,
-    /// The peer's published version from its last data, stale or not; `None` for an older peer
-    /// or a peer never seen.
+    /// The peer's published version from its last data, stale or not; `None` for a peer never
+    /// seen.
     pub version: Option<String>,
     pub error: Option<String>,
     pub stale: bool,
@@ -225,7 +225,7 @@ impl Matrix {
                     .map(|col| upstream(col).and_then(pressure_of))
                     .collect(),
                 host,
-                version: view.as_ref().and_then(|v| v.health.reiki_version.clone()),
+                version: view.as_ref().map(|v| v.health.reiki_version.clone()),
                 error: fleet.error(name).map(str::to_owned),
                 stale: fresh.is_none(),
                 age: view.as_ref().map(|v| v.age),
@@ -623,13 +623,14 @@ impl History {
     }
 }
 
-/// `requests_1h` is what marks a new publisher; the other two default rather than drop it.
+/// All the core figures arrive together when a publisher exposes usage; absence means there is
+/// nothing to chart, not a zero to invent.
 fn pressure_of(upstream: &Upstream) -> Option<Pressure> {
-    upstream.requests_1h.map(|requests_1h| Pressure {
-        requests_1h,
-        limited_1h: upstream.limited_1h.unwrap_or(0),
-        tokens_1h: upstream.tokens_1h.unwrap_or(0),
-        buckets: upstream.request_buckets.unwrap_or([0; 12]),
+    Some(Pressure {
+        requests_1h: upstream.requests_1h?,
+        limited_1h: upstream.limited_1h?,
+        tokens_1h: upstream.tokens_1h?,
+        buckets: upstream.request_buckets?,
         minutes: upstream.request_minutes,
         token_buckets: upstream.token_buckets,
         token_minutes: upstream.token_minutes,
@@ -978,21 +979,28 @@ mod tests {
 
     fn upstream(name: &str, healthy: u32, cooling: u32, disabled: u32) -> String {
         format!(
-            r#"{{"name":"{name}","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":{disabled},"soonest_cooldown_seconds":null,"last_status_class":null}}"#
+            r#"{{"name":"{name}","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":{disabled},
+                "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null}}"#
         )
     }
 
     fn usage_upstream(name: &str, requests: u64, limited: u32, buckets: &str) -> String {
         format!(
             r#"{{"name":"{name}","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
                 "requests_1h":{requests},"limited_1h":{limited},
-                "request_buckets":{buckets}}}"#
+                "request_buckets":{buckets},"tokens_1h":0,
+                "token_buckets":[0,0,0,0,0,0,0,0,0,0,0,0],
+                "request_minutes":[0,0,0,0,0,0,0,0,0,0],
+                "token_minutes":[0,0,0,0,0,0,0,0,0,0]}}"#
         )
     }
 
     fn doc(upstreams: &str) -> String {
-        format!(r#"{{"instance":"x","observed_at":"t","upstreams":[{upstreams}]}}"#)
+        format!(
+            r#"{{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                "failures":{{}},"upstreams":[{upstreams}]}}"#
+        )
     }
 
     fn names(peers: &[&str]) -> Vec<String> {
@@ -1100,25 +1108,53 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            &doc(
-                r#"{"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
-                 "soonest_cooldown_seconds":300,"last_status_class":"4xx",
-                 "keys":[{"name":"b","state":"cooling","cooldown_seconds":300,
-                          "cooldown_class":"quota_exhausted"}]}"#,
-            ),
+            &doc(r#"{
+   "cooling_combinations" : 0,
+   "cooling_keys" : 1,
+   "disabled_keys" : 0,
+   "healthy_keys" : 1,
+   "keys" : [
+      {
+         "cooldown_class" : "quota_exhausted",
+         "cooldown_seconds" : 300,
+         "name" : "b",
+         "state" : "cooling"
+      }
+   ],
+   "last_status_class" : "4xx",
+   "name" : "zen",
+   "soonest_cooldown_seconds" : 300
+}
+"#),
             t0,
         );
         add(
             &mut f,
             "peer-b",
-            &doc(
-                r#"{"name":"zen","healthy_keys":0,"cooling_keys":2,"disabled_keys":0,
-                 "soonest_cooldown_seconds":42,"last_status_class":"4xx",
-                 "keys":[{"name":"a","state":"cooling","cooldown_seconds":300,
-                          "cooldown_class":"rate_limited"},
-                         {"name":"b","state":"cooling","cooldown_seconds":42,
-                          "cooldown_class":"quota_exhausted"}]}"#,
-            ),
+            &doc(r#"{
+   "cooling_combinations" : 0,
+   "cooling_keys" : 2,
+   "disabled_keys" : 0,
+   "healthy_keys" : 0,
+   "keys" : [
+      {
+         "cooldown_class" : "rate_limited",
+         "cooldown_seconds" : 300,
+         "name" : "a",
+         "state" : "cooling"
+      },
+      {
+         "cooldown_class" : "quota_exhausted",
+         "cooldown_seconds" : 42,
+         "name" : "b",
+         "state" : "cooling"
+      }
+   ],
+   "last_status_class" : "4xx",
+   "name" : "zen",
+   "soonest_cooldown_seconds" : 42
+}
+"#),
             t0,
         );
         let m = Matrix::build(&f, &names(&["peer-a", "peer-b"]), t0);
@@ -1250,16 +1286,16 @@ mod tests {
                 limited_1h: 3,
                 tokens_1h: 0,
                 buckets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-                minutes: None,
-                token_buckets: None,
-                token_minutes: None,
+                minutes: Some([0; 10]),
+                token_buckets: Some([0; 12]),
+                token_minutes: Some([0; 10]),
             })],
-            "a new publisher's figures reach the row"
+            "exposed figures reach the row"
         );
         assert_eq!(
             m.rows[1].pressure,
             vec![None],
-            "an older publisher has none"
+            "a publisher without exposure has none"
         );
         assert_eq!(m.rows[2].pressure, vec![None], "stale data counts nothing");
 
@@ -1272,62 +1308,95 @@ mod tests {
     }
 
     #[test]
-    fn pressure_treats_a_missing_limited_or_bucket_array_as_zero() {
-        let t0 = Instant::now();
-        let mut f = fleet();
-        add(
-            &mut f,
-            "peer-a",
-            &doc(
-                r#"{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                    "requests_1h":5}"#,
-            ),
-            t0,
-        );
-        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
-        assert_eq!(
-            m.rows[0].pressure,
-            vec![Some(Pressure {
-                requests_1h: 5,
-                limited_1h: 0,
-                tokens_1h: 0,
-                buckets: [0; 12],
-                minutes: None,
-                token_buckets: None,
-                token_minutes: None,
-            })]
-        );
-    }
-
-    #[test]
     fn host_summary_takes_worst_disk_and_survives_hostile_json() {
         let t0 = Instant::now();
         let mut f = fleet();
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"x","observed_at":"t",
-               "upstreams":[],
-               "host":{"load_average":[0.5,1.5],"cores":8,
-                       "disks":[{"used_percent":40.0},{"used_percent":90.5},{"used_percent":10.0}]},
-               "sessions":{"active_sessions":3}}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "cores" : 8,
+      "disks" : [
+         {
+            "used_percent" : 40
+         },
+         {
+            "used_percent" : 90.5
+         },
+         {
+            "used_percent" : 10
+         }
+      ],
+      "load_average" : [
+         0.5,
+         1.5
+      ]
+   },
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 3
+   },
+   "upstreams" : []
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-b",
-            r#"{"instance":"x","observed_at":"t","upstreams":[],
-               "host":"not an object",
-               "sessions":{"active_sessions":"three"}}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : "not an object",
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : "three"
+   },
+   "upstreams" : []
+}
+"#,
             t0,
         );
         add(
             &mut f,
             "peer-c",
-            r#"{"instance":"x","observed_at":"t","upstreams":[],
-               "host":{"load_average":[null,-1.0,1e308],"disks":[{"used_percent":"high"},
-                       {"used_percent":150.0},{"used_percent":-5.0}]},
-               "sessions":{"active_sessions":1e30}}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "host" : {
+      "disks" : [
+         {
+            "used_percent" : "high"
+         },
+         {
+            "used_percent" : 150
+         },
+         {
+            "used_percent" : -5
+         }
+      ],
+      "load_average" : [
+         null,
+         -1,
+         1e+308
+      ]
+   },
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 1e+30
+   },
+   "upstreams" : []
+}
+"#,
             t0,
         );
         let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c"]), t0);
@@ -1552,18 +1621,73 @@ mod tests {
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"x","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
-                 "soonest_cooldown_seconds":18446744073709551615,"last_status_class":null,
-                 "keys":[{"name":"a","state":"cooling","cooldown_seconds":null,"cooldown_class":null},
-                         {"name":"b","state":"weird","cooldown_seconds":5,"cooldown_class":null}]}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "keys" : [
+            {
+               "cooldown_class" : null,
+               "cooldown_seconds" : null,
+               "name" : "a",
+               "state" : "cooling"
+            },
+            {
+               "cooldown_class" : null,
+               "cooldown_seconds" : 5,
+               "name" : "b",
+               "state" : "weird"
+            }
+         ],
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 18446744073709551615
+      }
+   ]
+}
+"#,
             t0,
         );
         add(&mut f, "peer-a", &doc(&upstream("zen", 1, 1, 1)), t0);
         add(
             &mut f,
             "peer-a",
-            r#"{"instance":"x","observed_at":"t","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":null},{"name":"zen","healthy_keys":0,"cooling_keys":5,"disabled_keys":0,"soonest_cooldown_seconds":7,"last_status_class":null}]}"#,
+            r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "x",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 5,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 7
+      }
+   ]
+}
+"#,
             t0,
         );
         let m = Matrix::build(&f, &names(&["peer-a", "peer-b"]), t0);
@@ -1750,9 +1874,10 @@ mod tests {
     ) -> String {
         format!(
             r#"{{"name":"{name}","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":0,
-                "soonest_cooldown_seconds":null,"last_status_class":null,
+                "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null,
                 "requests_1h":{requests},"limited_1h":{limited},"tokens_1h":{tokens},
                 "request_buckets":[1,1,1,1,1,1,1,1,1,1,1,1],
+                "token_buckets":[1,1,1,1,1,1,1,1,1,1,1,1],
                 "request_minutes":{minutes},"token_minutes":{token_minutes}}}"#
         )
     }

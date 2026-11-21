@@ -45,7 +45,7 @@ For a key that is merely disabled, `reiki keys --enable NAME` clears its cooldow
 | --- | --- |
 | One extra upstream attempt per skipped key | `attempts` in the request log; `reiki_failovers_total` with the metrics plugin |
 | The attempt counts against `rate_limit_per_minute` and outbound budgets | Stream and upstream limits |
-| A cooldown shared by every stream that lists the key | `reiki keys`, `/status`, `reiki top` |
+| A cooldown shared by every stream that lists the key | `reiki keys`, `/v1/status`, `reiki top` |
 | A 3-second wait and one repeated request when `confirm_quota = true` | First quota `429` only; it still enters the failure ring |
 
 There is no replay after a `2xx` or `3xx` status line: a body that breaks mid-stream stays broken. Transport failures replay only when a side effect cannot be duplicated. An explicit upstream error response fails over for every method. See [failover](failover.md#transport-failures) and [classification](classification.md#reading-order).
@@ -60,7 +60,7 @@ A `rate_limited` failure and a 402 treated as quota exhaustion are scoped to `(r
 
 ## Does a reload apply every config change?
 
-No. SIGHUP, `POST /reload` and `reiki reload` re-read the config, key files and TLS material, build the whole new state, and swap it only if every part is valid. Keys, streams, upstreams, plugin settings and tunnel policy apply live. Listen addresses, `[log]` file settings and adding or removing `[tunnel]` need a restart and appear in `restart_needed`. A failed reload keeps the running state. See [troubleshooting](troubleshooting.md#reload) and [upgrades](upgrades.md#reload-vs-restart).
+No. SIGHUP, `POST /v1/reload` and `reiki reload` re-read the config, key files and TLS material, build the whole new state, and swap it only if every part is valid. Keys, streams, upstreams, plugin settings and tunnel policy apply live. Listen addresses, `[log]` file settings and adding or removing `[tunnel]` need a restart and appear in `restart_needed`. A failed reload keeps the running state. See [troubleshooting](troubleshooting.md#reload) and [upgrades](upgrades.md#reload-vs-restart).
 
 ## Why did my POST stay on the first key after a timeout?
 

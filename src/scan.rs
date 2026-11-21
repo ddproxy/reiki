@@ -91,11 +91,6 @@ pub fn known_labels() -> Vec<&'static str> {
 
 /// Scans `text` with the named plugins (all compiled-in ones when `only` is empty).
 pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Finding>, String> {
-    if only.iter().any(|p| p == "gov") {
-        return Err(
-            "plugin `gov` was removed; use `controlled` (feature `plugin-controlled`)".to_owned(),
-        );
-    }
     let available = plugins();
     if let Some(unknown) = only.iter().find(|p| !available.contains(&p.as_str())) {
         return Err(format!(
@@ -373,13 +368,6 @@ mod tests {
             run(text, &["phi"], &Kinds::All),
             [("phi".to_owned(), "email".to_owned())]
         );
-    }
-
-    #[test]
-    fn the_removed_gov_plugin_name_is_rejected() {
-        let err = scan("x", &["gov".into()], &Kinds::Default).unwrap_err();
-        assert!(err.contains("gov") && err.contains("controlled"), "{err}");
-        assert!(err.contains("plugin-controlled"), "{err}");
     }
 
     #[test]

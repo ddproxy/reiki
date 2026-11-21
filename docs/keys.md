@@ -43,7 +43,7 @@ chown reiki:reiki /etc/reiki/keys/zen-a
 chmod 0600 /etc/reiki/keys/zen-a
 ```
 
-`NAME` in `[keys.NAME]` is a stable label. Logs, `/status`, chains and the state file use it. Reiki does not enforce a naming pattern for the label or the file. Keep a name until you intend to start fresh health for that key.
+`NAME` in `[keys.NAME]` is a stable label. Logs, `/v1/status`, chains and the state file use it. Reiki does not enforce a naming pattern for the label or the file. Keep a name until you intend to start fresh health for that key.
 
 At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty, too short, or (with the default `strict_key_permissions = true`) having group or other read or write bits stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
 
@@ -98,13 +98,13 @@ A request uses only the chain keys whose upstream matches the request path. One 
 
 ## Key state and enable
 
-| `reiki keys` state | `/status` state | Meaning |
+| `reiki keys` state | `/v1/status` state | Meaning |
 | --- | --- | --- |
 | `ok` | `available` | Key can be selected. |
 | `cooling` | `cooling` | Key waits for `retry_after_seconds`. |
 | `disabled` | `out_of_rotation` | Key stays out until enabled or its file changes. |
 
-A key with scoped cooldowns stays `ok` for other routes and models. `reiki keys --json` shows the `scopes` array. See [monitoring](monitoring.md#get-status).
+A key with scoped cooldowns stays `ok` for other routes and models. `reiki keys --json` shows the `scopes` array. See [monitoring](monitoring.md#get-v1status).
 
 Set up the admin listener first; see [monitoring](monitoring.md#configure-and-authenticate). Then:
 
@@ -116,14 +116,14 @@ reiki --config /etc/reiki/reiki.toml keys --json
 reiki --config /etc/reiki/reiki.toml keys --enable zen-a
 ```
 
-`reiki keys` calls `GET /status`. `--url` and `--token-file` override the admin address and token source. `reiki keys --enable NAME` calls `POST /keys/enable`:
+`reiki keys` calls `GET /v1/status`. `--url` and `--token-file` override the admin address and token source. `reiki keys --enable NAME` calls `POST /v1/keys/enable`:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
   "http://127.0.0.1:4098/v1/keys/enable?key=zen-a"
 ```
 
-The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"ok":true,"key":"zen-a"}`. `400` means a missing, repeated, bare or invalid `key` parameter, or an unknown flag; `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-keysenable).
+The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"ok":true,"key":"zen-a"}`. `400` means a missing, repeated, bare or invalid `key` parameter, or an unknown flag; `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-v1keysenable).
 
 ## Rotate a key without downtime
 

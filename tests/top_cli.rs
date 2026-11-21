@@ -4,9 +4,25 @@
 
 use std::path::{Path, PathBuf};
 
-const DOC: &str = r#"{"instance":"mock","observed_at":"t","upstreams":[
-    {"name":"zen","healthy_keys":2,"cooling_keys":0,"disabled_keys":0,
-     "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#;
+const DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "mock",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 2,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
 
 struct Dir(PathBuf);
 

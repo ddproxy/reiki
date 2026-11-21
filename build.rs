@@ -19,23 +19,9 @@ struct Plugin {
 /// The plugins whose findings are about the unmasked request, so they must run before `placeholders`.
 const DETECTORS: &[&str] = &["phi", "finance", "controlled"];
 
-/// Old plugin names and their replacements; these must fail loudly, not silently map.
-const REMOVED_PLUGINS: &[(&str, &str)] = &[("gov", "controlled")];
-
 fn fail(message: &str) -> ! {
     println!("cargo::error={message}");
     std::process::exit(1);
-}
-
-fn removed_plugin_message(name: &str) -> Option<String> {
-    REMOVED_PLUGINS
-        .iter()
-        .find(|(old, _)| *old == name)
-        .map(|(old, new)| {
-            format!(
-                "REIKI_PLUGINS names `{old}`, which was removed; use `{new}` (feature `plugin-{new}`)"
-            )
-        })
 }
 
 fn parse_catalog(text: &str) -> Result<Vec<Plugin>, String> {
@@ -162,9 +148,6 @@ fn main() {
         Ok(list) if !list.trim().is_empty() => {
             let mut picked: Vec<&Plugin> = Vec::new();
             for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                if let Some(message) = removed_plugin_message(name) {
-                    fail(&message);
-                }
                 let Some(plugin) = all.iter().find(|p| p.name == name) else {
                     fail(&format!("REIKI_PLUGINS names `{name}`, which is not a known plugin (known: {known})"));
                 };
@@ -252,16 +235,6 @@ mod tests {
         assert!(parse_catalog(&duplicate)
             .unwrap_err()
             .contains("names `phi` twice"));
-    }
-
-    #[test]
-    fn a_removed_plugin_name_has_a_replacement_error() {
-        let message = removed_plugin_message("gov").unwrap();
-        assert!(
-            message.contains("gov") && message.contains("plugin-controlled"),
-            "{message}"
-        );
-        assert!(removed_plugin_message("controlled").is_none());
     }
 
     #[test]

@@ -12,14 +12,15 @@ token_sha256 = "<sha256 of the admin token>"
 
 Both fields are required. The address is bound at startup, so moving `[admin]` needs a restart; a changed token hash applies on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address next to the client one.
 
-Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
+Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404` for every HTTP method; plugin routes answer `GET` only. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
+Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes and the plugin routes are served under `/v1`. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
 
 ```bash
 export ADMIN_TOKEN='...'
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status
 ```
 
-## GET /status
+## GET /v1/status
 
 Method `GET`. Auth: bearer token. Query: none. Shows key health, stream chains and reload state.
 
@@ -90,7 +91,7 @@ Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current
 
 `reiki keys` reads this route and prints a table; `reiki keys --json` prints a derived key-only document with remapped states and a `streams` name list per key. See [key health](troubleshooting.md#key-health).
 
-## GET /failures
+## GET /v1/failures
 
 Method `GET`. Auth: bearer token. Query: `limit` (1 to 64, default 64), `key` (one key name). Returns the in-memory ring, newest first. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding gets `400` with `{"ok":false,"error":"..."}`.
 
@@ -139,7 +140,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 The ring holds 64 entries, starts empty after a restart, and drops a record when another thread holds the buffer. `reiki failures --limit 20` prints this data as a table; `--json` prints the array. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
 
-## POST /keys/enable
+## POST /v1/keys/enable
 
 Method `POST`. Auth: bearer token. Query: `key` (required, percent-encoded key name). Clears the key's cooldown, disabled flag, consecutive failures and combination cooldowns, and saves the change so a restart keeps it.
 
@@ -161,7 +162,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 The CLI equivalent is `reiki keys --enable zen-a --token-file /etc/reiki/admin.token`.
 
-## POST /reload
+## POST /v1/reload
 
 Method `POST`. Auth: bearer token. Query: `dry_run` with `true`, `1`, `false` or `0`; anything else gets `400` and applies nothing. Re-reads the config, key files and CA files, then swaps the new state in when every part validates.
 
@@ -174,7 +175,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 {"ok":true,"dry_run":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
+A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/v1/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
 
 ## GET /v1/openapi.json
 
@@ -201,23 +202,23 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | Route | Location | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET /__reiki/healthz` | Client listener | None | Returns `200` with body `ok` while Reiki is up |
-| `GET /metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
-| `GET /usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
+| `GET /v1/metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
+| `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 
 The plugin routes exist only with `[plugins.metrics]` in the config. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
 
-## GET /metrics
+## GET /v1/metrics
 
-Served by the `metrics` plugin with the same bearer auth as `/status`, at `/metrics` and `/v1/metrics`. Without `[plugins.metrics]` the route returns `404`.
+Served by the `metrics` plugin with the same bearer auth as `/v1/status`. Without `[plugins.metrics]` the route returns `404`.
 
 ```toml
 [plugins.metrics]
 ```
 
 ```bash
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/metrics
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/metrics
 ```
 
 ```text
@@ -249,12 +250,12 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 
 `status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The three `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists).
 
-## GET /usage
+## GET /v1/usage
 
-Method `GET`. Auth: bearer token. Query: none. Same plugin as `/metrics`. Totals come from provider `usage` objects: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`; event streams combine the events that carry `usage`. Bodies over 1 MiB and compressed responses count nothing.
+Method `GET`. Auth: bearer token. Query: none. Same plugin as `/v1/metrics`. Totals come from provider `usage` objects: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`; event streams combine the events that carry `usage`. Bodies over 1 MiB and compressed responses count nothing.
 
 ```bash
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/usage
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/usage
 ```
 
 ```json
@@ -266,7 +267,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/usage
 ```yaml
 scrape_configs:
   - job_name: reiki
-    metrics_path: /metrics
+    metrics_path: /v1/metrics
     authorization:
       credentials_file: /etc/reiki/admin.token
     static_configs:
@@ -302,4 +303,4 @@ groups:
           summary: A Reiki stream chain has no available key
 ```
 
-Reiki publishes `reiki_keys` globally, with no `stream` label. The two `reiki_status_*` and `reiki_stream_healthy_keys` series come from a JSON exporter that reads `GET /status` with the admin token: `reiki_status_intercept_ca_days_left` from `intercept.ca_days_left`, and `reiki_stream_healthy_keys{stream="..."}` from the keys named in each `streams[].chain` whose `state` is `available`. Those names are exporter series, not built-in Reiki metrics. Reiki logs a CA warning within 30 days of expiry and reports `ca_days_left` on `/status`; see [tunnel](tunnel.md#interception).
+Reiki publishes `reiki_keys` globally, with no `stream` label. The two `reiki_status_*` and `reiki_stream_healthy_keys` series come from a JSON exporter that reads `GET /v1/status` with the admin token: `reiki_status_intercept_ca_days_left` from `intercept.ca_days_left`, and `reiki_stream_healthy_keys{stream="..."}` from the keys named in each `streams[].chain` whose `state` is `available`. Those names are exporter series, not built-in Reiki metrics. Reiki logs a CA warning within 30 days of expiry and reports `ca_days_left` on `/v1/status`; see [tunnel](tunnel.md#interception).

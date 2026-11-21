@@ -411,18 +411,28 @@ fn process_salt() -> [u8; 16] {
     })
 }
 
-/// Per-character lowercasing, enough to match names whatever their case.
+/// Per-character lowercasing, enough to match names whatever their case. A character whose
+/// lowercase mapping expands (for example `İ` to `i` plus a combining dot) contributes every
+/// resulting character.
 fn fold(text: &str) -> Vec<char> {
-    text.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+    fold_indexed(text).into_iter().map(|(_, _, c)| c).collect()
 }
 
-/// Each character of `text` with its byte range, lowercased once for the folded haystack.
+/// Each folded character with the byte range of the original character it came from. An expansion
+/// shares that range, so a match inside it still masks the whole original character.
 fn fold_indexed(text: &str) -> Vec<(usize, usize, char)> {
-    text.char_indices()
-        .map(|(i, c)| (i, i + c.len_utf8(), c.to_lowercase().next().unwrap_or(c)))
-        .collect()
+    let mut out = Vec::with_capacity(text.len());
+    for (start, c) in text.char_indices() {
+        let end = start + c.len_utf8();
+        let mut lower = c.to_lowercase();
+        if let Some(first) = lower.next() {
+            out.push((start, end, first));
+            out.extend(lower.map(|c| (start, end, c)));
+        } else {
+            out.push((start, end, c));
+        }
+    }
+    out
 }
 
 /// The folded text searched once, plus the map back to byte offsets in the original.
@@ -581,6 +591,24 @@ mod tests {
         let mut reverse = HashMap::new();
         let out = m.mask("日本 ZÜRICH büro 日本", &mut reverse).unwrap();
         assert!(out.starts_with("日本 [[REIKI_TERM_") && out.ends_with("]] 日本"));
+    }
+
+    #[test]
+    fn a_lowercase_mapping_that_expands_to_several_characters_is_matched() {
+        // U+0130 lowercases to the two characters `i` and U+0307. A one-character-per-byte fold
+        // would keep only the first and miss the rest of the term.
+        let m = masker(&["i\u{307}stanbul"], false);
+        let mut reverse = HashMap::new();
+        let out = m.mask("Visit İSTANBUL now", &mut reverse).unwrap();
+        assert!(!out.contains('İ') && !out.contains("STANBUL"), "{out}");
+        assert_eq!(reverse.values().next().unwrap(), "İSTANBUL");
+
+        // A match inside the expansion maps back to the whole original character.
+        let m = masker(&["i"], false);
+        let mut reverse = HashMap::new();
+        let out = m.mask("İ", &mut reverse).unwrap();
+        assert!(!out.contains('İ'), "{out}");
+        assert_eq!(reverse.values().next().unwrap(), "İ");
     }
 
     /// The first placeholder in a masked body.

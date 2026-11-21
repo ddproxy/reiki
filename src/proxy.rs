@@ -828,12 +828,12 @@ impl App {
         paths
     }
 
-    /// Records the config path that `POST /reload` re-reads.
+    /// Records the config path that `POST /v1/reload` re-reads.
     pub fn set_config_path(&self, path: PathBuf) {
         let _ = self.config_path.set(path);
     }
 
-    /// The `config` object of `/status`: the reload generation, when it loaded and how the last reload went.
+    /// The `config` object of `/v1/status`: the reload generation, when it loaded and how the last reload went.
     pub fn reload_status_json(&self) -> String {
         self.reload_state
             .lock()
@@ -841,7 +841,7 @@ impl App {
             .status_json()
     }
 
-    /// Failed service-log file writes dropped since start, for `/status`.
+    /// Failed service-log file writes dropped since start, for `/v1/status`.
     pub(crate) fn file_write_errors(&self) -> u64 {
         self.logging
             .get()
@@ -1051,16 +1051,65 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new().fallback(handle).with_state(app)
 }
 
+/// How many percent-decoding layers are inspected. Each valid decode shortens the path, so a
+/// path still changing after this many layers cannot be checked and is refused.
+const MAX_PATH_DECODE_LAYERS: usize = 8;
+
 /// True for a `.` or `..` segment, plain or percent-encoded, an encoded `/` or `\`, or a
 /// raw backslash: forms an upstream may normalise into a path outside the one Reiki checked.
+/// Every encoding layer is checked, so `%252e%252e` is caught once it decodes to `%2e%2e`.
 fn has_path_trick(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("%2f")
-        || lower.contains("%5c")
-        || lower.contains('\\')
-        || lower
-            .split('/')
-            .any(|segment| matches!(segment.replace("%2e", ".").as_str(), "." | ".."))
+    let mut layer = path.to_owned();
+    for _ in 0..MAX_PATH_DECODE_LAYERS {
+        let lower = layer.to_ascii_lowercase();
+        if lower.contains("%2f")
+            || lower.contains("%5c")
+            || lower.contains('\\')
+            || lower
+                .split('/')
+                .any(|segment| matches!(segment.replace("%2e", ".").as_str(), "." | ".."))
+        {
+            return true;
+        }
+        // A malformed escape, or bytes that are not UTF-8 after decoding, cannot be validated:
+        // refuse the path instead of forwarding something an upstream might normalise differently.
+        let Some(decoded) = decode_path_layer(&layer) else {
+            return true;
+        };
+        if decoded == layer {
+            return false;
+        }
+        layer = decoded;
+    }
+    // Still changing after the last layer: the check could not be completed.
+    true
+}
+
+/// One pass of percent-decoding, or `None` for a malformed escape or non-UTF-8 result.
+fn decode_path_layer(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = |byte: u8| -> Option<u8> {
+                match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                }
+            };
+            let high = hex(*bytes.get(at + 1)?)?;
+            let low = hex(*bytes.get(at + 2)?)?;
+            out.push((high << 4) | low);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -3409,10 +3458,23 @@ mod tests {
             "/up/a%2fb",
             "/up/a%5Cb",
             "/up\\x",
+            "/up/%252e%252e/admin",
+            "/up/%252Fadmin",
+            "/up/%255cadmin",
+            "/up/%25252e%25252e/admin",
+            "/up/%",
+            "/up/%zz",
         ] {
             assert!(has_path_trick(path), "{path}");
         }
-        for path in ["/up/v1/chat", "/up/a..b/c", "/up/.hidden", "/up/..x", "/"] {
+        for path in [
+            "/up/v1/chat",
+            "/up/a..b/c",
+            "/up/.hidden",
+            "/up/..x",
+            "/",
+            "/up/a%2520b",
+        ] {
             assert!(!has_path_trick(path), "{path}");
         }
     }

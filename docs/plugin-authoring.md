@@ -67,7 +67,7 @@ The context types are `#[non_exhaustive]`. Use their constructors in tests; do n
 
 `Event` is `#[non_exhaustive]`, so match with a wildcard arm. Its variants are `RequestDone`, `Failover`, `Cooldown`, `RateLimited`, `PluginRejected` and `Finding`. `Finding` carries a sanitised `detail` label from `report_detail`. `FailureKind` is also non-exhaustive; `CooldownScope` is `Key` or `Model`.
 
-Admin paths must start with `/`, must not be `/`, have no trailing slash, `%`, or empty, `.` or `..` segment. A duplicate path, or one Reiki reserves (`/status`, `/failures`, `/reload`, `/keys/enable`, their `/v1` forms, `/v1/openapi.json`), fails plugin chain construction at startup; a bad reload is refused. Reiki authenticates the caller before calling the hook.
+Admin paths must start with `/`, must not be `/`, have no trailing slash, `%`, or empty, `.` or `..` segment. A duplicate path, or one Reiki reserves (`/v1/status`, `/v1/failures`, `/v1/reload`, `/v1/keys/enable`, `/v1/openapi.json`), fails plugin chain construction at startup; a bad reload is refused. Reiki authenticates the caller before calling the hook.
 
 ## Errors and `on_error`
 

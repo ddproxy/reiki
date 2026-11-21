@@ -93,16 +93,15 @@ pub fn load_state(path: &Path, config: &Config) -> LoadedState {
     let file: File = match toml::from_str(&text) {
         Ok(file) => file,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "ignoring corrupt key state");
+            tracing::warn!(path = %path.display(), error = %e, "ignoring key state in an unsupported format; starting fresh");
             return LoadedState::default();
         }
     };
 
     let now = unix_millis(SystemTime::now());
-    let saved_at = UNIX_EPOCH + Duration::from_millis(file.saved_at);
     let mut out = LoadedState::default();
     for (name, entry) in &file.keys {
-        if !matches_key(config, name, saved_at, &entry.upstream, &entry.key_sha256) {
+        if !matches_key(config, name, &entry.upstream, &entry.key_sha256) {
             continue;
         }
         let cooling = if entry.recovery > now {
@@ -120,7 +119,7 @@ pub fn load_state(path: &Path, config: &Config) -> LoadedState {
         );
     }
     for (name, entry) in file.shaper {
-        if !matches_key(config, &name, saved_at, &entry.upstream, &entry.key_sha256) {
+        if !matches_key(config, &name, &entry.upstream, &entry.key_sha256) {
             continue;
         }
         let snapshot = entry.into_snapshot();
@@ -131,25 +130,14 @@ pub fn load_state(path: &Path, config: &Config) -> LoadedState {
     out
 }
 
-/// The existing rotation rule: same configured key, same upstream and same key-file
-/// digest (or an older file than the state) as when the state was written.
-fn matches_key(
-    config: &Config,
-    name: &str,
-    saved_at: SystemTime,
-    saved_upstream: &Option<String>,
-    saved_digest: &Option<String>,
-) -> bool {
+/// The rotation rule: same configured key, same upstream and same key-file digest
+/// as when the state was written.
+fn matches_key(config: &Config, name: &str, saved_upstream: &str, saved_digest: &str) -> bool {
     let Some(key) = config.keys.get(name) else {
         return false;
     };
     // A re-pointed key (same name and secret, different upstream) must start healthy.
-    if let Some(saved_upstream) = saved_upstream.as_deref() {
-        if saved_upstream != key.upstream {
-            return false;
-        }
-    }
-    !secret_changed(&key.file, saved_at, saved_digest.as_deref())
+    saved_upstream == key.upstream && !secret_changed(&key.file, saved_digest)
 }
 
 pub fn save(
@@ -171,12 +159,13 @@ pub fn save_with_shaper(
     let now = unix_millis(SystemTime::now());
     let entries = snapshot
         .iter()
-        .map(|(name, health)| {
-            // Store the upstream the key targeted when saved; absent in older
-            // state files. A re-pointed key (same name and secret, different
-            // upstream) must not inherit the saved health.
-            let upstream = config.keys.get(name).map(|k| k.upstream.clone());
-            (
+        .filter_map(|(name, health)| {
+            // Store the upstream the key targeted when saved. A re-pointed key
+            // (same name and secret, different upstream) must not inherit the
+            // saved health.
+            let key = config.keys.get(name)?;
+            let secret = keys.get(name)?;
+            Some((
                 name.clone(),
                 Entry {
                     disabled: health.disabled,
@@ -184,18 +173,17 @@ pub fn save_with_shaper(
                         .cooling
                         .map_or(0, |cooling| now + cooling.as_millis() as u64),
                     failures: health.transient_failures,
-                    key_sha256: keys
-                        .get(name)
-                        .map(|key| crate::auth::sha256_hex(key.expose())),
-                    upstream,
+                    key_sha256: crate::auth::sha256_hex(secret.expose()),
+                    upstream: key.upstream.clone(),
                 },
-            )
+            ))
         })
         .collect();
     let shaper = shaper
         .iter()
         .filter_map(|(name, snapshot)| {
             let upstream = config.keys.get(name)?.upstream.clone();
+            let secret = keys.get(name)?;
             Some((
                 name.clone(),
                 ShaperEntry {
@@ -204,16 +192,13 @@ pub fn save_with_shaper(
                     closed_secs: snapshot.closed.map(ceil_secs),
                     daily: snapshot.daily.map(QuotaEntry::from),
                     monthly: snapshot.monthly.map(QuotaEntry::from),
-                    key_sha256: keys
-                        .get(name)
-                        .map(|key| crate::auth::sha256_hex(key.expose())),
-                    upstream: Some(upstream),
+                    key_sha256: crate::auth::sha256_hex(secret.expose()),
+                    upstream,
                 },
             ))
         })
         .collect();
     let file = File {
-        saved_at: now,
         keys: entries,
         shaper,
     };
@@ -230,18 +215,13 @@ pub fn save_with_shaper(
 }
 
 /// A key whose secret changed after the state was written starts healthy. The recorded digest
-/// decides when there is one; state without it falls back to the file's modified time. A file
-/// that cannot be read counts as changed: nothing proves it holds the recorded secret.
-fn secret_changed(file: &str, saved_at: SystemTime, saved_digest: Option<&str>) -> bool {
-    if let Some(saved) = saved_digest {
-        let digest = std::fs::read_to_string(file)
-            .ok()
-            .map(|text| crate::auth::sha256_hex(text.trim()));
-        return digest.as_deref() != Some(saved);
-    }
-    std::fs::metadata(file)
-        .and_then(|meta| meta.modified())
-        .map_or(true, |modified| modified > saved_at)
+/// decides; a file that cannot be read counts as changed because nothing proves it still holds
+/// that secret.
+fn secret_changed(file: &str, saved_digest: &str) -> bool {
+    let digest = std::fs::read_to_string(file)
+        .ok()
+        .map(|text| crate::auth::sha256_hex(text.trim()));
+    digest.as_deref() != Some(saved_digest)
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -298,34 +278,30 @@ fn ceil_secs(duration: Duration) -> u64 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct File {
-    saved_at: u64,
-    #[serde(default)]
     keys: BTreeMap<String, Entry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     shaper: BTreeMap<String, ShaperEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
-    #[serde(default)]
     disabled: bool,
-    #[serde(default)]
     recovery: u64,
-    #[serde(default)]
     failures: u32,
-    /// SHA-256 of the key when saved; absent in state written before it was recorded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    key_sha256: Option<String>,
-    /// Upstream the key targeted when saved; absent in older state files. A re-pointed
-    /// key (same name and secret, different upstream) must not inherit the saved health.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    upstream: Option<String>,
+    /// SHA-256 of the key when saved. A rotated key file starts healthy.
+    key_sha256: String,
+    /// Upstream the key targeted when saved. A re-pointed key starts healthy.
+    upstream: String,
 }
 
 /// The shaper's durable facts for one key. Durations are rounded up to whole
 /// seconds; the quota windows keep their absolute start so a later window resets.
+/// Only facts learned for the key are present; identity fields are always required.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShaperEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     learned_rpm: Option<u32>,
@@ -337,13 +313,12 @@ struct ShaperEntry {
     daily: Option<QuotaEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     monthly: Option<QuotaEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    key_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    upstream: Option<String>,
+    key_sha256: String,
+    upstream: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QuotaEntry {
     start: i64,
     requests: u32,
@@ -487,17 +462,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A key file last modified an hour ago, so state saved now is newer than it.
-    fn old_key_file(tag: &str) -> PathBuf {
+    fn key_file(tag: &str) -> PathBuf {
         let path = temp_path(&format!("{tag}-key"));
         crate::keys::write_key(&path, "sk-fake-secret");
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
         path
     }
 
-    fn write_state(path: &Path, saved_at: u64, entries: &[(&str, bool, u64, u32)]) {
+    fn write_state(path: &Path, upstream: &str, digest: &str, entries: &[(&str, bool, u64, u32)]) {
         let mut keys = BTreeMap::new();
         for (name, disabled, recovery, failures) in entries {
             keys.insert(
@@ -506,13 +477,12 @@ mod tests {
                     disabled: *disabled,
                     recovery: *recovery,
                     failures: *failures,
-                    key_sha256: None,
-                    upstream: None, // no upstream in legacy write_state
+                    key_sha256: digest.to_owned(),
+                    upstream: upstream.to_owned(),
                 },
             );
         }
         let file = File {
-            saved_at,
             keys,
             shaper: BTreeMap::new(),
         };
@@ -523,7 +493,7 @@ mod tests {
     fn key_health_round_trips_through_the_file() {
         let path = temp_path("roundtrip");
         let _ = std::fs::remove_file(&path);
-        let (key_a, key_b) = (old_key_file("rt-a"), old_key_file("rt-b"));
+        let (key_a, key_b) = (key_file("rt-a"), key_file("rt-b"));
         let config = config_with_keys(&[
             ("a", key_a.to_str().unwrap()),
             ("b", key_b.to_str().unwrap()),
@@ -565,19 +535,20 @@ mod tests {
     #[test]
     fn a_corrupt_file_loads_as_empty() {
         let path = temp_path("corrupt");
-        std::fs::write(&path, "saved_at = \"soon\"\n[keys.\n").unwrap();
+        std::fs::write(&path, "[keys.a\nrecovery = \"soon\"\n").unwrap();
         let config = config_with_keys(&[("a", "/unused/a")]);
         assert!(load(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn a_key_file_newer_than_the_state_starts_healthy() {
+    fn a_key_file_with_a_different_digest_starts_healthy() {
         let path = temp_path("changed");
         let key_file = temp_path("changed-key");
         crate::keys::write_key(&key_file, "sk-fake-secret");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
-        write_state(&path, 1_000, &[("a", true, 4_000_000_000_000, 3)]);
+        let other = crate::auth::sha256_hex("a-different-secret");
+        write_state(&path, "zen", &other, &[("a", true, 4_000_000_000_000, 3)]);
         assert!(load(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
@@ -590,7 +561,8 @@ mod tests {
         crate::keys::write_key(&key_file, "sk-fake-secret");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let now = unix_millis(SystemTime::now());
-        write_state(&path, now + 3_600_000, &[("a", false, now + 3_600_000, 2)]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        write_state(&path, "zen", &digest, &[("a", false, now + 3_600_000, 2)]);
         let loaded = load(&path, &config);
         assert_eq!(loaded.len(), 1);
         assert!(loaded["a"].cooling.is_some());
@@ -603,7 +575,7 @@ mod tests {
     fn the_state_file_holds_a_key_digest_and_never_the_key() {
         let path = temp_path("secrets");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("secrets");
+        let key_file = key_file("secrets");
         crate::keys::write_key(&key_file, "sk-fake-secret\n");
         let mut state = KeyState::default();
         state.record_failure(
@@ -631,10 +603,10 @@ mod tests {
     #[test]
     fn an_absurd_recovery_time_is_capped_instead_of_overflowing() {
         let path = temp_path("absurd");
-        let key_file = old_key_file("absurd");
+        let key_file = key_file("absurd");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
-        let now = unix_millis(SystemTime::now());
-        write_state(&path, now, &[("a", false, i64::MAX as u64, 0)]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        write_state(&path, "zen", &digest, &[("a", false, i64::MAX as u64, 0)]);
 
         let loaded = load(&path, &config);
         let cooling = loaded["a"].cooling.unwrap();
@@ -648,29 +620,27 @@ mod tests {
     }
 
     #[test]
-    fn hostile_recovery_and_saved_at_values_are_rejected_or_capped() {
+    fn hostile_recovery_values_are_rejected_or_capped() {
         let path = temp_path("hostile-recovery");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("hostile-recovery");
+        let key_file = key_file("hostile-recovery");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
-        // The recorded digest keeps the key eligible regardless of saved_at, so the
-        // test isolates how the timestamps themselves are handled.
         let digest = crate::auth::sha256_hex("sk-fake-secret");
         let now = unix_millis(SystemTime::now());
 
-        let write = |saved_at: &str, recovery: &str| {
+        let write = |recovery: &str| {
             std::fs::write(
                 &path,
                 format!(
-                    "saved_at = {saved_at}\n[keys.a]\nrecovery = {recovery}\n\
-                     key_sha256 = \"{digest}\"\nupstream = \"zen\"\n"
+                    "[keys.a]\ndisabled = false\nrecovery = {recovery}\n\
+                     failures = 0\nkey_sha256 = \"{digest}\"\nupstream = \"zen\"\n"
                 ),
             )
             .unwrap();
         };
 
         // The largest TOML integer is accepted, but capped before it reaches Instant.
-        write(&now.to_string(), &(i64::MAX as u64).to_string());
+        write(&(i64::MAX as u64).to_string());
         let loaded = load(&path, &config);
         assert_eq!(loaded["a"].cooling, Some(MAX_RESTORED_COOLDOWN));
         let mut state = KeyState::default();
@@ -678,32 +648,55 @@ mod tests {
         assert!(state.cooling_remaining("a", Instant::now()).is_some());
 
         // A value beyond TOML's integer range is rejected with the whole file.
-        write(&now.to_string(), "18446744073709551615");
+        write("18446744073709551615");
         assert!(load(&path, &config).is_empty());
 
         // Zero and a deadline that has already passed never become a cooldown.
-        write(&now.to_string(), "0");
+        write("0");
         assert_eq!(load(&path, &config)["a"].cooling, None);
-        write(&now.to_string(), &now.to_string());
+        write(&now.to_string());
         assert_eq!(load(&path, &config)["a"].cooling, None);
 
-        // Negative, NaN-like and float values are not u64: the file is ignored,
-        // rather than reaching any Instant/SystemTime arithmetic.
+        // Negative, float and string values are not u64: the file is ignored rather
+        // than reaching any Instant arithmetic.
         for recovery in ["-1", "nan", "inf", "-inf", "1e30", "\"NaN\""] {
-            write(&now.to_string(), recovery);
+            write(recovery);
             assert!(load(&path, &config).is_empty(), "recovery = {recovery}");
         }
-        for saved_at in ["-1", "nan", "inf", "1e30"] {
-            write(saved_at, &(now + 3_600_000).to_string());
-            assert!(load(&path, &config).is_empty(), "saved_at = {saved_at}");
-        }
 
-        // A huge but valid saved_at converts to SystemTime without panicking.
-        write(
-            &(i64::MAX as u64).to_string(),
-            &(now + 3_600_000).to_string(),
-        );
-        assert!(load(&path, &config)["a"].cooling.is_some());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn a_state_file_in_another_format_is_ignored() {
+        let path = temp_path("unsupported-format");
+        let key_file = key_file("unsupported-format");
+        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        let now = unix_millis(SystemTime::now());
+
+        // A previous field is unknown now.
+        std::fs::write(
+            &path,
+            format!(
+                "saved_at = {now}\n[keys.a]\ndisabled = false\nrecovery = {now}\n\
+                 failures = 0\nkey_sha256 = \"{digest}\"\nupstream = \"zen\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(load(&path, &config).is_empty());
+
+        // A required identity field is missing.
+        std::fs::write(
+            &path,
+            format!(
+                "[keys.a]\ndisabled = false\nrecovery = {now}\n\
+                 failures = 0\nupstream = \"zen\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(load(&path, &config).is_empty());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
@@ -712,11 +705,12 @@ mod tests {
     #[test]
     fn a_month_long_quota_cooldown_survives_a_restart() {
         let path = temp_path("month");
-        let key_file = old_key_file("month");
+        let key_file = key_file("month");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let now = unix_millis(SystemTime::now());
         let in_20_days = now + 20 * 86_400_000;
-        write_state(&path, now, &[("a", false, in_20_days, 0)]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        write_state(&path, "zen", &digest, &[("a", false, in_20_days, 0)]);
 
         let cooling = load(&path, &config)["a"].cooling.unwrap();
         assert!(cooling > Duration::from_secs(19 * 86_400));
@@ -728,15 +722,16 @@ mod tests {
         let path = temp_path("unreadable");
         let config = config_with_keys(&[("a", "/unused/a")]);
         let now = unix_millis(SystemTime::now());
-        write_state(&path, now, &[("a", true, now + 3_600_000, 3)]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
+        write_state(&path, "zen", &digest, &[("a", true, now + 3_600_000, 3)]);
         assert!(load(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn a_replaced_key_starts_healthy_even_with_an_old_mtime() {
+    fn a_replaced_key_starts_healthy() {
         let path = temp_path("resized");
-        let key_file = old_key_file("resized");
+        let key_file = key_file("resized");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let mut state = KeyState::default();
         state.record_failure(
@@ -754,12 +749,6 @@ mod tests {
         assert!(load(&path, &config)["a"].disabled, "same file is restored");
 
         crate::keys::write_key(&key_file, "a-longer-replacement-secret");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&key_file)
-            .unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
         assert!(load(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
@@ -769,7 +758,7 @@ mod tests {
     fn a_repointed_key_starts_healthy() {
         let path = temp_path("repointed");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("repointed");
+        let key_file = key_file("repointed");
         let zen = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
         let mut state = KeyState::default();
         state.record_failure(
@@ -797,7 +786,7 @@ mod tests {
     fn the_same_upstream_restores_saved_health() {
         let path = temp_path("same-upstream");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("same-upstream");
+        let key_file = key_file("same-upstream");
         let config = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
         let mut state = KeyState::default();
         state.record_failure(
@@ -819,16 +808,22 @@ mod tests {
     }
 
     #[test]
-    fn older_state_without_the_upstream_field_still_restores() {
-        let path = temp_path("legacy");
-        let key_file = old_key_file("legacy");
+    fn a_state_file_without_the_upstream_field_is_ignored() {
+        let path = temp_path("no-upstream");
+        let key_file = key_file("no-upstream");
         let config = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
+        let digest = crate::auth::sha256_hex("sk-fake-secret");
         let now = unix_millis(SystemTime::now());
-        write_state(&path, now, &[("a", false, now + 3_600_000, 2)]);
-        let loaded = load(&path, &config);
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded["a"].cooling.is_some());
-        assert_eq!(loaded["a"].transient_failures, 2);
+        std::fs::write(
+            &path,
+            format!(
+                "[keys.a]\ndisabled = false\nrecovery = {}\n\
+                 failures = 2\nkey_sha256 = \"{digest}\"\n",
+                now + 3_600_000
+            ),
+        )
+        .unwrap();
+        assert!(load(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
     }
@@ -837,7 +832,7 @@ mod tests {
     fn a_shaper_snapshot_round_trips_through_the_file() {
         let path = temp_path("shaper-roundtrip");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("shaper-roundtrip");
+        let key_file = key_file("shaper-roundtrip");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let shaper = BTreeMap::from([(
             "a".to_owned(),
@@ -871,7 +866,7 @@ mod tests {
     fn a_rotated_key_does_not_restore_shaper_state() {
         let path = temp_path("shaper-rotated");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("shaper-rotated");
+        let key_file = key_file("shaper-rotated");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let shaper = BTreeMap::from([(
             "a".to_owned(),
@@ -885,12 +880,6 @@ mod tests {
         assert_eq!(load_shaper(&path, &config).len(), 1);
 
         crate::keys::write_key(&key_file, "a-different-secret");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&key_file)
-            .unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
         assert!(load_shaper(&path, &config).is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&key_file);
@@ -900,7 +889,7 @@ mod tests {
     fn a_repointed_upstream_does_not_restore_shaper_state() {
         let path = temp_path("shaper-repointed");
         let _ = std::fs::remove_file(&path);
-        let key_file = old_key_file("shaper-repointed");
+        let key_file = key_file("shaper-repointed");
         let zen = config_with_keys_upstream("zen", &[("a", key_file.to_str().unwrap())]);
         let shaper = BTreeMap::from([(
             "a".to_owned(),
@@ -925,41 +914,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_shaper_table_serialises_like_the_old_file() {
-        #[derive(serde::Serialize)]
-        struct Legacy {
-            saved_at: u64,
-            keys: BTreeMap<String, Entry>,
-        }
-
-        let file = File {
-            saved_at: 1,
-            keys: BTreeMap::new(),
-            shaper: BTreeMap::new(),
-        };
-        let legacy = Legacy {
-            saved_at: 1,
-            keys: BTreeMap::new(),
-        };
-        let text = toml::to_string(&file).unwrap();
-        assert_eq!(text, toml::to_string(&legacy).unwrap());
-        assert!(!text.contains("shaper"));
-    }
-
-    #[test]
-    fn older_state_without_a_shaper_table_loads_without_one() {
-        let path = temp_path("no-shaper");
-        let key_file = old_key_file("no-shaper");
-        let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
-        let now = unix_millis(SystemTime::now());
-        write_state(&path, now, &[("a", false, now + 3_600_000, 2)]);
-        assert_eq!(load(&path, &config).len(), 1);
-        assert!(load_shaper(&path, &config).is_empty());
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&key_file);
-    }
-
-    #[test]
     fn saving_survives_a_planted_temporary_file_and_leaves_none_behind() {
         let dir = std::env::temp_dir().join(format!("reiki-state-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -972,9 +926,9 @@ mod tests {
             let name = format!("reiki.toml.state.tmp.{}.{n}", std::process::id());
             std::os::unix::fs::symlink(&planted, dir.join(name)).unwrap();
         }
-        write_atomically(&path, "saved_at = 1\n").unwrap();
-        write_atomically(&path, "saved_at = 2\n").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "saved_at = 2\n");
+        write_atomically(&path, "marker = 1\n").unwrap();
+        write_atomically(&path, "marker = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "marker = 2\n");
         assert_eq!(std::fs::read_to_string(&planted).unwrap(), "x");
         let _ = std::fs::remove_dir_all(&dir);
     }

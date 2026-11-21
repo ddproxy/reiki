@@ -112,7 +112,7 @@ Replaying a non-idempotent request could duplicate a side effect, so Reiki does 
 
 ## Re-enabling keys
 
-- `reiki keys --enable NAME` calls `POST /keys/enable` on the admin listener. This clears the key's cooldown, its disabled flag, its failure count and its combination cooldowns. The change is saved. See [keys and streams](keys.md#key-state-and-enable).
+- `reiki keys --enable NAME` calls `POST /v1/keys/enable` on the admin listener. This clears the key's cooldown, its disabled flag, its failure count and its combination cooldowns. The change is saved. See [keys and streams](keys.md#key-state-and-enable).
 - A reload (`reiki reload`, SIGHUP, or `[reload] watch`) re-enables a key only when its key file content changed, or when the key is new. A disabled key whose file did not change stays disabled.
 - A restart restores disabled flags and key-level cooldowns from the state file, `<config>.state`. Combination cooldowns and the last status are not restored. A key whose file or upstream changed starts healthy.
 
@@ -122,9 +122,9 @@ Replaying a non-idempotent request could duplicate a side effect, so Reiki does 
 | --- | --- |
 | `reiki keys` | Per key: `ok`, `cooling` or `disabled`, cooldown seconds, last status, streams. See [cli](cli.md). |
 | `reiki keys --json` | Adds a `scopes` array for keys with cooling combinations. |
-| `GET /status` (admin) | `keys[].state` is `available`, `cooling` or `out_of_rotation`. Also `retry_after_seconds`, `cooldown_class`, `consecutive_failures`, `last_status_code` and `scopes`. See [monitoring](monitoring.md). |
+| `GET /v1/status` (admin) | `keys[].state` is `available`, `cooling` or `out_of_rotation`. Also `retry_after_seconds`, `cooldown_class`, `consecutive_failures`, `last_status_code` and `scopes`. See [monitoring](monitoring.md). |
 | `reiki top` | Live view of cooldowns and failures. See [top](top.md). |
-| `/metrics` | `reiki_cooldowns_total{key,class,scope}` and `reiki_failovers_total{stream,key,class}`. Needs the `metrics` plugin. |
+| `/v1/metrics` | `reiki_cooldowns_total{key,class,scope}` and `reiki_failovers_total{stream,key,class}`. Needs the `metrics` plugin. |
 | Log | `upstream key failed` (with class, status, whether it cooled and seconds remaining), `request needs more than this key can afford, trying the next key`, `falling back`, `key refused this request, trying the next key`, and `not replaying a non-idempotent request`. |
 
 For a 503 that does not clear, check the log for `upstream key failed` and whether the key shows as `disabled`. The [troubleshooting](troubleshooting.md) page covers the status codes Reiki sends.

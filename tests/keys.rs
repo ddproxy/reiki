@@ -212,9 +212,8 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     assert_eq!(code, 200, "{body}");
     let all: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert!(!all.is_empty(), "{body}");
-    let (code, bare) = rig.admin_get("/failures", true).await;
-    assert_eq!(code, 200, "{bare}");
-    assert_eq!(bare, body, "the v1 and bare routes answer the same");
+    let (code, _bare) = rig.admin_get("/failures", true).await;
+    assert_eq!(code, 404, "the bare route is not served");
     let first = &all[0];
     assert_eq!(first["key"], "a");
     assert_eq!(first["stream"], "s");

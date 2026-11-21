@@ -1047,9 +1047,25 @@ mod tests {
 
     const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-    const DOC: &str = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-        {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-         "soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#;
+    const DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
 
     fn fleet() -> Fleet {
         Fleet::new(Duration::from_secs(30))
@@ -1116,9 +1132,21 @@ mod tests {
             "peer-a",
             FeedEvent::Event {
                 event: "key".to_owned(),
-                data: r#"{"upstream":{"name":"zen","healthy_keys":0,"cooling_keys":1,
-                    "disabled_keys":0,"last_status_class":"4xx"}}"#
-                    .to_owned(),
+                data: r#"{
+   "age_seconds" : 0,
+   "observed_at" : "t",
+   "upstream" : {
+      "cooling_combinations" : 0,
+      "cooling_keys" : 1,
+      "disabled_keys" : 0,
+      "healthy_keys" : 0,
+      "last_status_class" : "4xx",
+      "name" : "zen",
+      "soonest_cooldown_seconds" : null
+   }
+}
+"#
+                .to_owned(),
             },
             now,
         );
@@ -1311,15 +1339,18 @@ mod tests {
         let mut fleet = fleet();
         let usage = |name: &str, zen: &str, worklog: &str| {
             format!(
-                r#"{{"instance":"{name}","observed_at":"t","upstreams":[
+                r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                    "failures":{{}},"upstreams":[
                     {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                      "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-                      "requests_1h":10,"limited_1h":2,"request_minutes":{zen},
-                      "token_minutes":{zen}}},
+                      "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                      "requests_1h":10,"limited_1h":2,"request_buckets":[0,0,0,0,0,0,0,0,0,0,1,9],
+                      "tokens_1h":10,"token_buckets":[0,0,0,0,0,0,0,0,0,0,1,9],
+                      "request_minutes":{zen},"token_minutes":{zen}}},
                     {{"name":"worklog","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-                      "soonest_cooldown_seconds":null,"last_status_class":"2xx",
-                      "requests_1h":3,"limited_1h":1,"request_minutes":{worklog},
-                      "token_minutes":{worklog}}}]}}"#
+                      "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                      "requests_1h":3,"limited_1h":1,"request_buckets":[0,0,0,0,0,0,0,0,0,0,0,3],
+                      "tokens_1h":3,"token_buckets":[0,0,0,0,0,0,0,0,0,0,0,3],
+                      "request_minutes":{worklog},"token_minutes":{worklog}}}]}}"#
             )
         };
         apply_feed(
@@ -1464,10 +1495,26 @@ mod tests {
             &mut fleet,
             "peer-b",
             FeedEvent::Snapshot(
-                r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-                {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-                 "soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#
-                    .to_owned(),
+                r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 60
+      }
+   ]
+}
+"#
+                .to_owned(),
             ),
             now,
         );
@@ -1507,8 +1554,18 @@ mod tests {
         let every = Duration::from_secs(1);
         let t0 = Instant::now();
         let mut fleet = fleet();
-        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
-            "sessions":{"active_sessions":4}}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 4
+   },
+   "upstreams" : []
+}
+"#;
         apply_feed(
             &mut fleet,
             "peer-a",
@@ -1565,8 +1622,18 @@ mod tests {
     fn a_stale_peer_is_not_sampled() {
         let t0 = Instant::now();
         let mut fleet = Fleet::new(Duration::from_secs(30));
-        let doc = r#"{"instance":"peer-a","observed_at":"t","upstreams":[],
-            "sessions":{"active_sessions":4}}"#;
+        let doc = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "sessions" : {
+      "active_sessions" : 4
+   },
+   "upstreams" : []
+}
+"#;
         apply_feed(
             &mut fleet,
             "peer-a",
@@ -1628,18 +1695,228 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_draws_a_gauge_for_each_peer_from_its_own_traffic() {
-        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "requests_1h":42,"limited_1h":0,
-             "request_buckets":[1,1,2,2,3,3,4,4,5,5,6,6]}]}"#;
-        let doc_b = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "requests_1h":0,"limited_1h":0,
-             "request_buckets":[0,0,0,0,0,0,0,0,0,0,0,0]}]}"#;
-        let doc_c = r#"{"instance":"peer-c","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
-             "requests_1h":12,"limited_1h":2,
-             "request_buckets":[6,6,0,0,0,0,0,0,0,0,0,0]}]}"#;
+        let doc_a = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            4,
+            4,
+            5,
+            5,
+            6,
+            6
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 42,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#;
+        let doc_b = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 0,
+         "name" : "zen",
+         "request_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 0,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#;
+        let doc_c = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-c",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "limited_1h" : 2,
+         "name" : "zen",
+         "request_buckets" : [
+            6,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "request_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "requests_1h" : 12,
+         "soonest_cooldown_seconds" : null,
+         "token_buckets" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "token_minutes" : [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+         ],
+         "tokens_1h" : 0
+      }
+   ]
+}
+"#;
         let url_a = health_server_with(doc_a).await;
         let url_b = health_server_with(doc_b).await;
         let url_c = health_server_with(doc_c).await;
@@ -1812,11 +2089,53 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_filters_to_one_provider_and_hides_absent_peers() {
-        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx"},
-            {"name":"openrouter","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx"}]}"#;
-        let doc_b = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-            {"name":"openrouter","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}]}"#;
+        let doc_a = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      },
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : "2xx",
+         "name" : "openrouter",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
+        let doc_b = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "openrouter",
+         "soonest_cooldown_seconds" : 60
+      }
+   ]
+}
+"#;
         let url_a = health_server_with(doc_a).await;
         let url_b = health_server_with(doc_b).await;
         let token = token_file("once-provider-filter");
@@ -1854,9 +2173,25 @@ mod tests {
         assert!(out.contains("zen"), "{out}");
         assert_eq!(err.trim(), "unknown provider: gone");
     }
-    const COOLING_DOC: &str = r#"{"instance":"peer-b","observed_at":"t","upstreams":[
-        {"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
-         "soonest_cooldown_seconds":90,"last_status_class":"4xx"}]}"#;
+    const COOLING_DOC: &str = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-b",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 1,
+         "disabled_keys" : 0,
+         "healthy_keys" : 0,
+         "last_status_class" : "4xx",
+         "name" : "zen",
+         "soonest_cooldown_seconds" : 90
+      }
+   ]
+}
+"#;
 
     fn plain(lines: &[view::Line]) -> Vec<String> {
         lines.iter().map(view::Line::plain_text).collect()
@@ -1905,8 +2240,25 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_prints_the_cooling_panel_after_the_matrix() {
-        let doc_a = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
-            {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0}]}"#;
+        let doc_a = r#"{
+   "age_seconds" : 0,
+   "failures" : {},
+   "instance" : "peer-a",
+   "observed_at" : "t",
+   "reiki_version" : "0.10.3",
+   "upstreams" : [
+      {
+         "cooling_combinations" : 0,
+         "cooling_keys" : 0,
+         "disabled_keys" : 0,
+         "healthy_keys" : 1,
+         "last_status_class" : null,
+         "name" : "zen",
+         "soonest_cooldown_seconds" : null
+      }
+   ]
+}
+"#;
         let url_a = health_server_with(doc_a).await;
         let url_b = health_server_with(COOLING_DOC).await;
         let token = token_file("once-cooling");

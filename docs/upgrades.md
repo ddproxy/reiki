@@ -2,14 +2,14 @@
 
 Upgrade the binary, apply config, and verify health. Read [CHANGELOG.md](../CHANGELOG.md) first for behaviour changes and new keys.
 
-Reiki does not load new binary code on reload. `SIGHUP`, `reiki reload`, `POST /reload` and `[reload] watch` re-read the config and restart nothing. A reload builds the whole new state, including key files, plugin settings, tunnel policy, TLS material and the log level, before it swaps anything. A bad reload keeps the running state. Requests and tunnels already open keep the state they started with.
+Reiki does not load new binary code on reload. `SIGHUP`, `reiki reload`, `POST /v1/reload` and `[reload] watch` re-read the config and restart nothing. A reload builds the whole new state, including key files, plugin settings, tunnel policy, TLS material and the log level, before it swaps anything. A bad reload keeps the running state. Requests and tunnels already open keep the state they started with.
 
 ```bash
 reiki --config /etc/reiki/reiki.toml reload --dry-run \
   --token-file /etc/reiki/admin.token
 ```
 
-The JSON answer has `changed` and `restart_needed`. Preview with `?dry_run=true` on `POST /reload`; see [monitoring](monitoring.md#post-reload).
+The JSON answer has `changed` and `restart_needed`. Preview with `?dry_run=true` on `POST /v1/reload`; see [monitoring](monitoring.md#post-v1reload).
 
 ## Reload vs restart
 
@@ -60,14 +60,14 @@ This is the complete map for every config table and key. "Live" means the change
 
 Reload error cases keep the old state: an unknown plugin, an invalid setting, a key file that is missing or too short, and a failed interception CA check. See [configuration](configuration.md#validation), [plugins](plugins.md) and [troubleshooting](troubleshooting.md#reload).
 
-## State file compatibility
+## State file
 
-Key health lives in `<config>.state`, beside the config. The state file is TOML with `saved_at`, `keys` and optional `shaper` tables. It has no version field. Newer fields use defaults when absent, and unknown fields are ignored, so an older binary can read state written by a newer one for the fields it knows.
+Key health lives in `<config>.state`, beside the config. The state file is TOML with `keys` and an optional `shaper` table. Unknown fields are errors: a file that is not in the current shape is ignored with a warning and rebuilt.
 
 | Fact | Effect |
 | --- | --- |
-| Missing, unreadable or corrupt file | Logged as a warning; Reiki starts fresh. |
-| Key SHA-256 and saved upstream | A rotated key file or re-pointed key starts healthy. Older state without a digest falls back to the file's modified time. |
+| Missing, unreadable or unsupported file | Logged as a warning; Reiki starts fresh. |
+| Key SHA-256 and saved upstream | A rotated key file or re-pointed key starts healthy. The recorded digest is the only rotation check. |
 | Disabled flag, key cooldown, transient failures | Restored at start when the key name, upstream and file digest still match. |
 | Scoped `(route, model)` cooldowns, last status and the failure ring | Not saved; they start empty. |
 | Shaper snapshot | Saved with the same digest and upstream; durations are rounded up to whole seconds. |
@@ -128,15 +128,15 @@ flowchart TD
 1. Prepare the same binary and config on every host. Check each config with the new binary.
 2. Upgrade one instance at a time. Peers do not route traffic, so a brief `unknown` peer view is acceptable. Data older than three poll intervals is treated as unknown.
 3. Reload hosts with live-only changes. Restart hosts with listener, server-cap, shutdown-drain or log-file changes. Coordinate listener moves with clients and TLS proxies.
-4. After each host, check `/__reiki/healthz`, `/status`, `reiki keys`, and the fleet view in `reiki peers` or `reiki top`.
-5. Watch `/metrics` and `GET /failures` after the last host. The failure ring is in memory and starts empty after each restart. See [monitoring](monitoring.md) and [top](top.md).
+4. After each host, check `/__reiki/healthz`, `/v1/status`, `reiki keys`, and the fleet view in `reiki peers` or `reiki top`.
+5. Watch `/v1/metrics` and `GET /v1/failures` after the last host. The failure ring is in memory and starts empty after each restart. See [monitoring](monitoring.md) and [top](top.md).
 
 ## Rollback
 
 Keep the previous binary and config until verification passes. Restore both together: a new config can need a new binary, and an old binary can reject new config keys.
 
-- For a config-only change, put the old config back and reload. State compatibility means no state rewrite is needed.
-- For a binary change, restart with the old binary and old config. `<config>.state` is still readable.
+- For a config-only change, put the old config back and reload. The running binary keeps its state file.
+- For a binary change, restart with the old binary and old config. `<config>.state` is tied to the shape that wrote it, so do not carry it across versions.
 - Roll a fleet back in the reverse order; verify each host before moving to the next.
 
-If the state file was written after a key rotation, the old config and key files still decide which saved health entries match. A key whose file or upstream changed starts healthy.
+If the state file was written after a key rotation, the config and key files decide which saved health entries match. A key whose file or upstream changed starts healthy.

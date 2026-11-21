@@ -69,7 +69,7 @@ $ reiki --config /etc/reiki/reiki.toml failures --limit 20 --key zen-b --json
 
 `time` is Unix seconds. `retry_after` is the received header; `cooling_seconds` is the wait left at the snapshot. `note` is a printable body snippet of at most 200 characters with credentials scrubbed.
 
-A quota `429` with `Retry-After: 90` cools the key for 60 to 90 seconds. The next request is refused locally with `503` and a `retry-after` header; the cooled key is not tried again. The ring holds 64 records in memory and is empty after a restart. See [GET /failures](monitoring.md#get-failures).
+A quota `429` with `Retry-After: 90` cools the key for 60 to 90 seconds. The next request is refused locally with `503` and a `retry-after` header; the cooled key is not tried again. The ring holds 64 records in memory and is empty after a restart. See [GET /v1/failures](monitoring.md#get-v1failures).
 
 > **Limit:** The row above is illustrative. Failure records are a live sample, not the request log; a record can be dropped when another thread holds the buffer.
 
@@ -114,7 +114,7 @@ $ reiki --config /etc/reiki/reiki.toml reload --dry-run --token-file /etc/reiki/
 {"ok":true,"dry_run":true,"generation":0,"keys":1,"streams":1,"changed":["plugins phi,requestlog"],"restart_needed":[]}
 ```
 
-The test asserts `"dry_run":true`, `"generation":0` and `plugins phi,requestlog`; the key and stream counts here are illustrative. A preview applies nothing: `/status` still reports `generation:0` and `last_reload:null`.
+The test asserts `"dry_run":true`, `"generation":0` and `plugins phi,requestlog`; the key and stream counts here are illustrative. A preview applies nothing: `/v1/status` still reports `generation:0` and `last_reload:null`.
 
 `changed` carries plugin, peer TLS and tunnel or intercept diff labels. Key, stream and upstream edits are applied but are not named there. `restart_needed` lists settings that the file changed but the running instance cannot apply. Exit status is `0` for success, `1` for a refused or failed reload and `2` when the admin listener cannot be reached. See [reload](troubleshooting.md#reload).
 

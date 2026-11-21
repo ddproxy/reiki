@@ -68,7 +68,7 @@ Expected answer shape:
 {"ok":true,"dry_run":true,"generation":3,"keys":1,"streams":1,"changed":["plugins phi"],"restart_needed":[]}
 ```
 
-`dry_run` applies nothing. `changed` lists what differs; `restart_needed` lists settings that wait for a restart. A config that fails validation keeps the running state. A bad `dry_run` query on the admin API fails closed with `400`. See [monitoring](monitoring.md#post-reload) and [upgrades](upgrades.md#reload-vs-restart).
+`dry_run` applies nothing. `changed` lists what differs; `restart_needed` lists settings that wait for a restart. A config that fails validation keeps the running state. A bad `dry_run` query on the admin API fails closed with `400`. See [monitoring](monitoring.md#post-v1reload) and [upgrades](upgrades.md#reload-vs-restart).
 
 Plugin table changes rebuild the plugin. `streams` alone applies live without a rebuild. Plugin order is build-time only; it cannot be changed by reload. See [plugins](plugins.md#use-a-plugin).
 
@@ -103,10 +103,10 @@ Proof from the admin listener, with `[plugins.metrics]` enabled:
 
 ```bash
 curl -s -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
-  http://127.0.0.1:4098/metrics
+  http://127.0.0.1:4098/v1/metrics
 ```
 
-Look for `reiki_findings_total{...,action="blocked"}` and `reiki_plugin_rejections_total{plugin="phi",...}`. Neither series carries matched identifier text. See [monitoring](monitoring.md#get-metrics).
+Look for `reiki_findings_total{...,action="blocked"}` and `reiki_plugin_rejections_total{plugin="phi",...}`. Neither series carries matched identifier text. See [monitoring](monitoring.md#get-v1metrics).
 
 ## 6. Roll back
 

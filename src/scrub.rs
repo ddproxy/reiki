@@ -6,6 +6,8 @@
 //! keeps a correct one.
 
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use axum::body::Bytes;
@@ -364,7 +366,100 @@ fn base64_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) {
 
 pub struct StreamScrubber {
     secrets: Vec<Vec<u8>>,
+    /// Reversed proper prefixes of every form, so a walk from the end of a chunk finds the
+    /// longest possible partial secret without scanning the whole form list per chunk.
+    prefixes: PrefixTrie,
     carry: Vec<u8>,
+}
+
+/// A trie of reversed prefixes. A node marks the end of a prefix only when an inserted prefix
+/// finishes there: intermediate nodes are just steps toward a longer prefix.
+struct PrefixTrie {
+    /// Index of the first edge leaving each node, or `NO_EDGE` when it has none.
+    heads: Vec<usize>,
+    /// Whether the path to this node is a whole proper prefix of a secret form.
+    terminal: Vec<bool>,
+    edges: Vec<TrieEdge>,
+    /// Counts one step per byte walked, so a test can prove the suffix scan stays linear.
+    #[cfg(test)]
+    suffix_steps: AtomicUsize,
+}
+
+struct TrieEdge {
+    byte: u8,
+    target: usize,
+    next: usize,
+}
+
+const NO_EDGE: usize = usize::MAX;
+
+impl PrefixTrie {
+    fn new(secrets: &[Vec<u8>]) -> Self {
+        let mut trie = Self {
+            heads: vec![NO_EDGE],
+            terminal: vec![false],
+            edges: Vec::new(),
+            #[cfg(test)]
+            suffix_steps: AtomicUsize::new(0),
+        };
+        for secret in secrets {
+            // A full form is blanked before the suffix check. Every shorter prefix is a possible
+            // held-back tail, so each one is inserted in reverse for the backward walk.
+            for len in 1..secret.len() {
+                trie.insert(&secret[..len]);
+            }
+        }
+        trie
+    }
+
+    /// Inserts a secret prefix in reverse, so the trie can be walked backwards from a chunk end.
+    fn insert(&mut self, prefix: &[u8]) {
+        let mut node = 0;
+        for &byte in prefix.iter().rev() {
+            let mut edge = self.heads[node];
+            while edge != NO_EDGE && self.edges[edge].byte != byte {
+                edge = self.edges[edge].next;
+            }
+            if edge == NO_EDGE {
+                let target = self.heads.len();
+                self.heads.push(NO_EDGE);
+                self.terminal.push(false);
+                let added = self.edges.len();
+                self.edges.push(TrieEdge {
+                    byte,
+                    target,
+                    next: self.heads[node],
+                });
+                self.heads[node] = added;
+                node = target;
+            } else {
+                node = self.edges[edge].target;
+            }
+        }
+        self.terminal[node] = true;
+    }
+
+    /// Length of the longest suffix of `data` that is a proper prefix of a secret form.
+    fn longest_suffix(&self, data: &[u8]) -> usize {
+        let mut node = 0;
+        let mut keep = 0;
+        for (length, &byte) in data.iter().rev().enumerate() {
+            #[cfg(test)]
+            self.suffix_steps.fetch_add(1, Ordering::Relaxed);
+            let mut edge = self.heads[node];
+            while edge != NO_EDGE && self.edges[edge].byte != byte {
+                edge = self.edges[edge].next;
+            }
+            if edge == NO_EDGE {
+                break;
+            }
+            node = self.edges[edge].target;
+            if self.terminal[node] {
+                keep = length + 1;
+            }
+        }
+        keep
+    }
 }
 
 impl StreamScrubber {
@@ -374,8 +469,10 @@ impl StreamScrubber {
         if secrets.is_empty() {
             return None;
         }
+        let prefixes = PrefixTrie::new(&secrets);
         Some(Self {
             secrets,
+            prefixes,
             carry: Vec::new(),
         })
     }
@@ -396,17 +493,7 @@ impl StreamScrubber {
 
     /// The longest suffix of `data` that is a proper prefix of some secret.
     fn partial_suffix(&self, data: &[u8]) -> usize {
-        let mut keep = 0;
-        for secret in &self.secrets {
-            let most = (secret.len() - 1).min(data.len());
-            for len in (keep + 1..=most).rev() {
-                if data.ends_with(&secret[..len]) {
-                    keep = len;
-                    break;
-                }
-            }
-        }
-        keep
+        self.prefixes.longest_suffix(data)
     }
 }
 
@@ -548,6 +635,25 @@ mod tests {
         let out = String::from_utf8(run(&[b"a sk-sec", b"ret-", b"1234 b"])).unwrap();
         assert!(!out.contains("secret"), "{out}");
         assert_eq!(out.len(), "a sk-secret-1234 b".len());
+    }
+
+    #[test]
+    fn finding_a_partial_suffix_walks_the_chunk_once_not_every_form() {
+        let key = format!("sk-{}", "x".repeat(97));
+        let scrubber = StreamScrubber::new(&[&key]).unwrap();
+        assert!(
+            scrubber.secrets.len() > 100,
+            "the key must have many forms for this to be meaningful"
+        );
+        let data = b"prefix sk-xxxx";
+        assert!(
+            scrubber.partial_suffix(data) > 0,
+            "a key prefix is held back"
+        );
+        assert!(
+            scrubber.prefixes.suffix_steps.load(Ordering::Relaxed) <= data.len(),
+            "suffix work must follow the chunk length, not the form count"
+        );
     }
 
     #[test]

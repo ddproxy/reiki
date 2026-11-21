@@ -134,7 +134,7 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 - [Documentation index](docs/README.md): the numbered reading path and every page.
 - [Overview](docs/overview.md): how the parts fit together.
 - [Architecture](docs/architecture.md): request path, key states and source map.
-- [Glossary](docs/glossary.md): terms and CLI/status vocabulary.
+- [Glossary](docs/glossary.md): terms and CLI/v1/status vocabulary.
 - [Configuration](docs/configuration.md): every table and field.
 - [CLI](docs/cli.md): every subcommand.
 - [Keys and streams](docs/keys.md): key files, token hashes, chains and rotation.
@@ -161,9 +161,8 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 **Operations and security**
 
 - [Deploy](docs/deploy.md): install paths, directory layout, listeners and a service unit.
-- [Service (legacy stub)](docs/service.md): redirect kept for the old service page URL.
-- [Upgrades](docs/upgrades.md): reload and restart rules, state compatibility and rollback.
-- [Monitoring](docs/monitoring.md): the admin listener, `/status`, `/metrics` and key checks.
+- [Upgrades](docs/upgrades.md): reload and restart rules and rollback.
+- [Monitoring](docs/monitoring.md): the admin listener, `/v1/status`, `/v1/metrics` and key checks.
 - [Peers](docs/peers.md): read-only key health shared between instances; health document schema.
 - [Peers publishing](docs/peers-publishing.md): listener, tokens and stream names.
 - [Top](docs/top.md): the live fleet view.

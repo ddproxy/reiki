@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Terms in the `placeholders` plugin now match Unicode spellings whose lowercase mapping expands to several characters. A term written as `i` plus a combining dot is masked by `İ`, whose lowercase mapping is two characters, and a match inside the expansion masks the whole original character.
+- The stream scrubber finds a partial secret at a chunk boundary with one reverse-trie walk per byte instead of scanning every form of every key. High-throughput streaming with many configured keys no longer pays a per-form cost on each chunk.
+- Request paths are checked for dot segments and encoded separators through repeated percent-decoding, up to eight layers. Double-encoded forms such as `%252e%252e` are refused, and malformed escapes or undecodable bytes are refused rather than forwarded.
+- `/status` parses its `config`, `intercept` and `log` fragments as JSON before appending them in place of the closing brace, preserving field order. Trailing whitespace in an assembled fragment can no longer corrupt the response; an unmergeable document now answers 500 instead of invalid JSON.
+- Unknown admin paths answer `404` for every HTTP method, not only `GET`.
+- The peer publisher publishes the running listener's mode and its TLS certificate under one lock. A reload can no longer observe a TLS listener whose certificate has not been installed yet.
+### Removed
+
+- Old key state-file formats: only the current `keys` + optional `shaper` TOML shape is read. Files in another format are ignored with a log line and rebuilt. Rotation now requires the saved key digest and upstream, and no longer falls back to file mtime.
+- Config aliases and legacy keys kept for older versions: removed the `gov` compatibility shim, the `REMOVED_PLUGINS` list, and the ignored-key warning plumbing. `Config::parse` now parses and validates directly; unknown or renamed config keys are errors and only the current names remain.
+- Unversioned admin routes. `/status`, `/failures`, `/reload`, `/keys/enable` and `/openapi.json` are gone; the admin API is `/v1/*` only, and plugin admin paths must be requested under `/v1`.
+- Compatibility fields in `/v1/status` and `reiki keys`: peers no longer publish or read the older peer-health and failure-ring shapes. `scopes` is always emitted, including `[]`.
+- Older peer wire formats: the health document, upstream entries and key events now require the current fields and reject unknown ones. Removed the `observed_at` age fallback and the older top-view text grid.
+- `reiki top` data-layer compatibility with older publishers: strict current health shape with version validation; no older-publisher markers or text-grid parsing.
+- Legacy documentation: removed `docs/service.md`, all `Since 0.x` version qualifiers and compatibility/migration notes from configuration and upgrade docs, and updated every admin route, anchor and example to the current `/v1/*` shape.
+
 ## 0.12.0
 
 ### Added

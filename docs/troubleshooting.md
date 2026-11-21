@@ -61,8 +61,8 @@ file_keep = 5
 ```
 
 - `RUST_LOG`, when set, overrides `level` at startup.
-- SIGHUP and `POST /reload` apply a changed `level` without a restart and reopen the file. Changing `file`, `format`, `stderr`, `file_max_bytes` or `file_keep` needs a restart; see [reload](#reload).
-- The file is created with mode 0640, and an existing file is tightened to 0640. A symbolic link at the path is refused. A line that cannot be written is dropped and counted; stderr warns at most once a minute, and the count is on `GET /status` as `log.write_errors`.
+- SIGHUP and `POST /v1/reload` apply a changed `level` without a restart and reopen the file. Changing `file`, `format`, `stderr`, `file_max_bytes` or `file_keep` needs a restart; see [reload](#reload).
+- The file is created with mode 0640, and an existing file is tightened to 0640. A symbolic link at the path is refused. A line that cannot be written is dropped and counted; stderr warns at most once a minute, and the count is on `GET /v1/status` as `log.write_errors`.
 - Every line made while a request is handled carries its `id` in the span prefix (`req{id=…}`); the same `id` is on that request's records in the request log.
 - `info` logs one line per forwarded request with the stream, key name, method, path and upstream status, plus tunnel open and close lines.
 - `warn` logs `upstream key failed` with the class, whether the key started cooling and the seconds left, plus refused tunnel destinations and refused intercepted requests.
@@ -72,7 +72,7 @@ Key values and stream tokens stay out of the log.
 
 ## Reload
 
-Send `SIGHUP` (`kill -HUP <pid>`) or `POST /reload` to the admin listener to apply a changed config without a restart. Both re-read the config, key files and interception CA files, build and check the whole new state first, and swap it in only if every part is valid; a bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
+Send `SIGHUP` (`kill -HUP <pid>`) or `POST /v1/reload` to the admin listener to apply a changed config without a restart. Both re-read the config, key files and interception CA files, build and check the whole new state first, and swap it in only if every part is valid; a bad config keeps the running one and reports why. Requests and tunnels already open finish on the state they started with.
 
 ```bash
 reiki reload --dry-run
@@ -80,7 +80,7 @@ reiki reload --dry-run | jq .changed
 reiki reload --token-file /etc/reiki/admin.token
 ```
 
-`reiki reload` takes `--dry-run`, `--url` and `--token-file`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It prints the JSON answer: exit 0 for success, 1 for a refusal or failed config, and 2 when the instance cannot be reached. The [admin reference](monitoring.md#post-reload) shows the response fields.
+`reiki reload` takes `--dry-run`, `--url` and `--token-file`, falling back to `[admin] listen` and `REIKI_ADMIN_TOKEN`. It prints the JSON answer: exit 0 for success, 1 for a refusal or failed config, and 2 when the instance cannot be reached. The [admin reference](monitoring.md#post-v1reload) shows the response fields.
 
 To reload without a signal, turn on the watcher:
 
@@ -96,11 +96,11 @@ Applied live: keys, streams, upstreams and the admin token hash; plugin settings
 
 Needs a restart, reported as `restart_needed`: every `listen` address, the `[log]` file settings, and adding or removing `[tunnel]` or `[tunnel.intercept]`.
 
-`GET /status` shows `config.generation`, `config.loaded_at` and `config.last_reload`, with the error when the last attempt failed.
+`GET /v1/status` shows `config.generation`, `config.loaded_at` and `config.last_reload`, with the error when the last attempt failed.
 
 ## Key health
 
-`reiki keys` prints live health, last status code and streams for every key from the admin listener; see the [admin reference](monitoring.md#get-status). `reiki keys --enable NAME` clears a key's cooldown, disabled flag, failure count and combination cooldowns, and saves the change.
+`reiki keys` prints live health, last status code and streams for every key from the admin listener; see the [admin reference](monitoring.md#get-v1status). `reiki keys --enable NAME` clears a key's cooldown, disabled flag, failure count and combination cooldowns, and saves the change.
 
 Key health is saved next to the config as `<config>.state` and restored at startup, so cooldowns and out-of-rotation keys survive a restart. The directory must be writable by the user Reiki runs as: at startup Reiki creates and removes an unpredictably named probe file there (`create_new` plus `O_NOFOLLOW`) before binding listeners, and exits 1 with an error naming the directory and the OS cause on failure. A pre-existing probe file or symlink cannot satisfy the check. A reload keeps the live health of keys whose files did not change, resets keys whose files did, and leaves the state file unread. The file holds key names, timings and a SHA-256 of each key, plus the learned outbound cap, pause and daily and monthly counters, with no key value.
 
@@ -110,6 +110,6 @@ A key whose digest differs, or whose file cannot be read, counts as rotated and 
 
 `GET /__reiki/healthz` on the client listener returns `200` with the body `ok` while Reiki is up. The probe needs no token and answers from the client listener even when upstreams are cooling.
 
-The admin listener serves `/status`, `/failures`, `/reload` and `/keys/enable` under both bare paths and `/v1`, plus `/v1/openapi.json` and any plugin route such as `/metrics` and `/usage`. Missing or wrong tokens get a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. See [monitoring](monitoring.md) for the full reference.
+The admin listener serves `/v1/status`, `/v1/failures`, `/v1/reload` and `/v1/keys/enable`, plus `/v1/openapi.json` and any plugin route such as `/v1/metrics` and `/v1/usage`. Missing or wrong tokens get a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. See [monitoring](monitoring.md) for the full reference.
 
 Classification rules and cooldown numbers live in one place: [response classification](classification.md).

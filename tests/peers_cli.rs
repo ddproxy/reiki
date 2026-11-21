@@ -174,11 +174,12 @@ fn now_rfc3339(offset_secs: i64) -> String {
     )
 }
 
-fn health_json(observed_at: &str) -> String {
+fn health_json(observed_at: &str, age_seconds: u64) -> String {
     format!(
-        "{{\"instance\":\"mock\",\"observed_at\":\"{observed_at}\",\"upstreams\":[\
+        "{{\"instance\":\"mock\",\"reiki_version\":\"0.12.0\",\"observed_at\":\"{observed_at}\",\
+         \"age_seconds\":{age_seconds},\"failures\":{{}},\"upstreams\":[\
          {{\"name\":\"zen\",\"healthy_keys\":2,\"cooling_keys\":0,\"disabled_keys\":0,\
-         \"soonest_cooldown_seconds\":null,\"last_status_class\":\"2xx\"}}]}}"
+         \"cooling_combinations\":0,\"soonest_cooldown_seconds\":null,\"last_status_class\":\"2xx\"}}]}}"
     )
 }
 
@@ -221,7 +222,11 @@ async fn fresh_data_over_tls_pinned_to_the_peer_ca() {
     let pki = pki();
     let ca = dir.write("ca.pem", &pki.ca_pem, 0o644);
     let token = dir.write("token", &format!("{PEER_TOKEN}\n"), 0o600);
-    let peer = mock_peer(Some(pki.server), ok_reply(&health_json(&now_rfc3339(-5)))).await;
+    let peer = mock_peer(
+        Some(pki.server),
+        ok_reply(&health_json(&now_rfc3339(-5), 5)),
+    )
+    .await;
     let report = poll_one(
         ("client-a", format!("https://{}", peer.addr), Some(&ca)),
         &token,
@@ -249,7 +254,7 @@ async fn fresh_data_over_tls_pinned_to_the_peer_ca() {
 async fn stale_data_is_unknown_and_shows_no_counts() {
     let dir = Dir::new("stale");
     let token = dir.write("token", PEER_TOKEN, 0o600);
-    let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(-3600)))).await;
+    let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(-3600), 3600))).await;
     let report = poll_one(
         (
             "client-a",
@@ -289,7 +294,11 @@ async fn a_certificate_from_another_ca_is_refused() {
     let other = pki();
     let ca = dir.write("ca.pem", &other.ca_pem, 0o644);
     let token = dir.write("token", PEER_TOKEN, 0o600);
-    let peer = mock_peer(Some(served.server), ok_reply(&health_json(&now_rfc3339(0)))).await;
+    let peer = mock_peer(
+        Some(served.server),
+        ok_reply(&health_json(&now_rfc3339(0), 0)),
+    )
+    .await;
     let report = poll_one(
         ("client-a", format!("https://{}", peer.addr), Some(&ca)),
         &token,
@@ -305,7 +314,7 @@ async fn a_certificate_from_another_ca_is_refused() {
 async fn a_redirect_is_refused_and_not_followed() {
     let dir = Dir::new("redirect");
     let token = dir.write("token", PEER_TOKEN, 0o600);
-    let target = mock_peer(None, ok_reply(&health_json(&now_rfc3339(0)))).await;
+    let target = mock_peer(None, ok_reply(&health_json(&now_rfc3339(0), 0))).await;
     let location = format!("http://127.0.0.1:{}/v1/health", target.addr.port());
     let peer = mock_peer(
         None,
@@ -335,7 +344,7 @@ async fn an_oversized_body_is_refused_with_or_without_a_length() {
     let dir = Dir::new("oversized");
     let token = dir.write("token", PEER_TOKEN, 0o600);
     let padding = " ".repeat(70 * 1024);
-    let body = format!("{}{padding}", health_json(&now_rfc3339(0)));
+    let body = format!("{}{padding}", health_json(&now_rfc3339(0), 0));
     let with_length = mock_peer(None, ok_reply(&body)).await;
     let mut close_delimited =
         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n".to_vec();
@@ -361,7 +370,7 @@ async fn an_oversized_body_is_refused_with_or_without_a_length() {
 async fn a_token_file_others_can_read_is_refused_before_any_request() {
     let dir = Dir::new("mode");
     let token = dir.write("token", PEER_TOKEN, 0o644);
-    let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(0)))).await;
+    let peer = mock_peer(None, ok_reply(&health_json(&now_rfc3339(0), 0))).await;
     let report = poll_one(
         (
             "client-a",

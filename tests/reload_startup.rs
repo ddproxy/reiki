@@ -108,7 +108,7 @@ fn reload(admin: u16, query: &str) -> String {
     http(
         admin,
         &format!(
-            "POST /reload{query} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            "POST /v1/reload{query} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         ),
     )
     .expect("reload answers")
@@ -165,7 +165,7 @@ fn a_toml_error_in_a_reload_never_echoes_the_source() {
     let status = http(
         admin,
         &format!(
-            "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\n\r\n"
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\n\r\n"
         ),
     )
     .unwrap();
@@ -174,8 +174,8 @@ fn a_toml_error_in_a_reload_never_echoes_the_source() {
 }
 
 #[test]
-fn a_removed_plugin_name_fails_startup_with_its_replacement() {
-    let dir = std::env::temp_dir().join(format!("reiki-startup-warn-{}", std::process::id()));
+fn an_unknown_plugin_name_fails_startup() {
+    let dir = std::env::temp_dir().join(format!("reiki-startup-plugin-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     write_key(dir.join("key"), "upstream-secret\n");
     let config = dir.join("reiki.toml");
@@ -185,7 +185,7 @@ fn a_removed_plugin_name_fails_startup_with_its_replacement() {
             "[upstream.api]\nbase_url = \"http://127.0.0.1:1/v1\"\n\
              [keys.k1]\nupstream = \"api\"\nfile = \"{}/key\"\n\
              [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k1\"]\n\
-             [plugins.gov]\nmode = \"report\"\n",
+             [plugins.unknown]\nmode = \"report\"\n",
             dir.display(),
             reiki::auth::sha256_hex("stream-token-for-startup"),
         ),
@@ -202,10 +202,9 @@ fn a_removed_plugin_name_fails_startup_with_its_replacement() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(
-        stderr.contains("gov") && stderr.contains("controlled"),
+        stderr.contains("unknown") && stderr.contains("not compiled in"),
         "{stderr}"
     );
-    assert!(stderr.contains("plugin-controlled"), "{stderr}");
 }
 
 #[cfg(unix)]
@@ -226,7 +225,7 @@ fn sighup_reloads_the_running_instance() {
         let reply = http(
             admin,
             &format!(
-                "GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\n\r\n"
+                "GET /v1/status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\nConnection: close\r\n\r\n"
             ),
         )
         .unwrap();

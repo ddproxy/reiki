@@ -100,7 +100,7 @@ socat - UNIX-CONNECT:/run/reiki/requests.sock | jq -c '{event, id, stream, statu
 tail -f /var/lib/reiki/requests.jsonl | jq .
 ```
 
-At most 32 subscribers connect at once. Each has its own bounded queue and is disconnected if it cannot keep up, so a slow reader never delays Reiki.
+At most 32 subscribers connect at once. Each has its own bounded queue. On each broadcast a subscriber whose queue is full, or whose client has gone away, is disconnected, so a slow reader never delays Reiki. Merely accepting another connection never sends a ping or evicts a subscriber.
 
 ## What is kept out of the log
 

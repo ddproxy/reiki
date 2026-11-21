@@ -56,6 +56,16 @@ fn open_append(path: &Path) -> io::Result<File> {
         ));
     }
     #[cfg(unix)]
+    {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+
+        // O_NONBLOCK only kept the open of a FIFO we then reject from hanging. The descriptor is
+        // now known to be a regular file; make it blocking again, because some network
+        // filesystems honour the flag for regular writes and could return EAGAIN under pressure.
+        let flags = fcntl_getfl(&file)?;
+        fcntl_setfl(&file, flags & !OFlags::NONBLOCK)?;
+    }
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
@@ -252,6 +262,15 @@ mod unix {
                 .unwrap_or_else(PoisonError::into_inner)
                 .len()
         }
+
+        #[cfg(test)]
+        pub fn subscriber_sender(&self, index: usize) -> SyncSender<Arc<str>> {
+            let subs = self
+                .subscribers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            subs[index].clone()
+        }
     }
 
     impl Drop for SocketHub {
@@ -273,7 +292,6 @@ mod unix {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let mut subs = subscribers.lock().unwrap_or_else(PoisonError::into_inner);
-                    subs.retain(|tx| tx.try_send(Arc::from("")).is_ok());
                     if subs.len() >= MAX_SUBSCRIBERS {
                         continue;
                     }
@@ -334,6 +352,21 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_verified_log_file_is_opened_in_blocking_mode() {
+        let dir = temp("blocking");
+        let path = dir.join("req.jsonl");
+        let file = open_append(&path).unwrap();
+        assert!(
+            !rustix::fs::fcntl_getfl(&file)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK),
+            "O_NONBLOCK must not leak onto a regular log file"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -563,6 +596,34 @@ mod tests {
             let mut line = String::new();
             BufReader::new(stay).read_line(&mut line).unwrap();
             assert_eq!(line, "{\"x\":1}\n");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_full_subscriber_queue_survives_new_connections() {
+            let dir = temp("sockfull");
+            let path = dir.join("req.sock");
+            let hub = SocketHub::bind(&path).unwrap();
+            let first = UnixStream::connect(&path).unwrap();
+            wait_for(|| hub.subscriber_count() == 1);
+            drop(first);
+
+            // With the reader gone, the subscriber thread is blocked in recv and the queue
+            // cannot drain. Fill it to its bound without broadcasting any pings.
+            {
+                let tx = hub.subscriber_sender(0);
+                while tx.try_send(Arc::from("queued")).is_ok() {}
+            }
+            assert_eq!(hub.subscriber_count(), 1);
+
+            let _extra = UnixStream::connect(&path).unwrap();
+            wait_for(|| hub.subscriber_count() == 2);
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                hub.subscriber_count(),
+                2,
+                "accepting a connection must not evict a full but live subscriber"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 

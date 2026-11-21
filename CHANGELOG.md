@@ -46,6 +46,16 @@
 - `POST /keys/enable` now parses `?key=` strictly: a repeated, bare or unknown flag, or invalid percent-encoding, answers `400` instead of enabling an unintended key.
 - The request log now refuses any configured header whose name contains an authentication credential pattern (`auth`, `token`, `key`, `secret`, `cookie`, `credential`), not just a fixed list of names.
 
+### Fixed
+
+- `strict_key_permissions` now rejects key files with group or other **write** bits as well as read bits (for example mode 0620 or 0666). `reiki keys --check` reports the same verdict, and the error and warning messages name the read/write check.
+- A peer SSE event's accumulated `data` is now bounded after UTF-8 decoding. Invalid bytes could make the decoded value longer than the raw line, letting one event exceed the configured cap.
+- Intercepted `CONNECT` requests now count towards the shared `[auth]` login throttle. Repeated bad `Proxy-Authorization` headers get `429` with `Retry-After` after `max_failures`; a valid token clears the address's count. Addresses whose peer cannot be read are refused.
+- Accepting a new request-log socket client no longer sends empty pings to existing subscribers. A subscriber with a full bounded queue is no longer disconnected by unrelated connections; only broadcasts prune subscribers that cannot keep up (or have disconnected).
+- The 400 invalid-key marker is now read from parsed JSON string properties instead of substring matching. A plain-text or echoed copy of `"reason": "api_key_invalid"` no longer takes a healthy key out of rotation.
+- The request-log file's descriptor no longer keeps `O_NONBLOCK` after the regular-file check. `O_NONBLOCK` is only used to avoid hanging while opening a FIFO that is then refused; writes to a regular file on a network filesystem can no longer fail with `EAGAIN`.
+- Re-verified that scrubber forms stay sorted longest-first across all configured secrets, so a short form from another key cannot be blanked before a longer form that contains it.
+
 ## 0.11.0
 
 ### Fixed

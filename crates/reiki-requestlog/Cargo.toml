@@ -19,6 +19,8 @@ tracing = "0.1"
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW and O_NONBLOCK for the log file; std has no constants for them.
 libc = "0.2"
+# Safe fcntl wrappers: clearing O_NONBLOCK on the verified regular file must not need unsafe.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [lints.rust]
 unsafe_code = "forbid"

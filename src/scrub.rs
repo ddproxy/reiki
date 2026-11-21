@@ -733,6 +733,29 @@ mod tests {
     }
 
     #[test]
+    fn a_longer_form_of_a_later_key_is_blanked_before_a_shorter_one() {
+        let short = "sk-12345678";
+        let long = format!("Bearer {short}-long");
+        let all = forms(&[short, &long]);
+        let short_at = all
+            .iter()
+            .position(|f| f.as_slice() == short.as_bytes())
+            .unwrap();
+        let long_at = all
+            .iter()
+            .position(|f| f.as_slice() == long.as_bytes())
+            .unwrap();
+        assert!(
+            long_at < short_at,
+            "the longer form must come first across secrets"
+        );
+        let text = format!("echo {long}");
+        let out = scrub_text(&text, &[short, &long]);
+        assert!(!out.contains("-long"), "{out}");
+        assert_eq!(out.len(), text.len());
+    }
+
+    #[test]
     fn a_long_key_still_gets_a_base64_form() {
         let key = format!("sk-{}", "a".repeat(597));
         let forms = forms(&[&key]);

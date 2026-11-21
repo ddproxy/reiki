@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -329,6 +330,17 @@ pub fn check_ca(config: &InterceptConfig) -> Result<i64, String> {
 /// Days of validity at or below which startup warns.
 const CA_WARN_DAYS: i64 = 30;
 
+/// The outcome of checking an intercepted CONNECT's stream token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterceptAuth {
+    /// The host entry authorised for this tunnel, pinned against reloads.
+    Authorized(InterceptHost),
+    /// No credential, or a credential for another stream.
+    Refused,
+    /// This peer has used up its `[auth]` allowance; wait before trying again.
+    Throttled(Duration),
+}
+
 /// Serves intercepted CONNECT tunnels.
 pub struct Interceptor {
     app: Arc<App>,
@@ -524,23 +536,45 @@ impl Interceptor {
         self.settings().hosts.contains_key(host)
     }
 
-    /// Returns the authorised host entry from one settings snapshot, or `None` when a CONNECT to
-    /// `host` may not be intercepted. A host served from a stream spends that stream's keys, so the
-    /// client must present the stream's token; a passthrough host spends none. The caller passes
-    /// the returned entry to [`Interceptor::serve`], so a reload cannot change the stream that
-    /// serves an already-authorised tunnel.
+    /// Checks one CONNECT against one settings snapshot and the client login throttle. A host
+    /// served from a stream spends that stream's keys, so the client must present the stream's
+    /// token; a passthrough host spends none and is not counted. The caller passes the returned
+    /// entry to [`Interceptor::serve`], so a reload cannot change the stream that serves an
+    /// already-authorised tunnel.
     pub fn authorize(
         &self,
         host: &str,
         proxy_authorization: Option<&str>,
-    ) -> Option<InterceptHost> {
+        peer: Option<IpAddr>,
+    ) -> InterceptAuth {
         let settings = self.settings();
-        let entry = settings.hosts.get(host)?;
-        let Some(stream) = entry.stream.as_deref().filter(|_| settings.require_auth) else {
-            return Some(entry.clone());
+        let Some(entry) = settings.hosts.get(host) else {
+            return InterceptAuth::Refused;
         };
-        let token = proxy_authorization.and_then(crate::auth::proxy_token)?;
-        (self.app.snapshot().authenticate(&token) == Some(stream)).then(|| entry.clone())
+        let Some(stream) = entry.stream.as_deref().filter(|_| settings.require_auth) else {
+            return InterceptAuth::Authorized(entry.clone());
+        };
+        // Check and reserve in one lock, so a burst of bad CONNECTs cannot all pass before any
+        // failure is counted. This is the client listener's count, shared with direct requests.
+        let logins = self.app.logins();
+        let attempt = peer.map(|ip| logins.reserve(ip, Instant::now()));
+        if let Some(Err(wait)) = attempt {
+            tracing::warn!(%host, ?peer, ?wait, "too many failed tunnel logins, refusing");
+            return InterceptAuth::Throttled(wait);
+        }
+        let token = proxy_authorization
+            .and_then(crate::auth::proxy_token)
+            .unwrap_or_default();
+        if self.app.snapshot().authenticate(&token) == Some(stream) {
+            if let Some(ip) = peer {
+                logins.succeed(ip);
+            }
+            InterceptAuth::Authorized(entry.clone())
+        } else {
+            let failures = attempt.and_then(Result::ok).map(|a| a.failures());
+            tracing::warn!(%host, ?peer, ?failures, "tunnel refused an intercepted host without a valid stream token");
+            InterceptAuth::Refused
+        }
     }
 
     fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
@@ -769,6 +803,22 @@ mod tests {
         )
     }
 
+    fn app_for_stream_with_auth(token: &str, max_failures: u32) -> Arc<App> {
+        let text = format!(
+            "[auth]\nmax_failures = {max_failures}\nwindow_secs = 60\n\
+             [upstream.api]\nbase_url = \"https://example.com/v1\"\n\
+             [keys.k]\nupstream = \"api\"\nfile = \"/unused\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+            crate::auth::sha256_hex(token)
+        );
+        App::new(
+            crate::config::Config::parse(&text).unwrap(),
+            [("k".to_owned(), crate::proxy::Secret::new("upstream-secret"))].into(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        )
+    }
+
     fn intercept_config(dir: &Path, hosts: &[&str]) -> InterceptConfig {
         InterceptConfig {
             ca_cert: dir.join("ca.pem").display().to_string(),
@@ -798,13 +848,20 @@ mod tests {
         config.hosts[0].stream = Some("s".to_owned());
         let interceptor = Interceptor::new(app_for_stream("tok"), &config).unwrap();
 
-        assert!(interceptor
-            .authorize("api.test", Some("Bearer wrong"))
-            .is_none());
-        assert!(interceptor.authorize("api.test", None).is_none());
-        let target = interceptor
-            .authorize("api.test", Some("Bearer tok"))
-            .expect("the stream token authorises the host");
+        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer wrong"), Some(peer)),
+            InterceptAuth::Refused
+        );
+        assert_eq!(
+            interceptor.authorize("api.test", None, Some(peer)),
+            InterceptAuth::Refused
+        );
+        let InterceptAuth::Authorized(target) =
+            interceptor.authorize("api.test", Some("Bearer tok"), Some(peer))
+        else {
+            panic!("the stream token authorises the host");
+        };
         assert_eq!(target.upstream, "api");
         assert_eq!(target.stream.as_deref(), Some("s"));
 
@@ -816,12 +873,61 @@ mod tests {
             "the entry handed to serve must be the authorised one"
         );
         assert_eq!(
-            interceptor
-                .authorize("api.test", Some("Bearer tok"))
-                .unwrap()
-                .upstream,
-            "other",
+            interceptor.authorize("api.test", Some("Bearer tok"), Some(peer)),
+            InterceptAuth::Authorized(next.hosts[0].clone()),
             "a fresh CONNECT uses the reloaded host"
+        );
+    }
+
+    #[test]
+    fn connect_token_guessing_is_throttled_and_a_good_token_clears_the_count() {
+        let dir = scratch("connect-throttle");
+        let ca = dir.join("ca");
+        init_ca(&ca, &["api.test".to_owned()], 30, false).unwrap();
+        let mut config = intercept_config(&ca, &["api.test"]);
+        config.hosts[0].upstream = "api".to_owned();
+        config.hosts[0].stream = Some("s".to_owned());
+        let app = app_for_stream_with_auth("tok", 2);
+        let interceptor = Interceptor::new(Arc::clone(&app), &config).unwrap();
+        let peer: IpAddr = "192.0.2.7".parse().unwrap();
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer wrong"), Some(peer)),
+            InterceptAuth::Refused
+        );
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer wrong"), Some(peer)),
+            InterceptAuth::Refused
+        );
+        assert!(matches!(
+            interceptor.authorize("api.test", Some("Bearer tok"), Some(peer)),
+            InterceptAuth::Throttled(_)
+        ));
+        assert!(
+            app.logins().blocked(peer, Instant::now()).is_some(),
+            "the client listener's shared count is used"
+        );
+        assert!(matches!(
+            interceptor.authorize("api.test", Some("Bearer tok"), Some(other)),
+            InterceptAuth::Authorized(_)
+        ));
+
+        // A successful login clears the address's count, as on the client listener. Allow a
+        // second attempt after the wrong token, so the good token can be checked and clear it.
+        let interceptor = Interceptor::new(app_for_stream_with_auth("tok", 2), &config).unwrap();
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer wrong"), Some(peer)),
+            InterceptAuth::Refused
+        );
+        assert!(matches!(
+            interceptor.authorize("api.test", Some("Bearer tok"), Some(peer)),
+            InterceptAuth::Authorized(_)
+        ));
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer wrong"), Some(peer)),
+            InterceptAuth::Refused,
+            "the good token cleared the count"
         );
     }
 

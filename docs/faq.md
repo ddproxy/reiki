@@ -52,7 +52,7 @@ There is no replay after a `2xx` or `3xx` status line: a body that breaks mid-st
 
 ## Why is one key disabled while its neighbours stay available?
 
-A `401`, a `400` with a real `"reason": "API_KEY_INVALID"` field, or a `403` naming an invalid, expired or revoked credential disables the key. Other `403` answers are `access_disabled`: the key is skipped for that request only. One request disables at most one key; a second `401` in the same walk is tried but left alone. With `hold_unauthorized = true`, the disable waits until a later key serves the request; if none does, no key is disabled. A `429` cools but does not disable. See [classification](classification.md#response-rules) and [providers](providers.md#unauthorized-keys).
+A `401`, a `400` whose parsed JSON has a real `"reason": "API_KEY_INVALID"` property, or a `403` naming an invalid, expired or revoked credential disables the key. Other `403` answers are `access_disabled`: the key is skipped for that request only. One request disables at most one key; a second `401` in the same walk is tried but left alone. With `hold_unauthorized = true`, the disable waits until a later key serves the request; if none does, no key is disabled. A `429` cools but does not disable. See [classification](classification.md#response-rules) and [providers](providers.md#unauthorized-keys).
 
 ## Why did a 429 or 402 cool one model instead of the whole key?
 

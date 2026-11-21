@@ -250,7 +250,7 @@ Reads each key file named in the config. It prints one line per key:
 
 ```
 zen-a: ok
-loose: warning: /path/to/key is group or world readable (mode 0644)
+loose: warning: /path/to/key has group or world read/write bits (mode 0644)
 gone: error: /path/to/key does not exist
 ```
 

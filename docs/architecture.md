@@ -48,7 +48,7 @@ Request hooks run once before the failover loop, so every key attempt sees the s
 | Stage | What happens | Source files | Configuration |
 | --- | --- | --- | --- |
 | Client listener | Accepts connections, applies connection caps, and serves `/__reiki/healthz`. | `src/main.rs`, `src/serve.rs`, `src/proxy.rs` | `listen`, `[server]`, `[service]` |
-| Stream authentication | Reads the client token, matches it to a stream, and applies failed-login backoff on the client listener. | `src/auth.rs`, `src/proxy.rs`, `src/serve.rs` | `[streams.*].token_sha256`, `[auth]` |
+| Stream authentication | Reads the client token, matches it to a stream, and applies failed-login backoff on the client listener and on intercepted tunnel `CONNECT`s. | `src/auth.rs`, `src/proxy.rs`, `src/serve.rs`, `src/intercept.rs` | `[streams.*].token_sha256`, `[auth]` |
 | Path and upstream selection | Maps the request path prefix to an upstream and filters chain keys to that upstream. | `src/proxy.rs`, `src/config.rs`, `src/rewrite.rs` | `[upstream.*]`, `[streams.*].chain` |
 | Plugin request hooks | Runs request hooks once, before any key is tried, in build order. | `src/plugins.rs`, `src/proxy.rs`, plugin crates in `crates/` | `[plugins.*]`, `streams` on plugin tables |
 | Stream rate limit and shaping | Counts the stream attempt budget, waits for or sheds an outbound slot, and tracks usage/cooldown hints. | `src/proxy.rs`, `src/shaper/`, `src/pressure.rs`, `src/chain.rs` | `[streams.*].rate_limit_per_minute`, `[upstream.*].limits`, `[accounts.*.limits]` (parsed) |

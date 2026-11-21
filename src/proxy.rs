@@ -148,7 +148,7 @@ impl fmt::Display for LoadError {
             ),
             Self::Permissions { key, mode } => write!(
                 f,
-                "key file for `{key}` has mode {mode:04o}; it is readable by group or others (chmod 600, or set strict_key_permissions = false)"
+                "key file for `{key}` has mode {mode:04o}; it is readable or writable by group or others (chmod 600, or set strict_key_permissions = false)"
             ),
             Self::Long { key, len } => write!(
                 f,
@@ -203,7 +203,7 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
                 }
                 tracing::warn!(
                     key = %name,
-                    "key file {} is group or world readable (mode {mode:04o}); set strict_key_permissions = true to refuse it",
+                    "key file {} has group or world read/write bits (mode {mode:04o}); set strict_key_permissions = true to refuse it",
                     key.file
                 );
             }
@@ -561,6 +561,11 @@ impl App {
     /// The in-memory ring of recent key failures.
     pub(crate) fn failures(&self) -> &crate::failures::FailureRing {
         &self.failures
+    }
+
+    /// Failed client and intercepted-CONNECT token checks share one count.
+    pub(crate) fn logins(&self) -> &LoginThrottle {
+        &self.logins
     }
 
     /// Failed admin token checks, kept apart from the client listener's counts.
@@ -3857,7 +3862,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn load_keys_refuses_a_group_or_world_readable_key_unless_strict_checks_are_off() {
+    fn load_keys_refuses_a_loosely_permissioned_key_unless_strict_checks_are_off() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -3876,14 +3881,20 @@ mod tests {
             path.display()
         );
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let config = Config::parse(&text).unwrap();
         assert!(config.strict_key_permissions);
-        let err = load_keys(&config).unwrap_err().to_string();
-        assert!(err.contains("0644") && err.contains("chmod 600"), "{err}");
+        for mode in [0o644, 0o620, 0o622, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = load_keys(&config).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("{mode:04o}")) && err.contains("chmod 600"),
+                "mode {mode:04o} must be refused: {err}"
+            );
 
-        let relaxed = Config::parse(&format!("strict_key_permissions = false\n{text}")).unwrap();
-        assert!(load_keys(&relaxed).is_ok());
+            let relaxed =
+                Config::parse(&format!("strict_key_permissions = false\n{text}")).unwrap();
+            assert!(load_keys(&relaxed).is_ok());
+        }
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load_keys(&config).is_ok());

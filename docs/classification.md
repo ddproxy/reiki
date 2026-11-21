@@ -8,7 +8,7 @@ This page is the single source for upstream response classes, key effects and co
 2. `pass_errors = true` on an upstream makes every status a pass-through: the response is relayed after secret scrubbing, and no key changes state.
 3. A transport failure is a `transient` class against the selected key. Idempotent methods are replayed on the next key; a non-idempotent method ends with `504` on timeout or `502` on connection failure.
 4. Error bodies are read up to 64 KiB, scrubbed of key and credential forms, and truncated with `x-reiki-truncated: 1` when longer. The body is lowercased with `to_lowercase()` before checks.
-5. Request-size errors are checked first for `400`, `402` and `413` and short-circuit every status rule; then the rules below are evaluated in the order shown, first match wins. All body conditions use lowercase substrings, except the `400` JSON pair, which must be a real unescaped `"reason": "api_key_invalid"` pair.
+5. Request-size errors are checked first for `400`, `402` and `413` and short-circuit every status rule; then the rules below are evaluated in the order shown, first match wins. All body conditions use lowercase substrings, except the `400` invalid-key marker, which must be a `reason` string property in a body that parses as JSON. Text that only looks like a pair, including an echoed prompt or a non-JSON body, is ignored.
 6. With `confirm_quota = true`, the first quota `429` from a key in a request waits 3 seconds and retries the same key. That first response is added to the failure ring but does not update key health or cool the key. Only a second quota `429` from that key updates key health and cools it. This switch applies to `429` only, never to `402`.
 7. One request disables at most one key. With `hold_unauthorized = true`, a `401` is held as a refusal until a later key serves the request; a second `401` in the same walk stays a refusal.
 
@@ -19,7 +19,7 @@ This page is the single source for upstream response classes, key effects and co
 | 200-399 | none | success | Transient count reset | Response is delivered |
 | 401 | none | `unauthorized` | Disabled | Next key |
 | 400 | `fewer max_tokens` or `can only afford` (JSON `error.message`/`message`, or whole body when not JSON) | `request_error` | None; the key is not cooled | Next key; the last upstream 400 is relayed unchanged if no key serves |
-| 400 | JSON pair `"reason": "API_KEY_INVALID"` | `unauthorized` | Disabled | Next key |
+| 400 | Parsed JSON `reason` string property equal to `api_key_invalid` | `unauthorized` | Disabled | Next key |
 | 400 | `credit balance is too low` | `quota_exhausted` | Cooling, whole key | Next key |
 | 400 | anything else (after the request-size, credential, quota and configured rate-limit checks) | pass-through | None | Response is relayed |
 | 402 | JSON `error.message` or `message` contains `fewer max_tokens` or `can only afford`; whole-body substring match only when the body is not JSON | `request_error` | None; the key is not cooled | Next key; the last upstream 402 is relayed unchanged if no key serves |

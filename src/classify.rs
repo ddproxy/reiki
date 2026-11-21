@@ -184,28 +184,24 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
-/// True when `"field": "value"` appears as real JSON. Text a client sent that an upstream
-/// echoes inside a string has its quotes escaped, so it cannot imitate a field.
+/// True when `field` is a real JSON string property with exactly `value`, anywhere in a parsed
+/// body. A `field`/`value` pair that merely appears in text (including inside an echoed string)
+/// is not a field, so it cannot make a healthy key look rejected.
 fn has_json_pair(body: &str, field: &str, value: &str) -> bool {
-    let key = format!("\"{field}\"");
-    let mut from = 0;
-    while let Some(at) = body[from..].find(&key) {
-        let start = from + at;
-        from = start + key.len();
-        if body[..start].ends_with('\\') {
-            continue;
-        }
-        let Some(rest) = body[from..].trim_start().strip_prefix(':') else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix('"') else {
-            continue;
-        };
-        if rest.strip_prefix(value).is_some_and(|r| r.starts_with('"')) {
-            return true;
+    fn find(json: &serde_json::Value, field: &str, value: &str) -> bool {
+        match json {
+            serde_json::Value::Object(map) => map.iter().any(|(key, child)| {
+                (key == field && child.as_str().is_some_and(|s| s == value))
+                    || find(child, field, value)
+            }),
+            serde_json::Value::Array(items) => items.iter().any(|child| find(child, field, value)),
+            _ => false,
         }
     }
-    false
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    find(&json, field, value)
 }
 
 fn is_edge_block_page(body: &str) -> bool {
@@ -677,6 +673,10 @@ mod tests {
         assert_eq!(classify(400, None, echoed), Outcome::PassThrough);
         let escaped = r#"{"error":{"message":"bad field \"reason\": \"API_KEY_INVALID\""}}"#;
         assert_eq!(classify(400, None, escaped), Outcome::PassThrough);
+        // A plain-text error body that echoes the pair is not JSON at all: there is no field
+        // to inspect, so it must not disable the key either.
+        let echoed = "400 Bad Request: your prompt had {\"reason\": \"API_KEY_INVALID\"}";
+        assert_eq!(classify(400, None, echoed), Outcome::PassThrough);
         let real = r#"{"error":{"details":[{ "reason" : "API_KEY_INVALID" }]}}"#;
         assert_eq!(
             classify(400, None, real),

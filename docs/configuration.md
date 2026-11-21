@@ -15,7 +15,7 @@ Conventions in this page:
 | --- | --- | --- |
 | `listen` | Client listener address | no |
 | `[admin]` | Admin listener and its token | no |
-| `[auth]` | Failed-token backoff on the client and admin listeners | no |
+| `[auth]` | Failed-token backoff on the client, admin, peer and intercepted-tunnel listeners | no |
 | `[server]` | Connection caps on the client and admin listeners | no |
 | `[service]` | Shutdown drain time | no |
 | `[reload]` | Reload on file change | no |
@@ -49,7 +49,7 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. | |
-| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable by group or others. Set to `false` to accept it with a warning instead. | |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits (anything looser than `0600`). Set to `false` to accept it with a warning instead. | |
 
 ## `[admin]`
 
@@ -62,7 +62,7 @@ The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST 
 
 ## `[auth]`
 
-Counts failed token checks per peer address on the client and admin listeners. A reload changes these values without a restart.
+Counts failed token checks per peer address on the client, admin, peer and tunnel listeners. Intercepted `CONNECT` requests share the client listener's count; a `429` with `Retry-After` answers a locked-out address. A reload changes these values without a restart.
 
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
@@ -411,7 +411,7 @@ Rules, by section:
 - **Upstream limits.** The table sets a preset or a limit. `max_wait_secs` is 1 to 120. The preset name is known.
 - **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `max_stream_bytes` and `stream_timeout_secs` are at least 1 when set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
-- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must not be readable by group or others.
+- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.

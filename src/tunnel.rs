@@ -9,7 +9,7 @@ use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 
 use crate::config::TunnelConfig;
-use crate::intercept::{InterceptPlan, Interceptor, Prefixed};
+use crate::intercept::{InterceptAuth, InterceptPlan, Interceptor, Prefixed};
 
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -396,15 +396,33 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
         .as_ref()
         .filter(|i| port == 443 && i.handles(&host))
     {
-        let Some(target) = interceptor.authorize(&host, proxy_authorization.as_deref()) else {
-            tracing::warn!(%host, "tunnel refused an intercepted host without a valid stream token");
-            let message = "a stream token is required";
-            let response = format!(
-                "HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"reiki\"\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
-                message.len()
-            );
-            client.write_all(response.as_bytes()).await?;
-            return client.shutdown().await;
+        // The login throttle is keyed by client address. If the socket has no peer, refuse
+        // instead of granting an unthrottled credential check.
+        let peer = match client.peer_addr() {
+            Ok(addr) => addr.ip(),
+            Err(error) => {
+                tracing::warn!(%host, %error, "cannot read the tunnel peer; refusing");
+                return respond(
+                    &mut client,
+                    "400 Bad Request",
+                    "cannot determine client address",
+                )
+                .await;
+            }
+        };
+        let target = match interceptor.authorize(&host, proxy_authorization.as_deref(), Some(peer))
+        {
+            InterceptAuth::Authorized(target) => target,
+            InterceptAuth::Refused => {
+                let message = "a stream token is required";
+                let response = format!(
+                        "HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"reiki\"\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
+                        message.len()
+                    );
+                client.write_all(response.as_bytes()).await?;
+                return client.shutdown().await;
+            }
+            InterceptAuth::Throttled(wait) => return throttled(&mut client, wait).await,
         };
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -486,6 +504,21 @@ async fn connect(tunnel: &Tunnel, host: &str, port: u16) -> std::io::Result<TcpS
 async fn respond(client: &mut TcpStream, status: &str, message: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
+        message.len()
+    );
+    client.write_all(response.as_bytes()).await?;
+    client.shutdown().await
+}
+
+/// The CONNECT equivalent of the client listener's login backoff response.
+async fn throttled(client: &mut TcpStream, wait: Duration) -> std::io::Result<()> {
+    let seconds = wait
+        .as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1);
+    let message = "too many failed logins";
+    let response = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nretry-after: {seconds}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
         message.len()
     );
     client.write_all(response.as_bytes()).await?;

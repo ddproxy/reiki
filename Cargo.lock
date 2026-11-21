@@ -1712,6 +1712,7 @@ dependencies = [
  "libc",
  "reiki-plugin",
  "reiki-redact",
+ "rustix",
  "serde_json",
  "toml",
  "tracing",

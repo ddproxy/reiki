@@ -99,8 +99,9 @@ stream = "client-a"
 | Path outside the intercepted API | `403`, `{"error":{"type":"forbidden","message":"the path is outside the intercepted API"}}` |
 | `Host` header differs from the tunnel destination | `421`, `{"error":{"type":"misdirected","message":"the Host header does not match the tunnel destination"}}` |
 | Intercepted host without a valid stream token | `HTTP/1.1 407 Proxy Authentication Required`, `proxy-authenticate: Basic realm="reiki"`, body `a stream token is required` |
+| Too many bad `Proxy-Authorization` attempts from one address | `HTTP/1.1 429 Too Many Requests`, `retry-after: <seconds>`, body `too many failed logins` |
 
-The 407 response also carries `content-type: text/plain`, `content-length: 26` and `connection: close`. A valid bearer token, or a basic password equal to the stream token, gets `200 Connection Established`.
+The 407 response also carries `content-type: text/plain`, `content-length: 26` and `connection: close`. A valid bearer token, or a basic password equal to the stream token, gets `200 Connection Established` and clears that address's failed-login count.
 
 > **Limit:** A plain CONNECT to an allowed host needs no token: the allowlist is the gate. Opaque tunnels have no request log, placeholders, key injection or failover. Only intercepted hosts get those controls. See [interception](tunnel.md#interception).
 

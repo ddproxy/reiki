@@ -398,7 +398,7 @@ fn check_reports_missing_empty_and_world_readable_files() {
         "{out}"
     );
     assert!(
-        out.contains("world: warning: ") && out.contains("group or world readable"),
+        out.contains("world: warning: ") && out.contains("group or world read/write bits"),
         "{out}"
     );
     assert!(!out.contains("secret-good") && !out.contains("secret-world"));

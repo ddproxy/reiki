@@ -538,6 +538,13 @@ impl SseParser {
                 match field {
                     "event" => value.clone_into(&mut self.event),
                     "data" => {
+                        // The per-line check above sees raw bytes; lossy UTF-8 decoding can make
+                        // the decoded value longer than the bytes it came from. Bound the
+                        // accumulated event explicitly, including the separating newline.
+                        let added = value.len() + usize::from(!self.data.is_empty());
+                        if self.data.len() + added > self.cap {
+                            return Err(format!("an event is over {} KiB", self.cap / 1024));
+                        }
                         if !self.data.is_empty() {
                             self.data.push('\n');
                         }
@@ -855,6 +862,28 @@ mod tests {
         assert!(
             small.feed(b"data: 0123456789").is_err(),
             "an endless line is refused"
+        );
+    }
+
+    #[test]
+    fn sse_data_accumulation_is_capped_after_lossy_decode() {
+        // Each invalid byte becomes a three-byte replacement character, so the raw-byte
+        // line check alone lets the decoded event grow past the cap.
+        let mut parser = SseParser::new(12);
+        let error = parser
+            .feed(b"data: \xff\xff\xff\xff\xff\xff\n")
+            .unwrap_err();
+        assert!(error.contains("over"), "{error}");
+
+        // Ordinary multi-line data still assembles normally under the same cap.
+        let mut parser = SseParser::new(16);
+        let items = parser.feed(b"data: 1234\ndata: 5678\n\n").unwrap();
+        assert_eq!(
+            items,
+            [SseItem::Event {
+                event: String::new(),
+                data: "1234\n5678".into()
+            }]
         );
     }
 

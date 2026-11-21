@@ -29,7 +29,7 @@ There is no `apiKey` config key and no `{file:...}` reference syntax. Use `file`
 | Item | Owner and mode | Rule |
 | --- | --- | --- |
 | Key directory, for example `/etc/reiki/keys/` | `reiki:reiki`, `0700` or `0750` | The Reiki user needs read access. No other user needs it. |
-| Key file, for example `/etc/reiki/keys/zen-a` | `reiki:reiki`, `0600` | Startup, reload and `reiki keys --check` refuse a file with group or other read bits set (the mode is checked on the same handle used to read the key). Set `strict_key_permissions = false` to downgrade this to a warning. |
+| Key file, for example `/etc/reiki/keys/zen-a` | `reiki:reiki`, `0600` | Startup, reload and `reiki keys --check` refuse a file with group or other read or write bits set (the mode is checked on the same handle used to read the key). Set `strict_key_permissions = false` to downgrade this to a warning. |
 | Config file, for example `/etc/reiki/reiki.toml` | `reiki:reiki`, `0640` | It holds paths and hashes, not raw keys. |
 | State file `<config>.state` | `reiki:reiki`, `0600` | Reiki writes it through a temporary file and rename. It holds key digests and health, not key values. |
 
@@ -45,7 +45,7 @@ chmod 0600 /etc/reiki/keys/zen-a
 
 `NAME` in `[keys.NAME]` is a stable label. Logs, `/status`, chains and the state file use it. Reiki does not enforce a naming pattern for the label or the file. Keep a name until you intend to start fresh health for that key.
 
-At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty, too short, or (with the default `strict_key_permissions = true`) readable by group or others stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
+At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty, too short, or (with the default `strict_key_permissions = true`) having group or other read or write bits stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
 
 ```bash
 reiki --config /etc/reiki/reiki.toml keys --check

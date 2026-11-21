@@ -174,13 +174,15 @@ pub enum CheckIssue {
     Missing,
     Unreadable(String),
     Empty,
+    /// Group or other read *or write* bits are set. The name is kept for compatibility.
     GroupOrWorldReadable(u32),
 }
 
 /// The permission problem with a key file whose mode is `mode`, if there is one.
 /// The same verdict drives the `reiki keys --check` warning and the load-time refusal.
+/// Write bits count too: a group-writable key can be replaced by anyone in that group.
 pub fn permission_verdict(mode: u32) -> Option<CheckIssue> {
-    (mode & 0o044 != 0).then_some(CheckIssue::GroupOrWorldReadable(mode))
+    (mode & 0o066 != 0).then_some(CheckIssue::GroupOrWorldReadable(mode))
 }
 
 /// Checks every configured key file without reading a key into the output.
@@ -277,7 +279,7 @@ pub fn render_check(checks: &[KeyCheck]) -> String {
                 CheckIssue::GroupOrWorldReadable(mode) => (
                     "warning",
                     format!(
-                        "{} is group or world readable (mode {mode:04o})",
+                        "{} has group or world read/write bits (mode {mode:04o})",
                         check.file.display()
                     ),
                 ),
@@ -357,21 +359,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_permission_verdict_flags_group_and_world_read_but_not_owner_only() {
+    fn a_permission_verdict_flags_group_and_world_access_but_not_owner_only() {
         assert_eq!(permission_verdict(0o600), None);
         assert_eq!(permission_verdict(0o700), None);
-        assert_eq!(
-            permission_verdict(0o640),
-            Some(CheckIssue::GroupOrWorldReadable(0o640))
-        );
-        assert_eq!(
-            permission_verdict(0o604),
-            Some(CheckIssue::GroupOrWorldReadable(0o604))
-        );
-        assert_eq!(
-            permission_verdict(0o644),
-            Some(CheckIssue::GroupOrWorldReadable(0o644))
-        );
+        assert_eq!(permission_verdict(0o400), None);
+        assert_eq!(permission_verdict(0o500), None);
+        for mode in [0o620, 0o622, 0o666, 0o060, 0o640, 0o604, 0o644] {
+            assert_eq!(
+                permission_verdict(mode),
+                Some(CheckIssue::GroupOrWorldReadable(mode)),
+                "mode {mode:04o} must be rejected"
+            );
+        }
     }
 
     #[cfg(unix)]

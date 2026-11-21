@@ -4,6 +4,8 @@
 pub use crossterm;
 pub use ratatui;
 
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use fw_tui::sanitize::printable;
 use fw_tui::text::{display_width, pad_width, truncate_width};
@@ -18,13 +20,14 @@ use ratatui::text::{Line as RatLine, Span as RatSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::matrix::UsageMetric;
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
 const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix  ? keys";
 /// The key hints under the matrix header. Kept within 100 columns so the header's status fits.
 const HINTS_MATRIX: &str =
-    "q quit  j/k peer  Enter detail  f filter  u metric  w window  m chart  p pause  v full  ? keys";
+    "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys";
 
 /// Rows of the matrix header panel: a border, the status line, the hints and a border.
 const HEADER_ROWS: u16 = 4;
@@ -40,9 +43,11 @@ const MATRIX_KEYS: &[&str] = &[
     "PgUp/PgDn, g/Home, G/End   scroll the detail",
     "f   cycle the provider filter",
     "c   clear the filter and the selection",
-    "u   gauge: requests or tokens",
+    "u   gauge and chart series: requests, limited, tokens",
     "w   gauge: last hour or last five minutes",
     "m   chart: load, disk, sessions, requests",
+    "s   requests chart: overlaid series or stacked total",
+    "a   jump back to ALL (the fleet row)",
     "p   freeze the screen; again to resume",
     "v or E   full text view",
     "?   this list; any key closes it, Ctrl-C quits",
@@ -93,6 +98,10 @@ pub enum Action {
     ToggleWindow,
     /// Cycles the chart's metric: load, disk, sessions, requests.
     CycleChart,
+    /// Switches the requests chart between overlaid lines and a stacked total.
+    ToggleStack,
+    /// Selects the `ALL` pseudo-peer.
+    SelectFleet,
     /// Opens or closes the key list.
     ToggleHelp,
 }
@@ -164,6 +173,10 @@ pub struct UiState {
     pub gauge: GaugeMode,
     /// What the matrix chart plots.
     pub chart: ChartMetric,
+    /// Requests chart lines are overlaid until `s` stacks them.
+    pub stacked: bool,
+    /// Which figure the provider-coloured chart sums.
+    pub chart_usage: UsageMetric,
     /// Whether the key list is open over the frame.
     pub help: bool,
 }
@@ -244,6 +257,8 @@ impl UiState {
                     GaugeMetric::Requests => GaugeMetric::Tokens,
                     GaugeMetric::Tokens => GaugeMetric::Requests,
                 };
+                // One key moves both figures that `u` names: the gauge and the chart series.
+                self.chart_usage = self.chart_usage.next();
             }
             Action::ToggleWindow => {
                 self.gauge.window = match self.gauge.window {
@@ -252,6 +267,12 @@ impl UiState {
                 };
             }
             Action::CycleChart => self.chart = self.chart.next(),
+            Action::ToggleStack => self.stacked = !self.stacked,
+            Action::SelectFleet => {
+                self.selected = Some(0);
+                self.detail = None;
+                self.scroll = 0;
+            }
             Action::ToggleHelp => self.help = !self.help,
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
@@ -285,6 +306,8 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Char('u') => Action::ToggleMetric,
         KeyCode::Char('w') => Action::ToggleWindow,
         KeyCode::Char('m') => Action::CycleChart,
+        KeyCode::Char('s') => Action::ToggleStack,
+        KeyCode::Char('a') => Action::SelectFleet,
         KeyCode::Char('?') => Action::ToggleHelp,
         _ => return None,
     };
@@ -455,6 +478,33 @@ pub fn bands(height: u16, matrix_lines: usize, cooling_lines: usize, detail_open
     b
 }
 
+/// One coloured line in the chart. Provider names are in provider-column order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChartSeries {
+    pub name: String,
+    pub points: Vec<Option<f64>>,
+    pub color: Color,
+}
+
+impl ChartSeries {
+    /// A legend entry: a coloured square, the name and the latest value.
+    fn legend_spans(&self) -> Vec<RatSpan<'static>> {
+        let latest = self
+            .points
+            .iter()
+            .rev()
+            .flatten()
+            .copied()
+            .next()
+            .unwrap_or(0.0);
+        let value = latest.round().max(0.0) as u64;
+        vec![
+            RatSpan::styled("■", RatStyle::new().fg(self.color)),
+            RatSpan::raw(format!(" {} {}  ", truncate_width(&self.name, 12), value)),
+        ]
+    }
+}
+
 /// What one matrix frame draws, built by the caller from the fleet and its history.
 pub struct MatrixFrame<'a> {
     pub version: &'a str,
@@ -474,9 +524,10 @@ pub struct MatrixFrame<'a> {
     /// The selected peer's detail card, when open.
     pub detail: Option<&'a [view::Line]>,
     pub chart_title: &'a str,
-    /// The series' name in the chart's legend.
-    pub chart_name: &'a str,
-    pub chart: &'a [Option<f64>],
+    /// One line per provider for the requests chart, or one line for the other charts.
+    pub chart_series: &'a [ChartSeries],
+    /// Time covered by one chart point, for the x axis labels.
+    pub chart_interval: Duration,
     /// Healthy, cooling and disabled keys across the fleet.
     pub keys: [u64; 3],
 }
@@ -565,7 +616,264 @@ fn draw_tabs(
     render_tabs(area, frame.buffer_mut(), &labels, selected, theme);
 }
 
-fn draw_charts(frame: &mut Frame, area: Rect, view: &MatrixFrame<'_>, theme: &Theme) {
+/// Colours in provider-column order. Glyphs carry the same order without colour.
+const SERIES_COLORS: [Color; 8] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Yellow,
+    Color::Magenta,
+    Color::Blue,
+    Color::LightGreen,
+    Color::LightCyan,
+    Color::LightYellow,
+];
+const SERIES_GLYPHS: [char; 8] = ['●', '◆', '▲', '■', '○', '◇', '△', '□'];
+
+fn series_color(index: usize) -> Color {
+    SERIES_COLORS[index % SERIES_COLORS.len()]
+}
+
+/// The colour of provider `index`, for callers building [`ChartSeries`].
+pub fn chart_color(index: usize) -> Color {
+    series_color(index)
+}
+
+fn series_glyph(index: usize) -> char {
+    SERIES_GLYPHS[index % SERIES_GLYPHS.len()]
+}
+
+fn put_char(frame: &mut Frame, x: u16, y: u16, ch: char, style: RatStyle) {
+    let area = frame.area();
+    if x >= area.width || y >= area.height {
+        return;
+    }
+    let Some(cell) = frame.buffer_mut().cell_mut((x, y)) else {
+        return;
+    };
+    cell.set_symbol(&ch.to_string());
+    cell.set_style(style);
+}
+
+fn put_text(frame: &mut Frame, x: u16, y: u16, text: &str, style: RatStyle) {
+    for (i, ch) in text.chars().enumerate() {
+        let at = x.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+        if at >= frame.area().width {
+            return;
+        }
+        put_char(frame, at, y, ch, style);
+    }
+}
+
+/// The smallest 1/2/5 x 10^n step at or above `value`; zero for an all-zero chart.
+fn nice_ceil(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0.0;
+    }
+    let power = 10f64.powf(value.log10().floor());
+    let unit = value / power;
+    let step = if unit <= 1.0 {
+        1.0
+    } else if unit <= 2.0 {
+        2.0
+    } else if unit <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    step * power
+}
+
+fn axis_label(value: f64) -> String {
+    if value <= 0.0 {
+        "0".to_owned()
+    } else if value >= 1000.0 && (value / 1000.0).fract() == 0.0 {
+        format!("{}k", (value / 1000.0) as u64)
+    } else if value.fract() == 0.0 {
+        format!("{}", value as u64)
+    } else {
+        let text = format!("{value:.2}");
+        let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+        if trimmed.is_empty() {
+            "0".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    }
+}
+
+fn x_label(interval: Duration) -> String {
+    let secs = interval.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("-{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("-{}m", secs / 60)
+    } else {
+        format!("-{}s", secs.max(1))
+    }
+}
+
+fn point_at(series: &ChartSeries, index: usize) -> f64 {
+    series
+        .points
+        .get(index)
+        .copied()
+        .flatten()
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
+/// The requests chart: a coloured line per provider, a clipped legend, and labels derived from
+/// the sample interval rather than the point indices. `s` switches to a stacked total.
+fn draw_usage_chart(frame: &mut Frame, area: Rect, view: &MatrixFrame<'_>, state: &UiState) {
+    if area.width < 8 || area.height < 4 || view.chart_series.is_empty() {
+        return;
+    }
+    let points = view
+        .chart_series
+        .iter()
+        .map(|s| s.points.len())
+        .max()
+        .unwrap_or(0);
+    if points == 0 {
+        return;
+    }
+    let peak = if state.stacked {
+        (0..points)
+            .map(|i| {
+                view.chart_series
+                    .iter()
+                    .map(|s| point_at(s, i))
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max)
+    } else {
+        view.chart_series
+            .iter()
+            .flat_map(|s| s.points.iter().flatten().copied())
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, f64::max)
+    };
+    let top = nice_ceil(peak);
+    let max_label = axis_label(top);
+    let gutter = u16::try_from(display_width(&max_label) + 1)
+        .unwrap_or(u16::MAX)
+        .min(area.width / 2);
+    let plot = Rect::new(
+        area.x.saturating_add(gutter),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(gutter),
+        area.height.saturating_sub(2),
+    );
+    if plot.width == 0 || plot.height == 0 {
+        return;
+    }
+    let baseline = plot.y.saturating_add(plot.height - 1);
+    let dim = RatStyle::new().fg(Color::DarkGray);
+    let mut spans = Vec::new();
+    for series in view.chart_series {
+        spans.extend(series.legend_spans());
+    }
+    frame.render_widget(
+        Paragraph::new(RatLine::from(spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    put_text(frame, area.x, plot.y, &max_label, dim);
+    put_text(frame, area.x, baseline, "0", dim);
+    put_text(
+        frame,
+        area.x,
+        area.y.saturating_add(area.height - 1),
+        &x_label(
+            view.chart_interval
+                .saturating_mul(u32::try_from(points).unwrap_or(u32::MAX)),
+        ),
+        dim,
+    );
+    let now = "now";
+    let now_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(display_width(now) as u16));
+    put_text(
+        frame,
+        now_x,
+        area.y.saturating_add(area.height - 1),
+        now,
+        dim,
+    );
+
+    let x_of = |i: usize| -> u16 {
+        if points <= 1 {
+            plot.x.saturating_add(plot.width - 1)
+        } else {
+            let span = u32::from(plot.width.saturating_sub(1));
+            let step = u32::try_from(i).unwrap_or(u32::MAX) * span
+                / u32::try_from(points - 1).unwrap_or(u32::MAX);
+            plot.x
+                .saturating_add(u16::try_from(step).unwrap_or(u16::MAX).min(plot.width - 1))
+        }
+    };
+    let y_of = |value: f64| -> u16 {
+        if top <= 0.0 || plot.height <= 1 {
+            baseline
+        } else {
+            let height = f64::from(plot.height - 1);
+            let scaled = (value / top).clamp(0.0, 1.0) * height;
+            baseline.saturating_sub(scaled.round() as u16)
+        }
+    };
+
+    if top <= 0.0 {
+        for x in plot.x..plot.x.saturating_add(plot.width) {
+            put_char(frame, x, baseline, '─', dim);
+        }
+    }
+    if state.stacked && top > 0.0 {
+        for i in 0..points {
+            let x = x_of(i);
+            let mut sum = 0.0;
+            for (n, series) in view.chart_series.iter().enumerate() {
+                let value = point_at(series, i);
+                if value <= 0.0 {
+                    continue;
+                }
+                let upper = y_of(sum + value);
+                let lower = y_of(sum);
+                for y in upper..=lower {
+                    put_char(frame, x, y, '█', RatStyle::new().fg(series_color(n)));
+                }
+                sum += value;
+            }
+        }
+    }
+    if !state.stacked {
+        for (n, series) in view.chart_series.iter().enumerate() {
+            let style = RatStyle::new().fg(series_color(n));
+            let glyph = series_glyph(n);
+            for i in 0..points {
+                let x = x_of(i);
+                let y = y_of(point_at(series, i));
+                if i > 0 {
+                    let from = x_of(i - 1);
+                    let mid = y.saturating_add(y_of(point_at(series, i - 1))) / 2;
+                    for at in from.saturating_add(1)..x {
+                        put_char(frame, at, mid, '─', style);
+                    }
+                }
+                put_char(frame, x, y, glyph, style);
+            }
+        }
+    }
+}
+
+#[allow(clippy::default_constructed_unit_structs)] // the real fw-tui may add fields later
+fn draw_charts(
+    frame: &mut Frame,
+    area: Rect,
+    view: &MatrixFrame<'_>,
+    state: &UiState,
+    theme: &Theme,
+) {
     let left_w = u16::try_from(u32::from(area.width) * 2 / 3).unwrap_or(area.width);
     let left = Rect::new(area.x, area.y, left_w, area.height);
     let right = Rect::new(
@@ -576,14 +884,23 @@ fn draw_charts(frame: &mut Frame, area: Rect, view: &MatrixFrame<'_>, theme: &Th
     );
     let title = printable(view.chart_title);
     frame.render_widget(Panel::new(&title).block(theme), left);
-    let series = [Series::new(view.chart_name, view.chart.to_vec())];
-    render_line_chart(
-        Panel::inner(left),
-        frame.buffer_mut(),
-        &series,
-        &LineChartConfig::default(),
-        theme,
-    );
+    let inner = Panel::inner(left);
+    if view.chart_title.starts_with("Requests") {
+        draw_usage_chart(frame, inner, view, state);
+    } else {
+        let series: Vec<Series> = view
+            .chart_series
+            .iter()
+            .map(|s| Series::new(&s.name, s.points.clone()))
+            .collect();
+        render_line_chart(
+            inner,
+            frame.buffer_mut(),
+            &series,
+            &LineChartConfig::default(),
+            theme,
+        );
+    }
 
     frame.render_widget(Panel::new("Keys").block(theme), right);
     let [healthy, cooling, disabled] = view.keys;
@@ -659,7 +976,7 @@ pub fn draw_matrix(frame: &mut Frame, view: &MatrixFrame<'_>, state: &UiState) {
             paint(frame, inner, &card[start..end]);
         }
     } else if b.charts > 0 {
-        draw_charts(frame, bottom, view, &theme);
+        draw_charts(frame, bottom, view, state, &theme);
     }
 
     if footer.height > 0 {
@@ -678,6 +995,10 @@ pub fn draw_matrix(frame: &mut Frame, view: &MatrixFrame<'_>, state: &UiState) {
             },
             ToggleChip::value("chart", state.chart.label()),
         ];
+        if state.chart == ChartMetric::Requests {
+            chips.push(ToggleChip::toggle("stack", state.stacked));
+            chips.push(ToggleChip::value("series", state.chart_usage.label()));
+        }
         if let Some(provider) = &state.filter.provider {
             chips.push(ToggleChip::value("filter", provider));
         }
@@ -896,6 +1217,8 @@ mod tests {
             detail: Some(true),
             gauge: GaugeMode::default(),
             chart: ChartMetric::Disk,
+            stacked: true,
+            chart_usage: UsageMetric::Tokens,
             help: true,
         };
         let before = state.clone();
@@ -1061,6 +1384,16 @@ mod tests {
                 KeyModifiers::NONE,
                 Some(Action::ToggleWindow),
             ),
+            (
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleStack),
+            ),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                Some(Action::SelectFleet),
+            ),
         ];
         for (code, modifiers, expected) in cases {
             let event = KeyEvent::new(code, modifiers);
@@ -1075,12 +1408,16 @@ mod tests {
         state.apply(Action::ToggleMetric, 0, 1);
         assert_eq!(state.gauge.metric, GaugeMetric::Tokens);
         assert_eq!(state.gauge.window, GaugeWindow::Hour);
+        assert_eq!(state.chart_usage, UsageMetric::Limited);
         state.apply(Action::ToggleWindow, 0, 1);
         assert_eq!(state.gauge.window, GaugeWindow::Minutes);
         state.apply(Action::ToggleMetric, 0, 1);
         assert_eq!(state.gauge.metric, GaugeMetric::Requests);
+        assert_eq!(state.chart_usage, UsageMetric::Tokens);
         state.apply(Action::ToggleWindow, 0, 1);
         assert_eq!(state.gauge, GaugeMode::default());
+        state.apply(Action::ToggleMetric, 0, 1);
+        assert_eq!(state.chart_usage, UsageMetric::Requests, "wraps");
     }
 
     #[test]
@@ -1089,6 +1426,8 @@ mod tests {
         assert!(HINTS_MATRIX.contains("u metric"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("w window"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("m chart"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("s stack"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("a all"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("? keys"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("v full"), "{HINTS_MATRIX:?}");
         assert!(
@@ -1161,7 +1500,9 @@ mod tests {
         rows: usize,
         cooling: Vec<view::Line>,
         detail: Option<Vec<view::Line>>,
-        chart: Vec<Option<f64>>,
+        chart_title: String,
+        chart: Vec<ChartSeries>,
+        chart_interval: Duration,
     }
 
     impl Fixture {
@@ -1176,7 +1517,13 @@ mod tests {
                 rows: 2,
                 cooling: Vec::new(),
                 detail: None,
-                chart: vec![Some(1.0), Some(2.0), Some(3.0)],
+                chart_title: "Load · fleet".to_owned(),
+                chart: vec![ChartSeries {
+                    name: "load".to_owned(),
+                    points: vec![Some(1.0), Some(2.0), Some(3.0)],
+                    color: Color::Cyan,
+                }],
+                chart_interval: Duration::from_secs(1),
             }
         }
 
@@ -1191,9 +1538,9 @@ mod tests {
                 selected: None,
                 cooling: &self.cooling,
                 detail: self.detail.as_deref(),
-                chart_title: "Load · fleet",
-                chart_name: "load",
-                chart: &self.chart,
+                chart_title: &self.chart_title,
+                chart_series: &self.chart,
+                chart_interval: self.chart_interval,
                 keys: [5, 2, 1],
             }
         }
@@ -1395,6 +1742,28 @@ mod tests {
     }
 
     #[test]
+    fn s_stacks_and_a_returns_to_the_fleet_row() {
+        let s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(map_key(s), Some(Action::ToggleStack));
+        assert_eq!(map_key(a), Some(Action::SelectFleet));
+        let mut state = UiState {
+            selected: Some(3),
+            detail: Some(true),
+            scroll: 4,
+            ..UiState::default()
+        };
+        state.apply(Action::ToggleStack, 10, 3);
+        assert!(state.stacked);
+        state.apply(Action::ToggleStack, 10, 3);
+        assert!(!state.stacked);
+        state.apply(Action::SelectFleet, 10, 3);
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.detail, None);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
     fn bands_drop_charts_then_cooling_then_tabs_then_fold_the_header() {
         // Three peers, so the bare matrix is five rows with its border.
         for height in 0..=60 {
@@ -1452,6 +1821,134 @@ mod tests {
         assert_eq!(utc_clock(3661), "01:01:01Z");
         assert_eq!(utc_clock(86_400 + 5), "00:00:05Z");
         assert_eq!(utc_clock(u64::MAX).len(), "00:00:00Z".len());
+    }
+
+    fn requests_fixture() -> Fixture {
+        let mut fixture = Fixture::sample();
+        fixture.chart_title = "Requests · fleet · req/interval".to_owned();
+        fixture.chart_interval = Duration::from_secs(60);
+        let latest = |value: f64| {
+            (0..12)
+                .map(|i| Some(if i == 11 { value } else { 0.0 }))
+                .collect()
+        };
+        fixture.chart = vec![
+            ChartSeries {
+                name: "zen".to_owned(),
+                points: (0..12)
+                    .map(|i| Some(if i == 11 { 12.0 } else { 1.0 }))
+                    .collect(),
+                color: Color::Cyan,
+            },
+            ChartSeries {
+                name: "openrouter".to_owned(),
+                points: latest(3.0),
+                color: Color::Green,
+            },
+            ChartSeries {
+                name: "worklog".to_owned(),
+                points: latest(1.0),
+                color: Color::Yellow,
+            },
+        ];
+        fixture
+    }
+
+    fn symbol_colors(buffer: &Buffer) -> Vec<Color> {
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| "●◆▲■○◇△□".contains(cell.symbol()) && cell.fg != Color::Reset)
+            .map(|cell| cell.fg)
+            .collect()
+    }
+
+    #[test]
+    fn the_requests_chart_names_every_provider_with_distinct_colours_and_a_real_axis() {
+        let buffer = rendered_matrix(&requests_fixture(), &UiState::default(), 100, 30);
+        let text = all_text(&buffer);
+        assert!(text.contains("Requests · fleet · req/interval"), "{text}");
+        assert!(text.contains("■ zen 12"), "legend: {text}");
+        assert!(text.contains("■ openrouter 3"), "legend: {text}");
+        assert!(text.contains("■ worklog 1"), "legend: {text}");
+        assert!(text.contains("-12m"), "x axis: {text}");
+        assert!(text.contains("now"), "x axis: {text}");
+        assert!(text.contains("0"), "y baseline: {text}");
+        let colors = symbol_colors(&buffer);
+        for color in [Color::Cyan, Color::Green, Color::Yellow] {
+            assert!(colors.contains(&color), "{color:?} missing: {colors:?}");
+        }
+        let distinct: std::collections::HashSet<Color> = colors.into_iter().collect();
+        assert!(distinct.len() >= 3, "one colour per provider: {distinct:?}");
+    }
+
+    #[test]
+    fn all_and_peer_selections_draw_distinct_chart_titles() {
+        let mut fixture = requests_fixture();
+        fixture.matrix = vec![
+            line("Fleet 2/3 fresh"),
+            line("> ALL     ■ ······"),
+            line("  peer-a  ■ ······"),
+        ];
+        fixture.rows = 2;
+        fixture.chart_title = "Requests · fleet · req/interval · fleet 2 of 3 fresh".to_owned();
+        let fleet = all_text(&rendered_matrix(&fixture, &UiState::default(), 100, 30));
+        assert!(fleet.contains("Requests · fleet"), "{fleet}");
+        assert!(fleet.contains("> ALL"), "{fleet}");
+        assert!(fleet.contains("fleet 2 of 3 fresh"), "{fleet}");
+
+        fixture.matrix[1] = line("  ALL     ■ ······");
+        fixture.matrix[2] = line("> peer-a  ■ ······");
+        fixture.chart_title = "Requests · peer-a · req/interval".to_owned();
+        let peer = all_text(&rendered_matrix(&fixture, &UiState::default(), 100, 30));
+        assert!(peer.contains("Requests · peer-a"), "{peer}");
+        assert!(peer.contains("> peer-a"), "{peer}");
+        assert!(!peer.contains("fleet 2 of 3 fresh"), "{peer}");
+    }
+
+    #[test]
+    fn s_switches_the_requests_chart_from_lines_to_a_stacked_total() {
+        let fixture = requests_fixture();
+        let overlaid = all_text(&rendered_matrix(&fixture, &UiState::default(), 100, 30));
+        assert!(overlaid.contains('●'), "overlaid points: {overlaid}");
+        let overlaid_blocks = overlaid.matches('█').count();
+        let state = UiState {
+            stacked: true,
+            ..UiState::default()
+        };
+        let stacked = all_text(&rendered_matrix(&fixture, &state, 100, 30));
+        assert!(
+            stacked.matches('█').count() > overlaid_blocks,
+            "stacked segments: {stacked}"
+        );
+        assert!(!stacked.contains('●'), "the lines are replaced: {stacked}");
+    }
+
+    #[test]
+    fn a_single_provider_draws_its_legend_and_all_zero_series_sits_on_the_baseline() {
+        let mut fixture = requests_fixture();
+        fixture.chart = vec![ChartSeries {
+            name: "zen".to_owned(),
+            points: vec![Some(0.0); 12],
+            color: Color::Cyan,
+        }];
+        let buffer = rendered_matrix(&fixture, &UiState::default(), 100, 30);
+        let text = all_text(&buffer);
+        assert!(text.contains("■ zen 0"), "{text}");
+        assert!(
+            text.contains('─'),
+            "an all-zero chart still draws its baseline: {text}"
+        );
+        assert!(text.contains("0"), "{text}");
+    }
+
+    #[test]
+    fn the_requests_chart_draws_from_twenty_to_forty_columns_without_panicking() {
+        let fixture = requests_fixture();
+        for width in 20..=40 {
+            let buffer = rendered_matrix(&fixture, &UiState::default(), width, 30);
+            assert_eq!(buffer.area.width, width);
+        }
     }
 
     #[test]

@@ -94,11 +94,27 @@ impl HostSummary {
 /// Minutes a publisher lists per upstream, the ten ending at its current minute.
 pub const MINUTE_SLOTS: usize = 10;
 
+/// The pseudo-peer that aggregates every fresh peer in the chart and the peers list.
+pub const FLEET_PEER: &str = "ALL";
+
+/// Points drawn in a usage chart window.
+pub const CHART_POINTS: usize = 12;
+/// The publisher's one-minute usage window.
+pub const MINUTE_INTERVAL: Duration = Duration::from_secs(60);
+/// The publisher's five-minute usage window.
+pub const BUCKET_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Whether this is the fleet's pseudo-row rather than a configured peer.
+pub fn is_fleet_row(row: &Row) -> bool {
+    row.peer == FLEET_PEER
+}
+
 /// One upstream's attempts and tokens in the last hour, from a publisher that exposes usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pressure {
     pub requests_1h: u64,
     pub limited_1h: u32,
+    pub tokens_1h: u64,
     /// Twelve five-minute request counts, oldest first, newest last.
     pub buckets: [u32; 12],
     /// Ten one-minute request counts, oldest first; `None` from an older publisher.
@@ -235,7 +251,7 @@ impl Matrix {
         let rows: Vec<Row> = self
             .rows
             .iter()
-            .filter(|r| r.cells.get(idx) != Some(&Cell::Absent))
+            .filter(|r| is_fleet_row(r) || r.cells.get(idx) != Some(&Cell::Absent))
             .map(|r| Row {
                 peer: r.peer.clone(),
                 cells: vec![r.cells[idx].clone()],
@@ -248,14 +264,14 @@ impl Matrix {
                 age: r.age,
             })
             .collect();
-        // keep original order (same as build input order) which is fine; display order applied later
-        let healthy_peers = rows
+        let real: Vec<&Row> = rows.iter().filter(|r| !is_fleet_row(r)).collect();
+        let healthy_peers = real
             .iter()
             .filter(|r| r.cells.first() == Some(&Cell::Healthy))
             .count();
         let column = Column {
             upstream: self.columns[idx].upstream.clone(),
-            peers_with: rows.len(),
+            peers_with: real.len(),
             healthy_peers,
         };
         Some(Matrix {
@@ -264,16 +280,209 @@ impl Matrix {
             hidden_columns: 0,
         })
     }
+
+    /// [`Matrix::build`] with the pseudo-peer `ALL` prepended. The fleet row sums the fresh
+    /// peers' usage and carries the worst key state of each provider; configured peer rows are
+    /// otherwise unchanged. Provider tallies and counts never include the pseudo-peer.
+    pub fn build_fleet(fleet: &Fleet, peers: &[String], now: Instant) -> Matrix {
+        let base = Self::build(fleet, peers, now);
+        let fleet_row = Self::fleet_row(&base);
+        let mut rows = Vec::with_capacity(base.rows.len() + 1);
+        if !base.rows.iter().any(is_fleet_row) {
+            rows.push(fleet_row);
+        }
+        rows.extend(base.rows);
+        Matrix {
+            columns: base.columns,
+            rows,
+            hidden_columns: base.hidden_columns,
+        }
+    }
+
+    /// The pseudo-row, from real peer rows only. Stale peers are excluded here; the caller counts
+    /// them separately in the chart title.
+    fn fleet_row(base: &Matrix) -> Row {
+        let fresh: Vec<&Row> = base.rows.iter().filter(|r| !r.stale).collect();
+        let cells: Vec<Cell> = (0..base.columns.len())
+            .map(|c| {
+                merge_cells(
+                    fresh
+                        .iter()
+                        .filter_map(|r| r.cells.get(c))
+                        .filter(|cell| **cell != Cell::Absent && **cell != Cell::Stale),
+                )
+            })
+            .collect();
+        let combos = (0..base.columns.len())
+            .map(|c| {
+                fresh
+                    .iter()
+                    .filter_map(|r| r.combos.get(c))
+                    .fold(0u32, |sum, &n| sum.saturating_add(n))
+            })
+            .collect();
+        let pressure = (0..base.columns.len())
+            .map(|c| {
+                let present: Vec<&Pressure> = fresh
+                    .iter()
+                    .filter_map(|r| r.pressure.get(c).and_then(Option::as_ref))
+                    .collect();
+                merge_pressures(&present)
+            })
+            .collect();
+        let host = HostSummary {
+            load1: fresh.iter().filter_map(|r| r.host.load1).reduce(f64::max),
+            disk_percent: fresh
+                .iter()
+                .filter_map(|r| r.host.disk_percent)
+                .reduce(f64::max),
+            sessions: fresh
+                .iter()
+                .filter_map(|r| r.host.sessions)
+                .reduce(u64::saturating_add),
+        };
+        Row {
+            peer: FLEET_PEER.to_owned(),
+            cells,
+            combos,
+            pressure,
+            host,
+            version: None,
+            error: None,
+            stale: fresh.is_empty(),
+            age: fresh.iter().filter_map(|r| r.age).min(),
+        }
+    }
+
+    /// `(fresh, total)` over configured peers. The `ALL` row is not a peer and never counts.
+    pub fn fresh_counts(&self) -> (usize, usize) {
+        let real: Vec<&Row> = self.rows.iter().filter(|r| !is_fleet_row(r)).collect();
+        (real.iter().filter(|r| !r.stale).count(), real.len())
+    }
 }
 
-/// Display order: problem peers (stale, or any `Partial`/`Cooling`/`Disabled` cell) first, then
-/// by name. A peer with only `Absent` and `Healthy` cells is not a problem.
+/// Cell severity, for the fleet row's "worst state" rule.
+fn cell_rank(cell: &Cell) -> u8 {
+    match cell {
+        Cell::Absent => 0,
+        Cell::Healthy => 1,
+        Cell::Partial { .. } => 2,
+        Cell::Cooling { .. } => 3,
+        Cell::Disabled => 4,
+        Cell::Stale => 5,
+    }
+}
+
+/// Keeps the worst state; equal states keep the soonest cooldown and summed key counts.
+fn merge_cells<'a>(cells: impl Iterator<Item = &'a Cell>) -> Cell {
+    let mut out = Cell::Absent;
+    for cell in cells {
+        match (&mut out, cell) {
+            (Cell::Absent, _) => out = cell.clone(),
+            (cur, next) if cell_rank(next) > cell_rank(cur) => out = next.clone(),
+            (
+                Cell::Partial {
+                    cooling,
+                    total,
+                    soonest,
+                },
+                Cell::Partial {
+                    cooling: n,
+                    total: t,
+                    soonest: s,
+                },
+            ) => {
+                *cooling = cooling.saturating_add(*n);
+                *total = total.saturating_add(*t);
+                *soonest = sooner(*soonest, *s);
+            }
+            (
+                Cell::Cooling { soonest, class },
+                Cell::Cooling {
+                    soonest: s,
+                    class: c,
+                },
+            ) => {
+                *soonest = sooner(*soonest, *s);
+                if class.is_none() {
+                    *class = c.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn sooner(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Adds fresh peers' usage buckets. A missing minute series becomes zeros, never a dropped
+/// interval, so the newest points still line up at the right edge.
+fn merge_pressures(pressures: &[&Pressure]) -> Option<Pressure> {
+    if pressures.is_empty() {
+        return None;
+    }
+    let mut out = Pressure {
+        requests_1h: 0,
+        limited_1h: 0,
+        tokens_1h: 0,
+        buckets: [0; 12],
+        minutes: None,
+        token_buckets: None,
+        token_minutes: None,
+    };
+    let mut minutes = [0u32; MINUTE_SLOTS];
+    let mut token_buckets = [0u64; 12];
+    let mut token_minutes = [0u32; MINUTE_SLOTS];
+    let mut has_minutes = false;
+    let mut has_token_buckets = false;
+    let mut has_token_minutes = false;
+    for p in pressures {
+        out.requests_1h = out.requests_1h.saturating_add(p.requests_1h);
+        out.limited_1h = out.limited_1h.saturating_add(p.limited_1h);
+        out.tokens_1h = out.tokens_1h.saturating_add(p.tokens_1h);
+        for (sum, bucket) in out.buckets.iter_mut().zip(p.buckets) {
+            *sum = sum.saturating_add(bucket);
+        }
+        if let Some(values) = p.minutes {
+            has_minutes = true;
+            for (sum, value) in minutes.iter_mut().zip(values) {
+                *sum = sum.saturating_add(value);
+            }
+        }
+        if let Some(values) = p.token_buckets {
+            has_token_buckets = true;
+            for (sum, value) in token_buckets.iter_mut().zip(values) {
+                *sum = sum.saturating_add(value);
+            }
+        }
+        if let Some(values) = p.token_minutes {
+            has_token_minutes = true;
+            for (sum, value) in token_minutes.iter_mut().zip(values) {
+                *sum = sum.saturating_add(value);
+            }
+        }
+    }
+    out.minutes = has_minutes.then_some(minutes);
+    out.token_buckets = has_token_buckets.then_some(token_buckets);
+    out.token_minutes = has_token_minutes.then_some(token_minutes);
+    Some(out)
+}
+
+/// Display order: `ALL` first, then problem peers (stale, or any `Partial`/`Cooling`/`Disabled`
+/// cell), then by name. A peer with only `Absent` and `Healthy` cells is not a problem.
 pub fn order_peers(matrix: &Matrix) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..matrix.rows.len()).collect();
     idx.sort_by(|&a, &b| {
         let (ra, rb) = (&matrix.rows[a], &matrix.rows[b]);
-        is_problem(rb)
-            .cmp(&is_problem(ra))
+        is_fleet_row(rb)
+            .cmp(&is_fleet_row(ra))
+            .then_with(|| is_problem(rb).cmp(&is_problem(ra)))
             .then_with(|| ra.peer.cmp(&rb.peer))
     });
     idx
@@ -287,6 +496,9 @@ pub fn resolve(selected: Option<usize>, len: usize) -> Option<usize> {
 
 /// Whether a row needs attention: stale, or any cell that is not fully healthy or absent.
 pub fn is_problem(row: &Row) -> bool {
+    if is_fleet_row(row) {
+        return false;
+    }
     row.stale
         || row.cells.iter().any(|c| {
             matches!(
@@ -416,6 +628,7 @@ fn pressure_of(upstream: &Upstream) -> Option<Pressure> {
     upstream.requests_1h.map(|requests_1h| Pressure {
         requests_1h,
         limited_1h: upstream.limited_1h.unwrap_or(0),
+        tokens_1h: upstream.tokens_1h.unwrap_or(0),
         buckets: upstream.request_buckets.unwrap_or([0; 12]),
         minutes: upstream.request_minutes,
         token_buckets: upstream.token_buckets,
@@ -501,6 +714,225 @@ pub fn request_series(rows: &[Row]) -> Vec<Option<f64>> {
         return vec![None; sums.len()];
     }
     sums.iter().map(|&n| Some(n as f64)).collect()
+}
+
+/// The figure a provider-coloured usage chart plots. `u` cycles this alongside the gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageMetric {
+    #[default]
+    Requests,
+    Limited,
+    Tokens,
+}
+
+impl UsageMetric {
+    /// The next `u` position.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Requests => Self::Limited,
+            Self::Limited => Self::Tokens,
+            Self::Tokens => Self::Requests,
+        }
+    }
+
+    /// The legend/title name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Requests => "requests",
+            Self::Limited => "limited",
+            Self::Tokens => "tokens",
+        }
+    }
+
+    /// The chart title's name.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Requests => "Requests",
+            Self::Limited => "Limited",
+            Self::Tokens => "Tokens",
+        }
+    }
+
+    /// The unit shown in the chart title.
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::Requests => "req/interval",
+            Self::Limited => "limited/interval",
+            Self::Tokens => "tok/interval",
+        }
+    }
+}
+
+/// Usage points with the time each point covers. The chart's x axis is derived from these,
+/// never from the point indices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedSeries {
+    pub interval: Duration,
+    pub points: Vec<f64>,
+}
+
+/// One provider's series, in provider-column order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderSeries {
+    pub upstream: String,
+    pub series: TimedSeries,
+}
+
+/// Aligns series on their newest point and sums them. Different intervals are resolved by
+/// splitting a coarse point evenly across the fine points it covers; missing points are zero.
+pub fn align_and_sum(series: &[TimedSeries]) -> TimedSeries {
+    let Some(interval) = series.iter().map(|s| s.interval).min() else {
+        return TimedSeries {
+            interval: MINUTE_INTERVAL,
+            points: Vec::new(),
+        };
+    };
+    let fine = interval.as_secs().max(1);
+    let ratio_of = |s: &TimedSeries| {
+        usize::try_from((s.interval.as_secs().max(fine) / fine).max(1)).unwrap_or(usize::MAX)
+    };
+    let len = series
+        .iter()
+        .map(|s| s.points.len().saturating_mul(ratio_of(s)))
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![0.0; len];
+    for s in series {
+        let ratio = ratio_of(s);
+        for (age, value) in s.points.iter().rev().enumerate() {
+            let right = len.saturating_sub(age.saturating_mul(ratio));
+            let left = right.saturating_sub(ratio);
+            for slot in out.iter_mut().take(right).skip(left) {
+                *slot += *value / ratio as f64;
+            }
+        }
+    }
+    TimedSeries {
+        interval,
+        points: out,
+    }
+}
+
+fn minute_points(values: Option<[u32; MINUTE_SLOTS]>) -> Option<Vec<f64>> {
+    values.map(|minutes| {
+        let mut points = vec![0.0; CHART_POINTS - MINUTE_SLOTS];
+        points.extend(minutes.iter().map(|&n| f64::from(n)));
+        points
+    })
+}
+
+fn token_minute_points(values: Option<[u32; MINUTE_SLOTS]>) -> Option<Vec<f64>> {
+    values.map(|minutes| {
+        let mut points = vec![0.0; CHART_POINTS - MINUTE_SLOTS];
+        points.extend(minutes.iter().map(|&n| f64::from(n)));
+        points
+    })
+}
+
+fn bucket_points(values: [u32; 12]) -> Vec<f64> {
+    values.iter().map(|&n| f64::from(n)).collect()
+}
+
+fn token_points(pressure: &Pressure, interval: Duration) -> Vec<f64> {
+    if interval == MINUTE_INTERVAL {
+        token_minute_points(pressure.token_minutes).unwrap_or_else(|| vec![0.0; CHART_POINTS])
+    } else {
+        pressure
+            .token_buckets
+            .as_ref()
+            .map(|values| values.iter().map(|&n| n as f64).collect())
+            .unwrap_or_else(|| vec![0.0; CHART_POINTS])
+    }
+}
+
+/// One pressure's points for a metric. Limited has no bucket series in health: it is derived
+/// from the hour's limited/request ratio, spread evenly when no requests were reported.
+fn usage_points(pressure: &Pressure, metric: UsageMetric, interval: Duration) -> Vec<f64> {
+    match metric {
+        UsageMetric::Requests => {
+            if interval == MINUTE_INTERVAL {
+                minute_points(pressure.minutes).unwrap_or_else(|| bucket_points(pressure.buckets))
+            } else {
+                bucket_points(pressure.buckets)
+            }
+        }
+        UsageMetric::Limited => {
+            let ratio = if pressure.requests_1h > 0 {
+                f64::from(pressure.limited_1h) / pressure.requests_1h as f64
+            } else if pressure.limited_1h > 0 {
+                f64::from(pressure.limited_1h) / CHART_POINTS as f64
+            } else {
+                0.0
+            };
+            let base = if interval == MINUTE_INTERVAL {
+                minute_points(pressure.minutes).unwrap_or_else(|| bucket_points(pressure.buckets))
+            } else {
+                bucket_points(pressure.buckets)
+            };
+            base.iter().map(|v| v * ratio).collect()
+        }
+        UsageMetric::Tokens => token_points(pressure, interval),
+    }
+}
+
+/// Provider-coloured chart series for the fresh rows of `matrix`, in column order. Minute data
+/// wins when any fresh peer publishes it; otherwise the hour's five-minute buckets are used.
+/// A provider with no pressure at all still gets a zero series so its name and colour appear.
+pub fn usage_by_provider(matrix: &Matrix, metric: UsageMetric) -> Vec<ProviderSeries> {
+    (0..matrix.columns.len())
+        .filter_map(|c| {
+            let has_upstream = matrix.rows.iter().any(|row| {
+                !is_fleet_row(row) && !row.stale && row.cells.get(c) != Some(&Cell::Absent)
+            });
+            if !has_upstream {
+                return None;
+            }
+            let pressures: Vec<&Pressure> = matrix
+                .rows
+                .iter()
+                .filter(|row| {
+                    !is_fleet_row(row) && !row.stale && row.cells.get(c) != Some(&Cell::Absent)
+                })
+                .filter_map(|row| row.pressure.get(c).and_then(Option::as_ref))
+                .collect();
+            let use_minutes = match metric {
+                UsageMetric::Requests => pressures.iter().any(|p| p.minutes.is_some()),
+                UsageMetric::Tokens => pressures.iter().any(|p| p.token_minutes.is_some()),
+                UsageMetric::Limited => pressures.iter().any(|p| p.minutes.is_some()),
+            };
+            let interval = if use_minutes {
+                MINUTE_INTERVAL
+            } else {
+                BUCKET_INTERVAL
+            };
+            let series: Vec<TimedSeries> = if pressures.is_empty() {
+                vec![TimedSeries {
+                    interval,
+                    points: vec![0.0; CHART_POINTS],
+                }]
+            } else {
+                pressures
+                    .iter()
+                    .filter(|p| match metric {
+                        UsageMetric::Tokens => {
+                            use_minutes == p.token_minutes.is_some()
+                                || (!use_minutes && p.token_buckets.is_some())
+                        }
+                        _ => use_minutes == p.minutes.is_some(),
+                    })
+                    .map(|p| TimedSeries {
+                        interval,
+                        points: usage_points(p, metric, interval),
+                    })
+                    .collect()
+            };
+            let series = align_and_sum(&series);
+            Some(ProviderSeries {
+                upstream: matrix.columns[c].upstream.clone(),
+                series,
+            })
+        })
+        .collect()
 }
 
 /// Keys by state, summed over the fresh peers and every provider: healthy, cooling, disabled.
@@ -816,6 +1248,7 @@ mod tests {
             vec![Some(Pressure {
                 requests_1h: 120,
                 limited_1h: 3,
+                tokens_1h: 0,
                 buckets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
                 minutes: None,
                 token_buckets: None,
@@ -857,6 +1290,7 @@ mod tests {
             vec![Some(Pressure {
                 requests_1h: 5,
                 limited_1h: 0,
+                tokens_1h: 0,
                 buckets: [0; 12],
                 minutes: None,
                 token_buckets: None,
@@ -1301,5 +1735,228 @@ mod tests {
             [0, 0, 0],
             "stale peers count for nothing"
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rich_upstream(
+        name: &str,
+        requests: u64,
+        limited: u32,
+        tokens: u64,
+        healthy: u32,
+        cooling: u32,
+        minutes: &str,
+        token_minutes: &str,
+    ) -> String {
+        format!(
+            r#"{{"name":"{name}","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":0,
+                "soonest_cooldown_seconds":null,"last_status_class":null,
+                "requests_1h":{requests},"limited_1h":{limited},"tokens_1h":{tokens},
+                "request_buckets":[1,1,1,1,1,1,1,1,1,1,1,1],
+                "request_minutes":{minutes},"token_minutes":{token_minutes}}}"#
+        )
+    }
+
+    #[test]
+    fn align_and_sum_aligns_newest_points_and_splits_a_coarse_interval() {
+        let fine = TimedSeries {
+            interval: MINUTE_INTERVAL,
+            points: vec![1.0, 2.0, 3.0],
+        };
+        let coarse = TimedSeries {
+            interval: Duration::from_secs(180),
+            points: vec![30.0],
+        };
+        let summed = align_and_sum(&[fine, coarse]);
+        assert_eq!(summed.interval, MINUTE_INTERVAL);
+        assert_eq!(
+            summed.points,
+            vec![11.0, 12.0, 13.0],
+            "the newest points align"
+        );
+    }
+
+    #[test]
+    fn align_and_sum_treats_missing_points_as_zero_and_aligns_the_newest() {
+        let short = TimedSeries {
+            interval: MINUTE_INTERVAL,
+            points: vec![1.0, 2.0],
+        };
+        let long = TimedSeries {
+            interval: MINUTE_INTERVAL,
+            points: vec![10.0, 20.0, 30.0],
+        };
+        assert_eq!(align_and_sum(&[short, long]).points, vec![10.0, 21.0, 32.0]);
+        assert!(align_and_sum(&[]).points.is_empty());
+        assert_eq!(
+            align_and_sum(&[TimedSeries {
+                interval: MINUTE_INTERVAL,
+                points: vec![0.0; CHART_POINTS],
+            }])
+            .points
+            .len(),
+            CHART_POINTS
+        );
+    }
+
+    #[test]
+    fn the_fleet_row_sums_fresh_usage_and_carries_the_worst_state() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(&rich_upstream(
+                "zen",
+                10,
+                2,
+                100,
+                1,
+                0,
+                "[1,1,1,1,1,1,1,1,1,1]",
+                "[1,1,1,1,1,1,1,1,1,1]",
+            )),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &doc(&rich_upstream(
+                "zen",
+                5,
+                1,
+                50,
+                0,
+                1,
+                "[1,1,1,1,1,1,1,1,1,1]",
+                "[1,1,1,1,1,1,1,1,1,1]",
+            )),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-c",
+            &doc(&rich_upstream(
+                "zen",
+                100,
+                9,
+                900,
+                1,
+                0,
+                "[9,9,9,9,9,9,9,9,9,9]",
+                "[9,9,9,9,9,9,9,9,9,9]",
+            )),
+            t0 - Duration::from_secs(91),
+        );
+        let peers = names(&["peer-a", "peer-b", "peer-c"]);
+        let m = Matrix::build_fleet(&f, &peers, t0);
+        assert_eq!(m.rows.len(), 4);
+        assert_eq!(m.rows[0].peer, FLEET_PEER);
+        assert_eq!(order_peers(&m)[0], 0, "ALL is the first display row");
+        assert_eq!(m.fresh_counts(), (2, 3));
+        assert!(!is_problem(&m.rows[0]));
+        assert_eq!(m.columns[0].peers_with, 3, "tallies ignore ALL");
+        let pressure = m.rows[0].pressure[0].as_ref().expect("fleet pressure");
+        assert_eq!(pressure.requests_1h, 15, "the stale peer is excluded");
+        assert_eq!(pressure.limited_1h, 3);
+        assert_eq!(pressure.tokens_1h, 150);
+        assert_eq!(pressure.buckets, [2; 12]);
+        assert!(matches!(m.rows[0].cells[0], Cell::Cooling { .. }));
+        let filtered = m.filter_provider("zen").expect("zen");
+        assert_eq!(filtered.rows[0].peer, FLEET_PEER);
+        assert_eq!(filtered.columns[0].peers_with, 3);
+    }
+
+    #[test]
+    fn usage_series_cover_every_provider_even_with_different_peer_sets() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &doc(&format!(
+                "{},{}",
+                rich_upstream(
+                    "zen",
+                    10,
+                    2,
+                    20,
+                    1,
+                    0,
+                    "[1,1,1,1,1,1,1,1,1,1]",
+                    "[2,2,2,2,2,2,2,2,2,2]",
+                ),
+                rich_upstream(
+                    "worklog",
+                    3,
+                    1,
+                    6,
+                    1,
+                    0,
+                    "[0,0,0,0,0,0,0,0,0,1]",
+                    "[0,0,0,0,0,0,0,0,0,1]",
+                )
+            )),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-b",
+            &doc(&rich_upstream(
+                "zen",
+                5,
+                1,
+                10,
+                1,
+                0,
+                "[0,0,0,0,0,0,0,0,0,2]",
+                "[0,0,0,0,0,0,0,0,0,2]",
+            )),
+            t0,
+        );
+        add(
+            &mut f,
+            "peer-c",
+            &doc(&rich_upstream(
+                "forgejo",
+                90,
+                0,
+                900,
+                1,
+                0,
+                "[9,9,9,9,9,9,9,9,9,9]",
+                "[9,9,9,9,9,9,9,9,9,9]",
+            )),
+            t0 - Duration::from_secs(91),
+        );
+        let peers = names(&["peer-a", "peer-b", "peer-c"]);
+        let m = Matrix::build_fleet(&f, &peers, t0);
+        let requests = usage_by_provider(&m, UsageMetric::Requests);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|s| s.upstream.as_str())
+                .collect::<Vec<_>>(),
+            ["zen", "worklog"],
+            "the stale-only forgejo is excluded; credential upstreams are kept"
+        );
+        assert_eq!(requests[0].series.interval, MINUTE_INTERVAL);
+        assert_eq!(requests[0].series.points.len(), CHART_POINTS);
+        assert_eq!(requests[0].series.points[11], 3.0, "1 + 2 newest minutes");
+        assert_eq!(
+            requests[0].series.points[0], 0.0,
+            "unreported minutes are zero"
+        );
+        assert_eq!(requests[1].series.points[11], 1.0);
+        let limited = usage_by_provider(&m, UsageMetric::Limited);
+        assert!(
+            (limited[0].series.points[11] - 0.6).abs() < 1e-9,
+            "2/10 of 3"
+        );
+        let tokens = usage_by_provider(&m, UsageMetric::Tokens);
+        assert_eq!(tokens[0].series.points[11], 4.0, "2 + 2 newest minutes");
+
+        let empty = Matrix::build_fleet(&f, &[], t0);
+        assert!(usage_by_provider(&empty, UsageMetric::Requests).is_empty());
     }
 }

@@ -8,7 +8,8 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::matrix::{
-    order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row, MINUTE_SLOTS,
+    is_fleet_row, order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row, FLEET_PEER,
+    MINUTE_SLOTS,
 };
 use crate::Fleet;
 
@@ -226,6 +227,7 @@ fn column_peak(matrix: &Matrix, column: usize, mode: GaugeMode) -> u64 {
     matrix
         .rows
         .iter()
+        .filter(|row| !is_fleet_row(row))
         .filter_map(|row| row.pressure.get(column).and_then(Option::as_ref))
         .filter_map(|pressure| gauge_values(pressure, mode))
         .flatten()
@@ -370,6 +372,105 @@ pub fn peer_detail(fleet: &Fleet, name: &str, now: Instant, width: usize) -> Vec
     let mut out = Vec::new();
     peer_card(fleet, name, now, width, &mut out);
     out
+}
+
+/// The `ALL` detail: per-upstream totals followed by one `(peer, upstream, requests, limited,
+/// state)` line per fresh peer that publishes it. Stale peers are left out, as in the chart.
+pub fn fleet_detail(fleet: &Fleet, peers: &[String], now: Instant, width: usize) -> Vec<Line> {
+    let matrix = Matrix::build_fleet(fleet, peers, now);
+    let (fresh, total) = matrix.fresh_counts();
+    let mut out = vec![
+        line(
+            vec![span(format!("{FLEET_PEER} · fleet"), Style::Title)],
+            width,
+        ),
+        line(
+            vec![span(
+                format!("fleet {fresh} of {total} fresh"),
+                if fresh == total {
+                    Style::Good
+                } else {
+                    Style::Warn
+                },
+            )],
+            width,
+        ),
+    ];
+    for col in &matrix.columns {
+        let mut requests = 0u64;
+        let mut limited = 0u64;
+        let mut rows = Vec::new();
+        for name in peers {
+            let Some(peer) = fleet.peer(name, now).filter(|p| !p.stale) else {
+                continue;
+            };
+            let Some(u) = peer
+                .health
+                .upstreams
+                .iter()
+                .find(|u| u.name == col.upstream)
+            else {
+                continue;
+            };
+            let n = u.requests_1h.unwrap_or(0);
+            let lim = u.limited_1h.unwrap_or(0);
+            requests = requests.saturating_add(n);
+            limited = limited.saturating_add(u64::from(lim));
+            let (state, style) = upstream_state(u);
+            rows.push(line(
+                vec![span(
+                    format!(
+                        "    ({}, {}, {}, {}, {})",
+                        name, col.upstream, n, lim, state
+                    ),
+                    style,
+                )],
+                width,
+            ));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        out.push(line(
+            vec![
+                span(format!("  {}  ", col.upstream), Style::Title),
+                span(format!("{requests} requests"), Style::Plain),
+                span(format!("  {limited} limited"), Style::Warn),
+            ],
+            width,
+        ));
+        out.extend(rows);
+    }
+    if out.len() == 2 {
+        out.push(line(
+            vec![span("  no fresh upstream data", Style::Dim)],
+            width,
+        ));
+    }
+    out
+}
+
+/// The state shown in the `ALL` detail's per-peer tuples.
+fn upstream_state(u: &crate::Upstream) -> (&'static str, Style) {
+    let total = u
+        .healthy_keys
+        .saturating_add(u.cooling_keys)
+        .saturating_add(u.disabled_keys);
+    if total == 0 {
+        return ("absent", Style::Dim);
+    }
+    if u.healthy_keys > 0 {
+        return if u.cooling_keys == 0 && u.disabled_keys == 0 {
+            ("healthy", Style::Good)
+        } else {
+            ("partial", Style::Warn)
+        };
+    }
+    if u.cooling_keys > 0 {
+        ("cooling", Style::Warn)
+    } else {
+        ("disabled", Style::Bad)
+    }
 }
 
 fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Vec<Line>) {
@@ -649,11 +750,8 @@ pub fn render_matrix_mode(
 ) -> Vec<Line> {
     let order = order_peers(matrix);
     let selected = selected.and_then(|s| resolve(Some(s), order.len()));
-    let fresh = matrix.rows.iter().filter(|r| !r.stale).count();
-    let mut title = vec![span(
-        format!("Fleet {fresh}/{} fresh", matrix.rows.len()),
-        Style::Title,
-    )];
+    let (fresh, total) = matrix.fresh_counts();
+    let mut title = vec![span(format!("Fleet {fresh}/{total} fresh"), Style::Title)];
     if let Some(name) = filter {
         title.push(span(format!("   filter: {name}"), Style::Title));
     }
@@ -691,6 +789,9 @@ pub fn render_matrix_mode(
             let mut soonest: Option<Duration> = None;
             let mut has_peer = false;
             for row in &matrix.rows {
+                if is_fleet_row(row) {
+                    continue;
+                }
                 let Some(cell) = row.cells.get(c) else {
                     continue;
                 };
@@ -2961,5 +3062,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fleet_usage_doc(
+        name: &str,
+        requests: u64,
+        limited: u32,
+        healthy: u32,
+        cooling: u32,
+    ) -> String {
+        format!(
+            r#"{{"instance":"{name}","observed_at":"t","upstreams":[
+                {{"name":"zen","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":0,
+                  "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                  "requests_1h":{requests},"limited_1h":{limited}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn the_all_row_comes_first_and_does_not_change_the_tallies() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &fleet_usage_doc("peer-a", 10, 0, 1, 0),
+            t0,
+        );
+        add(&mut f, "peer-b", &fleet_usage_doc("peer-b", 5, 1, 0, 1), t0);
+        add(
+            &mut f,
+            "peer-c",
+            &fleet_usage_doc("peer-c", 90, 0, 1, 0),
+            t0 - Duration::from_secs(91),
+        );
+        let peers = names(&["peer-a", "peer-b", "peer-c"]);
+        let m = Matrix::build_fleet(&f, &peers, t0);
+        let lines = texts(&render_matrix_mode(
+            &m,
+            &History::new(0),
+            Some(0),
+            100,
+            None,
+            GaugeMode::default(),
+        ));
+        assert!(lines[0].contains("Fleet 2/3 fresh"), "{lines:?}");
+        assert!(lines[0].contains("zen 1/3"), "ALL is not a peer: {lines:?}");
+        assert!(lines[2].contains("ALL"), "ALL is the first row: {lines:?}");
+        assert!(
+            lines[2].contains("■"),
+            "the ALL row has a state cell: {lines:?}"
+        );
+        assert_eq!(
+            m.columns[0].peers_with, 3,
+            "the tally still counts configured peers only"
+        );
+    }
+
+    #[test]
+    fn the_all_detail_shows_totals_and_per_peer_tuples() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        add(
+            &mut f,
+            "peer-a",
+            &fleet_usage_doc("peer-a", 10, 2, 1, 0),
+            t0,
+        );
+        add(&mut f, "peer-b", &fleet_usage_doc("peer-b", 5, 1, 0, 1), t0);
+        add(
+            &mut f,
+            "peer-c",
+            &fleet_usage_doc("peer-c", 90, 9, 1, 0),
+            t0 - Duration::from_secs(91),
+        );
+        let peers = names(&["peer-a", "peer-b", "peer-c"]);
+        let lines = texts(&fleet_detail(&f, &peers, t0, 100));
+        assert_eq!(lines[0], "ALL · fleet");
+        assert!(lines[1].contains("fleet 2 of 3 fresh"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("15 requests") && l.contains("3 limited")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(peer-a, zen, 10, 2, healthy)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("(peer-b, zen, 5, 1, cooling)")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("peer-c")),
+            "stale peers are excluded: {lines:?}"
+        );
     }
 }

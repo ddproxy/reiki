@@ -10,10 +10,10 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use reiki_top::matrix::{
-    fleet_series, is_problem, key_counts, order_peers, request_series, resolve, History,
-    HostSummary, Matrix, Metric, Sample,
+    fleet_series, is_fleet_row, is_problem, key_counts, order_peers, resolve, usage_by_provider,
+    History, HostSummary, Matrix, Metric, Sample,
 };
-use reiki_top::ui::{self, crossterm, ratatui, ChartMetric};
+use reiki_top::ui::{self, crossterm, ratatui, ChartMetric, ChartSeries};
 use reiki_top::{view, Fleet, Health};
 use tokio::sync::mpsc;
 
@@ -207,7 +207,7 @@ async fn run_once_to_with_local(
     let lines = if full {
         view::render(&fleet, &names, now, 100)
     } else {
-        let matrix = Matrix::build(&fleet, &names, now);
+        let matrix = Matrix::build_fleet(&fleet, &names, now);
         let (matrix, filter_name): (Matrix, Option<&str>) = match provider {
             Some(p) if matrix.filter_provider(p).is_some() => {
                 (matrix.filter_provider(p).unwrap(), Some(p))
@@ -476,6 +476,9 @@ async fn live_loop(
             peer: None,
             provider: provider.map(str::to_owned),
         },
+        // More than one configured peer starts on ALL, so the chart is the fleet view until the
+        // user moves. `ALL` is the first display row.
+        selected: (all.len() > 1).then_some(0),
         ..ui::UiState::default()
     };
     // Pause freezes the picture, not just the redraws, so a peer that goes quiet cannot keep
@@ -544,8 +547,15 @@ async fn live_loop(
                     Some(f) => (&f.fleet, &f.history, f.at),
                     None => (&fleet, &history, Instant::now()),
                 };
-                let (total, viewport) =
-                    match measure(terminal, shown, shown_history, shown_at, &all, &state) {
+                let (total, viewport) = match measure(
+                    terminal,
+                    shown,
+                    shown_history,
+                    shown_at,
+                    &all,
+                    &state,
+                    redraw,
+                ) {
                         Ok(pair) => pair,
                         Err(e) => {
                             eprintln!("reiki: cannot size the terminal: {e}");
@@ -556,7 +566,7 @@ async fn live_loop(
                     .is_some_and(|(_, problem)| problem);
                 if action == ui::Action::CycleProvider {
                     if state.mode == ui::Mode::Matrix {
-                        let matrix = Matrix::build(shown, &all, shown_at);
+                        let matrix = Matrix::build_fleet(shown, &all, shown_at);
                         let providers: Vec<String> =
                             matrix.columns.iter().map(|c| c.upstream.clone()).collect();
                         state.cycle_provider(&providers);
@@ -583,7 +593,7 @@ async fn live_loop(
                 now: shown_at,
                 paused_for,
             };
-            if let Err(e) = render_screen(terminal, &shown, &all, &state) {
+            if let Err(e) = render_screen(terminal, &shown, &all, &state, redraw) {
                 eprintln!("reiki: cannot draw: {e}");
                 return 1;
             }
@@ -627,10 +637,20 @@ fn apply_action(
         }
         return true;
     }
+    // `a` is the matrix's shortcut back to the fleet row.
+    if action == ui::Action::SelectFleet {
+        if state.mode == ui::Mode::Matrix {
+            state.apply(action, total, viewport);
+        }
+        return true;
+    }
     // The gauge and the chart only exist in the matrix, so the full view ignores their keys.
     if matches!(
         action,
-        ui::Action::ToggleMetric | ui::Action::ToggleWindow | ui::Action::CycleChart
+        ui::Action::ToggleMetric
+            | ui::Action::ToggleWindow
+            | ui::Action::CycleChart
+            | ui::Action::ToggleStack
     ) {
         if state.mode == ui::Mode::Matrix {
             state.apply(action, total, viewport);
@@ -680,7 +700,7 @@ fn selected_peer(
     now: Instant,
     state: &ui::UiState,
 ) -> Option<(String, bool)> {
-    let matrix = Matrix::build(fleet, all, now);
+    let matrix = Matrix::build_fleet(fleet, all, now);
     let matrix = if state.mode == ui::Mode::Matrix {
         match state.filter.provider.as_deref() {
             Some(p) => matrix.filter_provider(p).unwrap_or(matrix),
@@ -705,8 +725,8 @@ struct Parts {
     detail: Option<Vec<view::Line>>,
     providers: Vec<String>,
     chart_title: String,
-    chart_name: &'static str,
-    chart: Vec<Option<f64>>,
+    chart_series: Vec<ChartSeries>,
+    chart_interval: Duration,
     keys: [u64; 3],
 }
 
@@ -717,6 +737,7 @@ fn build_parts(
     now: Instant,
     state: &ui::UiState,
     width: usize,
+    sample_interval: Duration,
 ) -> Parts {
     match state.mode {
         ui::Mode::Full => Parts {
@@ -726,7 +747,8 @@ fn build_parts(
         ui::Mode::Matrix => {
             // The panels draw inside a border.
             let inner = width.saturating_sub(2);
-            let full = Matrix::build(fleet, all, now);
+            let full = Matrix::build_fleet(fleet, all, now);
+            let (fresh, total) = full.fresh_counts();
             let providers = full.columns.iter().map(|c| c.upstream.clone()).collect();
             let (matrix, filter_name): (Matrix, Option<&str>) =
                 match state.filter.provider.as_deref() {
@@ -740,17 +762,35 @@ fn build_parts(
             let pos = resolve(state.selected, order.len());
             let row = pos.map(|pos| &matrix.rows[order[pos]]);
             let detail = row.and_then(|row| {
-                state
-                    .detail_open(is_problem(row))
-                    .then(|| view::peer_detail(fleet, &row.peer, now, inner))
+                state.detail_open(is_problem(row)).then(|| {
+                    if is_fleet_row(row) {
+                        view::fleet_detail(fleet, all, now, inner)
+                    } else {
+                        view::peer_detail(fleet, &row.peer, now, inner)
+                    }
+                })
             });
-            // The chart follows the user's own selection; the fleet until they move it.
+            // The chart follows the user's own selection; ALL (the default) is the fleet view.
             let chart_row = state.selected.and(row);
-            let (chart_name, chart) = chart_series(state.chart, history, &matrix, chart_row);
-            let chart_title = match (state.chart, chart_row) {
-                (ChartMetric::Disk, None) => format!("{} · fleet max", state.chart.title()),
-                (_, None) => format!("{} · fleet", state.chart.title()),
-                (_, Some(row)) => format!("{} · {}", state.chart.title(), row.peer),
+            let fleet_view = chart_row.is_none_or(is_fleet_row);
+            let (chart_series, chart_interval) =
+                chart_series(state, history, &matrix, chart_row, sample_interval);
+            let chart_title = if state.chart == ChartMetric::Requests {
+                let subject = match chart_row {
+                    Some(row) if !fleet_view => format!("Requests · {}", row.peer),
+                    _ => "Requests · fleet".to_owned(),
+                };
+                let mut title = format!("{} · {}", subject, state.chart_usage.unit());
+                if fleet_view && fresh < total {
+                    title.push_str(&format!(" · fleet {fresh} of {total} fresh"));
+                }
+                title
+            } else {
+                match (state.chart, fleet_view) {
+                    (ChartMetric::Disk, true) => format!("{} · fleet max", state.chart.title()),
+                    (_, true) => format!("{} · fleet", state.chart.title()),
+                    (_, false) => format!("{} · {}", state.chart.title(), chart_row.unwrap().peer),
+                }
             };
             Parts {
                 lines: view::render_matrix_mode(
@@ -771,46 +811,77 @@ fn build_parts(
                 detail,
                 providers,
                 chart_title,
-                chart_name,
-                chart,
+                chart_series,
+                chart_interval,
                 keys: key_counts(fleet, all, now),
             }
         }
     }
 }
 
-/// The chart's legend name and points: the selected peer's history, or the fleet's when no
-/// peer is selected. Requests come from the matrix rows, so a provider filter narrows them.
+/// The chart's lines and the time one point covers. Requests get one coloured line per provider;
+/// the other metrics keep the single fleet or selected-peer history series.
 fn chart_series(
-    metric: ChartMetric,
+    state: &ui::UiState,
     history: &History,
     matrix: &Matrix,
     row: Option<&reiki_top::matrix::Row>,
-) -> (&'static str, Vec<Option<f64>>) {
-    let name = metric.label();
-    let metric = match metric {
-        ChartMetric::Requests => {
-            let rows = row.map_or(&matrix.rows[..], std::slice::from_ref);
-            return (name, request_series(rows));
-        }
+    sample_interval: Duration,
+) -> (Vec<ChartSeries>, Duration) {
+    if state.chart == ChartMetric::Requests {
+        let source = match row.filter(|r| !is_fleet_row(r)) {
+            Some(row) => Matrix {
+                columns: matrix.columns.clone(),
+                rows: vec![row.clone()],
+                hidden_columns: matrix.hidden_columns,
+            },
+            None => matrix.clone(),
+        };
+        let series = usage_by_provider(&source, state.chart_usage);
+        let interval = series
+            .first()
+            .map_or(sample_interval, |s| s.series.interval);
+        let lines = series
+            .into_iter()
+            .enumerate()
+            .map(|(i, provider)| ChartSeries {
+                name: provider.upstream,
+                points: provider.series.points.into_iter().map(Some).collect(),
+                color: ui::chart_color(i),
+            })
+            .collect();
+        return (lines, interval);
+    }
+    let metric = match state.chart {
         ChartMetric::Load => Metric::Load1,
         ChartMetric::Disk => Metric::DiskPercent,
         ChartMetric::Sessions => Metric::Sessions,
+        ChartMetric::Requests => unreachable!("handled above"),
     };
-    match row {
-        Some(row) => (
-            name,
-            history
-                .values(&row.peer, metric)
-                .into_iter()
-                .map(Some)
-                .collect(),
-        ),
+    let points = match row.filter(|r| !is_fleet_row(r)) {
+        Some(row) => history
+            .values(&row.peer, metric)
+            .into_iter()
+            .map(Some)
+            .collect(),
         None => {
-            let peers: Vec<String> = matrix.rows.iter().map(|r| r.peer.clone()).collect();
-            (name, fleet_series(history, &peers, metric))
+            let peers: Vec<String> = matrix
+                .rows
+                .iter()
+                .filter(|r| !is_fleet_row(r))
+                .map(|r| r.peer.clone())
+                .collect();
+            fleet_series(history, &peers, metric)
         }
-    }
+    };
+    (
+        vec![ChartSeries {
+            name: state.chart.label().to_owned(),
+            points,
+            color: ui::chart_color(0),
+        }],
+        sample_interval,
+    )
 }
 
 /// Pushes one host sample for each fresh peer, at most once per `every`. Called from the redraw
@@ -861,9 +932,18 @@ fn measure(
     now: Instant,
     all: &[String],
     state: &ui::UiState,
+    sample_interval: Duration,
 ) -> io::Result<(usize, usize)> {
     let size = terminal.size()?;
-    let parts = build_parts(fleet, history, all, now, state, usize::from(size.width));
+    let parts = build_parts(
+        fleet,
+        history,
+        all,
+        now,
+        state,
+        usize::from(size.width),
+        sample_interval,
+    );
     Ok(match (state.mode, parts.detail) {
         (ui::Mode::Full, _) => (
             parts.lines.len(),
@@ -902,6 +982,7 @@ fn render_screen(
     shown: &Shown<'_>,
     all: &[String],
     state: &ui::UiState,
+    sample_interval: Duration,
 ) -> io::Result<()> {
     let visible = visible_cts(all, state);
     let fresh = visible
@@ -927,6 +1008,7 @@ fn render_screen(
             shown.now,
             state,
             usize::from(frame.area().width),
+            sample_interval,
         );
         match state.mode {
             ui::Mode::Full => ui::draw(frame, &parts.lines, state, &status),
@@ -943,8 +1025,8 @@ fn render_screen(
                     cooling: &parts.cooling,
                     detail: parts.detail.as_deref(),
                     chart_title: &parts.chart_title,
-                    chart_name: parts.chart_name,
-                    chart: &parts.chart,
+                    chart_series: &parts.chart_series,
+                    chart_interval: parts.chart_interval,
                     keys: parts.keys,
                 },
                 state,
@@ -962,6 +1044,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use reiki_top::matrix::Metric;
+
+    const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
     const DOC: &str = r#"{"instance":"peer-a","observed_at":"t","upstreams":[
         {"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
@@ -1204,21 +1288,135 @@ mod tests {
                 sessions: Some(2),
             },
         );
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         assert_eq!(
             parts.chart_title, "Disk · fleet max",
             "no selection, so the fleet"
         );
-        assert_eq!(parts.chart, vec![Some(40.0)]);
+        assert_eq!(parts.chart_series[0].points, vec![Some(40.0)]);
         assert!(parts.keys.iter().sum::<u64>() > 0, "{:?}", parts.keys);
         assert_eq!(parts.providers, vec!["zen".to_owned()]);
 
         state.chart = ui::ChartMetric::Load;
-        state.selected = Some(0);
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        state.selected = Some(1); // 0 is the ALL row
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         assert_eq!(parts.chart_title, "Load · peer-a");
-        assert_eq!(parts.chart, vec![Some(1.5)]);
-        assert_eq!(parts.chart_name, "load");
+        assert_eq!(parts.chart_series[0].points, vec![Some(1.5)]);
+        assert_eq!(parts.chart_series[0].name, "load");
+    }
+
+    #[test]
+    fn the_all_view_sums_providers_into_a_fleet_chart_and_opens_fleet_detail() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        let usage = |name: &str, zen: &str, worklog: &str| {
+            format!(
+                r#"{{"instance":"{name}","observed_at":"t","upstreams":[
+                    {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                      "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                      "requests_1h":10,"limited_1h":2,"request_minutes":{zen},
+                      "token_minutes":{zen}}},
+                    {{"name":"worklog","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                      "soonest_cooldown_seconds":null,"last_status_class":"2xx",
+                      "requests_1h":3,"limited_1h":1,"request_minutes":{worklog},
+                      "token_minutes":{worklog}}}]}}"#
+            )
+        };
+        apply_feed(
+            &mut fleet,
+            "peer-a",
+            FeedEvent::Snapshot(usage(
+                "peer-a",
+                "[1,1,1,1,1,1,1,1,1,1]",
+                "[0,0,0,0,0,0,0,0,0,1]",
+            )),
+            now,
+        );
+        apply_feed(
+            &mut fleet,
+            "peer-b",
+            FeedEvent::Snapshot(usage(
+                "peer-b",
+                "[0,0,0,0,0,0,0,0,0,2]",
+                "[0,0,0,0,0,0,0,0,0,2]",
+            )),
+            now,
+        );
+        apply_feed(
+            &mut fleet,
+            "peer-c",
+            FeedEvent::Snapshot(usage(
+                "peer-c",
+                "[9,9,9,9,9,9,9,9,9,9]",
+                "[9,9,9,9,9,9,9,9,9,9]",
+            )),
+            now - Duration::from_secs(91),
+        );
+        let all = vec![
+            "peer-a".to_owned(),
+            "peer-b".to_owned(),
+            "peer-c".to_owned(),
+        ];
+        let history = History::new(0);
+        let state = ui::UiState {
+            selected: Some(0),
+            detail: Some(false),
+            chart: ui::ChartMetric::Requests,
+            ..ui::UiState::default()
+        };
+        let parts = build_parts(
+            &fleet,
+            &history,
+            &all,
+            now,
+            &state,
+            100,
+            Duration::from_secs(1),
+        );
+        assert!(
+            parts.chart_title.contains("Requests · fleet"),
+            "{:?}",
+            parts.chart_title
+        );
+        assert!(
+            parts.chart_title.contains("fleet 2 of 3 fresh"),
+            "{:?}",
+            parts.chart_title
+        );
+        assert_eq!(parts.chart_interval, Duration::from_secs(60));
+        assert_eq!(
+            parts
+                .chart_series
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["worklog", "zen"]
+        );
+        assert_eq!(parts.chart_series[0].points[11], Some(3.0));
+        assert!(
+            parts.detail.is_none(),
+            "ALL does not open a detail by itself"
+        );
+
+        let mut opened = state.clone();
+        opened.detail = Some(true);
+        let card = build_parts(&fleet, &history, &all, now, &opened, 100, SAMPLE_INTERVAL)
+            .detail
+            .expect("Enter on ALL opens the fleet detail");
+        assert!(
+            card[0].plain_text().contains("ALL · fleet"),
+            "{:?}",
+            card[0]
+        );
+
+        let mut peer = state.clone();
+        peer.selected = Some(2);
+        let parts = build_parts(&fleet, &history, &all, now, &peer, 100, SAMPLE_INTERVAL);
+        assert_eq!(parts.chart_title, "Requests · peer-a · req/interval");
+        assert_eq!(parts.chart_series[0].points[11], Some(1.0), "one peer only");
+
+        apply_action(&mut peer, ui::Action::SelectFleet, &all, 10, 3, false);
+        assert_eq!(peer.selected, Some(0), "a jumps back to ALL");
     }
 
     #[test]
@@ -1239,7 +1437,7 @@ mod tests {
             now,
         );
         let history = History::new(0);
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         assert!(
             parts.lines[0].plain_text().ends_with("[tok 5m]"),
             "{:?}",
@@ -1275,8 +1473,11 @@ mod tests {
         );
         let all = vec!["peer-a".to_owned(), "peer-b".to_owned()];
         let history = History::new(0);
-        let state = ui::UiState::default();
-        let parts = build_parts(&fleet, &history, &all, now, &state, 100);
+        let state = ui::UiState {
+            selected: Some(1), // ALL is row 0; peer-b is the first problem peer
+            ..ui::UiState::default()
+        };
+        let parts = build_parts(&fleet, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         let card = parts
             .detail
             .expect("peer-b is a problem, so the pane opens");
@@ -1287,14 +1488,18 @@ mod tests {
 
         let mut closed = state.clone();
         closed.detail = Some(false);
-        assert!(build_parts(&fleet, &history, &all, now, &closed, 100)
-            .detail
-            .is_none());
+        assert!(
+            build_parts(&fleet, &history, &all, now, &closed, 100, SAMPLE_INTERVAL)
+                .detail
+                .is_none()
+        );
         let mut full = state.clone();
         full.toggle_mode();
-        assert!(build_parts(&fleet, &history, &all, now, &full, 100)
-            .detail
-            .is_none());
+        assert!(
+            build_parts(&fleet, &history, &all, now, &full, 100, SAMPLE_INTERVAL)
+                .detail
+                .is_none()
+        );
     }
 
     #[test]
@@ -1676,25 +1881,25 @@ mod tests {
         let history = History::new(0);
 
         let matrix = plain(&view::render_matrix_mode(
-            &Matrix::build(&f, &all, now),
+            &Matrix::build_fleet(&f, &all, now),
             &history,
             Some(0),
             98,
             None,
             state.gauge,
         ));
-        let parts = build_parts(&f, &history, &all, now, &state, 100);
+        let parts = build_parts(&f, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         assert_eq!(
             plain(&parts.lines),
             matrix,
             "the matrix lines are unchanged"
         );
-        assert_eq!(parts.rows, 2);
+        assert_eq!(parts.rows, 3, "ALL plus the two peers");
         assert_eq!(parts.cooling.len(), 1, "{:?}", plain(&parts.cooling));
         assert!(plain(&parts.cooling)[0].contains("peer-b"));
         assert!(!plain(&parts.cooling).iter().any(|l| l == "Cooling"));
 
-        let healthy_only = build_parts(&f, &history, &all[..1], now, &state, 100);
+        let healthy_only = build_parts(&f, &history, &all[..1], now, &state, 100, SAMPLE_INTERVAL);
         assert!(healthy_only.cooling.is_empty());
     }
 

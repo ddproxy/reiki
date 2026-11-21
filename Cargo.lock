@@ -661,9 +661,10 @@ dependencies = [
 [[package]]
 name = "fw-tui"
 version = "0.1.0"
+source = "git+https://github.com/ddproxy/fw-tui?rev=05af6efa4634e3a52d8e0720ccdc54a5241936dd#05af6efa4634e3a52d8e0720ccdc54a5241936dd"
 dependencies = [
+ "crossterm",
  "ratatui",
- "unicode-width",
 ]
 
 [[package]]

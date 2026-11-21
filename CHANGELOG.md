@@ -6,10 +6,13 @@
 
 - Test coverage re-verifies the state-file recovery path: huge, negative, NaN-like and zero recovery and saved-at values are rejected or capped before any `Instant`/`SystemTime` arithmetic.
 - Test coverage re-verifies the request-body timeout: a client that sends complete headers and then stalls on a `Content-Length` or chunked body is cut off with 408 on the real client listener.
+- `reiki top` gains an `ALL` fleet row in the matrix and tabs. It is selected by default with more than one peer, sums fresh peers' request gauges per provider, carries the worst key state, and opens a detail with per-upstream totals and per-peer `(peer, upstream, requests, limited, state)` tuples on Enter. `a` returns to it.
+- The `reiki top` Requests chart now plots one coloured line per upstream, including credential upstreams, with a clipped legend, real interval-based axes and a rounded zero-based maximum. `s` toggles overlaid lines and a stacked total.
 
 ### Changed
 
 - Behaviour change: `[admin].listen` must be a loopback address (when given as an IP:port). The admin listener has no TLS option, so a non-loopback bind is now a config error; terminate TLS in front and bind on loopback if the admin routes must be reachable off-host.
+- In `reiki top`, `u` also cycles the Requests chart series (requests, limited, tokens), and stale peers are excluded from fleet charts with the fresh count shown in the title. The X axis is labelled from the sample interval and point count, not raw sample indices.
 
 ### Fixed
 

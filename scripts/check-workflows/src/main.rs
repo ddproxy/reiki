@@ -2,7 +2,7 @@
 //! Run from the repository root:
 //!   cargo run --quiet --manifest-path scripts/check-workflows/Cargo.toml
 
-use serde_yaml::{Mapping, Value};
+use serde_norway::{Mapping, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,7 +130,7 @@ fn check_pin(line: &str, file: &str, number: usize, errors: &mut Vec<String>) ->
 fn check_workflow(path: &Path, errors: &mut Vec<String>) -> usize {
     let file = path.file_name().unwrap_or_default().to_string_lossy();
     let source = fs::read_to_string(path).expect("read workflow");
-    let workflow: Value = match serde_yaml::from_str(&source) {
+    let workflow: Value = match serde_norway::from_str(&source) {
         Ok(value) => value,
         Err(err) => {
             errors.push(format!("{file}: invalid YAML: {err}"));
@@ -194,7 +194,7 @@ fn check_workflow(path: &Path, errors: &mut Vec<String>) -> usize {
 fn check_support_yaml(root: &Path, errors: &mut Vec<String>) {
     let path = root.join(".github/dependabot.yml");
     if let Err(err) =
-        serde_yaml::from_str::<Value>(&fs::read_to_string(&path).expect("read dependabot.yml"))
+        serde_norway::from_str::<Value>(&fs::read_to_string(&path).expect("read dependabot.yml"))
     {
         errors.push(format!("dependabot.yml: invalid YAML: {err}"));
     }

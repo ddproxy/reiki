@@ -13,6 +13,7 @@ use reiki::proxy::{router, App, Clock, Secret};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 #[derive(Clone, Debug)]
 struct Call {
@@ -440,7 +441,7 @@ fn key_dir() -> &'static std::path::Path {
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["a", "b", "c", "d"] {
             let path = dir.join(name);
-            std::fs::write(&path, format!("up-{name}\n")).unwrap();
+            write_key(&path, format!("up-{name}\n"));
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -2577,9 +2578,9 @@ async fn a_sighup_reload_does_not_revive_the_old_state_of_a_rotated_key() {
     // Key files exist before the failure is persisted, so the state file is newer
     // than they are and would normally be trusted on a replay.
     let write_config = |a_secret: &str| {
-        std::fs::write(dir.join("a"), a_secret).unwrap();
+        write_key(dir.join("a"), a_secret);
         // At least 8 bytes, or the reload refuses the file at load.
-        std::fs::write(dir.join("b"), "upstream-b").unwrap();
+        write_key(dir.join("b"), "upstream-b");
         let text = format!(
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\
@@ -2635,9 +2636,9 @@ async fn a_reload_naming_an_unknown_plugin_is_refused_and_the_old_config_keeps_s
     let h = harness(&one_stream(), Policy::default()).await;
 
     let write_config = |a_secret: &str, extra: &str| {
-        std::fs::write(dir.join("a"), a_secret).unwrap();
+        write_key(dir.join("a"), a_secret);
         // At least 8 bytes, or the reload refuses the file at load.
-        std::fs::write(dir.join("b"), "upstream-b").unwrap();
+        write_key(dir.join("b"), "upstream-b");
         let text = format!(
             "[upstream.zen]\nbase_url = \"{}/v1\"\n\
              [keys.a]\nupstream = \"zen\"\nfile = \"{}\"\n\

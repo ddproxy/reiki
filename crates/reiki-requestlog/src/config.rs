@@ -5,16 +5,8 @@ use toml::{Table, Value};
 
 use crate::syslog::facility_code;
 
-/// Credential headers, refused in `headers` so they can never be logged.
-pub const DENIED_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "x-api-key",
-    "x-goog-api-key",
-    "cookie",
-    "set-cookie",
-    "x-auth-token",
-];
+/// Credential-like substrings in header names, refused in `headers` so they can never be logged.
+pub const DENIED_HEADERS: &[&str] = &["auth", "token", "key", "secret", "cookie", "credential"];
 
 const DEFAULT_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_FILE_KEEP: u32 = 5;
@@ -404,6 +396,11 @@ fn paths(table: &Table, key: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// True when an already-lowercased header name might carry a credential.
+fn is_denied_header(name: &str) -> bool {
+    DENIED_HEADERS.iter().any(|pattern| name.contains(pattern))
+}
+
 fn headers(table: &Table) -> Result<Vec<String>, String> {
     let Some(value) = table.get("headers") else {
         return Ok(Vec::new());
@@ -420,7 +417,7 @@ fn headers(table: &Table) -> Result<Vec<String>, String> {
             return Err("`headers` must contain only strings".to_owned());
         };
         let name = name.to_ascii_lowercase();
-        if DENIED_HEADERS.contains(&name.as_str()) {
+        if is_denied_header(&name) {
             return Err(format!(
                 "header `{name}` carries credentials and cannot be logged"
             ));
@@ -510,9 +507,14 @@ mod tests {
     fn credential_headers_cannot_be_logged() {
         for name in [
             "Authorization",
-            "x-api-key",
-            "COOKIE",
             "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "X-Auth-Foo",
+            "x-credential",
+            "my-token",
+            "COOKIE",
+            "Cookie",
         ] {
             let text = format!("file = \"/x\"\nheaders = [\"{name}\"]");
             assert!(parse(&text).unwrap_err().contains("credentials"), "{name}");
@@ -520,6 +522,14 @@ mod tests {
         let ok =
             parse("file = \"/x\"\nheaders = [\"User-Agent\", \"x-opencode-session\"]").unwrap();
         assert_eq!(ok.headers, ["user-agent", "x-opencode-session"]);
+    }
+
+    #[test]
+    fn credential_headers_are_refused_even_without_redaction() {
+        let text = "file = \"/x\"\nredact = false\nheaders = [\"api-key\"]";
+        assert!(parse(text).unwrap_err().contains("credentials"));
+        let ok = parse("file = \"/x\"\nredact = false\nheaders = [\"user-agent\"]").unwrap();
+        assert_eq!(ok.headers, ["user-agent"]);
     }
 
     #[test]

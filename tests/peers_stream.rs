@@ -1,6 +1,9 @@
 //! `GET /v1/health/stream` and `reiki peers --watch`.
 #![cfg(feature = "peers")]
 
+mod common;
+use common::write_key;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -105,7 +108,7 @@ impl Rig {
             std::env::temp_dir().join(format!("reiki-peers-stream-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["zen-a", "zen-b"] {
-            std::fs::write(dir.join(name), format!("upstream-{name}\n")).unwrap();
+            write_key(dir.join(name), format!("upstream-{name}\n"));
         }
         let path = dir.join("reiki.toml");
         let text = edit(&self.text).replace("/unused/", &format!("{}/", dir.display()));

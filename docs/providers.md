@@ -11,6 +11,21 @@ Each provider is an `[upstream.<name>]` table in `reiki.toml`. A client reaches 
 
 A stream can chain keys from several providers; a request uses only keys from the provider in its path.
 
+## Provider status and test coverage
+
+No test calls a live provider. Integration tests point an upstream at a local mock listener, socket or command. "Covered" below means the behaviour has a test in this repository, not that the provider's current API has been checked. Test names and source paths are given where they are specific to a provider.
+
+| Provider or profile | Config mapping | Covered by tests | Not verified here |
+| --- | --- | --- | --- |
+| OpenAI | `base_url = "https://api.openai.com/v1"`; default `authorization: Bearer {key}` | Bearer and `x-api-key` token extraction (`src/auth.rs`), path and credential swap (`tests/proxy.rs`), 401 disable and 429 quota/rate rules (`src/classify.rs`, `tests/exhausted.rs`), 402 request-size pass-through (`tests/proxy.rs`) | Real OpenAI endpoint, SDK and exhausted key |
+| OpenCode Zen | `base_url = "https://opencode.ai/zen/v1"`; default Bearer mapping | `model_aliases` and `drop_params` (`src/rewrite.rs`, `tests/proxy.rs`), `FreeUsageLimitError` and free-model 429 classification (`src/classify.rs`), `confirm_quota` retry and scoped 402/429 (`tests/proxy.rs`) | Real Zen account, free-tier headers, paid-model 402, `/responses` probe, `scope_escalate_after` behaviour |
+| Anthropic | `x-api-key`, `{key}` | `/anthropic/v1/messages` path with `anthropic-version` and placeholder/SSE handling in `tests/anthropic_path.rs` (needs `plugin-placeholders` and Unix); 400 credit-balance classification in `src/classify.rs` | Real Anthropic endpoint; `tests/anthropic_path.rs` does not send the documented quota body |
+| Gemini | `x-goog-api-key`, `{key}` | `x-goog-api-key` extraction, `?key=` accepted then stripped (`src/auth.rs`, `tests/proxy.rs`); 400 `API_KEY_INVALID` classification (`src/classify.rs`) | No end-to-end Gemini profile test and no real response |
+| Other OpenAI-compatible (OpenRouter, Groq, Together) | OpenAI mapping with the service's base URL | OpenRouter 402 request-size and free-model 429 classifier units (`src/classify.rs`); generic failover and limits tests | No base-URL integration tests; no Groq- or Together-specific tests |
+| Passthrough | `passthrough = true`; no Reiki token or key | Client credentials and `key=` query forwarded, no key used, no failover (`tests/passthrough.rs`) | Real provider TLS handshake and HTTP version |
+| Forwarders | `[upstream.X.forward]` socket or command | Socket and command round trips, failover, uid check, streaming, timeouts and concurrency (`tests/forward.rs`) | A real listener or program outside the tests |
+| Fallback and transport | `[upstream.X.fallback]`, limits and transport flags | Exhaustion fallback, budgets, compression and header settings (`tests/fallback.rs`, `tests/proxy.rs`, `tests/transport.rs`, `tests/headers.rs`); one hop is enforced in `src/proxy.rs` | The one-hop rule has no behavioural test; HTTP/2 negotiation over TLS is not exercised |
+
 ## Rewriting the request body
 
 Two optional upstream settings adjust the JSON body before Reiki sends it:
@@ -25,7 +40,7 @@ model_aliases = { "gpt-4o" = "opencode/gpt-4o" }
 drop_params = ["stream_options"]
 ```
 
-Reiki rewrites the body once before picking a key, so failover replays the same bytes. A non-object body, a missing or non-string `model`, an unknown model and a non-matching `drop_params` pass through byte-for-byte. Only top-level keys are dropped; nested objects stay. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise they must match exactly. A body with more than 4096 top-level members is left untouched instead of being scanned to the end.
+Reiki rewrites the body once before picking a key, so failover replays the same bytes. A non-object body, a missing or non-string `model`, an unknown model and a non-matching `drop_params` pass through byte-for-byte. Only top-level keys are dropped; nested objects stay. Keys and the `model` value are compared after JSON escapes are decoded, so `{"model":"gpt\u002d4o"}` matches an alias for `gpt-4o`; otherwise they must match exactly. A body with more than 4096 top-level members is refused with `400 too_many_members` before any key is used, rather than being rewritten by a scan that `request_model` does not complete.
 
 ## Transport options
 
@@ -131,7 +146,7 @@ args = ["/usr/local/lib/reiki/forwarder.ts", "--allow", "opencode.ai"]
 streaming = true
 ```
 
-- The response returns as soon as its head is in; the body then flows unbuffered, so the 8 MiB cap does not apply.
+- The response returns as soon as its head is in; the body then flows unbuffered but is still bounded: `max_stream_bytes` (default 64 MiB) caps the bytes relayed and `stream_timeout_secs` (default 1800) bounds the body's total time. Passing either limit ends the stream instead of letting it run without bound.
 - The 120-second request timeout bounds only the wait for the head, not the body.
 - A reported `content-length` is kept; otherwise the body is chunked. `transfer-encoding` and the other hop-by-hop headers are removed, and `content-encoding` is still relayed as-is unless it names a coding Reiki cannot decode while a key is in play, in which case the response is refused with 502.
 - A forwarder that fails after the head cannot be retried or fall back: the client sees the body end early with an error. A failure before the head is handled as for a buffered answer.
@@ -168,7 +183,7 @@ Any failure of the link answers 502: a failed connect or start, a wrong uid, a c
 
 - `args`, `pass_env` and `max_concurrent` need `command`; `expect_uid` needs `socket`.
 - A forward upstream cannot be combined with `http2` or `title_case_headers`; startup rejects both. It can serve an intercepted tunnel host: Reiki terminates the client's TLS and swaps the key, then hands the request to the forwarder.
-- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response; with it, only the wait for the head. `response_idle_timeout_secs` and `response_timeout_secs` also bound the body.
+- Without `streaming`, the 120-second request timeout bounds the whole exchange: connect, send and the full response; with it, only the wait for the head. A streamed body is also bounded by `max_stream_bytes` (default 64 MiB) and `stream_timeout_secs` (default 1800). `response_idle_timeout_secs` and `response_timeout_secs` also bound the body.
 - A buffered request does not necessarily stop when the client disconnects; it ends when the forwarder answers or the timeout fires.
 
 ## OpenAI
@@ -180,7 +195,7 @@ base_url = "https://api.openai.com/v1"
 
 Client base URL: `http://127.0.0.1:4097/openai`
 
-Covered by tests with invalid keys: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, follows the [quota rules](classification.md#cooldowns); other 429s follow the rate-limit rule there. These rules are unit-tested but not exercised with a real exhausted key.
+Covered by tests with mock upstreams: a 401 takes the key out of rotation and moves the request to the next key. A 429 whose body names a quota, such as `insufficient_quota`, follows the [quota rules](classification.md#cooldowns); other 429s follow the rate-limit rule there. The rules are unit-tested; no test uses a real invalid or exhausted OpenAI key.
 
 ## OpenCode Zen
 
@@ -223,7 +238,7 @@ auth_format = "{key}"
 
 Client base URL: `http://127.0.0.1:4097/gemini`. The Gemini API reports an invalid key as a 400 with `API_KEY_INVALID`; Reiki treats that as a rejected key. A client that sends the key as a `?key=` query parameter is accepted when no credential header is present, and Reiki removes the parameter before forwarding.
 
-Covered by tests with an invalid key, including a client authenticating with `x-goog-api-key`.
+Token extraction for `x-goog-api-key` and the 400 `API_KEY_INVALID` classification are unit-tested. There is no end-to-end Gemini profile test; see [provider status](#provider-status-and-test-coverage).
 
 ## Other providers
 
@@ -234,7 +249,7 @@ Any HTTP API that takes its key in a header can be an upstream. For OpenAI-compa
 base_url = "https://openrouter.ai/api/v1"
 ```
 
-Reiki decides a key failure from the status code, the `Retry-After` header, and a few error-body phrases. OpenAI and Gemini are covered by tests with invalid keys in this repository, and Anthropic's documented quota/error handling is exercised in `tests/anthropic_path.rs`. OpenAI-compatible services can use the same mapping, while a provider that signals quota or key problems differently may need a new rule in `src/classify.rs`.
+Reiki decides a key failure from the status code, the `Retry-After` header, and a few error-body phrases. The generic 401, 400 and quota rules have unit and mock-upstream tests for all three mappings; `tests/anthropic_path.rs` covers path, header and masking behaviour, not the documented quota body. No test calls a live provider. See [provider status](#provider-status-and-test-coverage). OpenAI-compatible services can use the same mapping, while a provider that signals quota or key problems differently may need a new rule in `src/classify.rs`.
 
 ## Unauthorized keys
 

@@ -1,3 +1,6 @@
+mod common;
+use common::write_key;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,7 +87,7 @@ struct Setup {
 async fn setup(label: &str, extra: &str, host_fields: &str) -> Setup {
     let dir = scratch(label);
     init_ca(&dir.join("ca"), &[HOST.to_owned()], 30, false).unwrap();
-    std::fs::write(dir.join("key"), REAL_KEY).unwrap();
+    write_key(dir.join("key"), REAL_KEY);
     let port = upstream().await;
     let text = format!(
         r#"

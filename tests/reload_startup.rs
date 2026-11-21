@@ -1,6 +1,9 @@
 //! The running binary keeps the `[tunnel]` table in its config snapshot, so an unchanged reload
 //! reports no restart and the interception CA files are watched.
 
+mod common;
+use common::write_key;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -42,7 +45,7 @@ fn http(port: u16, request: &str) -> Option<String> {
 fn start(label: &str) -> Option<(Child, u16)> {
     let dir = std::env::temp_dir().join(format!("reiki-startup-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    write_key(dir.join("key"), "upstream-secret\n");
     init_ca(&dir.join("ca"), &["api.test".to_owned()], 30, false).unwrap();
     let (client, admin, tunnel) = (free_port(), free_port(), free_port());
     let text = format!(
@@ -174,7 +177,7 @@ fn a_toml_error_in_a_reload_never_echoes_the_source() {
 fn a_removed_plugin_name_fails_startup_with_its_replacement() {
     let dir = std::env::temp_dir().join(format!("reiki-startup-warn-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    write_key(dir.join("key"), "upstream-secret\n");
     let config = dir.join("reiki.toml");
     std::fs::write(
         &config,
@@ -239,7 +242,7 @@ fn sighup_reloads_the_running_instance() {
 fn check_prints_the_connection_caps_and_names_unserved_hub_tables() {
     let dir = std::env::temp_dir().join(format!("reiki-check-caps-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    write_key(dir.join("key"), "upstream-secret\n");
     let config = dir.join("reiki.toml");
     let text = format!(
         "[server]\nmax_connections = 32\nmax_connections_per_addr = 8\n\

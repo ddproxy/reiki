@@ -1,3 +1,6 @@
+mod common;
+use common::write_key;
+
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
@@ -30,7 +33,7 @@ async fn head_sent_with(label: &str, upstream_extra: &str) -> String {
     let (port, task) = capture().await;
     let dir = std::env::temp_dir().join(format!("reiki-headers-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-key").unwrap();
+    write_key(dir.join("key"), "upstream-key");
     let text = format!(
         "[upstream.api]\nbase_url = \"http://127.0.0.1:{port}/v1\"\n{upstream_extra}\n[keys.k]\nupstream = \"api\"\nfile = \"{}\"\n[streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
         dir.join("key").display(),

@@ -16,6 +16,10 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW and O_NONBLOCK for the log file; std has no constants for them.
+libc = "0.2"
+
 [lints.rust]
 unsafe_code = "forbid"
 

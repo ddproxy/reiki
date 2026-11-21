@@ -93,7 +93,11 @@ impl Plugin for Placeholders {
 
     fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
         let Some(state) = ctx.state.downcast_mut::<State>() else {
-            return Ok(());
+            // A missing state means `new_state` failed. Sending the body on unmasked would defeat
+            // this plugin, so treat it like any other failure and let the host apply `on_error`.
+            return Err(PluginError::Skip(
+                "placeholders: the per-request masking state is missing".to_owned(),
+            ));
         };
         // An encoded or non-text body cannot be masked, so refuse it rather than send it raw.
         let encoded = reiki_detect::body_is_encoded(ctx.headers);
@@ -460,6 +464,25 @@ mod tests {
             panic!("{refused:?}")
         };
         assert!(message.contains("not UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_state_refuses_the_request_instead_of_sending_it_unmasked() {
+        let p = plugin("terms = [\"Falcon\"]\nbuiltin = false");
+        let mut headers = HeaderMap::new();
+        let mut payload = Bytes::from_static(b"{\"q\":\"Falcon\"}");
+        let mut wrong: Box<dyn Any + Send> = Box::new(());
+        let refused = p.on_request(&mut RequestCtx::new(
+            "client-a",
+            "zen",
+            &Method::POST,
+            "/zen/x",
+            &mut headers,
+            &mut payload,
+            wrong.as_mut(),
+        ));
+        assert!(matches!(refused, Err(PluginError::Skip(_))), "{refused:?}");
+        assert!(payload.as_ref() == b"{\"q\":\"Falcon\"}");
     }
 
     #[test]

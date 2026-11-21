@@ -1,12 +1,16 @@
 - title: Start
   items:
     - { title: Home, url: / }
+    - { title: Quickstart, url: /docs/quickstart.html }
+    - { title: Documentation index, url: /docs/README.html }
     - { title: Overview, url: /docs/overview.html }
     - { title: Architecture, url: /docs/architecture.html }
     - { title: Glossary, url: /docs/glossary.html }
     - { title: Command line, url: /docs/cli.html }
     - { title: Configuration, url: /docs/configuration.html }
     - { title: Keys and streams, url: /docs/keys.html }
+    - { title: OpenCode, url: /docs/opencode.html }
+    - { title: Claude Code, url: /docs/claude-code.html }
 - title: Reliability
   items:
     - { title: Failover, url: /docs/failover.html }
@@ -16,6 +20,9 @@
 - title: Security and data
   items:
     - { title: Security, url: /docs/security.html }
+    - { title: What Reiki does not protect against, url: /docs/limits.html }
+    - { title: Observe, then enforce, url: /docs/rollout.html }
+    - { title: Redaction reference, url: /docs/redaction.html }
     - { title: Plugins, url: /docs/plugins.html }
     - { title: Plugin authoring, url: /docs/plugin-authoring.html }
     - { title: Placeholders, url: /docs/placeholders.html }
@@ -33,4 +40,6 @@
     - { title: Peers publishing, url: /docs/peers-publishing.html }
     - { title: reiki top, url: /docs/top.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
+    - { title: Examples, url: /docs/examples.html }
+    - { title: FAQ, url: /docs/faq.html }
     - { title: Hub, url: /docs/hub.html }

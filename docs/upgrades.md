@@ -18,6 +18,7 @@ This is the complete map for every config table and key. "Live" means the change
 | Config | Reload | Restart | Notes |
 | --- | --- | --- | --- |
 | Top level: `listen` | — | Yes | Label `listen`. `--listen` and `REIKI_LISTEN` also bind only at start. |
+| Top level: `strict_key_permissions` | Live | — | Applies to key files read on the next reload; already-loaded keys keep running. |
 | `[admin]`: `token_sha256` | Live | — | New bearer hash applies on reload. |
 | `[admin]`: `listen` | — | Yes | Label `admin.listen`. Adding or removing `[admin]` also needs a restart. |
 | `[auth]`: `backoff`, `max_failures`, `window_secs` | Live | — | Failed-token throttle settings. |
@@ -28,7 +29,7 @@ This is the complete map for every config table and key. "Live" means the change
 | `[log]`: `file`, `format`, `stderr`, `file_max_bytes`, `file_keep` | — | Yes | Labels `log.file`, `log.format`, `log.stderr`, `log.file_max_bytes`, `log.file_keep`. |
 | `[upstream.NAME]`: `base_url`, `auth_header`, `auth_format`, `model_aliases`, `drop_params`, `http2`, `forward_accept_encoding`, `max_decoded_bytes`, `response_idle_timeout_secs`, `response_timeout_secs`, `title_case_headers`, `send_keep_alive`, `pass_errors`, `confirm_quota`, `scope_escalate_after`, `hold_unauthorized`, `passthrough` | Live | — | The upstream is rebuilt for new requests. In-flight requests keep the old route. |
 | `[upstream.NAME.fallback]`: `upstream`, `model_aliases` | Live | — | Applied with the upstream. |
-| `[upstream.NAME.forward]`: `command`, `args`, `pass_env`, `socket`, `expect_uid`, `max_concurrent`, `streaming` | Live | — | Applied with the upstream. Existing forwarder links keep their starting config. |
+| `[upstream.NAME.forward]`: `command`, `args`, `pass_env`, `socket`, `expect_uid`, `max_concurrent`, `streaming`, `max_stream_bytes`, `stream_timeout_secs` | Live | — | Applied with the upstream. Existing forwarder links keep their starting config. |
 | `[upstream.NAME.limits]`: `preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs` | Live | — | Applied with the upstream. Saved shaping state is tied to the key digest and upstream. |
 | `[keys.NAME]`: `file`, `quota_resets` | Live | — | Key files are re-read. A changed file digest starts that key healthy. |
 | `[keys.NAME]`: `upstream` | Live | — | A re-pointed key also starts healthy. |

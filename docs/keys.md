@@ -29,7 +29,7 @@ There is no `apiKey` config key and no `{file:...}` reference syntax. Use `file`
 | Item | Owner and mode | Rule |
 | --- | --- | --- |
 | Key directory, for example `/etc/reiki/keys/` | `reiki:reiki`, `0700` or `0750` | The Reiki user needs read access. No other user needs it. |
-| Key file, for example `/etc/reiki/keys/zen-a` | `reiki:reiki`, `0600` | `reiki keys --check` warns when group or other read bits are set. Startup does not check the mode. |
+| Key file, for example `/etc/reiki/keys/zen-a` | `reiki:reiki`, `0600` | Startup, reload and `reiki keys --check` refuse a file with group or other read bits set (the mode is checked on the same handle used to read the key). Set `strict_key_permissions = false` to downgrade this to a warning. |
 | Config file, for example `/etc/reiki/reiki.toml` | `reiki:reiki`, `0640` | It holds paths and hashes, not raw keys. |
 | State file `<config>.state` | `reiki:reiki`, `0600` | Reiki writes it through a temporary file and rename. It holds key digests and health, not key values. |
 
@@ -45,13 +45,13 @@ chmod 0600 /etc/reiki/keys/zen-a
 
 `NAME` in `[keys.NAME]` is a stable label. Logs, `/status`, chains and the state file use it. Reiki does not enforce a naming pattern for the label or the file. Keep a name until you intend to start fresh health for that key.
 
-At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty or too short stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
+At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty, too short, or (with the default `strict_key_permissions = true`) readable by group or others stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
 
 ```bash
 reiki --config /etc/reiki/reiki.toml keys --check
 ```
 
-Exit status: 0 when every file is clean, 1 for a problem or permission warning, 2 when the config cannot be read. The command never prints a key value.
+Exit status: 0 when every file is clean, 1 for a problem or permission warning (or a permission refusal under the default strict mode), 2 when the config cannot be read. The command never prints a key value.
 
 ## Stream tokens
 
@@ -123,7 +123,7 @@ curl -X POST -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
   "http://127.0.0.1:4098/v1/keys/enable?key=zen-a"
 ```
 
-The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"ok":true,"key":"zen-a"}`. `400` means a missing or invalid `key` parameter, `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-keysenable).
+The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"ok":true,"key":"zen-a"}`. `400` means a missing, repeated, bare or invalid `key` parameter, or an unknown flag; `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-keysenable).
 
 ## Rotate a key without downtime
 

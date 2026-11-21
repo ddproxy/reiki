@@ -12,7 +12,7 @@ token_sha256 = "<sha256 of the admin token>"
 
 Both fields are required. The address is bound at startup, so moving `[admin]` needs a restart; a changed token hash applies on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address next to the client one.
 
-Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`; ten bad tokens from one address in a minute get `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
+Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The four built-in routes plus the plugin routes are mounted bare and under `/v1`; the v1 copies add fields. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
 
 ```bash
 export ADMIN_TOKEN='...'
@@ -155,7 +155,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 | Status | Response |
 | --- | --- |
 | `200` | `{"ok":true,"key":"<name>"}`; also for a key that was available |
-| `400` | Missing `key`, or a name with invalid percent-encoding |
+| `400` | Missing `key`, a repeated or bare `key` flag, an unknown flag, or a name with invalid percent-encoding |
 | `401` | Missing or wrong token |
 | `404` | No configured key with that name |
 

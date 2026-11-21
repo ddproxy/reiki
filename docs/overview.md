@@ -45,7 +45,7 @@ Reiki reads `/etc/reiki/reiki.toml` unless `--config` names another file. `--lis
 
 Upstream keys stay out of the client. Keys stay in Reiki's files, and the client never receives one.
 
-- Keys live in files only Reiki reads. The client authenticates with a stream token that you can revoke. See [security](security.md#clients-and-keys).
+- Keys live in files on the Reiki host. Keep them mode `0600`; the daemon checks that a key file is readable and long enough, not its mode. The client authenticates with a stream token that you can revoke. See [keys](keys.md#key-files) and [security](security.md#clients-and-keys).
 - Reiki removes the client's own credential headers before it sets the upstream header. See [configuration](configuration.md).
 - A key that an upstream echoes back in an error is redacted. The cases that are not caught are listed in [security](security.md).
 - A `passthrough` upstream is the exception. It forwards the client's own credentials. See [providers](providers.md#passing-the-clients-own-credentials-through).

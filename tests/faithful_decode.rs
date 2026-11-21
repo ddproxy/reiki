@@ -1,3 +1,6 @@
+mod common;
+use common::write_key;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -106,7 +109,7 @@ struct Setup {
 async fn setup(label: &str, response: Vec<u8>) -> Setup {
     let dir = scratch(label);
     init_ca(&dir.join("ca"), &[HOST.to_owned()], 30, false).unwrap();
-    std::fs::write(dir.join("key"), REAL_KEY).unwrap();
+    write_key(dir.join("key"), REAL_KEY);
     let upstream_port = upstream(response).await;
     let text = format!(
         r#"

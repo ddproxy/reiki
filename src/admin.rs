@@ -134,7 +134,7 @@ async fn openapi(
                 "schema": {"type": "string"},
             }]);
             op["responses"]["400"] = serde_json::json!({
-                "description": "Missing key name, or a name that is not valid percent-encoding"
+                "description": "Missing, repeated or unknown flag, or a name that is not valid percent-encoding"
             });
             op["responses"]["404"] = serde_json::json!({"description": "No such key"});
         }
@@ -316,6 +316,31 @@ fn hex_digit(byte: u8) -> Option<u8> {
         .and_then(|d| u8::try_from(d).ok())
 }
 
+/// Reads `key` strictly: a repeated, bare, empty or unknown flag, or invalid percent-encoding,
+/// answers 400 rather than enabling a key the caller did not name unambiguously.
+fn parse_key_query(query: &str) -> Result<String, &'static str> {
+    let mut key = None;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let Some((name, value)) = pair.split_once('=') else {
+            return Err("every flag needs a value");
+        };
+        match name {
+            "key" => {
+                if key.is_some() {
+                    return Err("key may be given only once");
+                }
+                key = Some(
+                    decode_query_value(value)
+                        .filter(|key| !key.is_empty())
+                        .ok_or("the key name is empty or not valid percent-encoding")?,
+                );
+            }
+            _ => return Err("unknown flag; use key"),
+        }
+    }
+    key.ok_or("give the key name as ?key=<name>")
+}
+
 /// Re-enables a key that was taken out of rotation, so its chain may pick it again. Sends
 /// the key's name as `?key=<name>`; an unknown name answers `404`.
 async fn enable_key(
@@ -328,27 +353,13 @@ async fn enable_key(
     if let Err(refusal) = authorize(&app, peer, "/keys/enable", &headers) {
         return *refusal;
     }
-    let key = uri
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("key="))
-        .filter(|key| !key.is_empty());
-    let Some(key) = key else {
-        return text_response(
-            StatusCode::BAD_REQUEST,
-            "application/json",
-            "{\"ok\":false,\"error\":\"give the key name as ?key=<name>\"}".to_owned(),
-        );
-    };
-    let key = match decode_query_value(key).filter(|key| !key.is_empty()) {
-        Some(key) => key,
-        None => {
+    let key = match parse_key_query(uri.query().unwrap_or("")) {
+        Ok(key) => key,
+        Err(e) => {
             return text_response(
                 StatusCode::BAD_REQUEST,
                 "application/json",
-                "{\"ok\":false,\"error\":\"the key name is not valid percent-encoding\"}"
-                    .to_owned(),
+                format!("{{\"ok\":false,\"error\":{}}}", json_string(e)),
             );
         }
     };
@@ -740,6 +751,25 @@ mod tests {
             "dry_run&x=1",
         ] {
             assert_eq!(parse_dry_run(bad), Err(()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn key_query_is_read_strictly() {
+        assert_eq!(parse_key_query("key=a"), Ok("a".to_owned()));
+        assert_eq!(parse_key_query("key=a%2Fb+c"), Ok("a/b c".to_owned()));
+        assert_eq!(
+            parse_key_query("key=a&key=b"),
+            Err("key may be given only once")
+        );
+        assert_eq!(
+            parse_key_query("key=a&other=1"),
+            Err("unknown flag; use key")
+        );
+        assert_eq!(parse_key_query("key"), Err("every flag needs a value"));
+        assert_eq!(parse_key_query(""), Err("give the key name as ?key=<name>"));
+        for bad in ["key=", "key=%zz", "other=1", "other"] {
+            assert!(parse_key_query(bad).is_err(), "{bad}");
         }
     }
 

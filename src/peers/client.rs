@@ -470,6 +470,10 @@ const STREAM_IDLE: Duration = Duration::from_secs(40);
 /// A snapshot may be larger, but no key event adds an upstream past this cap.
 const MAX_KEY_UPSTREAMS: usize = 256;
 
+/// Largest number of items one `feed` may emit. A comment is three bytes and one item, so
+/// without this cap one chunk could enqueue tens of thousands of them.
+const MAX_SSE_ITEMS_PER_FEED: usize = 1024;
+
 /// One parsed Server-Sent Events item.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SseItem {
@@ -495,6 +499,15 @@ impl SseParser {
         }
     }
 
+    fn has_room(items: &[SseItem]) -> Result<(), String> {
+        if items.len() >= MAX_SSE_ITEMS_PER_FEED {
+            return Err(format!(
+                "too many SSE items in one chunk (cap {MAX_SSE_ITEMS_PER_FEED})"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<SseItem>, String> {
         let mut items = Vec::new();
         for &byte in bytes {
@@ -510,12 +523,14 @@ impl SseParser {
                 String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
             if line.is_empty() {
                 if !self.data.is_empty() || !self.event.is_empty() {
+                    Self::has_room(&items)?;
                     items.push(SseItem::Event {
                         event: std::mem::take(&mut self.event),
                         data: std::mem::take(&mut self.data),
                     });
                 }
             } else if line.starts_with(':') {
+                Self::has_room(&items)?;
                 items.push(SseItem::Comment);
             } else {
                 let (field, value) = line.split_once(':').unwrap_or((line.as_str(), ""));
@@ -612,12 +627,26 @@ pub(crate) enum Chunk {
     Ended,
 }
 
+/// Largest one read from a live stream. One event may be at most [`MAX_BODY`] bytes, so a
+/// chunk this size can still carry a whole one.
+const MAX_STREAM_CHUNK: usize = MAX_BODY;
+
+fn capped_chunk(chunk: &[u8]) -> Result<Chunk, String> {
+    if chunk.len() > MAX_STREAM_CHUNK {
+        return Err(format!(
+            "a stream chunk is over {} KiB",
+            MAX_STREAM_CHUNK / 1024
+        ));
+    }
+    Ok(Chunk::Data(chunk.to_vec()))
+}
+
 pub(crate) async fn next_chunk(response: &mut reqwest::Response) -> Result<Chunk, String> {
     match tokio::time::timeout(STREAM_IDLE, response.chunk()).await {
         Err(_) => Err("the stream went quiet".to_owned()),
         Ok(Err(e)) => Err(describe(&e)),
         Ok(Ok(None)) => Ok(Chunk::Ended),
-        Ok(Ok(Some(chunk))) => Ok(Chunk::Data(chunk.to_vec())),
+        Ok(Ok(Some(chunk))) => capped_chunk(&chunk),
     }
 }
 
@@ -827,6 +856,29 @@ mod tests {
             small.feed(b"data: 0123456789").is_err(),
             "an endless line is refused"
         );
+    }
+
+    #[test]
+    fn sse_feed_caps_the_items_from_one_chunk() {
+        let at_cap = ":x\n".repeat(MAX_SSE_ITEMS_PER_FEED);
+        let items = SseParser::new(MAX_BODY).feed(at_cap.as_bytes()).unwrap();
+        assert_eq!(items.len(), MAX_SSE_ITEMS_PER_FEED);
+        // One more comment in the same chunk is refused, not added to the vector.
+        let over_cap = ":x\n".repeat(MAX_SSE_ITEMS_PER_FEED + 1);
+        let error = SseParser::new(MAX_BODY)
+            .feed(over_cap.as_bytes())
+            .unwrap_err();
+        assert!(error.contains("too many SSE items"), "{error}");
+    }
+
+    #[test]
+    fn a_stream_chunk_is_capped() {
+        assert!(capped_chunk(&vec![0; MAX_STREAM_CHUNK]).is_ok());
+        let error = match capped_chunk(&vec![0; MAX_STREAM_CHUNK + 1]) {
+            Ok(_) => panic!("an oversized chunk was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("over"), "{error}");
     }
 
     fn doc(observed_at: &str) -> HealthDoc {

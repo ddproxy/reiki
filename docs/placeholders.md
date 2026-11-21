@@ -34,7 +34,9 @@ A masked value becomes `[[REIKI_TERM_9b2e41f0c3a7d652]]` (a term) or `[[REIKI_SE
 
 Reasoning blocks are not touched. A `thinking` block's `thinking` text and `signature`, and a `redacted_thinking` block's `data`, pass through byte for byte in both directions, including streamed `thinking_delta` and `signature_delta` events. Base64 `image` and `document` blocks pass through untouched and are never scanned. Treat anything inside those blocks as already sent, not as protected.
 
-Responses are restored as they stream; JSON and other bodies are held until they end, then restored. A JSON body carrying tool calls is walked as JSON so credential placeholders can stay masked in them (see `restore_tool_args`); only changed string values are rewritten, so key order, spacing and number formatting survive byte for byte.
+Responses are restored as they stream; JSON and other bodies are held until they end, then restored. A JSON body carrying tool calls is walked as JSON so credential placeholders can stay masked in them (see `restore_tool_args`); only changed string values are rewritten, so key order, spacing and number formatting survive byte for byte. Long JSON strings are decoded in full up to the 8 MiB request-body ceiling, so a term inside a heavily escaped string is still masked rather than passing through because the string exceeded a smaller decode cap.
+
+If the plugin cannot find its per-request state (for example, a reload replaced the plugin instance between the request and response hooks), the request is refused with 503 rather than sent or relayed unmasked. This is fail-closed: with `on_error = "pass_through"`, a masking plugin would otherwise let the original text through.
 
 For event streams (`text/event-stream`), each event is parsed. A placeholder split across two events, such as `[[REI` then `KI_TERM_9b2e41f0c3a7d652]]`, is held back from the first and completed with the second, and a lone `[` at the end of a field is held the same way. A held fragment still unfinished when the stream ends, at `[DONE]`, at `message_stop` or at the last chunk, is sent as plain text. Events with no placeholder start keep their exact bytes; the others are re-serialised as JSON, so key order and number formatting can change.
 
@@ -53,7 +55,7 @@ The path segment after the host selects the upstream, so `[upstream.anthropic] b
 
 The plugin masks message text, array-of-blocks text, `tool_result` content, `system` (string or array), tool descriptions and `stop_sequences`, and restores placeholders across streamed text and tool-argument deltas. Thinking blocks, signatures and base64 images or PDFs are relayed byte for byte (see [What it does](#what-it-does)).
 
-What is guaranteed: no configured term or detected credential in scannable request text reaches Anthropic; a resent history masks to the same placeholder ids while the process lives, including across a reload; the response is restored before Claude Code sees it.
+In scannable request text, Reiki masks every configured term and detected credential before it reaches Anthropic. A resent history masks to the same placeholder ids while the process lives, including across a reload, and the response is restored before Claude Code sees it.
 
 What is not: request headers, paths and query strings are not masked, OAuth headers pass through as they are, and image, PDF and thinking payloads are never scanned. Restarting Reiki changes every placeholder id and loses the provider's cached prefix. A model that paraphrases a value instead of repeating its placeholder defeats the restore, and a stream that ends mid-placeholder delivers the unfinished fragment as plain text.
 

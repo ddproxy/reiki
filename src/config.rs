@@ -233,6 +233,9 @@ pub struct Config {
     pub upstream: BTreeMap<String, Upstream>,
     #[serde(default)]
     pub keys: BTreeMap<String, KeyConfig>,
+    /// Whether a key file that its group or other users can read is a load error.
+    #[serde(default = "default_true")]
+    pub strict_key_permissions: bool,
     #[serde(default)]
     pub streams: BTreeMap<String, StreamConfig>,
     #[serde(default)]
@@ -893,6 +896,10 @@ pub struct Forward {
     /// Relay the forwarder's body as it arrives instead of buffering it whole (8 MiB cap).
     /// The request timeout then bounds only the wait for the response head.
     pub streaming: bool,
+    /// Most bytes a streamed body may relay before its stream fails. Defaults to 64 MiB.
+    pub max_stream_bytes: Option<u64>,
+    /// Total time a streamed body may take after its head arrives. Defaults to 30 minutes.
+    pub stream_timeout_secs: Option<u64>,
 }
 
 /// One hop to another upstream, used only when the chain has no usable key left here.
@@ -1212,6 +1219,24 @@ fn hide_quoted(text: &str) -> String {
     out
 }
 
+/// The admin listener has no TLS option, so only a literal loopback IP and port can keep its
+/// bearer token and operational data off the network. Hostnames are refused: `TcpListener::bind`
+/// resolves `host:port` at bind time, after validation, and that resolution could pick a
+/// routable address. The caller binds the returned address, not the original string.
+pub fn check_admin_listen(listen: &str) -> Result<std::net::SocketAddr, String> {
+    let addr = listen.parse::<std::net::SocketAddr>().map_err(|e| {
+        format!(
+            "listen `{listen}` must be a literal loopback IP and port ({e}); the admin listener serves plain HTTP, so terminate TLS in front and listen on loopback"
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "listen `{addr}` is not a loopback address; the admin listener serves plain HTTP, so terminate TLS in front and listen on loopback"
+        ));
+    }
+    Ok(addr)
+}
+
 impl Config {
     /// Whether per-upstream usage is kept, for the peer document and `/metrics`: `[peers]
     /// expose_usage`, which is on when there is no `[peers]` table.
@@ -1444,6 +1469,20 @@ impl Config {
                     upstream: name.clone(),
                     reason: "response_timeout_secs must be at least 1".to_owned(),
                 });
+            }
+            if let Some(forward) = &upstream.forward {
+                if forward.max_stream_bytes == Some(0) {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason: "forward.max_stream_bytes must be at least 1".to_owned(),
+                    });
+                }
+                if forward.stream_timeout_secs == Some(0) {
+                    return Err(ConfigError::BadUpstream {
+                        upstream: name.clone(),
+                        reason: "forward.stream_timeout_secs must be at least 1".to_owned(),
+                    });
+                }
             }
             if !(2..=16).contains(&upstream.scope_escalate_after) {
                 return Err(ConfigError::BadUpstream {
@@ -1702,16 +1741,7 @@ impl Config {
             if admin.listen == self.listen {
                 return Err(ConfigError::AdminListenConflict);
             }
-            // The admin listener has no TLS option, so a reachable address would carry its
-            // bearer token and operational data in plain HTTP. A hostname cannot be checked
-            // here and is left to the binder, as before.
-            if let Ok(addr) = admin.listen.parse::<std::net::SocketAddr>() {
-                if !addr.ip().is_loopback() {
-                    return Err(ConfigError::BadAdminListen(format!(
-                        "listen `{addr}` is not a loopback address; the admin listener serves plain HTTP, so terminate TLS in front and listen on loopback"
-                    )));
-                }
-            }
+            check_admin_listen(&admin.listen).map_err(ConfigError::BadAdminListen)?;
         }
         if !(1..=300).contains(&self.service.shutdown_timeout_secs) {
             return Err(ConfigError::BadService(format!(
@@ -2802,12 +2832,34 @@ file = "/etc/reiki/keys/zen-b"
     }
 
     #[test]
+    fn rejects_a_hostname_admin_listen_value() {
+        for listen in ["localhost:4098", "example.com:4098", "127.0.0.1:http"] {
+            let text = base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"{listen}\"\ntoken_sha256 = \"{HASH_B}\"\n"
+            ));
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(
+                err.contains("literal loopback IP and port"),
+                "{listen}: {err}"
+            );
+            assert!(err.contains("TLS"), "{listen}: {err}");
+        }
+    }
+
+    #[test]
     fn accepts_an_ipv6_loopback_admin_listen_address() {
         let text = base(&format!(
             "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"[::1]:4098\"\ntoken_sha256 = \"{HASH_B}\"\n"
         ));
         let admin = Config::parse(&text).unwrap().admin.unwrap();
         assert_eq!(admin.listen, "[::1]:4098");
+    }
+
+    #[test]
+    fn strict_key_permissions_defaults_on_and_can_be_turned_off() {
+        assert!(Config::parse(&base("")).unwrap().strict_key_permissions);
+        let text = format!("strict_key_permissions = false\n{}", base(""));
+        assert!(!Config::parse(&text).unwrap().strict_key_permissions);
     }
 
     #[test]

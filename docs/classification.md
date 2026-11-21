@@ -113,4 +113,4 @@ Invalid-credential phrases matched on `403`: `invalid api key`, `incorrect api k
 | `503` | `reiki_exhausted` | Every key in the stream's chain is unavailable |
 | `504` | `gateway_timeout` | Upstream headers or buffered body timed out |
 
-Ten wrong stream tokens from one client address in a minute answer `429` with `Retry-After`. A `429` from the stream limit or local shaping leaves every key available. See [troubleshooting](troubleshooting.md) for first commands for each symptom.
+After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. A `429` from the stream limit or local shaping leaves every key available. See [troubleshooting](troubleshooting.md) for first commands for each symptom.

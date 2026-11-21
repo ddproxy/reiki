@@ -783,7 +783,10 @@ async fn main() {
     // The other listeners drain with the client one; their tasks are joined before exit.
     let mut listeners: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(addr) = &admin_listen {
-        let admin_listener = tokio::net::TcpListener::bind(addr)
+        // Bind the validated literal, not a string a later resolution could point off loopback.
+        let bind_addr = reiki::config::check_admin_listen(addr)
+            .unwrap_or_else(|e| fail(&format!("invalid admin listen: {e}")));
+        let admin_listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .unwrap_or_else(|e| fail(&format!("cannot bind admin {addr}: {e}")));
         tracing::info!(%addr, "reiki admin listening");

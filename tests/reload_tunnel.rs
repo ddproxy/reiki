@@ -1,5 +1,8 @@
 //! Tunnel reload: policy and intercept hosts apply in place, and a changed CA is validated before the swap
 
+mod common;
+use common::write_key;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -79,7 +82,7 @@ fn rig() -> Rig {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("reiki-reload-tunnel-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    write_key(dir.join("key"), "upstream-secret\n");
     init_ca(&dir.join("ca"), &HOSTS.map(str::to_owned), 30, false).unwrap();
     let ca = dir.join("ca").display().to_string();
     let mut config = config_text(

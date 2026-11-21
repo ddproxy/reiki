@@ -49,6 +49,7 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. | |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable by group or others. Set to `false` to accept it with a warning instead. | |
 
 ## `[admin]`
 
@@ -56,7 +57,7 @@ The admin listener serves `GET /status`, `GET /failures`, `POST /reload`, `POST 
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `listen` | string | required | Admin listener address: a loopback IP and port. Must differ from `listen`. There is no admin TLS option; terminate TLS in front and bind on loopback for remote access. |
+| `listen` | string | required | Admin listener address: a literal loopback IP and port, such as `127.0.0.1:9090` or `[::1]:9090`. Hostnames such as `localhost:9090` and non-loopback IPs are config errors. Must differ from `listen`. There is no admin TLS option; terminate TLS in front and bind on loopback for remote access. |
 | `token_sha256` | string | required | SHA-256 hex of the admin token, 64 characters. Must differ from every stream token. Make it with `reiki hash-token`, from a token of at least 16 characters. |
 
 ## `[auth]`
@@ -163,7 +164,9 @@ Hands each request to a child command or to a Unix socket that speaks HTTP/1.1. 
 | `socket` | string | unset | Absolute path of a Unix socket, at most 103 bytes. | 0.7.0 |
 | `expect_uid` | integer | unset | User id that must own the socket's peer. Only for `socket`. Required when the socket's directory is writable by group or others and lacks the sticky bit. | 0.7.0 |
 | `max_concurrent` | integer | `16` | Copies of `command` running at once. Further requests get a 502. Only for `command`. At least 1. | 0.7.0 |
-| `streaming` | bool | `false` | Relay the body as it arrives, capped at 8 MiB, instead of buffering it. | 0.7.1 |
+| `streaming` | bool | `false` | Relay the body as it arrives instead of buffering it. | 0.7.1 |
+| `max_stream_bytes` | integer | `67108864` (64 MiB) | Largest streamed body relayed by a `streaming` forwarder. A stream past the cap ends. At least 1. | |
+| `stream_timeout_secs` | integer | `1800` | Longest total time for a streamed forwarder body after its head. At least 1. | |
 
 See [providers](providers.md#forwarding).
 
@@ -306,7 +309,7 @@ Keys that every plugin accepts:
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Set `false` to keep the table and not run the plugin. | |
-| `on_error` | `"pass_through"` or `"reject"` | plugin-specific | What happens when the plugin fails. `pass_through` continues without it. `reject` stops the request with a 503. Plugins that mask data reject by default, and so do detectors in `block` mode. | |
+| `on_error` | `"pass_through"` or `"reject"` | plugin-specific | What happens when the plugin fails, including a panic in `on_request`, `new_state` or a response hook. `pass_through` continues without it (and logs a warning when the plugin would otherwise fail closed). `reject` stops the request with a 503. Plugins that mask data reject by default, and so do detectors in `block` mode. | |
 | `dry_run` | bool | `false` where used | Accepted by every plugin. Plugins that use it validate settings without opening files, sockets or threads; `reiki check` adds `dry_run = true` to every plugin table. | |
 | `streams` | array of strings | all streams | Run only for requests on these streams. Each name is a configured stream or `passthrough`. | 0.8.0 |
 
@@ -406,11 +409,11 @@ Rules, by section:
 - **Listeners.** `admin.listen`, `tunnel.listen` and `peers.listen` must differ from each other and from `listen`. A non-loopback peer listener needs TLS; a non-loopback admin listener is refused because it has no TLS option.
 - **Upstream.** `base_url` is `https`, or `http` on loopback. `auth_header` is a valid header name. `auth_format` has `{key}` once and makes a valid header value. Model alias keys and values are not empty. Drop-parameter names are not empty. The timeouts and `max_decoded_bytes` are at least 1. `scope_escalate_after` is 2 to 16. Each response phrase list has at most 16 unique phrases of 3 to 120 non-control characters.
 - **Upstream limits.** The table sets a preset or a limit. `max_wait_secs` is 1 to 120. The preset name is known.
-- **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
+- **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `max_stream_bytes` and `stream_timeout_secs` are at least 1 when set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
-- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes.
+- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must not be readable by group or others.
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
-- **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a loopback address when it is an IP:port.
+- **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
 - **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `[peers.NAME]` has a valid URL and `token_file`. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset.
 - **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid.

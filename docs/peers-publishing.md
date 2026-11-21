@@ -54,7 +54,7 @@ With `tls_cert` and `tls_key` the listener serves HTTPS (rustls, TLS 1.2 and 1.3
 
 - `tls_cert` holds the PEM chain, leaf first. `tls_key` holds its PEM key (PKCS#8, PKCS#1 or SEC1) and stays readable and writable only by its owner: refused by default, loaded with a warning under `tls_key_permissions = "warn"`.
 - The certificate must be unexpired and the key must match it; otherwise startup, `reiki check` and a reload fail. `reiki check` prints `peers TLS certificate valid for N more day(s)`.
-- A reload reads both files again. New contents or new paths swap in without a restart and show in `changed` as `peers.tls`; open connections keep the old certificate. Both files are watched like key files, so a renewal on disk triggers the reload. Turning TLS on or off needs a restart.
+- A reload reads both files again. New contents or new paths swap in without a restart and show in `changed` as `peers.tls`; open connections keep the old certificate. Both files are watched like key files, so a renewal on disk triggers the reload. Turning TLS on or off needs a restart. Reiki tracks the running listener's scheme on every start, so a later reload still reports the switch as needing a restart even after the listener has been restarted.
 
 A private CA and a listener certificate for a peer reached as `192.0.2.10`:
 

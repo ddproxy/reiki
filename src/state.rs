@@ -1,7 +1,10 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::hash::{BuildHasher, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -27,11 +30,35 @@ pub fn path_for(config_path: &Path) -> PathBuf {
 /// Probes a directory by creating and removing a file, so the daemon fails before binding
 /// listeners instead of silently losing state later.
 pub fn check_writable(dir: &Path) -> Result<(), String> {
-    let probe = dir.join(format!(".reiki-probe-{}", std::process::id()));
+    let name = format!(".reiki-probe-{}-{:016x}", std::process::id(), probe_nonce());
+    probe_file(dir, &name)
+}
+
+/// Nonce for the probe name, so a squatter cannot plant a symlink at a predictable path.
+fn probe_nonce() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u64(std::process::id() as u64);
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
+/// `name` is separate from [`check_writable`] so tests can plant a file or symlink at it.
+fn probe_file(dir: &Path, name: &str) -> Result<(), String> {
+    let probe = dir.join(name);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    // A pre-existing file is never reused: it may be a symlink to something the caller
+    // should not truncate, or a victim file a local attacker wants removed.
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
     let failure =
         |e: std::io::Error| format!("state directory {} is not writable: {e}", dir.display());
     options
@@ -411,10 +438,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_probe_never_reuses_a_planted_file_or_follows_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("reiki-probe-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+
+        std::fs::write(dir.join("planted"), "precious").unwrap();
+        let err = probe_file(&dir, "planted").unwrap_err();
+        assert!(
+            err.contains("not writable") && err.contains("exists"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("planted")).unwrap(),
+            "precious"
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&victim, dir.join("linked")).unwrap();
+            let err = probe_file(&dir, "linked").unwrap_err();
+            assert!(err.contains("not writable"), "{err}");
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        }
+
+        check_writable(&dir).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(left.contains(&victim) && left.contains(&dir.join("planted")));
+        assert!(
+            left.iter().all(|p| !p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("reiki-probe")),
+            "the probe cleaned up after itself: {left:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            dir.join("linked").symlink_metadata().is_ok(),
+            "the symlink was left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A key file last modified an hour ago, so state saved now is newer than it.
     fn old_key_file(tag: &str) -> PathBuf {
         let path = temp_path(&format!("{tag}-key"));
-        std::fs::write(&path, "sk-fake-secret").unwrap();
+        crate::keys::write_key(&path, "sk-fake-secret");
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(SystemTime::now() - Duration::from_secs(3600))
             .unwrap();
@@ -499,7 +575,7 @@ mod tests {
     fn a_key_file_newer_than_the_state_starts_healthy() {
         let path = temp_path("changed");
         let key_file = temp_path("changed-key");
-        std::fs::write(&key_file, "sk-fake-secret").unwrap();
+        crate::keys::write_key(&key_file, "sk-fake-secret");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         write_state(&path, 1_000, &[("a", true, 4_000_000_000_000, 3)]);
         assert!(load(&path, &config).is_empty());
@@ -511,7 +587,7 @@ mod tests {
     fn an_unchanged_key_is_restored() {
         let path = temp_path("unchanged");
         let key_file = temp_path("unchanged-key");
-        std::fs::write(&key_file, "sk-fake-secret").unwrap();
+        crate::keys::write_key(&key_file, "sk-fake-secret");
         let config = config_with_keys(&[("a", key_file.to_str().unwrap())]);
         let now = unix_millis(SystemTime::now());
         write_state(&path, now + 3_600_000, &[("a", false, now + 3_600_000, 2)]);
@@ -528,7 +604,7 @@ mod tests {
         let path = temp_path("secrets");
         let _ = std::fs::remove_file(&path);
         let key_file = old_key_file("secrets");
-        std::fs::write(&key_file, "sk-fake-secret\n").unwrap();
+        crate::keys::write_key(&key_file, "sk-fake-secret\n");
         let mut state = KeyState::default();
         state.record_failure(
             "a",
@@ -677,7 +753,7 @@ mod tests {
         );
         assert!(load(&path, &config)["a"].disabled, "same file is restored");
 
-        std::fs::write(&key_file, "a-longer-replacement-secret").unwrap();
+        crate::keys::write_key(&key_file, "a-longer-replacement-secret");
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&key_file)
@@ -808,7 +884,7 @@ mod tests {
         save_with_shaper(&path, &HashMap::new(), &shaper, &keys, &config);
         assert_eq!(load_shaper(&path, &config).len(), 1);
 
-        std::fs::write(&key_file, "a-different-secret").unwrap();
+        crate::keys::write_key(&key_file, "a-different-secret");
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&key_file)

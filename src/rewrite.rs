@@ -23,8 +23,25 @@ const MODEL_PREFIX_BYTES: usize = 100;
 const MODEL_HASH_HEX: usize = 8;
 
 /// Members scanned before `request_model` gives up, so a body of millions of tiny members
-/// costs a bounded scan.
+/// costs a bounded scan. A request over the cap is refused rather than forwarded unscanned.
 const MAX_SCANNED_MEMBERS: usize = 4096;
+
+/// True when a JSON object holds more top-level members than the scanners can handle. Only
+/// counts, so the check itself does not allocate one entry per member. Malformed bodies are left
+/// to the scanners: this is a cap check, not a JSON validator.
+pub(crate) fn over_member_cap(body: &[u8]) -> bool {
+    let mut seen = 0usize;
+    let mut over = false;
+    let scanned = scan_members(body, |_, _, _, _, _| {
+        seen += 1;
+        if seen > MAX_SCANNED_MEMBERS {
+            over = true;
+            return false;
+        }
+        true
+    });
+    scanned.is_some() && over
+}
 
 /// The top-level `model` string of a request body, decoded. A name over the cap is shortened
 /// to a stable prefix and digest, so it still scopes. `None` for a missing or non-string
@@ -531,19 +548,20 @@ mod tests {
     }
 
     #[test]
-    fn rewriting_gives_up_on_a_body_with_too_many_top_level_members() {
+    fn a_body_with_too_many_top_level_members_is_detected_for_refusal() {
         let many = format!(
             "{{{}\"model\":\"gpt-4o\"}}",
             "\"a\":1,".repeat(MAX_SCANNED_MEMBERS)
         );
+        assert!(over_member_cap(many.as_bytes()));
         assert!(top_level_members(many.as_bytes()).is_none());
-        let out = run(&many, &aliases(&[("gpt-4o", "zen")]), &[]);
-        assert_eq!(out, Bytes::copy_from_slice(many.as_bytes()));
+        assert_eq!(request_model(many.as_bytes()), None);
 
         let at_cap = format!(
             "{{{}\"model\":\"gpt-4o\"}}",
             "\"a\":1,".repeat(MAX_SCANNED_MEMBERS - 1)
         );
+        assert!(!over_member_cap(at_cap.as_bytes()));
         assert_eq!(
             top_level_members(at_cap.as_bytes()).unwrap().len(),
             MAX_SCANNED_MEMBERS

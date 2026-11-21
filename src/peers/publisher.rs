@@ -1,7 +1,8 @@
 //! The peer listener: `GET /v1/health` for holders of the peer token, 404 for everything else.
 
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -20,6 +21,11 @@ use super::sessions::Sessions;
 use super::stream::{ensure_ticker, Frames, Hub, Limits, Refused, HEARTBEAT, STREAM_PATH};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
+
+/// No listener has started yet, so no running mode exists to compare a reload against.
+const LISTENER_NONE: u8 = 0;
+const LISTENER_PLAIN: u8 = 1;
+const LISTENER_TLS: u8 = 2;
 
 /// The address a caller is told apart by, or `None` for one arriving from loopback. Tunnels
 /// (`ssh -L`, WireGuard forwarding) and a local TLS-terminating proxy all connect from loopback,
@@ -41,8 +47,8 @@ pub struct Publisher {
     logins: LoginThrottle,
     sessions: Sessions,
     hub: Arc<Hub>,
-    /// Whether the running listener serves HTTPS, set once when it starts.
-    listener_tls: OnceLock<bool>,
+    /// The running listener's mode, updated on every start so an HTTP/HTTPS switch is seen.
+    listener_tls: AtomicU8,
     /// The certificate the HTTPS listener hands each new connection, and its fingerprint.
     tls: RwLock<Option<(String, Arc<rustls::ServerConfig>)>>,
 }
@@ -67,9 +73,25 @@ impl Publisher {
             logins: LoginThrottle::new(throttle),
             sessions: Sessions::new(),
             hub: Hub::new(),
-            listener_tls: OnceLock::new(),
+            listener_tls: AtomicU8::new(LISTENER_NONE),
             tls: RwLock::new(None),
         })
+    }
+
+    fn running_tls(&self) -> Option<bool> {
+        match self.listener_tls.load(Ordering::Acquire) {
+            LISTENER_NONE => None,
+            LISTENER_TLS => Some(true),
+            _ => Some(false),
+        }
+    }
+
+    /// Records the mode of a listener as it starts, replacing the mode of any previous one.
+    fn set_listener_tls(&self, tls: bool) {
+        self.listener_tls.store(
+            if tls { LISTENER_TLS } else { LISTENER_PLAIN },
+            Ordering::Release,
+        );
     }
 
     fn current_tls(&self) -> Option<Arc<rustls::ServerConfig>> {
@@ -87,7 +109,7 @@ impl Publisher {
 
     /// Loads the TLS files a reload asks for, without applying them; an error fails the reload.
     pub(crate) fn plan_tls(&self, next: Option<&PeersConfig>) -> Result<TlsReload, String> {
-        let Some(&running) = self.listener_tls.get() else {
+        let Some(running) = self.running_tls() else {
             return Ok(TlsReload::default());
         };
         // Stopping or moving the listener is a `peers.listen` restart already.
@@ -168,7 +190,7 @@ pub fn serve_with_per_addr(
         None => None,
     };
     let publisher = Arc::clone(app.peer_publisher());
-    let _ = publisher.listener_tls.set(loaded.is_some());
+    publisher.set_listener_tls(loaded.is_some());
     let routes = router(app);
     let shutdown = crate::lifecycle::stopped();
     let Some(loaded) = loaded else {
@@ -481,5 +503,73 @@ mod tests {
             200,
             "a distinct address has its own count"
         );
+    }
+
+    #[test]
+    fn a_reload_plan_tracks_the_running_listener_through_a_tls_switch() {
+        let dir = std::env::temp_dir().join(format!("reiki-publisher-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let issue = || {
+            use rcgen::{CertificateParams, KeyPair};
+            let pair = KeyPair::generate().unwrap();
+            let params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+            let leaf = params.self_signed(&pair).unwrap();
+            std::fs::write(&cert, leaf.pem()).unwrap();
+            std::fs::write(&key, pair.serialize_pem()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        };
+        let peers = |tls: bool| {
+            let tls_lines = if tls {
+                format!(
+                    "tls_cert = \"{}\"\ntls_key = \"{}\"\n",
+                    cert.display(),
+                    key.display()
+                )
+            } else {
+                String::new()
+            };
+            let text = format!(
+                "[peers]\nenabled = true\npublish = true\nlisten = \"127.0.0.1:4099\"\n\
+                 peer_token_sha256 = \"{}\"\n{tls_lines}",
+                sha256_hex("plan-token")
+            );
+            crate::config::Config::parse(&text).unwrap().peers.unwrap()
+        };
+
+        issue();
+        let publisher = Publisher::new(crate::auth::ThrottleSettings::default());
+        let plan = publisher.plan_tls(Some(&peers(true))).unwrap();
+        assert!(!plan.restart && !plan.swaps(), "no listener running yet");
+
+        publisher.set_listener_tls(false); // plain HTTP starts
+        assert!(!publisher.plan_tls(Some(&peers(false))).unwrap().restart);
+        assert!(publisher.plan_tls(Some(&peers(true))).unwrap().restart);
+
+        publisher.set_listener_tls(true); // the listener switches to HTTPS
+        let loaded = crate::peers::tls::load(&peers(true)).unwrap().unwrap();
+        publisher.set_tls(loaded);
+        let plan = publisher.plan_tls(Some(&peers(true))).unwrap();
+        assert!(!plan.restart, "the switch must not stick at restart: true");
+        assert!(!plan.swaps(), "the same certificate needs no swap");
+
+        issue(); // a new certificate, with a new fingerprint
+        let plan = publisher.plan_tls(Some(&peers(true))).unwrap();
+        assert!(!plan.restart);
+        assert!(plan.swaps(), "a changed certificate still swaps in place");
+        publisher.apply_tls(plan);
+        assert!(!publisher.plan_tls(Some(&peers(true))).unwrap().swaps());
+
+        publisher.set_listener_tls(false); // switched back to HTTP
+        assert!(!publisher.plan_tls(Some(&peers(false))).unwrap().restart);
+        assert!(publisher.plan_tls(Some(&peers(true))).unwrap().restart);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

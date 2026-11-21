@@ -13,6 +13,7 @@ use reiki::proxy::{load_keys, router, App};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const TOKEN: &str = "stream-token";
 const SSN: &str = "123-45-6789";
@@ -21,7 +22,7 @@ const SSN: &str = "123-45-6789";
 async fn logged(format: &str, mode: &str, tag: &str) -> (u16, Vec<serde_json::Value>) {
     let dir = std::env::temp_dir().join(format!("reiki-findings-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+    write_key(dir.join("key"), "upstream-secret\n");
     let log = dir.join("requests.jsonl");
     let upstream = serve(Router::new().fallback(any(|| async { "ok" }))).await;
     let text = format!(

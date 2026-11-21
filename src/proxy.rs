@@ -21,7 +21,9 @@ use crate::chain::{scope_route, Chain, KeyState, Policy, SavedHealth, Scope};
 use crate::classify::{classify_with, Classification, ExtraPhrases, FailureClass, Outcome};
 use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
 use crate::forward::Forwarder;
-use crate::plugins::{PluginChain, PluginSession, RequestMeta};
+use crate::plugins::{
+    PluginChain, PluginSession, RequestMeta, PLUGIN_FAILURE_MESSAGE, PLUGIN_FAILURE_STATUS,
+};
 use crate::pressure::PressureCounter;
 use crate::rewrite::{request_model, rewrite_body};
 use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
@@ -113,9 +115,25 @@ impl fmt::Debug for Secret {
 
 #[derive(Debug)]
 pub enum LoadError {
-    Read { key: String, source: std::io::Error },
+    Read {
+        key: String,
+        source: std::io::Error,
+    },
     Empty(String),
-    Short { key: String, len: usize },
+    Short {
+        key: String,
+        len: usize,
+    },
+    /// The key file can be read by its group or by others, and strict checks are on.
+    Permissions {
+        key: String,
+        mode: u32,
+    },
+    /// The key file is longer than the scrubber can cover with bounded forms.
+    Long {
+        key: String,
+        len: usize,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -128,6 +146,15 @@ impl fmt::Display for LoadError {
                 "key file for `{key}` holds {len} bytes; a key must be at least {} bytes so an echoed copy can be scrubbed",
                 crate::scrub::MIN_SECRET
             ),
+            Self::Permissions { key, mode } => write!(
+                f,
+                "key file for `{key}` has mode {mode:04o}; it is readable by group or others (chmod 600, or set strict_key_permissions = false)"
+            ),
+            Self::Long { key, len } => write!(
+                f,
+                "key file for `{key}` holds {len} bytes; a key must be at most {} bytes so the scrubber's forms stay bounded",
+                crate::scrub::MAX_SECRET
+            ),
         }
     }
 }
@@ -136,7 +163,9 @@ impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::Empty(_) | Self::Short { .. } => None,
+            Self::Empty(_) | Self::Short { .. } | Self::Permissions { .. } | Self::Long { .. } => {
+                None
+            }
         }
     }
 }
@@ -144,7 +173,43 @@ impl std::error::Error for LoadError {
 pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> {
     let mut keys = HashMap::new();
     for (name, key) in &config.keys {
-        let raw = std::fs::read_to_string(&key.file).map_err(|source| LoadError::Read {
+        // Metadata and contents come from one handle, so a swap between the mode check and
+        // the read cannot substitute a private file for a loose one.
+        let mut handle = std::fs::File::open(&key.file).map_err(|source| LoadError::Read {
+            key: name.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = handle
+                .metadata()
+                .map_err(|source| LoadError::Read {
+                    key: name.clone(),
+                    source,
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if let Some(crate::keys::CheckIssue::GroupOrWorldReadable(_)) =
+                crate::keys::permission_verdict(mode)
+            {
+                if config.strict_key_permissions {
+                    return Err(LoadError::Permissions {
+                        key: name.clone(),
+                        mode,
+                    });
+                }
+                tracing::warn!(
+                    key = %name,
+                    "key file {} is group or world readable (mode {mode:04o}); set strict_key_permissions = true to refuse it",
+                    key.file
+                );
+            }
+        }
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut handle, &mut raw).map_err(|source| LoadError::Read {
             key: name.clone(),
             source,
         })?;
@@ -154,6 +219,12 @@ pub fn load_keys(config: &Config) -> Result<HashMap<String, Secret>, LoadError> 
         }
         if value.len() < crate::scrub::MIN_SECRET {
             return Err(LoadError::Short {
+                key: name.clone(),
+                len: value.len(),
+            });
+        }
+        if value.len() > crate::scrub::MAX_SECRET {
+            return Err(LoadError::Long {
                 key: name.clone(),
                 len: value.len(),
             });
@@ -1449,6 +1520,17 @@ async fn dispatch_body(
             StatusCode::PAYLOAD_TOO_LARGE,
             "too_large",
             "request body too large",
+        );
+    }
+
+    // Both the rewriter and model-scoped key selection read top-level members. Past the scan cap
+    // they would give up; forwarding the original body would silently skip both, so refuse it.
+    let rewrites = !upstream.model_aliases.is_empty() || !upstream.drop_params.is_empty();
+    if (rewrites || !upstream.passthrough) && crate::rewrite::over_member_cap(&body) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "too_many_members",
+            "the request body has too many top-level members",
         );
     }
 
@@ -2888,6 +2970,13 @@ fn stream_response(
         let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
         session.on_response_head(key, upstream, &mut status, &mut headers);
+        if session.failed() {
+            return json_error(
+                PLUGIN_FAILURE_STATUS,
+                "plugin_failed",
+                PLUGIN_FAILURE_MESSAGE,
+            );
+        }
         // A plugin may change the body length, and a known length would also stop
         // the final `is_last` call from being made. These responses carry no body, so
         // their length is only metadata.
@@ -2930,6 +3019,13 @@ fn finish_buffered(
     session.on_response_head(key, upstream, &mut status, &mut headers);
     let mut body = body;
     session.on_response_chunk(&mut body, true);
+    if session.failed() {
+        return json_error(
+            PLUGIN_FAILURE_STATUS,
+            "plugin_failed",
+            PLUGIN_FAILURE_MESSAGE,
+        );
+    }
     buffered_response(status, &headers, body)
 }
 
@@ -2977,6 +3073,11 @@ impl Stream for PluginBody {
                     this.done = true;
                     let mut tail = Bytes::new();
                     this.session.on_response_chunk(&mut tail, true);
+                    if this.session.failed() {
+                        return Poll::Ready(Some(Err(std::io::Error::other(
+                            PLUGIN_FAILURE_MESSAGE,
+                        ))));
+                    }
                     return if tail.is_empty() {
                         Poll::Ready(None)
                     } else {
@@ -2991,6 +3092,14 @@ impl Stream for PluginBody {
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     this.session.on_response_chunk(&mut chunk, false);
+                    if this.session.failed() {
+                        // Headers are already on the wire, so the only safe response is to cut
+                        // the body short rather than relay bytes the plugin could not process.
+                        this.done = true;
+                        return Poll::Ready(Some(Err(std::io::Error::other(
+                            PLUGIN_FAILURE_MESSAGE,
+                        ))));
+                    }
                     if chunk.is_empty() {
                         continue;
                     }
@@ -3576,6 +3685,98 @@ mod tests {
         assert_eq!(*CHUNKS.lock().unwrap(), [false, true]);
     }
 
+    /// A session whose response hook panics, as a fail-closed plugin would.
+    fn panicking_response_session() -> PluginSession {
+        struct PanicResponse;
+        impl Plugin for PanicResponse {
+            fn name(&self) -> &str {
+                "panic_response"
+            }
+            fn fails_closed(&self) -> bool {
+                true
+            }
+            fn needs_response_hooks(&self) -> bool {
+                true
+            }
+            fn on_response_head(&self, _ctx: &mut reiki_plugin::ResponseHeadCtx<'_>) {
+                panic!("boom");
+            }
+            fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {
+                panic!("boom");
+            }
+        }
+        let registry = vec![Registration {
+            name: "panic_response",
+            build: |_| Ok(Box::new(PanicResponse) as Box<dyn Plugin>),
+        }];
+        let chain = Arc::new(
+            PluginChain::build(&toml::from_str("[panic_response]\n").unwrap(), &registry).unwrap(),
+        );
+        let mut session = chain.session();
+        let method = Method::GET;
+        let meta = RequestMeta {
+            id: "test",
+            stream: "client-a",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/x",
+        };
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn a_panicking_response_head_refuses_a_streamed_response() {
+        let response = UpstreamResponse::from_stream(
+            StatusCode::OK,
+            HeaderMap::new(),
+            axum::http::Version::HTTP_11,
+            futures_util::stream::iter(Vec::<Result<Bytes, std::io::Error>>::new()),
+        );
+        let out = stream_response(
+            panicking_response_session(),
+            "k",
+            "zen",
+            response,
+            false,
+            &[],
+            Accounting::default(),
+        );
+        assert_eq!(out.status(), PLUGIN_FAILURE_STATUS);
+    }
+
+    #[test]
+    fn a_panicking_response_hook_refuses_a_buffered_response() {
+        let mut session = panicking_response_session();
+        let response = finish_buffered(
+            &mut session,
+            "k",
+            "zen",
+            StatusCode::OK,
+            &HeaderMap::new(),
+            Bytes::from_static(b"unprocessed secret"),
+        );
+        assert_eq!(response.status(), PLUGIN_FAILURE_STATUS);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_chunk_hook_cuts_the_stream_short() {
+        use futures_util::StreamExt;
+
+        let mut body = PluginBody {
+            session: panicking_response_session(),
+            inner: Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                b"unprocessed secret",
+            ))])),
+            done: false,
+        };
+        let error = body.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("fail-closed plugin"), "{error}");
+        assert!(body.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn a_body_read_error_is_reported_with_the_bytes_read_so_far() {
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
@@ -3655,6 +3856,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn load_keys_refuses_a_group_or_world_readable_key_unless_strict_checks_are_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "reiki-perm-key-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k");
+        std::fs::write(&path, "eight-by\n").unwrap();
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.com\"\n\
+             [keys.k]\nupstream = \"zen\"\nfile = \"{}\"\n",
+            path.display()
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert!(config.strict_key_permissions);
+        let err = load_keys(&config).unwrap_err().to_string();
+        assert!(err.contains("0644") && err.contains("chmod 600"), "{err}");
+
+        let relaxed = Config::parse(&format!("strict_key_permissions = false\n{text}")).unwrap();
+        assert!(load_keys(&relaxed).is_ok());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_keys(&config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_keys_refuses_a_key_too_short_to_be_scrubbed() {
         let dir = std::env::temp_dir().join(format!(
             "reiki-short-key-{}-{}",
@@ -3665,7 +3901,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("k"), "abc\n").unwrap();
+        crate::keys::write_key(&dir.join("k"), "abc\n");
         let text = format!(
             "[upstream.zen]\nbase_url = \"https://example.com\"\n\
              [keys.k]\nupstream = \"zen\"\nfile = \"{}\"\n",
@@ -3679,7 +3915,46 @@ mod tests {
         );
         assert!(err.contains("k"), "the error names the key: {err}");
         // A key of exactly the minimum length loads.
-        std::fs::write(dir.join("k"), "eight-by\n").unwrap();
+        crate::keys::write_key(&dir.join("k"), "eight-by\n");
+        let config = Config::parse(&text).unwrap();
+        assert!(load_keys(&config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_keys_refuses_a_key_too_long_to_scrub_with_a_bounded_form_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "reiki-long-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.com\"\n\
+             [keys.k]\nupstream = \"zen\"\nfile = \"{}\"\n",
+            dir.join("k").display()
+        );
+        std::fs::write(dir.join("k"), "x".repeat(10_000)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("k"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let config = Config::parse(&text).unwrap();
+        let err = load_keys(&config).unwrap_err().to_string();
+        assert!(err.contains("10000"), "the error names the length: {err}");
+        assert!(err.contains("4096"), "the error names the cap: {err}");
+        assert!(err.contains('k'), "the error names the key: {err}");
+        // A key at the cap loads.
+        std::fs::write(dir.join("k"), "x".repeat(crate::scrub::MAX_SECRET)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("k"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         let config = Config::parse(&text).unwrap();
         assert!(load_keys(&config).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -4007,5 +4282,16 @@ mod tests {
         assert_eq!(rows[0].class, FailureClass::QuotaExhausted.name());
         assert_eq!(rows[0].status, Some(402));
         assert!(rows[0].cooled);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_member_scan_cap_is_refused_without_being_forwarded() {
+        let rig = ProxyRig::new("drop_params = [\"stream_options\"]\n").await;
+        let body = format!("{{{}\"model\":\"gpt-4o\"}}", "\"a\":1,".repeat(4096));
+        let response = rig.post().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("too_many_members"), "{text}");
+        assert!(rig.keys_called().is_empty(), "no key was tried");
     }
 }

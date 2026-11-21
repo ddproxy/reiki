@@ -1,6 +1,6 @@
 # PHI and NPPI plugin
 
-The `phi` plugin stops protected health information (PHI) and nonpublic personal information (NPPI) from leaving in an outbound request. It checks each request body for structured identifiers. In `block` mode a request that holds one is rejected before any key is used. In `report` mode the request goes through and the finding is logged.
+The `phi` plugin reports or rejects protected health information (PHI) and nonpublic personal information (NPPI) in outbound request bodies. It checks each body for structured identifiers. In `block` mode a request that holds one is rejected before any key is used. In `report` mode the request goes through and the finding is logged.
 
 It is a safeguard that catches common identifiers. It does not prove a request is free of protected data. Read [What it does not cover](#what-it-does-not-cover) before relying on it.
 

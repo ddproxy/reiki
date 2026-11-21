@@ -7,7 +7,7 @@
 
 # Reiki
 
-Reiki is a security proxy for coding-agent and LLM traffic. It sits between a client and the providers it calls, keeps upstream API keys in files only Reiki reads, and gives the client a revocable stream token instead. Requests pass through one place where Reiki can rotate and fail over keys, filter outbound content and expose health and logs. Reiki runs as one binary, reads one TOML file and compiles plugins in at build time.
+Reiki is a security proxy for coding-agent and LLM traffic. It sits between a client and the providers it calls, keeps upstream API keys in files on the Reiki host, and gives the client a revocable stream token instead. Requests pass through one place where Reiki can rotate and fail over keys, filter outbound content and expose health and logs. Reiki runs as one binary, reads one TOML file and compiles plugins in at build time.
 
 ## Is it for you
 
@@ -18,7 +18,17 @@ Reiki is a security proxy for coding-agent and LLM traffic. It sits between a cl
 | You need to limit or inspect what leaves the machine | Upstreams come from the config, plugins can mask or block content, and the request log and metrics show what happened. |
 | You run several instances and need a shared view of key health | Peers publish a read-only health summary that other instances and `reiki top` can read. |
 
-Start with the [overview](docs/overview.md) for how the parts fit together, or the [architecture](docs/architecture.md) for the request path.
+## Read in this order
+
+1. [Overview](docs/overview.md) — the model and the listeners. Use the [glossary](docs/glossary.md) for CLI and status vocabulary.
+2. [Configuration](docs/configuration.md) and [command line](docs/cli.md) — every table and flag; then [keys and streams](docs/keys.md).
+3. [Providers](docs/providers.md) — mapping and test coverage; then [failover](docs/failover.md) and [classification](docs/classification.md).
+4. [Security](docs/security.md) — assets and trust boundaries; then the [redaction reference](docs/redaction.md) and the egress plugins: [placeholders](docs/placeholders.md), [PHI](docs/phi.md), [finance](docs/finance.md), [controlled information](docs/controlled.md).
+5. [Request log](docs/requestlog.md), [monitoring](docs/monitoring.md), [troubleshooting](docs/troubleshooting.md) and the [FAQ](docs/faq.md) — observe and diagnose.
+6. [Tunnel](docs/tunnel.md), [shaping](docs/shaping.md), [peers](docs/peers.md), [reiki top](docs/top.md) and [hub](docs/hub.md) — optional subsystems.
+7. [Deploy](docs/deploy.md), [upgrades](docs/upgrades.md) and [worked examples](docs/examples.md) — run, change and see the output.
+
+The full index is [docs/README.md](docs/README.md).
 
 ## Install
 
@@ -96,6 +106,8 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 
 **Start**
 
+- [Quickstart](docs/quickstart.md): ten-minute proof-first setup and negative test.
+- [Documentation index](docs/README.md): the numbered reading path and every page.
 - [Overview](docs/overview.md): how the parts fit together.
 - [Architecture](docs/architecture.md): request path, key states and source map.
 - [Glossary](docs/glossary.md): terms and CLI/status vocabulary.
@@ -106,6 +118,8 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 **Keys and providers**
 
 - [Providers](docs/providers.md): upstreams, transport, forwarding, fallback and passthrough.
+- [OpenCode](docs/opencode.md): base URL, client token, proof check and bypasses.
+- [Claude Code](docs/claude-code.md): base URL, client token, proof check and bypasses.
 - [Failover](docs/failover.md): chains and key states.
 - [Classification](docs/classification.md): response rules, one cooldown table and client errors.
 - [Shaping](docs/shaping.md): outbound budgets and limits.
@@ -115,8 +129,10 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 - [Plugins](docs/plugins.md): the plugin model and the bundled set.
 - [Plugin authoring](docs/plugin-authoring.md): hooks, tests and build-time registration.
 - [Placeholders](docs/placeholders.md), [PHI and NPPI](docs/phi.md), [Finance](docs/finance.md), [Controlled information](docs/controlled.md).
-- [Request log](docs/requestlog.md).
+- [Request log](docs/requestlog.md): records and their stability note.
+- [Redaction reference](docs/redaction.md): the exact forms scrubbed from relayed bodies and headers.
 - [Tunnel](docs/tunnel.md): CONNECT proxy, destination allow-list and interception.
+- [Worked examples](docs/examples.md): verified command output formats for PHI, placeholders, quotas, tunnel denials, reload and rotation.
 
 **Operations and security**
 
@@ -129,7 +145,10 @@ This sets up one upstream, one key, one stream and an admin listener so you can 
 - [Top](docs/top.md): the live fleet view.
 - [Hub](docs/hub.md): hub configuration, parsed and validated in this release.
 - [Troubleshooting](docs/troubleshooting.md): status codes, logs, reload and common problems.
+- [FAQ](docs/faq.md): short answers to the questions asked most often.
 - [Security](docs/security.md): protections, limits and trust boundaries.
+- [Observe, then enforce](docs/rollout.md): placeholders, report mode, `reiki scan` and the reload gate.
+- [What Reiki does not protect against](docs/limits.md): key-file modes, plugins, tunnels and encodings.
 
 ## Develop
 

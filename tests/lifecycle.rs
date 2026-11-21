@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 
 mod common;
+use common::write_key;
 
 const STREAM_TOKEN: &str = "stream-token-for-lifecycle";
 
@@ -74,7 +75,7 @@ fn start(label: &str, upstream: &str, notify: Option<&std::path::Path>) -> Runni
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a"), "secret-key-aaaaaaaa\n").unwrap();
+        write_key(dir.join("a"), "secret-key-aaaaaaaa\n");
         let text = format!(
             "listen = \"127.0.0.1:{client}\"\n\
              [upstream.zen]\nbase_url = \"{upstream}/v1\"\n\

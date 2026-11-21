@@ -177,6 +177,12 @@ pub enum CheckIssue {
     GroupOrWorldReadable(u32),
 }
 
+/// The permission problem with a key file whose mode is `mode`, if there is one.
+/// The same verdict drives the `reiki keys --check` warning and the load-time refusal.
+pub fn permission_verdict(mode: u32) -> Option<CheckIssue> {
+    (mode & 0o044 != 0).then_some(CheckIssue::GroupOrWorldReadable(mode))
+}
+
 /// Checks every configured key file without reading a key into the output.
 pub fn check_files(config: &Config) -> Vec<KeyCheck> {
     config
@@ -202,8 +208,8 @@ pub fn check_files(config: &Config) -> Vec<KeyCheck> {
                         {
                             use std::os::unix::fs::PermissionsExt;
                             let mode = metadata.permissions().mode() & 0o777;
-                            if mode & 0o044 != 0 {
-                                issues.push(CheckIssue::GroupOrWorldReadable(mode));
+                            if let Some(issue) = permission_verdict(mode) {
+                                issues.push(issue);
                             }
                         }
                         let mut text = String::new();
@@ -222,6 +228,24 @@ pub fn check_files(config: &Config) -> Vec<KeyCheck> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn write_key(path: &std::path::Path, text: &str) {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
 }
 
 /// True when any key file has a problem or warning.
@@ -329,6 +353,25 @@ mod tests {
             ));
         }
         Config::parse(&text).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_verdict_flags_group_and_world_read_but_not_owner_only() {
+        assert_eq!(permission_verdict(0o600), None);
+        assert_eq!(permission_verdict(0o700), None);
+        assert_eq!(
+            permission_verdict(0o640),
+            Some(CheckIssue::GroupOrWorldReadable(0o640))
+        );
+        assert_eq!(
+            permission_verdict(0o604),
+            Some(CheckIssue::GroupOrWorldReadable(0o604))
+        );
+        assert_eq!(
+            permission_verdict(0o644),
+            Some(CheckIssue::GroupOrWorldReadable(0o644))
+        );
     }
 
     #[cfg(unix)]

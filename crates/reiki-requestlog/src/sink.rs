@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 /// Append-only JSONL file that rotates by size and is readable by its owner only.
 pub struct FileSink {
@@ -42,8 +42,19 @@ fn open_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never write through a symlink, and never block opening a FIFO we are about to reject.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.mode(0o600);
+    }
     let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the request log path is not a regular file",
+        ));
+    }
     #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
@@ -343,6 +354,27 @@ mod tests {
             0o600
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_at_the_log_path_is_refused_without_touching_its_target() {
+        let dir = temp("symlink");
+        let path = dir.join("req.jsonl");
+        let target = dir.join("elsewhere.jsonl");
+        std::fs::write(&target, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = FileSink::open(&path, 0, 0).err().unwrap();
+        assert!(err.kind() != io::ErrorKind::NotFound, "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_non_regular_log_path_is_refused() {
+        let err = FileSink::open(Path::new("/dev/null"), 0, 0).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[test]

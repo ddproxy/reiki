@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
 
 ### Added
 
@@ -13,23 +13,38 @@
 
 - Behaviour change: `[admin].listen` must be a loopback address (when given as an IP:port). The admin listener has no TLS option, so a non-loopback bind is now a config error; terminate TLS in front and bind on loopback if the admin routes must be reachable off-host.
 - In `reiki top`, `u` also cycles the Requests chart series (requests, limited, tokens), and stale peers are excluded from fleet charts with the fresh count shown in the title. The X axis is labelled from the sample interval and point count, not raw sample indices.
+- Top-level `strict_key_permissions` (default `true`) rejects key files that are readable by group or others. Set it to `false` to keep the old warning-only behaviour.
+
+### Changed
+
+- Behaviour change: `[admin].listen` must be a literal loopback IP and port. The admin listener has no TLS option, so a non-loopback bind is now a config error; hostnames such as `localhost:9090` are rejected too, even if they would resolve to loopback. Terminate TLS in front and bind on loopback if the admin routes must be reachable off-host.
 
 ### Fixed
 
 - Login throttling on the client, admin and peer listeners now checks the lockout and reserves the attempt under one lock. A concurrent burst of bad tokens can no longer all pass the check before any failure is counted; a successful peer poll still leaves earlier failures counted.
-- Plugin panics in `new_state` and `on_shutdown` are caught and logged like the other hooks. A panicking `new_state` yields the default `()` state for that request, and a panicking `on_shutdown` no longer stops later plugins from shutting down.
+- Plugin panics in `new_state` and `on_shutdown` are caught and logged like the other hooks. A panicking `new_state` now fails the request closed with 503 when the plugin's resolved `on_error` is `reject` (the default for masking and block-mode plugins); opting in with `on_error = "pass_through"` keeps the old default-state behaviour. A panic in a response hook also blocks the request: buffered responses are refused and streamed bodies stop at 503. A panicking `on_shutdown` no longer stops later plugins from shutting down.
+- Placeholders no longer skip a long JSON string because it exceeds a decode-size cap; masked terms inside very long escaped strings are redacted. A missing or wrong per-request placeholder state now fails closed with 503 instead of passing the request through unmasked.
+- The startup state-directory probe uses an unpredictable file name with `create_new` and `O_NOFOLLOW`. A pre-planted file or a symlink at the probe path can no longer make the check pass or redirect the write.
+- The request-log sink refuses a path that is a symlink or not a regular file (`O_NOFOLLOW` plus an `fstat` check). A planted symlink can no longer redirect log writes to another file.
+- Key file permissions are checked from the same file handle used to read the key. With `strict_key_permissions = true` (the default), a group- or world-readable key file is a load error; reloads keep the last good key table rather than accepting a loosened file.
 ### Fixed
 
 - An intercepted CONNECT now keeps the exact authorised host entry (upstream and stream) for its lifetime. A reload between authorisation and `serve` can no longer switch an already-authorised tunnel to a different upstream or stream; new CONNECTs use the reloaded table.
 - A response that still carries a content coding Reiki did not decode (an unknown name or a list such as `gzip, br`) is refused with 502 when a key is in play, instead of relaying raw bytes that could contain an echoed key. Responses without a key in play, bodyless responses, and single recognised codings are unaffected.
 - The scrubber reserves half of each key's 4096-form budget for the raw form and its split variants, with space-separated forms first. A long key with a space inserted at any boundary is now redacted instead of being crowded out by encoding variants.
 - `GET /status` gains `log.write_errors`, the number of service-log file writes dropped since start. A failed write now warns on stderr at most once a minute instead of only once ever.
-- A rewrite body with more than 4096 top-level members is left byte-for-byte unchanged, matching `request_model`'s scan cap.
+- A request body with more than 4096 top-level members is now refused with `400 too_many_members` before any key is used, instead of being rewritten by a scan that `request_model` does not complete.
 
 ### Fixed
 
 - `reiki peers --watch` no longer grows a watched document without bound: key events that would add a 257th upstream are dropped and counted in a warning.
 - A reload that changes `leaf_ttl_hours` now clears the cached leaves, so new intercepted connections use the new lifetime instead of reusing a leaf minted under the old TTL.
+- A configured key over 4096 bytes is now refused at load instead of building unbounded scrubber forms. Form generation is lazy and bounded per category, so a long key cannot crowd out the raw and split forms that matter most.
+- A streaming forwarder body is now capped and time-bounded: `[upstream.NAME.forward]` gains `max_stream_bytes` (default 64 MiB) and `stream_timeout_secs` (default 1800), and a stream past either limit ends instead of running without bound.
+- `reiki peers --watch` no longer accepts an unbounded SSE feed: at most 1024 items are kept per feed and each stream chunk is cut at 64 KiB.
+- The peer publisher now tracks whether its listener is plain HTTP or HTTPS on every start. A reload that switches a peer token from a plain to a TLS listener (or back) no longer keeps the old scheme's state.
+- `POST /keys/enable` now parses `?key=` strictly: a repeated, bare or unknown flag, or invalid percent-encoding, answers `400` instead of enabling an unintended key.
+- The request log now refuses any configured header whose name contains an authentication credential pattern (`auth`, `token`, `key`, `secret`, `cookie`, `credential`), not just a fixed list of names.
 
 ## 0.11.0
 

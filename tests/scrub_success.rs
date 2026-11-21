@@ -15,6 +15,7 @@ use reiki::proxy::{load_keys, router, App};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const TOKEN: &str = "stream-token";
 const KEY: &str = "upstream-secret-key-1234";
@@ -30,7 +31,7 @@ async fn echo(headers: HeaderMap) -> impl IntoResponse {
 async fn relay(plugins: &str, tag: &str) -> (String, reqwest::Client) {
     let dir = std::env::temp_dir().join(format!("reiki-scrub-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), format!("{KEY}\n")).unwrap();
+    write_key(dir.join("key"), format!("{KEY}\n"));
     let upstream = serve(Router::new().fallback(any(echo))).await;
     let text = format!(
         "listen = \"127.0.0.1:0\"\n[upstream.zen]\nbase_url = \"{upstream}/v1\"\n\
@@ -91,7 +92,7 @@ async fn an_echoed_key_is_scrubbed_before_a_plugin_sees_it() {
 async fn a_response_without_the_key_is_unchanged_and_keeps_its_length() {
     let dir = std::env::temp_dir().join(format!("reiki-scrub-{}-clean", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("key"), format!("{KEY}\n")).unwrap();
+    write_key(dir.join("key"), format!("{KEY}\n"));
     let upstream = serve(Router::new().fallback(any(|| async { "plain body" }))).await;
     let text = format!(
         "listen = \"127.0.0.1:0\"\n[upstream.zen]\nbase_url = \"{upstream}/v1\"\n\

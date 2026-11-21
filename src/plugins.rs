@@ -49,11 +49,18 @@ pub enum OnError {
 }
 
 /// A request the chain stopped before it reached an upstream.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Blocked {
     pub status: StatusCode,
     pub message: String,
 }
+
+/// Told to the client when a fail-closed plugin fails and its work cannot be trusted.
+pub const PLUGIN_FAILURE_MESSAGE: &str =
+    "a fail-closed plugin failed; the request was not processed";
+
+/// The status used for a plugin failure, independent of the error the plugin returned.
+pub const PLUGIN_FAILURE_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 
 /// One compiled-in plugin and how to build it from its config table.
 pub struct Registration {
@@ -351,10 +358,12 @@ impl PluginChain {
 
     /// Starts a request's plugin session: this chain and fresh per-request state for each plugin.
     pub fn session(self: &Arc<Self>) -> PluginSession {
+        let (states, failed) = self.states_with_failures();
         PluginSession {
             chain: Arc::clone(self),
-            states: self.states(),
+            states,
             scope: self.scope(None),
+            failed,
         }
     }
 
@@ -465,15 +474,32 @@ impl PluginChain {
 
     /// Creates the per-request state for every plugin, in chain order. A panicking hook is
     /// logged and skipped: that plugin gets the same default state as one that implements no
-    /// `new_state`, so the request keeps its one-state-per-plugin shape.
-    pub fn states(&self) -> Vec<Box<dyn Any + Send>> {
-        self.entries
+    /// `new_state`, so the request keeps its one-state-per-plugin shape. The flag reports a
+    /// panic in a plugin whose failure policy is [`OnError::Reject`].
+    fn states_with_failures(&self) -> (Vec<Box<dyn Any + Send>>, bool) {
+        let mut failed = false;
+        let states = self
+            .entries
             .iter()
-            .map(|e| {
-                guard(e.plugin.name(), "new_state", || e.plugin.new_state())
-                    .unwrap_or_else(|| Box::new(()))
-            })
-            .collect()
+            .map(
+                |e| match guard(e.plugin.name(), "new_state", || e.plugin.new_state()) {
+                    Some(state) => state,
+                    None => {
+                        if e.on_error == OnError::Reject {
+                            failed = true;
+                        }
+                        Box::new(())
+                    }
+                },
+            )
+            .collect();
+        (states, failed)
+    }
+
+    /// Creates states without reporting a failure; request handling uses [`Self::session`],
+    /// which fails closed when a fail-closed plugin panics.
+    pub fn states(&self) -> Vec<Box<dyn Any + Send>> {
+        self.states_with_failures().0
     }
 
     /// Runs `on_request` on every plugin, in order, mutating the request in
@@ -593,7 +619,8 @@ impl PluginChain {
 
     /// Runs `on_response_head` on every plugin, in reverse order, so the plugin that
     /// touched the request first sees the response last. A panicking hook is logged
-    /// and skipped.
+    /// and skipped; `true` means a plugin whose failure policy is [`OnError::Reject`]
+    /// panicked and the response must not be relayed.
     #[allow(clippy::too_many_arguments)]
     pub fn on_response_head(
         &self,
@@ -603,7 +630,8 @@ impl PluginChain {
         upstream: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
-    ) {
+    ) -> bool {
+        let mut failed = false;
         for ((entry, state), runs) in self
             .entries
             .iter()
@@ -616,21 +644,29 @@ impl PluginChain {
             }
             let mut ctx = ResponseHeadCtx::new(key, &mut *status, &mut *headers, &mut **state)
                 .with_upstream(upstream);
-            let _ = guard(entry.plugin.name(), "on_response_head", || {
+            if guard(entry.plugin.name(), "on_response_head", || {
                 entry.plugin.on_response_head(&mut ctx);
-            });
+            })
+            .is_none()
+                && entry.on_error == OnError::Reject
+            {
+                failed = true;
+            }
         }
+        failed
     }
 
     /// Runs `on_response_chunk` on every plugin, in reverse order, letting each rewrite
-    /// `chunk` before the next sees it. A panicking hook is logged and skipped.
+    /// `chunk` before the next sees it. A panicking hook is logged and skipped; `true`
+    /// means a plugin whose failure policy is [`OnError::Reject`] panicked.
     pub fn on_response_chunk(
         &self,
         states: &mut [Box<dyn Any + Send>],
         scope: &[bool],
         chunk: &mut Bytes,
         is_last: bool,
-    ) {
+    ) -> bool {
+        let mut failed = false;
         for ((entry, state), runs) in self
             .entries
             .iter()
@@ -642,10 +678,16 @@ impl PluginChain {
                 continue;
             }
             let mut ctx = ChunkCtx::new(&mut *chunk, is_last, &mut **state);
-            let _ = guard(entry.plugin.name(), "on_response_chunk", || {
+            if guard(entry.plugin.name(), "on_response_chunk", || {
                 entry.plugin.on_response_chunk(&mut ctx);
-            });
+            })
+            .is_none()
+                && entry.on_error == OnError::Reject
+            {
+                failed = true;
+            }
         }
+        failed
     }
 }
 
@@ -656,6 +698,8 @@ pub struct PluginSession {
     states: Vec<Box<dyn Any + Send>>,
     /// Which plugins run for this request, set by `on_request`; only unscoped plugins until then.
     scope: Vec<bool>,
+    /// A fail-closed plugin panicked, so its work cannot be trusted for this request.
+    failed: bool,
 }
 
 impl Default for PluginSession {
@@ -664,6 +708,7 @@ impl Default for PluginSession {
             chain: Arc::new(PluginChain::default()),
             states: Vec::new(),
             scope: Vec::new(),
+            failed: false,
         }
     }
 }
@@ -684,6 +729,11 @@ impl PluginSession {
         &self.chain
     }
 
+    /// True when a fail-closed plugin panicked while preparing or processing this request.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
     pub fn on_request(
         &mut self,
         meta: &RequestMeta<'_>,
@@ -691,6 +741,12 @@ impl PluginSession {
         body: &mut Bytes,
     ) -> Result<(), Blocked> {
         self.scope = self.chain.scope(Some(meta.stream));
+        if self.failed {
+            return Err(Blocked {
+                status: PLUGIN_FAILURE_STATUS,
+                message: PLUGIN_FAILURE_MESSAGE.to_owned(),
+            });
+        }
         self.chain.on_request(&mut self.states, meta, headers, body)
     }
 
@@ -705,8 +761,8 @@ impl PluginSession {
         upstream: &str,
         status: &mut StatusCode,
         headers: &mut HeaderMap,
-    ) {
-        self.chain.on_response_head(
+    ) -> bool {
+        self.failed |= self.chain.on_response_head(
             &mut self.states,
             &self.scope,
             key,
@@ -714,11 +770,14 @@ impl PluginSession {
             status,
             headers,
         );
+        self.failed
     }
 
-    pub fn on_response_chunk(&mut self, chunk: &mut Bytes, is_last: bool) {
-        self.chain
+    pub fn on_response_chunk(&mut self, chunk: &mut Bytes, is_last: bool) -> bool {
+        self.failed |= self
+            .chain
             .on_response_chunk(&mut self.states, &self.scope, chunk, is_last);
+        self.failed
     }
 }
 
@@ -1465,6 +1524,105 @@ mod tests {
         let mut body = Bytes::new();
         request(&chain, &mut states, &mut body).unwrap();
         assert_eq!(&body[..], b"still served");
+    }
+
+    #[test]
+    fn a_fail_closed_plugin_that_panics_in_new_state_blocks_the_request() {
+        struct PanicState;
+        impl Plugin for PanicState {
+            fn name(&self) -> &str {
+                "panic_state"
+            }
+            fn fails_closed(&self) -> bool {
+                true
+            }
+            fn new_state(&self) -> Box<dyn Any + Send> {
+                panic!("boom");
+            }
+        }
+        let registry = vec![Registration {
+            name: "panic_state",
+            build: |_| Ok(Box::new(PanicState) as Box<dyn Plugin>),
+        }];
+        let chain =
+            Arc::new(PluginChain::build(&configured("[panic_state]\n"), &registry).unwrap());
+        let mut session = chain.session();
+        assert!(session.failed());
+
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "test",
+            stream: "default",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/chat",
+        };
+        let mut body = Bytes::from_static(b"unmasked secret");
+        let blocked = session
+            .on_request(&meta, &mut HeaderMap::new(), &mut body)
+            .unwrap_err();
+        assert_eq!(blocked.status, PLUGIN_FAILURE_STATUS);
+        assert_eq!(&body[..], b"unmasked secret");
+
+        // The operator can explicitly accept the risk, in which case the request goes on.
+        let chain = Arc::new(
+            PluginChain::build(
+                &configured("[panic_state]\non_error = \"pass_through\"\n"),
+                &registry,
+            )
+            .unwrap(),
+        );
+        let mut session = chain.session();
+        assert!(!session.failed());
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut body)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_response_hook_panic_in_a_fail_closed_plugin_is_reported_to_the_session() {
+        struct PanicResponse;
+        impl Plugin for PanicResponse {
+            fn name(&self) -> &str {
+                "panic_response"
+            }
+            fn fails_closed(&self) -> bool {
+                true
+            }
+            fn needs_response_hooks(&self) -> bool {
+                true
+            }
+            fn on_response_head(&self, _ctx: &mut ResponseHeadCtx<'_>) {
+                panic!("boom");
+            }
+            fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {
+                panic!("boom");
+            }
+        }
+        let registry = vec![Registration {
+            name: "panic_response",
+            build: |_| Ok(Box::new(PanicResponse) as Box<dyn Plugin>),
+        }];
+        let chain =
+            Arc::new(PluginChain::build(&configured("[panic_response]\n"), &registry).unwrap());
+        let mut session = chain.session();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "test",
+            stream: "default",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/chat",
+        };
+        session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap();
+
+        let mut status = StatusCode::OK;
+        assert!(session.on_response_head("k", "zen", &mut status, &mut HeaderMap::new()));
+        let mut chunk = Bytes::from_static(b"secret");
+        assert!(session.on_response_chunk(&mut chunk, true));
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[test]

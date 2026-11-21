@@ -37,16 +37,16 @@ These are recommended paths. Reiki creates the state file, service log, request-
 | `/var/lib/reiki/requests.jsonl` | `reiki:reiki`, `0600` | Reiki | Optional request-log file |
 | `/run/reiki/requests.sock` | `reiki:reiki`, `0600` | Reiki | Optional request-log socket; parent `0700` |
 
-Reiki enforces `0600` on the state file and request-log file and socket. It tightens an existing service log to `0640`. `reiki keys --check` warns when a key file has group or other read bits; startup does not check key-file modes. Peer tokens, peer TLS keys and the intercept CA key must be private. See [keys](keys.md#key-files), [peers](peers.md) and [security](security.md#hardening).
+Reiki enforces `0600` on the state file and request-log file and socket. It tightens an existing service log to `0640`. By default startup, reload and `reiki keys --check` refuse a key file with group or other read bits (`strict_key_permissions = true`); set it to `false` for warning-only behaviour. Peer tokens, peer TLS keys and the intercept CA key must be private. See [keys](keys.md#key-files), [peers](peers.md) and [security](security.md#hardening).
 
-Before binding listeners, Reiki creates and removes a probe file in the state directory (the parent of `<config>.state`). A failed probe exits 1 with an error naming that directory and the OS cause, so a read-only mount cannot leave a running instance without health persistence. The unit below uses `ReadWritePaths=/etc/reiki` for the default config path. For a config under `StateDirectory`, that line is not needed.
+Before binding listeners, Reiki creates and removes an unpredictably named probe file in the state directory (the parent of `<config>.state`) with `create_new` and `O_NOFOLLOW`. A pre-existing file or a symlink at a probe path cannot satisfy the check. A failed probe exits 1 with an error naming that directory and the OS cause, so a read-only mount cannot leave a running instance without health persistence. The unit below uses `ReadWritePaths=/etc/reiki` for the default config path. For a config under `StateDirectory`, that line is not needed.
 
 ## Listeners
 
 | Listener | Config | Default | Authentication and use |
 | --- | --- | --- | --- |
 | Client | top-level `listen` | `127.0.0.1:4097` | Stream token on proxied requests. `GET /__reiki/healthz` needs no token. `--listen` wins over `REIKI_LISTEN`, which wins over config. Plain HTTP. |
-| Admin | `[admin].listen` and `token_sha256` | none; optional table | Bearer admin token. Serves `/status`, `/failures`, `/reload`, `/keys/enable`, `/metrics` and their `/v1` forms. Must differ from the client listener. |
+| Admin | `[admin].listen` and `token_sha256` | none; optional table | Bearer admin token. Serves `/status`, `/failures`, `/reload`, `/keys/enable`, `/metrics` and their `/v1` forms. Must be a literal loopback IP and port and differ from the client listener; hostnames are refused. |
 | Peers | `[peers].enabled`, `publish`, `listen` and a token | none; optional table | Read-only `/v1/health` and `/v1/health/stream` with a peer token. Needs the `peers` feature. A non-loopback address needs TLS. |
 | Tunnel | `[tunnel].listen` and `allow` | none; optional table | Opaque CONNECT on an allow-list. No token on the socket, so restrict network access. `[tunnel.intercept]` adds TLS termination for listed hosts. |
 | Hub | `[hub].listen` | none; optional table | Parsed and validated only in this release. No listener is bound and no hub is contacted. The `hub` feature is not in release builds. |

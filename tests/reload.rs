@@ -16,6 +16,7 @@ use reiki::proxy::{load_keys, router, App};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const STREAM_TOKEN: &str = "stream-token";
 const ADMIN_TOKEN: &str = "admin-token";
@@ -60,7 +61,7 @@ impl Rig {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("reiki-reload-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("key-a"), "upstream-secret\n").unwrap();
+        write_key(dir.join("key-a"), "upstream-secret\n");
         let mock_url = serve(mock).await;
         let mut rig = Self {
             config: dir.join("reiki.toml"),

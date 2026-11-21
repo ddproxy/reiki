@@ -5,10 +5,12 @@
 //! treated as a verdict on the key.
 
 use std::fmt;
+use std::pin::Pin;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::http::{header, HeaderName, HeaderValue, Method, Request, StatusCode, Version};
+use futures_core::Stream;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -22,6 +24,19 @@ const MAX_RESPONSE_HEADERS: usize = 128;
 const MAX_HEADER_VALUE: usize = 64 * 1024;
 const MAX_HEAD_BYTES: usize = 256 * 1024;
 const CHILD_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// A streamed forwarder body has no content length to settle against, so it needs its own cap
+/// and total deadline instead of the request header timeout.
+const DEFAULT_MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Byte cap and total deadline applied to a streamed forwarder body.
+struct StreamLimits {
+    max_bytes: u64,
+    total: Duration,
+}
+
+type ForwardStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 /// The forwarder link failed; carries no key material.
 #[derive(Debug)]
@@ -79,14 +94,29 @@ impl Transport for Forwarder {
             let request = build_request(&call).map_err(fail)?;
             let idle = Duration::from_secs(call.upstream.response_idle_timeout_secs);
             let total = call.upstream.response_timeout_secs.map(Duration::from_secs);
+            let stream_limits = StreamLimits {
+                max_bytes: spec.max_stream_bytes.unwrap_or(DEFAULT_MAX_STREAM_BYTES),
+                total: spec
+                    .stream_timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(DEFAULT_STREAM_TIMEOUT),
+            };
             match (&spec.socket, &spec.command) {
                 (Some(path), _) => {
-                    exchange_socket(path, spec.expect_uid, request, spec.streaming, idle, total)
-                        .await
+                    exchange_socket(
+                        path,
+                        spec.expect_uid,
+                        request,
+                        spec.streaming,
+                        idle,
+                        total,
+                        stream_limits,
+                    )
+                    .await
                 }
                 (None, Some(_)) => {
                     let permit = self.permit(spec)?;
-                    exchange_command(spec, request, permit, idle, total).await
+                    exchange_command(spec, request, permit, idle, total, stream_limits).await
                 }
                 (None, None) => Err(fail("[upstream.forward] has neither socket nor command")),
             }
@@ -164,6 +194,7 @@ async fn exchange_socket(
     streaming: bool,
     idle: Duration,
     total: Option<Duration>,
+    stream_limits: StreamLimits,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let stream = tokio::net::UnixStream::connect(path)
         .await
@@ -180,7 +211,7 @@ async fn exchange_socket(
             )));
         }
     }
-    exchange(stream, request, streaming, None, idle, total).await
+    exchange(stream, request, streaming, None, idle, total, stream_limits).await
 }
 
 #[cfg(not(unix))]
@@ -191,6 +222,7 @@ async fn exchange_socket(
     _streaming: bool,
     _idle: Duration,
     _total: Option<Duration>,
+    _stream_limits: StreamLimits,
 ) -> Result<UpstreamResponse, std::io::Error> {
     Err(fail("socket forwarding needs a Unix platform"))
 }
@@ -201,6 +233,7 @@ async fn exchange_command(
     permit: tokio::sync::OwnedSemaphorePermit,
     idle: Duration,
     total: Option<Duration>,
+    stream_limits: StreamLimits,
 ) -> Result<UpstreamResponse, std::io::Error> {
     let command = spec.command.as_deref().unwrap_or_default();
     let mut cmd = tokio::process::Command::new(command);
@@ -236,6 +269,7 @@ async fn exchange_command(
         Some(guard),
         idle,
         total,
+        stream_limits,
     )
     .await
 }
@@ -296,8 +330,8 @@ where
 /// One request and its response over `io`; every failure is a [`ForwarderError`].
 ///
 /// The body is buffered whole unless `streaming` is set, in which case the response is returned
-/// as soon as its head is in and the body is relayed as it arrives. `guard` keeps a forward
-/// command alive for as long as its body is still being read.
+/// as soon as its head is in and the body is relayed as it arrives under its own byte cap and
+/// total deadline. `guard` keeps a forward command alive for as long as its body is still being read.
 async fn exchange<T>(
     io: T,
     request: Request<Full<Bytes>>,
@@ -305,12 +339,22 @@ async fn exchange<T>(
     mut guard: Option<ChildGuard>,
     idle: Duration,
     total: Option<Duration>,
+    stream_limits: StreamLimits,
 ) -> Result<UpstreamResponse, std::io::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let is_head = request.method() == Method::HEAD;
-    let result = exchange_inner(io, request, streaming, is_head, idle, total).await;
+    let result = exchange_inner(
+        io,
+        request,
+        streaming,
+        is_head,
+        idle,
+        total,
+        stream_limits.max_bytes,
+    )
+    .await;
     match result {
         Ok((Relayed::Buffered(response), _)) => Ok(response),
         Ok((Relayed::Streaming(parts, body), connection)) => {
@@ -321,14 +365,12 @@ where
             let mut headers = parts.headers;
             strip_hop_by_hop(&mut headers, false);
             let stream = Guarded {
-                inner: ErrMap {
-                    inner: Box::pin(body.into_data_stream()),
-                },
+                inner: body,
                 _guard: guard.take(),
             };
             Ok(
                 UpstreamResponse::from_stream(parts.status, headers, Version::HTTP_11, stream)
-                    .with_deadlines(idle, total),
+                    .with_deadlines(idle, Some(stream_limits.total)),
             )
         }
         Err(error) => {
@@ -345,7 +387,7 @@ type Connection<T> =
 
 enum Relayed {
     Buffered(UpstreamResponse),
-    Streaming(axum::http::response::Parts, hyper::body::Incoming),
+    Streaming(axum::http::response::Parts, ForwardStream),
 }
 
 async fn exchange_inner<T>(
@@ -355,6 +397,7 @@ async fn exchange_inner<T>(
     is_head: bool,
     idle: Duration,
     total: Option<Duration>,
+    max_stream: u64,
 ) -> Result<(Relayed, Connection<T>), std::io::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -385,6 +428,12 @@ where
             return Err(fail("a response header value is over 64 KiB"));
         }
         if streaming {
+            // The body has no content length to settle against yet, so cap it here rather than
+            // after the response head has already been handed to the client.
+            let source = ErrMap {
+                inner: Box::pin(body.into_data_stream()),
+            };
+            let body = crate::upstream::capped_body(Box::pin(source), max_stream);
             return Ok(Relayed::Streaming(parts, body));
         }
         // The body cap and the response timeouts apply to the forwarder's answer just
@@ -760,5 +809,78 @@ file = "/etc/reiki/keys/zen-a"
             !second.to_string().contains("too many copies"),
             "the timed-out command still holds its slot: {second}"
         );
+    }
+
+    fn streaming_config(extra: &str) -> Config {
+        Config::parse(&format!(
+            "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+             [upstream.zen.forward]\ncommand = \"sh\"\n\
+             args = [\"-c\", {SCRIPT:?}]\nstreaming = true\n{extra}\n\
+             [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
+             [streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ))
+        .unwrap()
+    }
+
+    const SCRIPT: &str = "printf 'HTTP/1.1 200 OK\\r\\nContent-Type: text/event-stream\\r\\nContent-Length: 100000\\r\\nConnection: close\\r\\n\\r\\n'; yes x | head -c 100000";
+
+    async fn streamed_response(config: &Config) -> crate::upstream::UpstreamResponse {
+        let parts = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let call = Call {
+            parts: &parts,
+            url: "https://example.test/v1/chat",
+            credential: Some(("authorization", "Bearer key")),
+            body: Bytes::from_static(b"{}"),
+            upstream: &config.upstream["zen"],
+        };
+        tokio::time::timeout(Duration::from_secs(5), Forwarder::default().send(call))
+            .await
+            .expect("the forwarder answers")
+            .expect("the streamed response is returned with its head")
+    }
+
+    #[tokio::test]
+    async fn a_streamed_forward_body_fails_when_it_passes_its_byte_cap() {
+        let config = streaming_config("max_stream_bytes = 1024\n");
+        let mut response = streamed_response(&config).await;
+        let mut error = None;
+        while let Some(chunk) = response.chunk().await {
+            if let Err(e) = chunk {
+                error = Some(e);
+                break;
+            }
+        }
+        let error = error.expect("the body ends with a limit error");
+        assert!(
+            crate::upstream::is_body_limit_error(&error),
+            "unexpected stream error: {error}"
+        );
+    }
+
+    #[test]
+    fn stream_limits_default_to_64_mib_and_30_minutes_and_reject_zero() {
+        let config = streaming_config("");
+        let forward = config.upstream["zen"].forward.as_ref().unwrap();
+        assert_eq!(forward.max_stream_bytes, None);
+        assert_eq!(forward.stream_timeout_secs, None);
+        assert_eq!(super::DEFAULT_MAX_STREAM_BYTES, 64 * 1024 * 1024);
+        assert_eq!(super::DEFAULT_STREAM_TIMEOUT, Duration::from_secs(1800));
+
+        for (field, value) in [("max_stream_bytes", "0"), ("stream_timeout_secs", "0")] {
+            let text = format!(
+                "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
+                 [upstream.zen.forward]\ncommand = \"sh\"\n{field} = {value}\n"
+            );
+            assert!(
+                Config::parse(&text).is_err(),
+                "{field} = {value} is refused"
+            );
+        }
     }
 }

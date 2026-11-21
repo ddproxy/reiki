@@ -1,5 +1,8 @@
 //! A reload swaps the interception CA: new connections verify against the new CA, open connections keep their leaf, and the watcher picks up a renewed CA file.
 
+mod common;
+use common::write_key;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +49,7 @@ impl Rig {
         let dir = scratch(label);
         let ca_dir = dir.join("ca");
         init_ca(&ca_dir, &[HOST.to_owned()], 30, false).unwrap();
-        std::fs::write(dir.join("key"), "upstream-secret\n").unwrap();
+        write_key(dir.join("key"), "upstream-secret\n");
         let port = upstream().await;
         let config = dir.join("reiki.toml");
         let text = format!(

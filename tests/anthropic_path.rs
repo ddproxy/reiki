@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const CLIENT_TOKEN: &str = "claude-code-client-token-0123456789";
 const UPSTREAM_KEY: &str = "anthropic-upstream-key";
@@ -131,7 +132,7 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key_file = dir.join("key-a");
-        std::fs::write(&key_file, format!("{UPSTREAM_KEY}\n")).unwrap();
+        write_key(&key_file, format!("{UPSTREAM_KEY}\n"));
 
         let mock = Arc::new(Mock::default());
         let mock_url = serve(

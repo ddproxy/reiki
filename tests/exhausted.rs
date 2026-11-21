@@ -1,3 +1,6 @@
+mod common;
+use common::write_key;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,7 +52,7 @@ async fn a_chain_of_limited_keys_answers_promptly() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut keys = String::new();
     for n in 1..=4 {
-        std::fs::write(dir.join(format!("k{n}")), format!("upstream-key-{n}")).unwrap();
+        write_key(dir.join(format!("k{n}")), format!("upstream-key-{n}"));
         keys.push_str(&format!(
             "[keys.k{n}]\nupstream = \"api\"\nfile = \"{}\"\n",
             dir.join(format!("k{n}")).display()
@@ -100,7 +103,7 @@ async fn a_quota_429_with_retry_after_cools_the_key_for_that_long() {
     let port = limited_with(Arc::clone(&hits), Some("90")).await;
     let dir = std::env::temp_dir().join(format!("reiki-quota-hint-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("k1"), "upstream-key-1").unwrap();
+    write_key(dir.join("k1"), "upstream-key-1");
     let text = format!(
         "[upstream.api]\nbase_url = \"http://127.0.0.1:{port}/v1\"\n\
          [keys.k1]\nupstream = \"api\"\nfile = \"{}\"\n\

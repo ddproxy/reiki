@@ -17,44 +17,58 @@ pub(crate) const MIN_SECRET: usize = 8;
 
 type ByteResult = Result<Bytes, std::io::Error>;
 
+/// A configured key longer than this is refused at load time. Every form of a key is at least
+/// as long as the key, so an unbounded key would make the scrubber's bounded form list unbounded
+/// in size too.
+pub const MAX_SECRET: usize = 4096;
+
 /// A key split at every character boundary for every ASCII whitespace and control byte needs
 /// one form per boundary per separator. The cap keeps an unusually long credential bounded.
 const MAX_FORMS_PER_SECRET: usize = 4096;
 
-/// Slots of each secret's budget that the raw form and its split forms keep for themselves.
-/// Encodings and escapes may use only what is left, so they cannot push the split forms out of a
-/// long key's list. Space-separated forms come first, so an echoed key with a space at any
-/// boundary is still recognised.
+/// Reserved slots for each family of forms, so none can crowd the others out of a long key's
+/// list. The sum is the whole per-secret budget; each generator stops as soon as its slots run out.
+const RAW_FORM_BUDGET: usize = 1;
 const SPLIT_FORM_BUDGET: usize = MAX_FORMS_PER_SECRET / 2;
+const JSON_FORM_BUDGET: usize = MAX_FORMS_PER_SECRET / 8;
+const PERCENT_FORM_BUDGET: usize = MAX_FORMS_PER_SECRET / 8;
+const B64_FORM_BUDGET: usize = MAX_FORMS_PER_SECRET
+    - RAW_FORM_BUDGET
+    - SPLIT_FORM_BUDGET
+    - JSON_FORM_BUDGET
+    - PERCENT_FORM_BUDGET;
+
+/// Adds one form unless the shared slot budget is spent.
+fn push_form(forms: &mut Vec<Vec<u8>>, budget: usize, form: Vec<u8>) -> bool {
+    if forms.len() >= budget {
+        return false;
+    }
+    forms.push(form);
+    true
+}
 
 /// Every byte string that stands for one of `secrets`, longest first.
 pub fn forms(secrets: &[&str]) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     for secret in secrets.iter().filter(|s| s.len() >= MIN_SECRET) {
         let raw = secret.as_bytes();
-        let mut per_secret: Vec<Vec<u8>> = Vec::new();
+        let mut per_secret: Vec<Vec<u8>> = Vec::with_capacity(MAX_FORMS_PER_SECRET);
         per_secret.push(raw.to_vec());
-        // The raw form and its split forms come first and get a reserved half of the budget, so
-        // the many encoding variants below cannot crowd them out for a long key.
-        per_secret.extend(split_forms(secret).into_iter().take(SPLIT_FORM_BUDGET));
-        per_secret.extend(json_forms(secret));
-        per_secret.extend(percent_forms(raw));
-        per_secret.extend(percent_all_forms(raw));
-        per_secret.extend(percent_unreserved_forms(raw));
-        per_secret.extend(percent_one_forms(raw));
-        for alphabet in [B64_STD, B64_URL] {
-            for padded in [true, false] {
-                let encoded = base64(raw, alphabet, padded);
-                per_secret.extend(json_forms(&encoded));
-                per_secret.extend(percent_forms(encoded.as_bytes()));
-                per_secret.push(encoded.into_bytes());
-            }
-            for offset in [1, 2] {
-                if let Some(encoded) = base64_at_offset(raw, offset, alphabet) {
-                    per_secret.push(encoded);
-                }
-            }
-        }
+        split_forms(secret, &mut per_secret, RAW_FORM_BUDGET + SPLIT_FORM_BUDGET);
+        let json_limit = per_secret.len() + JSON_FORM_BUDGET;
+        json_forms(secret, &mut per_secret, json_limit);
+        let percent_limit = per_secret.len() + PERCENT_FORM_BUDGET;
+        percent_forms(raw, &mut per_secret, percent_limit);
+        percent_all_forms(raw, &mut per_secret, percent_limit);
+        percent_unreserved_forms(raw, &mut per_secret, percent_limit);
+        percent_one_forms(raw, &mut per_secret, percent_limit);
+        let b64_limit = per_secret.len() + B64_FORM_BUDGET;
+        base64_forms(raw, &mut per_secret, b64_limit);
+        // Longest first: blanking a short form inside a longer one would leave the rest of the
+        // longer form visible. Dedupe before the single truncation so no family is lost to copies.
+        per_secret.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        let mut seen = std::collections::HashSet::new();
+        per_secret.retain(|f| seen.insert(f.clone()));
         per_secret.truncate(MAX_FORMS_PER_SECRET);
         out.extend(per_secret);
     }
@@ -111,8 +125,7 @@ fn push_minimal_json(out: &mut String, c: char, slash: bool) {
 /// as `\uXXXX`, and with every alphanumeric as `\uXXXX`, in either hex case. A single escaped
 /// letter or digit at each position is also covered, since JSON encoders make that choice
 /// independently.
-fn json_forms(text: &str) -> Vec<Vec<u8>> {
-    let mut forms = Vec::new();
+fn json_forms(text: &str, forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
     for style in 0..8 {
         let mut s = String::new();
         for c in text.chars() {
@@ -128,8 +141,8 @@ fn json_forms(text: &str) -> Vec<Vec<u8>> {
                 push_minimal_json(&mut s, c, style == 1);
             }
         }
-        if s != text {
-            forms.push(s.into_bytes());
+        if s != text && !push_form(forms, budget, s.into_bytes()) {
+            return false;
         }
     }
     for (index, escaped) in text
@@ -146,7 +159,9 @@ fn json_forms(text: &str) -> Vec<Vec<u8>> {
                     push_minimal_json(&mut s, c, false);
                 }
             }
-            forms.push(s.into_bytes());
+            if !push_form(forms, budget, s.into_bytes()) {
+                return false;
+            }
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -163,10 +178,12 @@ fn json_forms(text: &str) -> Vec<Vec<u8>> {
                     push_minimal_json(&mut s, c, false);
                 }
             }
-            forms.push(s.into_bytes());
+            if !push_form(forms, budget, s.into_bytes()) {
+                return false;
+            }
         }
     }
-    forms
+    true
 }
 
 fn percent_byte(out: &mut Vec<u8>, b: u8, upper: bool) {
@@ -183,8 +200,7 @@ fn is_unreserved(b: u8) -> bool {
 }
 
 /// Lower and upper case hex, and a space as `+`.
-fn percent_forms(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut forms = Vec::new();
+fn percent_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
     for (upper, plus) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut out = Vec::with_capacity(raw.len());
         for &b in raw {
@@ -196,58 +212,59 @@ fn percent_forms(raw: &[u8]) -> Vec<Vec<u8>> {
                 percent_byte(&mut out, b, upper);
             }
         }
-        if out != raw {
-            forms.push(out);
+        if out != raw && !push_form(forms, budget, out) {
+            return false;
         }
     }
-    forms
+    true
 }
 
 /// Every byte percent-encoded, as a client that encodes even unreserved characters would.
-fn percent_all_forms(raw: &[u8]) -> Vec<Vec<u8>> {
-    [true, false]
-        .into_iter()
-        .map(|upper| {
-            let mut out = Vec::with_capacity(raw.len() * 3);
-            for &b in raw {
-                percent_byte(&mut out, b, upper);
-            }
-            out
-        })
-        .collect()
+fn percent_all_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
+    for upper in [true, false] {
+        let mut out = Vec::with_capacity(raw.len() * 3);
+        for &b in raw {
+            percent_byte(&mut out, b, upper);
+        }
+        if !push_form(forms, budget, out) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Only the unreserved characters percent-encoded, leaving reserved bytes as they are.
-fn percent_unreserved_forms(raw: &[u8]) -> Vec<Vec<u8>> {
-    [true, false]
-        .into_iter()
-        .map(|upper| {
-            let mut out = Vec::with_capacity(raw.len());
-            for &b in raw {
-                if is_unreserved(b) {
-                    percent_byte(&mut out, b, upper);
-                } else {
-                    out.push(b);
-                }
+fn percent_unreserved_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
+    for upper in [true, false] {
+        let mut out = Vec::with_capacity(raw.len());
+        for &b in raw {
+            if is_unreserved(b) {
+                percent_byte(&mut out, b, upper);
+            } else {
+                out.push(b);
             }
-            out
-        })
-        .collect()
+        }
+        if !push_form(forms, budget, out) {
+            return false;
+        }
+    }
+    true
 }
 
 /// One unreserved character percent-encoded at each position, in either hex case.
-fn percent_one_forms(raw: &[u8]) -> Vec<Vec<u8>> {
-    let mut forms = Vec::new();
+fn percent_one_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
     for (i, &b) in raw.iter().enumerate().filter(|(_, b)| is_unreserved(**b)) {
         for upper in [true, false] {
             let mut out = Vec::with_capacity(raw.len() + 2);
             out.extend_from_slice(&raw[..i]);
             percent_byte(&mut out, b, upper);
             out.extend_from_slice(&raw[i + 1..]);
-            forms.push(out);
+            if !push_form(forms, budget, out) {
+                return false;
+            }
         }
     }
-    forms
+    true
 }
 
 /// The complete base64 characters a key contributes when it starts at `offset` inside a larger
@@ -273,10 +290,10 @@ fn base64_at_offset(raw: &[u8], offset: usize, alphabet: &[u8; 64]) -> Option<Ve
 }
 
 /// The key with one ASCII whitespace or control byte inserted at each boundary, plus a form
-/// with one between every character.
-fn split_forms(text: &str) -> Vec<Vec<u8>> {
+/// with one between every character. Forms are built only while slots remain: a long key would
+/// otherwise allocate every separator times every boundary before the budget was applied.
+fn split_forms(text: &str, forms: &mut Vec<Vec<u8>>, budget: usize) -> bool {
     let chars: Vec<char> = text.chars().collect();
-    let mut forms = Vec::new();
     // A space is by far the most common separator injected by an echoing service, so its forms
     // come first and survive a budget that cannot hold every separator for a very long key.
     let separators = std::iter::once(b' ').chain(
@@ -285,27 +302,64 @@ fn split_forms(text: &str) -> Vec<Vec<u8>> {
             .filter(|b| *b != b' '),
     );
     for byte in separators {
+        if forms.len() >= budget {
+            return false;
+        }
         let separator = char::from(byte);
-        let mut joined = String::new();
+        let mut joined = String::with_capacity(text.len() + chars.len());
         for (i, c) in chars.iter().enumerate() {
             if i > 0 {
                 joined.push(separator);
             }
             joined.push(*c);
         }
-        forms.push(joined.into_bytes());
+        if !push_form(forms, budget, joined.into_bytes()) {
+            return false;
+        }
         for split in 1..chars.len() {
-            let mut form = String::new();
+            let mut form = String::with_capacity(text.len() + separator.len_utf8());
             for (i, c) in chars.iter().enumerate() {
                 if i == split {
                     form.push(separator);
                 }
                 form.push(*c);
             }
-            forms.push(form.into_bytes());
+            if !push_form(forms, budget, form.into_bytes()) {
+                return false;
+            }
         }
     }
-    forms
+    true
+}
+
+/// Base64 forms: the plain encodings and offset alignments first, then their escapes. The plain
+/// forms are what an echoing service most often emits, so the slot budget must reach them first.
+fn base64_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) {
+    let mut encoded = Vec::new();
+    for alphabet in [B64_STD, B64_URL] {
+        for padded in [true, false] {
+            encoded.push(base64(raw, alphabet, padded));
+        }
+    }
+    for text in &encoded {
+        if !push_form(forms, budget, text.as_bytes().to_vec()) {
+            return;
+        }
+    }
+    for alphabet in [B64_STD, B64_URL] {
+        for offset in [1, 2] {
+            if let Some(form) = base64_at_offset(raw, offset, alphabet) {
+                if !push_form(forms, budget, form) {
+                    return;
+                }
+            }
+        }
+    }
+    for text in &encoded {
+        if !json_forms(text, forms, budget) || !percent_forms(text.as_bytes(), forms, budget) {
+            return;
+        }
+    }
 }
 
 pub struct StreamScrubber {
@@ -676,6 +730,30 @@ mod tests {
         let unique: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(unique.len(), all.len());
         assert!(all.iter().all(|f| f.len() >= MIN_SECRET));
+    }
+
+    #[test]
+    fn a_long_key_still_gets_a_base64_form() {
+        let key = format!("sk-{}", "a".repeat(597));
+        let forms = forms(&[&key]);
+        let encoded = base64(key.as_bytes(), B64_STD, true);
+        assert!(
+            forms
+                .iter()
+                .any(|form| form.as_slice() == encoded.as_bytes()),
+            "the plain base64 form must survive the budget"
+        );
+        assert!(forms.iter().any(|form| form.as_slice() == key.as_bytes()));
+    }
+
+    #[test]
+    fn a_maximum_length_key_has_a_bounded_number_and_size_of_forms() {
+        let key = "x".repeat(MAX_SECRET);
+        let forms = forms(&[&key]);
+        assert!(forms.len() <= MAX_FORMS_PER_SECRET);
+        let bytes: usize = forms.iter().map(Vec::len).sum();
+        assert!(bytes < 64 * 1024 * 1024, "forms used {bytes} bytes");
+        assert!(forms.windows(2).all(|w| w[0].len() >= w[1].len()));
     }
 
     #[test]

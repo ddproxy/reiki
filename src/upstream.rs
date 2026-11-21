@@ -98,6 +98,12 @@ fn capped(inner: ByteStream, max: u64) -> ByteStream {
     capped_with_message(inner, max, BODY_LIMIT_MESSAGE)
 }
 
+/// Applies the same byte cap to a body assembled by another transport, so a forwarder's streamed
+/// answer fails the same way an over-limit upstream body does.
+pub(crate) fn capped_body(inner: ByteStream, max: u64) -> ByteStream {
+    capped(inner, max)
+}
+
 fn capped_with_message(inner: ByteStream, max: u64, message: &'static str) -> ByteStream {
     Box::pin(Capped {
         inner,

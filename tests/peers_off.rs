@@ -11,6 +11,7 @@ use reiki::proxy::{router, App, Secret};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const ADMIN_TOKEN: &str = "admin-secret-for-golden";
 const STREAM_TOKEN: &str = "stream-token-for-golden";
@@ -237,7 +238,7 @@ fn try_start(label: &str, ports: Ports, extra: &str, wait_peer: bool) -> Result<
     let dir = std::env::temp_dir().join(format!("reiki-peers-off-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["a", "b", "c"] {
-        std::fs::write(dir.join(name), format!("secret-{name}\n")).unwrap();
+        write_key(dir.join(name), format!("secret-{name}\n"));
     }
     let text = config_text(extra)
         .replace("/unused/", &format!("{}/", dir.display()))
@@ -368,7 +369,7 @@ fn check_reports_peers_as_disabled_without_a_table() {
     let dir = std::env::temp_dir().join(format!("reiki-peers-check-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["a", "b", "c"] {
-        std::fs::write(dir.join(name), "upstream-secret\n").unwrap();
+        write_key(dir.join(name), "upstream-secret\n");
     }
     let config = dir.join("reiki.toml");
     let text = config_text("").replace("/unused/", &format!("{}/", dir.display()));

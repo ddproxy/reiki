@@ -18,8 +18,6 @@ use crate::restore::{collect_strings, opaque_paths, within};
 pub const HEAD: &str = "[[REIKI_";
 pub const TAIL: &str = "]]";
 const PRIVATE_KEY_PLACEHOLDER: &str = "[[REIKI_PRIVATE_KEY_REMOVED]]";
-/// A JSON string value longer than this is not decoded, bounding work per body.
-const MAX_DECODE_LEN: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -156,9 +154,8 @@ impl Masker {
             }
             return;
         }
-        if body.len() > MAX_DECODE_LEN {
-            return;
-        }
+        // No length cut-off: a caller could hide a term past it and have it sent upstream raw.
+        // Request bodies are already bounded by the host, and the body was parsed above.
         #[cfg(test)]
         self.decodes.fetch_add(1, Ordering::Relaxed);
         let Ok(decoded) = serde_json::from_str::<String>(&text[start..end]) else {
@@ -707,12 +704,18 @@ mod tests {
     }
 
     #[test]
-    fn a_string_over_the_decode_limit_is_left_alone() {
+    fn a_long_escaped_string_is_still_masked() {
         let m = masker(&["Zürich"], false);
-        let body = format!(r#"{{"text":"{}Z\u00fcrich"}}"#, "x".repeat(MAX_DECODE_LEN));
-        assert!(body.len() > MAX_DECODE_LEN);
-        assert!(m.mask(&body, &mut HashMap::new()).is_none());
-        assert_eq!(m.decode_count(), 0);
+        let body = format!(r#"{{"text":"{}Z\u00fcrich"}}"#, "x".repeat(1024 * 1024));
+        assert!(body.len() > 1024 * 1024);
+        let mut reverse = HashMap::new();
+        let out = m.mask(&body, &mut reverse).unwrap();
+        assert!(
+            out.contains("[[REIKI_TERM_") && !out.contains("00fc"),
+            "{out}"
+        );
+        assert_eq!(reverse.values().next().unwrap(), "Zürich");
+        assert_eq!(m.decode_count(), 1);
     }
 
     #[test]

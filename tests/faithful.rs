@@ -1,3 +1,6 @@
+mod common;
+use common::write_key;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -66,7 +69,7 @@ struct Setup {
 async fn setup(label: &str) -> (Setup, JoinHandle<Vec<u8>>) {
     let dir = scratch(label);
     init_ca(&dir.join("ca"), &[HOST.to_owned()], 30, false).unwrap();
-    std::fs::write(dir.join("key"), REAL_KEY).unwrap();
+    write_key(dir.join("key"), REAL_KEY);
     let (upstream_port, captured) = upstream().await;
     let text = format!(
         r#"
@@ -287,7 +290,7 @@ async fn only_the_credential_is_added_when_the_client_sent_none() {
 async fn the_reverse_proxy_route_still_lowercases_and_sends_identity() {
     let (port, captured) = upstream().await;
     let dir = scratch("reverse");
-    std::fs::write(dir.join("key"), REAL_KEY).unwrap();
+    write_key(dir.join("key"), REAL_KEY);
     let text = format!(
         "[upstream.api]\nbase_url = \"http://127.0.0.1:{port}/v1\"\n\
          [keys.k]\nupstream = \"api\"\nfile = \"{}\"\n\

@@ -19,7 +19,7 @@ At least one of `file`, `socket` and `syslog` is required. File and socket paths
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `file` | none | Append-only JSON lines file, created with mode 0600. An existing file is tightened to 0600. |
+| `file` | none | Append-only JSON lines file, created with mode 0600. An existing file is tightened to 0600. The path must not be a symlink and must be a regular file; a symlink or a directory/device at that path is refused rather than followed. |
 | `file_max_bytes` | 52428800 | Rotate when the next line would pass this size. `0` never rotates. If a rename fails (a full or read-only directory, a stray file or directory at `<file>.N`), Reiki warns once, keeps writing to the current file, and retries after 1 second, doubling up to 60 seconds. No record is lost or written twice; the file stays over its limit until the rotation works. |
 | `file_keep` | 5 | Rotated files kept as `<file>.1` (newest) to `<file>.N`. `0` discards the old file at rotation. |
 | `socket` | none | Unix socket, mode 0600, path at most 100 bytes. The socket is created first and restricted a moment later, so put it in a directory that is not world-writable, ideally private (0700). A stale socket file is replaced; a live listener or any other file at that path is an error and is left alone. |
@@ -43,6 +43,34 @@ At least one of `file`, `socket` and `syslog` is required. File and socket paths
 `enabled` and `on_error` are handled by Reiki itself, as for every plugin. `reiki check` validates this table without creating the file or the socket.
 
 Stopping Reiki with a signal leaves the socket file behind; the next start replaces it.
+
+## Stability of records
+
+Every JSON record carries `"v":1`, written by `crates/reiki-requestlog/src/writer.rs` on `request`, `response`, `finding` and `dropped` records. OCSF output has no `v`; it sets `metadata.version` to the external schema version `1.3.0` (`crates/reiki-requestlog/src/ocsf.rs`). Syslog `VERSION 1` is the RFC 5424 protocol version.
+
+> **Limit:** `v:1` is a marker, not a compatibility contract. No code checks it, there is no `v:2` path, and no stability policy for log fields is written in this repository. The only stated stability promise is for the versioned admin API (`/v1`), not the request log.
+
+These fields are written by the renderer; most are also asserted by `tests/requestlog.rs` or the writer's unit tests. They describe current behaviour, not a promise that fields never change.
+
+| Record | Fields present |
+| --- | --- |
+| `request` | `v`, `event`, `id`, `ts`, `stream`, `upstream`, `method`, `body_bytes` |
+| `response` | `v`, `event`, `id`, `ts`, `status`, `duration_ms`, `bytes`, `key` |
+| `finding` | `v`, `event`, `id`, `stream`, `plugin`, `kind`, `count`, `action` |
+| `dropped` | `v`, `event`, `ts`, `count` |
+
+Optional fields are absent or `null` rather than always present: `headers`, `body`, `body_summary`, `body_excluded`, `body_truncated`, `attempts`, `attempts[].body`, `detail`. `status` and `key` are `null` when Reiki generated the response itself. Join a request to its response and findings by `id`; ignore unknown fields and tolerate missing ones.
+
+Changes are announced in the [changelog](../CHANGELOG.md) under a version heading and an `### Added`, `### Changed`, `### Fixed` or `### Security` subsection. The changelog has no dates. Examples of field changes:
+
+| Version | Announcement |
+| --- | --- |
+| 0.3.0 | Added request `path`, response `key` and `attempts`, and response bodies under `response = "body"`. |
+| 0.4.2 | Changed the default event-stream response body to an array of parsed events; `sse = "raw"` keeps the old text. |
+| 0.7.5 | Added `finding` records and OCSF 1.3 output. |
+| 0.8.0 | Added `detail` to a `finding` record. |
+
+A field addition changes no version marker: the record stays `v:1`. The `dropped` example later on this page omits `v` for brevity; the writer emits it.
 
 ## Records
 
@@ -78,7 +106,7 @@ At most 32 subscribers connect at once. Each has its own bounded queue and is di
 
 Request bodies are prompts, so treat the file and socket as sensitive. Both are readable by their owner only.
 
-- **Credential headers are never logged.** `authorization`, `proxy-authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, `set-cookie` and `x-auth-token` are refused in `headers`, so Reiki will not start with one listed. Upstream keys are never visible to a plugin.
+- **Credential headers are never logged.** Any header whose name contains `auth`, `token`, `key`, `secret`, `cookie` or `credential` is refused in `headers` (case-insensitively), so Reiki will not start with one listed — the fixed names `authorization`, `proxy-authorization`, `x-api-key`, `x-goog-api-key`, `cookie`, `set-cookie` and `x-auth-token` are covered, as are names like `x-credential`. Upstream keys are never visible to a plugin.
 - **Credential-shaped text is masked** with `[REDACTED]` in bodies and listed headers: `sk-…`, `sk_live_`/`sk_test_`/`rk_live_`/`whsec_` (Stripe), `oc_sk_…`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_` tokens, `glpat-`/`glptt-`, `AKIA`/`ASIA` access keys, `AIza…` and `ya29.` Google keys and tokens, `xox[bpas]-` tokens, `hf_`, `gsk_`, `xai-`, `pplx-`, `nvapi-`, `csk-`, `jina_`, `tvly-`, `r8_`, `npm_`, `pypi-`, `shpat_`, `SG.`, `dop_v1_`, `lin_api_`, `sbp_`, `dckr_pat_`, `hvs.` and `ATATT3` tokens, JWT-shaped `eyJ…` strings, `Bearer <token>` and PEM private key blocks.
 - **Encoded credentials are masked** when the value decodes to one anywhere in it: a base64 (standard or URL-safe) value whose decoded text holds one of the shapes above or a PEM private key, and a percent-encoded run, such as `sk%2D…` or `Bearer%20…`, that decodes to one. So a base64 `user:sk-…`, `{"token":"sk-…"}` or text with the key after a prefix is masked whole.
 - **Fields named like credentials** have their string value masked whatever it holds: a field named `password`, `passwd`, `secret`, `token`, `api_key`, `auth`, `authorization`, `cookie` or `credentials`, or ending in `_password`, `_secret`, `_token`, `_apikey`, `_secret_key`, `_private_key` or `_access_key`, matched without regard to case, dashes and underscores. Only a string is replaced, so a schema such as `"password": {"type": "string"}` and a number such as `max_tokens` are kept.

@@ -18,6 +18,7 @@ use reiki::proxy::{load_keys, router, App};
 
 mod common;
 use common::serve;
+use common::write_key;
 
 const ADMIN_TOKEN: &str = "admin-token";
 const STREAM_TOKEN: &str = "stream-token";
@@ -51,8 +52,8 @@ impl Rig {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("reiki-keys-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("key-a"), "upstream-secret-a\n").unwrap();
-        std::fs::write(dir.join("key-b"), "upstream-secret-b\n").unwrap();
+        write_key(dir.join("key-a"), "upstream-secret-a\n");
+        write_key(dir.join("key-b"), "upstream-secret-b\n");
         let upstream_status = Arc::new(AtomicU16::new(200));
         let status = Arc::clone(&upstream_status);
         let mock_url = serve(Router::new().fallback(move |_: Request| {

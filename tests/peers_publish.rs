@@ -1,6 +1,9 @@
 //! `GET /v1/health` on the peer listener: its own socket, its own token, nothing else served.
 #![cfg(feature = "peers")]
 
+mod common;
+use common::write_key;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -638,7 +641,7 @@ async fn turning_publishing_off_on_reload_closes_the_route_and_asks_for_a_restar
     let dir = std::env::temp_dir().join(format!("reiki-peers-reload-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["zen-a", "zen-b"] {
-        std::fs::write(dir.join(name), format!("upstream-{name}\n")).unwrap();
+        write_key(dir.join(name), format!("upstream-{name}\n"));
     }
     let text = config_text(&rig.upstream, rig.peer_addr, "")
         .replace("/unused/", &format!("{}/", dir.display()))
@@ -662,7 +665,7 @@ async fn a_changed_server_or_service_table_on_reload_asks_for_a_restart() {
     let dir = std::env::temp_dir().join(format!("reiki-server-reload-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["zen-a", "zen-b"] {
-        std::fs::write(dir.join(name), format!("upstream-{name}\n")).unwrap();
+        write_key(dir.join(name), format!("upstream-{name}\n"));
     }
     let text = config_text(&rig.upstream, rig.peer_addr, "")
         .replace("/unused/", &format!("{}/", dir.display()));

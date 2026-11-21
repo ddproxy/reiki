@@ -327,7 +327,7 @@ Plugin-specific keys are documented on each plugin's page:
 | Controlled information | `[plugins.controlled]` | [controlled](controlled.md) |
 | Metrics | `[plugins.metrics]` | [monitoring](monitoring.md) |
 
-The `requestlog` plugin records summaries only by default: `body = "summary"` and `capture_bodies = false`. Request, response and error body text requires the explicit `capture_bodies = true` opt-in together with `body = "full"` or `response = "body"`; the opt-in warns at startup and applies to every configured sink. See [requestlog](requestlog.md#configure).
+The `requestlog` plugin records summaries only by default: `body = "summary"` and `capture_bodies = false`. Request, response and error body text requires the explicit `capture_bodies = true` opt-in together with `body = "full"` or `response = "body"`; the opt-in warns at startup and applies to every configured sink. A separate summary-only export for a log collector is configured at `[plugins.requestlog.export]` and can be the plugin's only sink. See [requestlog](requestlog.md#configure) and [summary export](requestlog.md#summary-export).
 
 ## Limit presets
 

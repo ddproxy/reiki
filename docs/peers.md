@@ -48,6 +48,7 @@ Each fetch has a 5 s deadline, including connect. Redirects are refused so the t
 | `observed_at` | string (RFC3339 UTC) | Publisher clock when the answer was built. |
 | `age_seconds` | integer | Age of the figures when sent; `0`, because every figure is read as the answer is built. A reader adds its own time since receipt. |
 | `failures` | object: class → integer | Counts from the same bounded ring as `/v1/failures`, newest 64 failures. Classes present in the ring appear with their count; classes with no record are absent. Values are counts only: no bodies, key names or stream names. |
+| `requestlog_export_dropped_total` | integer | Only with `[plugins.requestlog.export]`: summary records dropped by the bounded export queue or a failed syslog send. Readers accept its absence. |
 | `upstreams` | array of object | One entry per upstream that uses Reiki's keys, in config order. A passthrough upstream is omitted. |
 | `upstreams[].name` | string | Upstream name. |
 | `upstreams[].healthy_keys` | integer | Keys in `available` state. |

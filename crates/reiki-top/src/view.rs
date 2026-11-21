@@ -568,6 +568,18 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
         }
         out.push(line(spans, width));
     }
+    if peer.health.requestlog_export_dropped_total > 0 {
+        out.push(line(
+            vec![span(
+                format!(
+                    "  export drops: {}",
+                    peer.health.requestlog_export_dropped_total
+                ),
+                Style::Warn,
+            )],
+            width,
+        ));
+    }
     // Only the local instance's admin listener returns rows; a remote peer publishes counts.
     if let Some(failures) = fleet.local_failures(&peer.health.instance) {
         for failure in failures {

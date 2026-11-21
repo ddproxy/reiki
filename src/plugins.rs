@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
+use serde_json::Value as JsonValue;
 use toml::Value;
 
 use reiki_plugin::{
@@ -446,6 +447,31 @@ impl PluginChain {
         self.entries
             .iter()
             .flat_map(|e| e.plugin.admin_paths())
+            .collect()
+    }
+
+    /// JSON objects to merge into the admin status document. A panicking or
+    /// malformed hook is skipped so one plugin cannot take status down.
+    pub fn status_fragments(&self) -> Vec<JsonValue> {
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                guard(e.plugin.name(), "status_fragment", || {
+                    e.plugin.status_fragment()
+                })
+                .flatten()
+            })
+            .filter(JsonValue::is_object)
+            .collect()
+    }
+
+    /// Named monotonic counters to publish in the shared health document.
+    pub fn health_gauges(&self) -> Vec<(&'static str, u64)> {
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                guard(e.plugin.name(), "health_gauge", || e.plugin.health_gauge()).flatten()
+            })
             .collect()
     }
 

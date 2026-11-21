@@ -151,6 +151,9 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         // Counts over the same bounded ring as `/v1/failures`; bodies and key names never leave.
         "failures": app.failures().counts(),
     });
+    for (name, value) in app.plugins().health_gauges() {
+        doc[name] = json!(value);
+    }
     if peers.expose_host_stats {
         doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config)).await;
         doc["sessions"] = sessions(app, peers);

@@ -71,7 +71,8 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
     "last_reload": { "ok": true, "at": "2026-11-18T10:12:00Z" }
   },
   "intercept": { "ca_not_after": 1790000000, "ca_days_left": 120 },
-  "log": { "write_errors": 0 }
+  "log": { "write_errors": 0 },
+  "requestlog": { "export_dropped_total": 0 }
 }
 ```
 
@@ -87,7 +88,7 @@ Key fields:
 | `cooldown_class` | Present while cooling with a known class: `rate_limited`, `quota_exhausted` or `transient`; a restored cooldown has no class |
 | `scopes` | Soonest-first route-and-model cooldowns, at most 16 entries; the key can stay `available` for other combinations |
 
-Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. The response carries key names, never key values, token hashes or file paths.
+Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
 
 `reiki keys` reads this route and prints a table; `reiki keys --json` prints a derived key-only document with remapped states and a `streams` name list per key. See [key health](troubleshooting.md#key-health).
 
@@ -203,12 +204,13 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | --- | --- | --- | --- |
 | `GET /__reiki/healthz` | Client listener | None | Returns `200` with body `ok` while Reiki is up |
 | `GET /v1/metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
+| `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Bearer token | Prometheus summary-export drop counter |
 | `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Bearer token | Prometheus tool-call counters |
 | `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 
-The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]` and `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
+The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]`, `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`, and `/v1/requestlog/metrics` needs `[plugins.requestlog]`. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
 
 ## GET /v1/metrics
 
@@ -260,6 +262,20 @@ Served by the `toolpolicy` plugin with the same bearer auth. Without `[plugins.t
 | `reiki_toolpolicy_calls_total` | counter | `stream`, `upstream`, `action` | Tool calls seen in responses; `action` is `passed`, `reported` or `blocked` |
 | `reiki_toolpolicy_findings_total` | counter | `rule`, `severity` | Rule matches, including findings below `block_severity` |
 | `reiki_toolpolicy_unparsed_total` | counter | `stream`, `upstream` | Recognized responses that could not be parsed |
+
+## GET /v1/requestlog/metrics
+
+Served by the `requestlog` plugin with the same bearer auth. Without `[plugins.requestlog]` the route returns `404`. The counter covers [summary export](requestlog.md#summary-export) only; drops from the main request log queue are recorded as a `dropped` record instead.
+
+| Metric | Type | Labels | Counts |
+| --- | --- | --- | --- |
+| `reiki_requestlog_export_dropped_total` | counter | none | Summaries dropped because the export queue was full or a syslog send failed |
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/requestlog/metrics
+```
+
+The same value is published as `requestlog.export_dropped_total` in `GET /v1/status` and as `requestlog_export_dropped_total` in `/v1/health`, which `reiki top` shows when it is above zero.
 
 ## GET /v1/usage
 

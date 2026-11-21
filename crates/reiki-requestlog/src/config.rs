@@ -25,6 +25,11 @@ const DEFAULT_SYSLOG_APP_NAME: &str = "reiki";
 /// RFC 5424 APP-NAME is at most 48 printable ASCII characters.
 const MAX_SYSLOG_APP_NAME: usize = 48;
 
+const DEFAULT_EXPORT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_EXPORT_MAX_FILES: u32 = 3;
+const DEFAULT_EXPORT_QUEUE: usize = 256;
+const DEFAULT_EXPORT_SYSLOG_APP_NAME: &str = "reiki-export";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
     Full,
@@ -61,6 +66,35 @@ pub enum SyslogTarget {
     Tcp(String),
     /// A Unix datagram socket, usually `/dev/log`.
     Unix(PathBuf),
+}
+
+/// Wire format for summary-only export records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Jsonl,
+    Syslog,
+}
+
+impl ExportFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Syslog => "syslog",
+        }
+    }
+}
+
+/// Where summary-only records go, independent of the main request log sinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportConfig {
+    pub format: ExportFormat,
+    pub file: Option<PathBuf>,
+    pub max_bytes: u64,
+    pub max_files: u32,
+    pub syslog: Option<SyslogTarget>,
+    pub syslog_facility: u8,
+    pub syslog_app_name: String,
+    pub queue: usize,
 }
 
 /// How an event-stream response body is logged.
@@ -105,6 +139,8 @@ pub struct Config {
     pub max_string_bytes: usize,
     pub sse: SseMode,
     pub format: LogFormat,
+    /// Summary-only export for a log collector; off when absent.
+    pub export: Option<ExportConfig>,
 }
 
 impl Config {
@@ -131,6 +167,7 @@ impl Config {
             "max_string_bytes",
             "sse",
             "format",
+            "export",
         ];
         for key in table.keys() {
             if !KNOWN.contains(&key.as_str()) && !HOST_KEYS.contains(&key.as_str()) {
@@ -149,9 +186,11 @@ impl Config {
             ));
         }
         let syslog = syslog_target(table)?;
-        if file.is_none() && socket.is_none() && syslog.is_none() {
+        let export = export_config(table)?;
+        if file.is_none() && socket.is_none() && syslog.is_none() && export.is_none() {
             return Err(
-                "set `file`, `socket`, `syslog` or several; nothing would be logged".to_owned(),
+                "set `file`, `socket`, `syslog`, `export` or several; nothing would be logged"
+                    .to_owned(),
             );
         }
         if syslog.is_none()
@@ -159,26 +198,8 @@ impl Config {
         {
             return Err("`syslog_facility` and `syslog_app_name` need `syslog`".to_owned());
         }
-        let syslog_facility = match string(table, "syslog_facility")? {
-            None => DEFAULT_SYSLOG_FACILITY,
-            Some(name) => facility_code(&name).ok_or_else(|| {
-                format!("`syslog_facility` must be a syslog facility name such as \"local0\", got \"{name}\"")
-            })?,
-        };
-        let syslog_app_name = match string(table, "syslog_app_name")? {
-            None => DEFAULT_SYSLOG_APP_NAME.to_owned(),
-            Some(name) => {
-                let valid = (1..=MAX_SYSLOG_APP_NAME).contains(&name.len())
-                    && name.bytes().all(|b| b.is_ascii_graphic())
-                    && name != "-";
-                if !valid {
-                    return Err(format!(
-                        "`syslog_app_name` must be 1 to {MAX_SYSLOG_APP_NAME} printable ASCII characters without spaces, got \"{name}\""
-                    ));
-                }
-                name
-            }
-        };
+        let syslog_facility = syslog_facility(table, "syslog_facility", DEFAULT_SYSLOG_FACILITY)?;
+        let syslog_app_name = syslog_app_name(table, "syslog_app_name", DEFAULT_SYSLOG_APP_NAME)?;
 
         let capture_bodies = match table.get("capture_bodies") {
             None => false,
@@ -311,6 +332,7 @@ impl Config {
             max_string_bytes,
             sse,
             format,
+            export,
         })
     }
 }
@@ -324,6 +346,112 @@ fn string(table: &Table, key: &str) -> Result<Option<String>, String> {
             other.type_str()
         )),
     }
+}
+
+fn syslog_facility(table: &Table, key: &str, default: u8) -> Result<u8, String> {
+    match string(table, key)? {
+        None => Ok(default),
+        Some(name) => facility_code(&name).ok_or_else(|| {
+            format!("`{key}` must be a syslog facility name such as \"local0\", got \"{name}\"")
+        }),
+    }
+}
+
+fn syslog_app_name(table: &Table, key: &str, default: &str) -> Result<String, String> {
+    match string(table, key)? {
+        None => Ok(default.to_owned()),
+        Some(name) => {
+            let valid = (1..=MAX_SYSLOG_APP_NAME).contains(&name.len())
+                && name.bytes().all(|b| b.is_ascii_graphic())
+                && name != "-";
+            if !valid {
+                return Err(format!(
+                    "`{key}` must be 1 to {MAX_SYSLOG_APP_NAME} printable ASCII characters without spaces, got \"{name}\""
+                ));
+            }
+            Ok(name)
+        }
+    }
+}
+
+/// The `[plugins.requestlog.export]` table: summary-only records for a log collector.
+fn export_config(table: &Table) -> Result<Option<ExportConfig>, String> {
+    const KNOWN: &[&str] = &[
+        "format",
+        "file",
+        "max_bytes",
+        "max_files",
+        "syslog",
+        "syslog_facility",
+        "syslog_app_name",
+        "queue",
+    ];
+    let Some(Value::Table(export)) = table.get("export") else {
+        return match table.get("export") {
+            None => Ok(None),
+            Some(other) => Err(format!(
+                "`export` must be a table, got {}",
+                other.type_str()
+            )),
+        };
+    };
+    for key in export.keys() {
+        if !KNOWN.contains(&key.as_str()) {
+            return Err(format!("unknown key `export.{key}`"));
+        }
+    }
+    let format = match string(export, "format")?.as_deref() {
+        None | Some("jsonl") => ExportFormat::Jsonl,
+        Some("syslog") => ExportFormat::Syslog,
+        Some(other) => {
+            return Err(format!(
+                "`export.format` must be \"jsonl\" or \"syslog\", got \"{other}\""
+            ))
+        }
+    };
+    let file = path(export, "file")?;
+    let syslog = syslog_target(export)?;
+    if let Some(SyslogTarget::Tcp(_)) = &syslog {
+        return Err("`export.syslog` must be udp:// or unix://; tcp is not supported".to_owned());
+    }
+    match format {
+        ExportFormat::Jsonl if file.is_none() => {
+            return Err("`export.file` is required for `export.format = \"jsonl\"`".to_owned());
+        }
+        ExportFormat::Jsonl if syslog.is_some() => {
+            return Err("`export.syslog` needs `export.format = \"syslog\"`".to_owned());
+        }
+        ExportFormat::Syslog if syslog.is_none() => {
+            return Err("`export.syslog` is required for `export.format = \"syslog\"`".to_owned());
+        }
+        ExportFormat::Syslog if file.is_some() => {
+            return Err("`export.file` needs `export.format = \"jsonl\"`".to_owned());
+        }
+        _ => {}
+    }
+    let max_bytes = integer(export, "max_bytes", DEFAULT_EXPORT_MAX_BYTES, 1, u64::MAX)?;
+    let max_files = integer(
+        export,
+        "max_files",
+        u64::from(DEFAULT_EXPORT_MAX_FILES),
+        0,
+        100,
+    )? as u32;
+    let queue = integer(export, "queue", DEFAULT_EXPORT_QUEUE as u64, 1, 65_536)? as usize;
+    Ok(Some(ExportConfig {
+        format,
+        file,
+        max_bytes,
+        max_files,
+        syslog,
+        syslog_facility: syslog_facility(export, "syslog_facility", DEFAULT_SYSLOG_FACILITY)?,
+        syslog_app_name: syslog_app_name(
+            export,
+            "syslog_app_name",
+            DEFAULT_EXPORT_SYSLOG_APP_NAME,
+        )?,
+        queue,
+    }))
 }
 
 /// `udp://host:port`, `tcp://host:port` or `unix:///absolute/path`.
@@ -694,5 +822,95 @@ mod tests {
         assert!(parse("file = \"/x\"\nfile_keep = 500").is_err());
         assert!(parse("file = \"/x\"\nredact = \"yes\"").is_err());
         assert!(parse("file = \"/x\"\nfile_max_bytes = -1").is_err());
+    }
+
+    #[test]
+    fn export_defaults_apply_and_an_export_only_config_is_valid() {
+        let text = "[export]\nformat = \"jsonl\"\nfile = \"/var/log/reiki/export.jsonl\"";
+        let config = parse(text).unwrap();
+        let export = config.export.as_ref().unwrap();
+        assert_eq!(export.format, ExportFormat::Jsonl);
+        assert_eq!(
+            export.file.as_deref(),
+            Some(std::path::Path::new("/var/log/reiki/export.jsonl"))
+        );
+        assert_eq!(
+            (export.max_bytes, export.max_files, export.queue),
+            (10_485_760, 3, 256)
+        );
+        assert_eq!(
+            (export.syslog_facility, export.syslog_app_name.as_str()),
+            (16, "reiki-export")
+        );
+        assert!(config.file.is_none() && config.socket.is_none() && config.syslog.is_none());
+    }
+
+    #[test]
+    fn export_syslog_accepts_udp_and_unix_but_not_tcp() {
+        let udp = parse(
+            "[export]\nformat = \"syslog\"\nsyslog = \"udp://collector:514\"\nsyslog_facility = \"local4\"\nsyslog_app_name = \"collector\"",
+        )
+        .unwrap()
+        .export
+        .unwrap();
+        assert_eq!(
+            udp.syslog,
+            Some(SyslogTarget::Udp("collector:514".to_owned()))
+        );
+        assert_eq!(
+            (udp.syslog_facility, udp.syslog_app_name.as_str()),
+            (20, "collector")
+        );
+        let unix = parse("[export]\nformat = \"syslog\"\nsyslog = \"unix:///dev/log\"")
+            .unwrap()
+            .export
+            .unwrap();
+        assert_eq!(
+            unix.syslog,
+            Some(SyslogTarget::Unix(PathBuf::from("/dev/log")))
+        );
+        assert!(
+            parse("[export]\nformat = \"syslog\"\nsyslog = \"tcp://collector:514\"")
+                .unwrap_err()
+                .contains("tcp is not supported")
+        );
+    }
+
+    #[test]
+    fn export_rejects_unknown_keys_and_wrong_sink_shapes() {
+        assert!(parse("[export]\nfile = \"/x\"\nformt = \"jsonl\"")
+            .unwrap_err()
+            .contains("export.formt"));
+        assert!(parse("[export]\nfile = \"/x\"\nextra = 1").is_err());
+        assert!(parse("[export]\nformat = \"jsonl\"").is_err());
+        assert!(
+            parse("[export]\nformat = \"jsonl\"\nfile = \"/x\"\nsyslog = \"udp://c:514\"").is_err()
+        );
+        assert!(parse("[export]\nformat = \"syslog\"").is_err());
+        assert!(
+            parse("[export]\nformat = \"syslog\"\nsyslog = \"udp://c:514\"\nfile = \"/x\"")
+                .is_err()
+        );
+        assert!(parse("[export]\nformat = \"yaml\"\nfile = \"/x\"").is_err());
+        assert!(parse("export = []").is_err());
+    }
+
+    #[test]
+    fn export_ranges_are_validated() {
+        let base = "[export]\nfile = \"/x\"";
+        assert!(parse(&format!("{base}\nmax_bytes = 0")).is_err());
+        assert!(parse(&format!("{base}\nmax_files = 101")).is_err());
+        assert!(parse(&format!("{base}\nqueue = 0")).is_err());
+        assert!(parse(&format!("{base}\nqueue = 65537")).is_err());
+        let config = parse(&format!(
+            "{base}\nmax_bytes = 100\nmax_files = 0\nqueue = 16"
+        ))
+        .unwrap()
+        .export
+        .unwrap();
+        assert_eq!(
+            (config.max_bytes, config.max_files, config.queue),
+            (100, 0, 16)
+        );
     }
 }

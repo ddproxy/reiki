@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 const DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "mock",
    "observed_at" : "t",

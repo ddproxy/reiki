@@ -19,6 +19,7 @@ Publish the health document with the listener, tokens and stream names described
 [peers]
 enabled = true
 poll_interval_secs = 30
+allowed_urls = ["https://192.0.2.10:4099"]   # optional exact allowlist
 
 [peers.peer-a]
 url = "https://192.0.2.10:4099"
@@ -30,6 +31,7 @@ ca_file = "/etc/reiki/peers/peer-a-ca.pem"     # required for https
 | --- | --- |
 | `enabled` | Enables the peer feature. With it off, Reiki opens no listener and makes no peer connection. |
 | `poll_interval_secs` | Reader poll period, 1 to 86400 seconds; default 30. Data older than three periods is unknown. |
+| `allowed_urls` | Optional exact base-URL allowlist for `[peers.NAME]` entries. A trailing `/` is ignored; empty keeps https-or-loopback. A URL pointing at this instance's own client, admin, tunnel or peer listener is refused. |
 | `[peers.NAME]` | One table per peer. Names use letters, digits, `-`, `_` and `.`. |
 | `url` | The publisher's `/v1/health` base URL. Use https, or http only on a loopback address. No credentials, query or fragment. |
 | `token_file` | The peer token issued by that publisher, sent as `Authorization: Bearer`. A file readable by group or others is refused. |
@@ -71,6 +73,17 @@ Each fetch has a 5 s deadline, including connect. Redirects are refused so the t
 | `upstreams[].keys[].cooldown_seconds` | integer or null | Bucketed remaining wait; `null` outside `cooling`. |
 | `upstreams[].keys[].cooldown_class` | string | `rate_limited`, `quota_exhausted` or `transient`, present for a cooling key with a known class. |
 | `upstreams[].keys[].quota_reset_at` | string (RFC3339 UTC) | The absolute reset behind a quota cooldown, present only for a cooling `quota_exhausted` key whose key config names a reset schedule or whose response supplied a non-zero `Retry-After`. Absent with the fixed quota window or a restored cooldown. |
+| `observed` | array of object | Always present; one entry per observed `(upstream, account)` pair from passthrough answers. No credential value is held or published. |
+| `observed[].upstream` | string | Upstream name from config. |
+| `observed[].account` | string | Operator label from `[upstream.NAME] account`, default `default`. |
+| `observed[].mode` | `"observed"` | Distinguishes these entries from key-backed upstreams. Required on the wire; older documents are refused. |
+| `observed[].status_class` | string | Fixed class from the last response: `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`. |
+| `observed[].observed_at` | string (RFC3339 UTC) | Publisher clock when the answer was recorded. |
+| `observed[].retry_after_seconds` | integer or null | Remaining `Retry-After` hint, counted down from the publisher's clock; `null` when absent or expired. |
+| `observed[].cooldown_class` | string or null | Informational cooldown class from the last response, or `null` when it started none. |
+| `observed[].quota` | object | Rate-limit numbers from response headers. Every field is an integer or `null`. |
+| `observed[].quota.requests_limit`, `requests_remaining`, `requests_reset_seconds` | integer or null | Request quota from `x-ratelimit-*` or Anthropic headers. Resets are whole seconds, rounded up. |
+| `observed[].quota.tokens_limit`, `tokens_remaining`, `tokens_reset_seconds` | integer or null | Token quota from the same header families. |
 | `host` | object | Host figures, present with `expose_host_stats = true`. |
 | `host.load_average` | array of 3 floats or null | `/proc/loadavg` 1, 5 and 15 minute values; `null` where unavailable. |
 | `host.cores` | integer | Parallelism available to Reiki, at least 1. |
@@ -125,7 +138,7 @@ A peer is `unknown` when it cannot be reached, fails TLS, refuses the token, ans
 
 ## Read with reiki top
 
-`reiki top` presents a live fleet view built from peer health documents. It is read-only and uses the same pinned clients and token files. See [reiki top](top.md) for `--once`, `--interval`, `--full` and `--provider`.
+`reiki top` presents a live fleet view built from peer health documents. It is read-only and uses the same pinned clients and token files. Observed entries become display-only columns named `observed/{account}`; they carry no key state and cannot be selected for failover. See [reiki top](top.md) for `--once`, `--interval`, `--full` and `--provider`.
 
 ## Check the configuration
 

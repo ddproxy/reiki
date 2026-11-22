@@ -5,14 +5,22 @@
 ### Added
 
 - `plugin-wasm` (off by default): runtime Wasm component plugins in the D5 inner slot. Phase 1 supports `on-request`, default-allowed capabilities, gated `request-body:read|edit` and `finding:detail-vocab`, embedded manifest pinning (`sha256` + `reiki-manifest`), host-applied JSON edit ops, limits/fuel/epoch traps, reload narrowing, `reiki plugin inspect`, and host-enforced request-side tool allowlists that reuse `reiki-toolpolicy` request parsing. See [Wasm plugins](docs/wasm-plugins.md).
+- Passthrough answers are observed in memory and published as a strict `observed` array in `/v1/status` and peer health. Each `(upstream, account)` entry carries a fixed status class, remaining `Retry-After`, quota headers and a host timestamp; no credential value is read or published. `[upstream.NAME] account` labels these entries and defaults to `default`.
+- `GET /v1/metrics` gains `reiki_passthrough_requests_total{upstream,status_class}`, `reiki_observed_cooldown_seconds{upstream,class}` and `reiki_upstream_unaccounted_1h{upstream}`. `reiki top` shows observed entries as display-only `observed/{account}` columns.
+- `[peers] allowed_urls` pins `[peers.NAME]` read targets to an exact base-URL allowlist; empty keeps https-or-loopback. Peer CA expiry is reported as `peers.tls_ca` on `/v1/status`, with warnings for unreadable, non-certificate and near-expiry CA files.
+- Response-header parsers are wired into observed quota fields for generic `x-ratelimit-*`, OpenAI-style and Anthropic rate-limit headers.
 
 ### Changed
 
 - `days_from_civil` moved into `reiki-plugin::timefmt` alongside `civil_from_days`; host modules now import the shared helper.
+- `reiki_health::Health` now requires `observed`; older peer documents without it are refused. Client-supplied `X-Reiki-*` request headers are stripped before every upstream transport.
 
 ### Fixed
 
 - Peers that read another instance's health document now accept `capacity_group` in polling snapshots and key events, so a configured group no longer breaks the peer view. Unsafe group values are still refused on the wire.
+- A peer URL that points at this instance's literal client, admin, tunnel or peer listener is refused at config load and reload; names are never resolved. Invalid base URLs, including ones with embedded credentials, are reported without echoing the URL.
+- `reiki keys` accepts the new `observed` and `peers` fragments in `/v1/status`, so key tables and JSON output no longer fail on the status document published by this version.
+- Error bodies read for observed passthrough classification are replayed intact to the client; a body read error is reported to the observer and the client still gets the bytes read so far.
 - A CONNECT connection still waiting for its request head is closed at the shutdown drain cut instead of holding a socket until the head timeout.
 - Tunnel idle detection uses one monotonic clock, so a wall-clock step cannot keep an idle tunnel open or close an active one. Tunnels cut by shutdown now log the `bytes_up` and `bytes_down` that actually moved.
 - Plugin request hooks offloaded to the blocking pool keep the `req{id=...}` span in their log lines. A session whose blocking hook is cancelled now fails closed with 503 if it is reused, instead of running without its plugin state.

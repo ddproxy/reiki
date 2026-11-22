@@ -404,29 +404,47 @@ pub fn fleet_detail(fleet: &Fleet, peers: &[String], now: Instant, width: usize)
             let Some(peer) = fleet.peer(name, now).filter(|p| !p.stale) else {
                 continue;
             };
-            let Some(u) = peer
+            if let Some(u) = peer
                 .health
                 .upstreams
                 .iter()
                 .find(|u| u.name == col.upstream)
-            else {
-                continue;
-            };
-            let n = u.requests_1h.unwrap_or(0);
-            let lim = u.limited_1h.unwrap_or(0);
-            requests = requests.saturating_add(n);
-            limited = limited.saturating_add(u64::from(lim));
-            let (state, style) = upstream_state(u);
-            rows.push(line(
-                vec![span(
-                    format!(
-                        "    ({}, {}, {}, {}, {})",
-                        name, col.upstream, n, lim, state
-                    ),
-                    style,
-                )],
-                width,
-            ));
+            {
+                let n = u.requests_1h.unwrap_or(0);
+                let lim = u.limited_1h.unwrap_or(0);
+                requests = requests.saturating_add(n);
+                limited = limited.saturating_add(u64::from(lim));
+                let (state, style) = upstream_state(u);
+                rows.push(line(
+                    vec![span(
+                        format!(
+                            "    ({}, {}, {}, {}, {})",
+                            name, col.upstream, n, lim, state
+                        ),
+                        style,
+                    )],
+                    width,
+                ));
+            }
+            for entry in &peer.health.observed {
+                if entry.upstream != col.upstream {
+                    continue;
+                }
+                rows.push(line(
+                    vec![span(
+                        format!(
+                            "    ({}, {}, observed/{}, {}, observed {})",
+                            name,
+                            col.upstream,
+                            entry.account,
+                            entry.retry_after_seconds.unwrap_or(0),
+                            entry.status_class
+                        ),
+                        observed_style(&entry.status_class),
+                    )],
+                    width,
+                ));
+            }
         }
         if rows.is_empty() {
             continue;
@@ -448,6 +466,15 @@ pub fn fleet_detail(fleet: &Fleet, peers: &[String], now: Instant, width: usize)
         ));
     }
     out
+}
+
+fn observed_style(class: &str) -> Style {
+    match class {
+        "ok" => Style::Good,
+        "rate_limited" | "quota_exhausted" => Style::Warn,
+        "credential_rejected" | "access_disabled" => Style::Bad,
+        _ => Style::Plain,
+    }
 }
 
 /// The state shown in the `ALL` detail's per-peer tuples.
@@ -562,6 +589,34 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
                 out.push(key_line(k, width));
             }
         }
+    }
+
+    for entry in &peer.health.observed {
+        let mut spans = vec![span(
+            format!("  {}: observed [{}] ", entry.upstream, entry.account),
+            Style::Plain,
+        )];
+        spans.push(span(
+            format!("last {}", entry.status_class),
+            observed_style(&entry.status_class),
+        ));
+        if let Some(seconds) = entry.retry_after_seconds {
+            spans.push(span(format!("  retry {seconds}s"), Style::Warn));
+        }
+        if let Some(class) = entry.cooldown_class.as_deref() {
+            spans.push(span(format!("  class {class}"), Style::Warn));
+        }
+        if entry.quota.requests_remaining.is_some() || entry.quota.tokens_remaining.is_some() {
+            spans.push(span(
+                format!(
+                    "  remaining req {} tok {}",
+                    entry.quota.requests_remaining.unwrap_or(0),
+                    entry.quota.tokens_remaining.unwrap_or(0)
+                ),
+                Style::Dim,
+            ));
+        }
+        out.push(line(spans, width));
     }
 
     if !peer.health.failures.is_empty() {
@@ -1477,6 +1532,7 @@ mod tests {
     /// Two fresh peers with a spread of providers for the summary bar tests.
     const MIX_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1515,6 +1571,7 @@ mod tests {
 
     const FULL_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "cores" : 8,
@@ -1558,6 +1615,7 @@ mod tests {
 
     const BARE_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1583,6 +1641,7 @@ mod tests {
         let cooldown = cooldown.map(|s| s.to_string()).unwrap_or("null".into());
         format!(
             r#"{{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "observed" : [],
              "failures":{{}},"upstreams":[
             {{"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
              "cooling_combinations":0,"soonest_cooldown_seconds":{cooldown},"last_status_class":"4xx",
@@ -1599,6 +1658,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "disks" : [
@@ -1638,6 +1698,7 @@ mod tests {
             "peer-b",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -1671,6 +1732,7 @@ mod tests {
             "peer-c",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-c",
    "observed_at" : "t",
@@ -1735,6 +1797,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1768,6 +1831,7 @@ mod tests {
             "peer-b",
             r#"{
     "age_seconds" : 0,
+    "observed" : [],
     "failures" : {},
     "instance" : "peer-b",
     "observed_at" : "t",
@@ -1811,6 +1875,26 @@ mod tests {
         let line = find(&card, "zen:").plain_text();
         assert!(line.contains("zen: [team-a] 1 healthy"), "{line:?}");
         assert!(!find(&card, "open:").plain_text().contains('['));
+    }
+
+    #[test]
+    fn an_observed_entry_is_marked_observed_in_the_detail() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = MIX_DOC.replace(
+            "\"observed\" : [],",
+            r#""observed" : [{"upstream":"oauth","account":"alice","mode":"observed",
+                "status_class":"rate_limited","observed_at":"t","retry_after_seconds":20,
+                "cooldown_class":"rate_limited","quota":{"requests_limit":100,
+                "requests_remaining":0,"requests_reset_seconds":30,"tokens_limit":null,
+                "tokens_remaining":null,"tokens_reset_seconds":null}}],"#,
+        );
+        add(&mut f, "peer-a", &doc, t0);
+        let card = peer_detail(&f, "peer-a", t0, 160);
+        let line = find(&card, "oauth: observed").plain_text();
+        assert!(line.contains("[alice]"), "{line:?}");
+        assert!(line.contains("last rate_limited"), "{line:?}");
+        assert!(line.contains("retry 20s"), "{line:?}");
     }
 
     #[test]
@@ -1908,6 +1992,7 @@ mod tests {
             .sum();
         format!(
             r#"{{"instance":"{peer}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "observed" : [],
              "failures":{{}},"upstreams":[
             {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
              "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
@@ -2000,6 +2085,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2093,6 +2179,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2404,6 +2491,7 @@ mod tests {
             &format!("p\u{1b}[2J{long}"),
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "x",
    "observed_at" : "t",
@@ -2609,6 +2697,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2633,6 +2722,7 @@ mod tests {
             "peer-b",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -2677,6 +2767,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2710,6 +2801,7 @@ mod tests {
             "peer-b",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -2750,7 +2842,7 @@ mod tests {
                 &format!("peer-{name}"),
                 &format!(
                     r#"{{"instance":"peer-{name}","reiki_version":"0.10.3","observed_at":"t",
-                    "age_seconds":0,"failures":{{}},"upstreams":[
+                    "age_seconds":0,"observed":[],"failures":{{}},"upstreams":[
                     {{"name":"p0","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
                     {{"name":"p1","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
                     {{"name":"p2","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":60,"last_status_class":"4xx"}},
@@ -2784,6 +2876,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2855,6 +2948,7 @@ mod tests {
             "peer-b",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -2980,6 +3074,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -3083,6 +3178,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "disks" : [
@@ -3159,6 +3255,7 @@ mod tests {
         let t0 = Instant::now();
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "x",
    "observed_at" : "t",
@@ -3202,6 +3299,7 @@ mod tests {
         let t0 = Instant::now();
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "x",
    "observed_at" : "t",
@@ -3292,6 +3390,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -3323,6 +3422,7 @@ mod tests {
     fn gauge_doc() -> String {
         r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -3476,6 +3576,7 @@ mod tests {
         let minute_doc = |minutes: &str| {
             format!(
                 r#"{{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                 "observed" : [],
                  "failures":{{}},"upstreams":[
                 {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
                  "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null,
@@ -3511,6 +3612,7 @@ mod tests {
         let secs = cooldown.map_or("null".to_owned(), |s| s.to_string());
         format!(
             r#"{{"instance":"{peer}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+             "observed" : [],
              "failures":{{}},"upstreams":[
             {{"name":"{provider}","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
              "cooling_combinations":0,"soonest_cooldown_seconds":{secs},"last_status_class":"{last}",
@@ -3656,6 +3758,7 @@ mod tests {
         let mut f = fleet();
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {
       "rate_limited" : 2,
       "transient" : 1
@@ -3737,6 +3840,7 @@ mod tests {
     ) -> String {
         format!(
             r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                 "observed" : [],
                  "failures":{{}},"upstreams":[
                 {{"name":"zen","healthy_keys":{healthy},"cooling_keys":{cooling},"disabled_keys":0,
                  "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",

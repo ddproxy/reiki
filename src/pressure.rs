@@ -21,6 +21,7 @@ struct Slot {
     requests: u32,
     limited: u32,
     tokens: u64,
+    unaccounted: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ pub(crate) struct PressureSnapshot {
     pub(crate) requests_1h: u64,
     pub(crate) limited_1h: u32,
     pub(crate) tokens_1h: u64,
+    pub(crate) unaccounted_1h: u32,
     pub(crate) buckets: [u32; BUCKETS],
     pub(crate) token_buckets: [u64; BUCKETS],
     pub(crate) minutes: [u32; MINUTE_SLOTS],
@@ -94,6 +96,22 @@ impl PressureCounter {
         slot.tokens = slot.tokens.saturating_add(tokens);
     }
 
+    /// Counts one response whose usage could not be accounted because its body passed a decode
+    /// cap. Such a response is intentionally not counted as a token total: the metric exists so
+    /// the gap is visible rather than silently mistaken for a zero-usage response.
+    pub(crate) fn record_unaccounted(&self, upstream: &str, now: Instant) {
+        let minute = self.minute(now);
+        let mut map = self
+            .upstreams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(series) = series_mut(&mut map, upstream) else {
+            return;
+        };
+        let slot = slot_at(series, minute);
+        slot.unaccounted = slot.unaccounted.saturating_add(1);
+    }
+
     /// All last-hour figures for `upstream`, read under one lock and at the same minute.
     pub(crate) fn snapshot(&self, upstream: &str, now: Instant) -> PressureSnapshot {
         let minute = self.minute(now);
@@ -109,6 +127,7 @@ impl PressureCounter {
             out.requests_1h = out.requests_1h.saturating_add(u64::from(slot.requests));
             out.limited_1h = out.limited_1h.saturating_add(slot.limited);
             out.tokens_1h = out.tokens_1h.saturating_add(slot.tokens);
+            out.unaccounted_1h = out.unaccounted_1h.saturating_add(slot.unaccounted);
             let bucket = bucket_of(slot, minute);
             out.buckets[bucket] = out.buckets[bucket].saturating_add(slot.requests);
             out.token_buckets[bucket] = out.token_buckets[bucket].saturating_add(slot.tokens);
@@ -156,6 +175,7 @@ pub(crate) fn upstream_usage(
                 requests_1h: snapshot.requests_1h,
                 limited_1h: u64::from(snapshot.limited_1h),
                 tokens_1h: snapshot.tokens_1h,
+                unaccounted_1h: u64::from(snapshot.unaccounted_1h),
             }
         })
         .collect()

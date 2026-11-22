@@ -1049,6 +1049,7 @@ mod tests {
 
     const DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1340,6 +1341,7 @@ mod tests {
         let usage = |name: &str, zen: &str, worklog: &str| {
             format!(
                 r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                    "observed" : [],
                     "failures":{{}},"upstreams":[
                     {{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
                       "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
@@ -1497,6 +1499,7 @@ mod tests {
             FeedEvent::Snapshot(
                 r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -1556,6 +1559,7 @@ mod tests {
         let mut fleet = fleet();
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1624,6 +1628,7 @@ mod tests {
         let mut fleet = Fleet::new(Duration::from_secs(30));
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1697,6 +1702,7 @@ mod tests {
     async fn run_once_draws_a_gauge_for_each_peer_from_its_own_traffic() {
         let doc_a = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1771,6 +1777,7 @@ mod tests {
 "#;
         let doc_b = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -1845,6 +1852,7 @@ mod tests {
 "#;
         let doc_c = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-c",
    "observed_at" : "t",
@@ -2091,6 +2099,7 @@ mod tests {
     async fn run_once_filters_to_one_provider_and_hides_absent_peers() {
         let doc_a = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -2119,6 +2128,7 @@ mod tests {
 "#;
         let doc_b = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -2175,6 +2185,7 @@ mod tests {
     }
     const COOLING_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -2242,6 +2253,7 @@ mod tests {
     async fn run_once_prints_the_cooling_panel_after_the_matrix() {
         let doc_a = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",

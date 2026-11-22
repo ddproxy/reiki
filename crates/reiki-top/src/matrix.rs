@@ -1,7 +1,7 @@
 //! Pure model for the matrix view: peers x providers, no drawing. A peer that does not use a
 //! provider is `Absent`, never a failure, because peers publish different provider sets.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -164,22 +164,22 @@ impl Matrix {
     pub fn build(fleet: &Fleet, peers: &[String], now: Instant) -> Matrix {
         // One pass for the column union: a peer with data counts towards peers_with once, even
         // if it repeats an upstream name.
-        let mut with: HashMap<&str, usize> = HashMap::new();
+        let mut with: HashMap<String, usize> = HashMap::new();
         for name in peers {
             let Some(view) = fleet.peer(name, now) else {
                 continue;
             };
             let mut seen = HashSet::new();
-            for upstream in &view.health.upstreams {
-                if seen.insert(upstream.name.as_str()) {
-                    *with.entry(upstream.name.as_str()).or_insert(0) += 1;
+            for upstream in display_upstreams(view.health) {
+                if seen.insert(upstream.name.clone()) {
+                    *with.entry(upstream.name).or_insert(0) += 1;
                 }
             }
         }
         let mut columns: Vec<Column> = with
             .into_iter()
             .map(|(upstream, peers_with)| Column {
-                upstream: upstream.to_owned(),
+                upstream,
                 peers_with,
                 healthy_peers: 0,
             })
@@ -196,13 +196,14 @@ impl Matrix {
         for name in peers {
             let view = fleet.peer(name, now);
             let fresh = view.as_ref().filter(|v| !v.stale);
+            let upstreams = view
+                .as_ref()
+                .map(|v| display_upstreams(v.health))
+                .unwrap_or_default();
             let upstream = |col: &Column| {
-                fresh.and_then(|v| v.health.upstreams.iter().find(|u| u.name == col.upstream))
+                fresh.and_then(|_| upstreams.iter().find(|u| u.name == col.upstream))
             };
-            let has_upstream = |col: &Column| {
-                view.as_ref()
-                    .is_some_and(|v| v.health.upstreams.iter().any(|u| u.name == col.upstream))
-            };
+            let has_upstream = |col: &Column| upstreams.iter().any(|u| u.name == col.upstream);
             let host = fresh
                 .map(|v| HostSummary::from_health(v.health))
                 .unwrap_or_default();
@@ -359,6 +360,76 @@ impl Matrix {
         let real: Vec<&Row> = self.rows.iter().filter(|r| !is_fleet_row(r)).collect();
         (real.iter().filter(|r| !r.stale).count(), real.len())
     }
+}
+
+/// Display-only upstream entries for observed passthrough accounts. They carry no key state:
+/// one synthetic entry stands for the account, marked through `capacity_group`, so a reader
+/// cannot mistake it for a failover-capable key.
+fn observed_upstreams(health: &Health) -> Vec<Upstream> {
+    let mut by_name: BTreeMap<String, (u8, Upstream)> = BTreeMap::new();
+    for entry in &health.observed {
+        let rank = observed_rank(&entry.status_class);
+        let (healthy, cooling, disabled) = match rank {
+            3 => (0, 0, 1),
+            2 => (0, 1, 0),
+            _ => (1, 0, 0),
+        };
+        let candidate = Upstream {
+            name: entry.upstream.clone(),
+            healthy_keys: healthy,
+            cooling_keys: cooling,
+            disabled_keys: disabled,
+            cooling_combinations: 0,
+            soonest_cooldown_seconds: if cooling > 0 {
+                entry.retry_after_seconds
+            } else {
+                None
+            },
+            last_status_class: Some(entry.status_class.clone()),
+            capacity_group: Some(format!("observed/{}", entry.account)),
+            keys: None,
+            requests_1h: None,
+            limited_1h: None,
+            request_buckets: None,
+            tokens_1h: None,
+            token_buckets: None,
+            request_minutes: None,
+            token_minutes: None,
+        };
+        match by_name.get_mut(&entry.upstream) {
+            Some((current, _)) if *current >= rank => {}
+            Some((current, existing)) => {
+                *current = rank;
+                *existing = candidate;
+            }
+            None => {
+                by_name.insert(entry.upstream.clone(), (rank, candidate));
+            }
+        }
+    }
+    by_name
+        .into_values()
+        .map(|(_, upstream)| upstream)
+        .collect()
+}
+
+fn observed_rank(class: &str) -> u8 {
+    match class {
+        "credential_rejected" | "access_disabled" => 3,
+        "rate_limited" | "quota_exhausted" => 2,
+        _ => 1,
+    }
+}
+
+fn display_upstreams(health: &Health) -> Vec<Upstream> {
+    let mut out = health.upstreams.clone();
+    let named: HashSet<String> = out.iter().map(|u| u.name.clone()).collect();
+    out.extend(
+        observed_upstreams(health)
+            .into_iter()
+            .filter(|u| !named.contains(&u.name)),
+    );
+    out
 }
 
 /// Cell severity, for the fleet row's "worst state" rule.
@@ -999,6 +1070,7 @@ mod tests {
     fn doc(upstreams: &str) -> String {
         format!(
             r#"{{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                "observed" : [],
                 "failures":{{}},"upstreams":[{upstreams}]}}"#
         )
     }
@@ -1186,6 +1258,30 @@ mod tests {
     }
 
     #[test]
+    fn observed_accounts_get_a_display_only_column() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = r#"{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+            "observed":[{"upstream":"oauth","account":"alice","mode":"observed",
+            "status_class":"rate_limited","observed_at":"t","retry_after_seconds":20,
+            "cooldown_class":"rate_limited","quota":{"requests_limit":100,"requests_remaining":0,
+            "requests_reset_seconds":30,"tokens_limit":null,"tokens_remaining":null,
+            "tokens_reset_seconds":null}}],"failures":{},"upstreams":[]}"#;
+        add(&mut f, "peer-a", doc, t0);
+        let m = Matrix::build(&f, &names(&["peer-a"]), t0);
+        assert_eq!(m.columns.len(), 1);
+        assert_eq!(m.columns[0].upstream, "oauth");
+        assert_eq!(
+            m.rows[0].cells,
+            vec![Cell::Cooling {
+                soonest: Some(Duration::from_secs(20)),
+                class: None,
+            }],
+            "an observed cooldown is visible but is not a key state"
+        );
+    }
+
+    #[test]
     fn stale_and_unseen_peers_are_all_stale_and_still_appear() {
         let t0 = Instant::now();
         let mut f = fleet();
@@ -1316,6 +1412,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "cores" : 8,
@@ -1351,6 +1448,7 @@ mod tests {
             "peer-b",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : "not an object",
    "instance" : "x",
@@ -1369,6 +1467,7 @@ mod tests {
             "peer-c",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "disks" : [
@@ -1623,6 +1722,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "x",
    "observed_at" : "t",
@@ -1662,6 +1762,7 @@ mod tests {
             "peer-a",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "x",
    "observed_at" : "t",

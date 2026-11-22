@@ -546,7 +546,7 @@ async fn watch_falls_back_to_polling_when_the_peer_cannot_stream() {
         async move {
             let body = format!(
                 "{{\"instance\":\"plain\",\"reiki_version\":\"0.12.0\",\"observed_at\":\"{observed}\",\
-                 \"age_seconds\":0,\"failures\":{{}},\"upstreams\":[\
+                 \"observed\":[],\"age_seconds\":0,\"failures\":{{}},\"upstreams\":[\
                  {{\"name\":\"zen\",\"healthy_keys\":1,\"cooling_keys\":0,\"disabled_keys\":0,\
                  \"cooling_combinations\":0,\"soonest_cooldown_seconds\":null,\"last_status_class\":null}}]}}"
             );

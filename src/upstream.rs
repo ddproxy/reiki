@@ -17,7 +17,9 @@ use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::config::Upstream;
-use crate::proxy::{passthrough_headers, upstream_headers};
+use crate::proxy::{
+    mark_passthrough_credentials, passthrough_headers, strip_reiki_headers, upstream_headers,
+};
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
@@ -274,6 +276,64 @@ impl UpstreamResponse {
         poll_fn(|cx| self.body.as_mut().poll_next(cx)).await
     }
 
+    /// Reads at most `limit` bytes for classification, then rebuilds a response that still
+    /// relays the prefix and the rest of the stream. Only error bodies use this; a body that
+    /// fails while being read is returned with the bytes read so far so status still classifies.
+    pub async fn peek_body(self, limit: usize) -> (Bytes, Option<std::io::Error>, Self) {
+        let Self {
+            status,
+            headers,
+            version,
+            mut body,
+            decoded,
+        } = self;
+        let mut collected = Vec::with_capacity(limit.min(64 * 1024));
+        let mut remainder = None;
+        let mut error = None;
+        while collected.len() < limit {
+            let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await else {
+                break;
+            };
+            match chunk {
+                Ok(chunk) => {
+                    let room = limit - collected.len();
+                    if chunk.len() <= room {
+                        collected.extend_from_slice(&chunk);
+                    } else {
+                        collected.extend_from_slice(&chunk[..room]);
+                        remainder = Some(chunk.slice(room..));
+                        break;
+                    }
+                }
+                Err(cause) => {
+                    error = Some(cause);
+                    break;
+                }
+            }
+        }
+        let head = Bytes::from(collected);
+        let snippet = head.clone();
+        let tail: ByteStream = Box::pin(Prepend {
+            prefix: remainder,
+            inner: body,
+        });
+        let full: ByteStream = Box::pin(Prepend {
+            prefix: Some(head),
+            inner: tail,
+        });
+        (
+            snippet,
+            error,
+            Self {
+                status,
+                headers,
+                version,
+                body: full,
+                decoded,
+            },
+        )
+    }
+
     /// True when the body is the decoded form of a compressed upstream response.
     pub fn is_decoded(&self) -> bool {
         self.decoded
@@ -354,6 +414,27 @@ impl UpstreamResponse {
 }
 
 struct OnceBody(Option<Bytes>);
+
+/// Replays bytes already read while classifying an error body ahead of the original stream.
+struct Prepend<S: ?Sized> {
+    prefix: Option<Bytes>,
+    inner: Pin<Box<S>>,
+}
+
+impl<S: ?Sized> Stream for Prepend<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return Poll::Ready(Some(Ok(prefix)));
+        }
+        this.inner.as_mut().poll_next(cx)
+    }
+}
 
 impl Stream for OnceBody {
     type Item = Result<Bytes, std::io::Error>;
@@ -674,6 +755,10 @@ pub fn faithful_request(
     };
 
     let mut headers = parts.headers.clone();
+    strip_reiki_headers(&mut headers);
+    if credential.is_none() {
+        mark_passthrough_credentials(&mut headers);
+    }
     let extensions = parts.extensions.clone();
 
     let keep_connection = headers
@@ -773,6 +858,58 @@ mod tests {
         );
         assert!(!is_event_stream(&headers));
         assert!(!is_event_stream(&HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn peeking_an_error_body_replays_the_prefix_and_the_rest_in_order() {
+        use futures_util::stream;
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = [
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"defgh"),
+            Bytes::from_static(b"ijkl"),
+        ]
+        .into_iter()
+        .map(Ok)
+        .collect();
+        let response = UpstreamResponse::from_stream(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Version::HTTP_11,
+            stream::iter(chunks),
+        );
+        let (head, error, mut replay) = response.peek_body(4).await;
+        assert_eq!(&head[..], b"abcd");
+        assert!(error.is_none());
+        let mut body = Vec::new();
+        while let Some(chunk) = replay.chunk().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"abcdefghijkl");
+    }
+
+    #[tokio::test]
+    async fn peeking_an_error_body_reports_the_error_and_replays_the_bytes_read() {
+        use futures_util::stream;
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"quota")),
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stalled")),
+        ];
+        let response = UpstreamResponse::from_stream(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Version::HTTP_11,
+            stream::iter(chunks),
+        );
+        let (head, error, mut replay) = response.peek_body(16).await;
+        assert_eq!(&head[..], b"quota");
+        assert_eq!(error.unwrap().to_string(), "stalled");
+        let mut body = Vec::new();
+        while let Some(chunk) = replay.chunk().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"quota");
     }
 
     #[tokio::test]

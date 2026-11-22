@@ -100,6 +100,23 @@ A cooldown only moves later. A shorter failure does not shorten a longer cooldow
 
 Invalid-credential phrases matched on `403`: `invalid api key`, `incorrect api key`, `api key is invalid`, `api key not valid`, `api key is not valid`, `api key has expired`, `api key has been revoked`, `api key is disabled`, `api_key_invalid`, `invalid_api_key`, `invalid x-api-key`, `invalid credential`, `credential has been revoked`, `credential has expired`, `invalid token`, `token has been revoked`, `token has expired`.
 
+## Observed passthrough headers
+
+A `passthrough` upstream holds no Reiki key, so its answer cannot cool or disable one. Reiki still classifies the status and a bounded error-body prefix, then records one observation under the upstream's `account` label. The class vocabulary is fixed in code and never taken from a response header or body: `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` and `pass_through`.
+
+Response headers are read for observation only. The supported families are:
+
+| Header | Meaning |
+| --- | --- |
+| `Retry-After` | Remaining wait, in seconds or an HTTP date; capped at 24 hours and counted down from the host clock. |
+| `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests` | OpenAI-style request quota. Reset accepts seconds, `h`/`m`/`s`/`ms` components, a small epoch delta or an epoch value. |
+| `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-tokens` | OpenAI-style token quota. |
+| `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset` | Generic request quota, used where the family above is absent. |
+| `anthropic-ratelimit-requests-limit`, `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-requests-reset` | Anthropic request quota; the reset is an RFC3339 instant, read relative to the response's `Date` when present. |
+| `anthropic-ratelimit-tokens-limit`, `anthropic-ratelimit-tokens-remaining`, `anthropic-ratelimit-tokens-reset` | Anthropic token quota. |
+
+Unparseable numbers and resets beyond 24 hours are ignored. The observed view appears in `GET /v1/status`, in the peer health document and as display-only columns in `reiki top`; it never holds a credential value. Client-supplied `X-Reiki-*` request headers are removed before the request is sent.
+
 ## Client errors from Reiki
 
 | Status | `error.type` | Cause |

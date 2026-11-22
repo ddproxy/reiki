@@ -69,6 +69,7 @@ Each fetch has a 5 s deadline, including connect. Redirects are refused so the t
 | `upstreams[].keys[].state` | `available`, `cooling` or `out_of_rotation` | Key state at build time. |
 | `upstreams[].keys[].cooldown_seconds` | integer or null | Bucketed remaining wait; `null` outside `cooling`. |
 | `upstreams[].keys[].cooldown_class` | string | `rate_limited`, `quota_exhausted` or `transient`, present for a cooling key with a known class. |
+| `upstreams[].keys[].quota_reset_at` | string (RFC3339 UTC) | The absolute reset behind a quota cooldown, present only for a cooling `quota_exhausted` key whose key config names a reset schedule or whose response supplied a non-zero `Retry-After`. Absent with the fixed quota window or a restored cooldown. |
 | `host` | object | Host figures, present with `expose_host_stats = true`. |
 | `host.load_average` | array of 3 floats or null | `/proc/loadavg` 1, 5 and 15 minute values; `null` where unavailable. |
 | `host.cores` | integer | Parallelism available to Reiki, at least 1. |

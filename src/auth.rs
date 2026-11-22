@@ -234,13 +234,13 @@ pub fn sha256_hex(input: &str) -> String {
 }
 
 /// Hashes a token for `token_sha256`, refusing one shorter than [`MIN_TOKEN_LEN`].
-pub fn hash_token(token: &str) -> Result<String, String> {
+///
+/// The error is a fixed description rather than one derived from the token: callers print it on
+/// stderr, and a length or fragment of the token must never reach the output.
+pub fn hash_token(token: &str) -> Result<String, &'static str> {
     let token = token.trim();
-    let length = token.chars().count();
-    if length < MIN_TOKEN_LEN {
-        return Err(format!(
-            "token must be at least {MIN_TOKEN_LEN} characters (got {length})"
-        ));
+    if token.chars().count() < MIN_TOKEN_LEN {
+        return Err("token must be at least the minimum number of characters");
     }
     Ok(sha256_hex(token))
 }
@@ -620,6 +620,7 @@ mod tests {
     fn hash_token_refuses_short_tokens() {
         let err = hash_token("shrt").unwrap_err();
         assert!(err.contains("at least"), "{err}");
+        assert!(!err.contains("shrt"), "the error must not echo the token");
         assert!(hash_token("a-sixteen-plus-char-token").is_ok());
         let hash = hash_token("a-sixteen-plus-char-token").unwrap();
         assert_eq!(hash, sha256_hex("a-sixteen-plus-char-token"));

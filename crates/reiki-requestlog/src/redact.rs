@@ -521,7 +521,10 @@ mod tests {
         let mut value: Value = serde_json::from_str(&raw).unwrap();
         json(&mut value);
         let text = value.to_string();
-        assert!(!text.contains("sk-0123"), "{text}");
+        assert!(
+            !text.contains("sk-0123"),
+            "the escaped secret must be masked"
+        );
         assert!(text.contains("[REDACTED]"));
         assert!(text.contains("\"n\":3"));
     }

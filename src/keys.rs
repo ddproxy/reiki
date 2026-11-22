@@ -446,7 +446,10 @@ mod tests {
         assert!(by("weird").issues.is_empty());
         assert!(check_has_problems(&checks));
         let text = render_check(&checks);
-        assert!(text.contains("good: ok"), "{text}");
+        assert!(
+            text.contains("good: ok"),
+            "the key check report must name the key"
+        );
         assert!(!text.contains("secret"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

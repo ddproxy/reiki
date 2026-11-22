@@ -239,14 +239,17 @@ async fn fresh_data_over_tls_pinned_to_the_peer_ca() {
     let heads = peer.heads.lock().unwrap().clone();
     assert_eq!(heads.len(), 1);
     let head = heads[0].to_ascii_lowercase();
-    assert!(head.starts_with("get /v1/health http/1.1"), "{head}");
+    assert!(
+        head.starts_with("get /v1/health http/1.1"),
+        "the health request must use the expected method and path"
+    );
     assert!(
         head.contains(&format!("authorization: bearer {PEER_TOKEN}")),
-        "{head}"
+        "the health request must use the peer bearer token"
     );
     assert!(
         !head.contains("x-api-key") && !head.contains("cookie"),
-        "{head}"
+        "the health request must omit alternate credential headers"
     );
 }
 
@@ -306,7 +309,10 @@ async fn a_certificate_from_another_ca_is_refused() {
     .await;
     assert_eq!(report.state, "unknown");
     let error = report.error.unwrap().to_ascii_lowercase();
-    assert!(error.contains("certificate"), "{error}");
+    assert!(
+        error.contains("certificate"),
+        "the peer CA must verify the published certificate"
+    );
     assert_eq!(peer.hits.load(Ordering::SeqCst), 0, "no request was sent");
 }
 

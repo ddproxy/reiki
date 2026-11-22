@@ -3166,8 +3166,14 @@ mod tests {
             100,
         ))
         .join("\n");
-        for bad in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}'] {
-            assert!(!text.contains(bad), "{bad:?} leaked: {text:?}");
+        for (i, bad) in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{FEFF}']
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !text.contains(bad),
+                "control character #{i} leaked into the peer name"
+            );
         }
         assert!(text.contains("peer?evil"));
     }
@@ -3669,10 +3675,16 @@ mod tests {
             local
                 .iter()
                 .any(|l| l.contains("01:00:00") && l.contains("rate_limited")),
-            "{local:?}"
+            "the local failure row was not rendered"
         );
-        assert!(local.iter().any(|l| l.contains("cooled 30s")), "{local:?}");
-        assert!(local.iter().any(|l| l.contains("body")), "{local:?}");
+        assert!(
+            local.iter().any(|l| l.contains("cooled 30s")),
+            "the cooldown was not rendered"
+        );
+        assert!(
+            local.iter().any(|l| l.contains("body")),
+            "the failure note was not rendered"
+        );
     }
 
     #[test]

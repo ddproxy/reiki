@@ -165,7 +165,7 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     assert_eq!(records[0]["event"], "request");
     assert_eq!(records[0]["stream"], "client-a");
     assert_eq!(records[0]["upstream"], "zen");
@@ -174,7 +174,10 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
     assert_eq!(records[0]["headers"]["user-agent"], "client/1.0");
     // The default records counts, never the prompt or the tool arguments.
     assert_eq!(records[0]["body_summary"]["messages"], 1);
-    assert!(records[0].get("body").is_none(), "{records:?}");
+    assert!(
+        records[0].get("body").is_none(),
+        "the request record must omit the body"
+    );
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["id"], records[0]["id"]);
     assert_eq!(records[1]["status"], 200);
@@ -196,8 +199,8 @@ async fn a_failover_request_is_logged_once_with_its_final_response() {
         !text.contains("hello there"),
         "the prompt leaked into the log"
     );
-    for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
-        assert!(!text.contains(secret), "{secret} leaked into the log");
+    for (i, secret) in [CLIENT_TOKEN, KEY_A, KEY_B].into_iter().enumerate() {
+        assert!(!text.contains(secret), "secret #{i} leaked into the log");
     }
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
@@ -213,7 +216,7 @@ async fn a_streamed_response_is_counted_and_closed_after_the_last_chunk() {
     assert!(text.contains("[DONE]"));
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["bytes"], text.len());
     assert!(records[1]["duration_ms"].as_u64().unwrap() >= 40);
@@ -229,10 +232,13 @@ async fn an_answer_without_an_upstream_response_is_logged_with_a_null_status() {
     assert_eq!(response.status(), 503);
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     assert_eq!(records[1]["event"], "response");
     assert_eq!(records[1]["id"], records[0]["id"]);
-    assert!(records[1]["status"].is_null(), "{}", records[1]);
+    assert!(
+        records[1]["status"].is_null(),
+        "the response must have a null status"
+    );
     assert_eq!(records[1]["bytes"], 0);
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
@@ -258,9 +264,12 @@ async fn the_live_stream_carries_requests_without_credentials() {
     BufReader::new(client).read_line(&mut line).unwrap();
     let record: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(record["body_summary"]["model"], "live");
-    assert!(record.get("body").is_none(), "{line}");
-    for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
-        assert!(!line.contains(secret), "{secret} leaked into the stream");
+    assert!(
+        record.get("body").is_none(),
+        "the live stream record must omit the body"
+    );
+    for (i, secret) in [CLIENT_TOKEN, KEY_A, KEY_B].into_iter().enumerate() {
+        assert!(!line.contains(secret), "secret #{i} leaked into the stream");
     }
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
@@ -297,7 +306,7 @@ async fn body_mode_records_the_response_body_and_never_a_key() {
     let _ = response.text().await.unwrap();
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     assert_eq!(records[1]["body"]["ok"], true);
     assert_eq!(records[1]["key"], "b");
     // The failed attempt keeps the upstream's own error text.
@@ -305,8 +314,8 @@ async fn body_mode_records_the_response_body_and_never_a_key() {
     assert!(records[1]["attempts"][1].get("body").is_none());
 
     let text = std::fs::read_to_string(&path).unwrap();
-    for secret in [CLIENT_TOKEN, KEY_A, KEY_B] {
-        assert!(!text.contains(secret), "{secret} leaked into the log");
+    for (i, secret) in [CLIENT_TOKEN, KEY_A, KEY_B].into_iter().enumerate() {
+        assert!(!text.contains(secret), "secret #{i} leaked into the log");
     }
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
@@ -325,7 +334,7 @@ async fn a_streamed_response_body_is_kept_up_to_the_cap_and_marked_cut() {
     assert!(text.len() > 20);
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     let body = records[1]["body"].as_str().unwrap();
     assert!(body.starts_with("data: one"), "{body}");
     assert!(body.len() <= 20, "{body}");
@@ -355,12 +364,21 @@ async fn an_opt_in_records_a_masked_size_capped_body() {
     let _ = response.text().await.unwrap();
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records.len(), 2, "unexpected record count");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(!text.contains(&secret), "{text}");
-    assert!(text.contains("[REDACTED]"), "{text}");
+    assert!(
+        !text.contains(&secret),
+        "the opt-in body leaked into the log"
+    );
+    assert!(
+        text.contains("[REDACTED]"),
+        "the opt-in body must be redacted"
+    );
     let logged = records[0]["body"].as_str().unwrap_or_default();
-    assert!(logged.len() <= 64, "{logged}");
+    assert!(
+        logged.len() <= 64,
+        "the logged body must stay within the cap"
+    );
     assert_eq!(records[0]["body_truncated"], true);
     assert_eq!(records[0]["body_bytes"], body.len());
     let _ = std::fs::remove_dir_all(&rig.dir);
@@ -375,8 +393,11 @@ async fn an_exhausted_chain_logs_every_attempt_and_no_serving_key() {
     assert_eq!(response.status(), 503);
 
     let records = records_when(&path, 2);
-    assert_eq!(records.len(), 2, "{records:?}");
-    assert!(records[1]["key"].is_null(), "{}", records[1]);
+    assert_eq!(records.len(), 2, "unexpected record count");
+    assert!(
+        records[1]["key"].is_null(),
+        "no serving key must be recorded"
+    );
     assert_eq!(
         records[1]["attempts"],
         serde_json::json!([
@@ -407,7 +428,7 @@ async fn an_export_only_config_writes_allow_listed_summaries_and_publishes_its_m
     assert_eq!(response.status(), 200);
 
     let records = records_when(&path, 1);
-    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records.len(), 1, "unexpected export record count");
     let record = &records[0];
     let expected: BTreeSet<&str> = [
         "v",
@@ -433,7 +454,7 @@ async fn an_export_only_config_writes_allow_listed_summaries_and_publishes_its_m
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(actual, expected, "unexpected export fields: {record}");
+    assert_eq!(actual, expected, "unexpected export fields");
     assert_eq!(record["v"], 1);
     assert_eq!(record["event"], "request_summary");
     assert_eq!(record["route"], "/zen/chat/completions");
@@ -442,11 +463,17 @@ async fn an_export_only_config_writes_allow_listed_summaries_and_publishes_its_m
     assert_eq!(record["key"], "b");
     assert_eq!(record["input_tokens"], 0);
     assert_eq!(record["output_tokens"], 0);
-    assert!(record["failure_class"].is_null(), "{record}");
+    assert!(
+        record["failure_class"].is_null(),
+        "a success has no failure class"
+    );
 
     let text = std::fs::read_to_string(&path).unwrap();
-    for secret in [CLIENT_TOKEN, KEY_A, KEY_B, "query-secret", "prompt-secret"] {
-        assert!(!text.contains(secret), "a secret leaked into the export");
+    for (i, secret) in [CLIENT_TOKEN, KEY_A, KEY_B, "query-secret", "prompt-secret"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!text.contains(secret), "secret #{i} leaked into the export");
     }
 
     let metrics = rig.admin_get("/v1/requestlog/metrics").await;

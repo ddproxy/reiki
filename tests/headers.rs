@@ -69,11 +69,17 @@ fn header_lines(head: &str) -> Vec<&str> {
 async fn by_default_names_are_lowercase_with_the_credential_first_and_no_connection_header() {
     let head = head_sent_with("default", "").await;
     let lines = header_lines(&head);
-    assert_eq!(lines[0], "authorization: Bearer upstream-key", "{head}");
-    assert!(lines.contains(&"x-custom-thing: 1"), "{head}");
+    assert_eq!(
+        lines[0], "authorization: Bearer upstream-key",
+        "the credential must be first"
+    );
+    assert!(
+        lines.contains(&"x-custom-thing: 1"),
+        "the custom header must be kept"
+    );
     assert!(
         !head.to_ascii_lowercase().contains("\r\nconnection:"),
-        "{head}"
+        "the connection header must be dropped"
     );
 }
 
@@ -85,17 +91,26 @@ async fn title_case_and_keep_alive_are_sent_when_asked_for() {
     )
     .await;
     let lines = header_lines(&head);
-    assert_eq!(lines[0], "Authorization: Bearer upstream-key", "{head}");
-    assert!(lines.contains(&"X-Custom-Thing: 1"), "{head}");
-    assert!(lines.contains(&"Connection: keep-alive"), "{head}");
+    assert_eq!(
+        lines[0], "Authorization: Bearer upstream-key",
+        "the credential must be first"
+    );
+    assert!(
+        lines.contains(&"X-Custom-Thing: 1"),
+        "the custom header must be kept"
+    );
+    assert!(
+        lines.contains(&"Connection: keep-alive"),
+        "keep-alive must be sent"
+    );
     assert!(
         lines.contains(&"Content-Type: application/json") || !head.contains("content-type"),
-        "{head}"
+        "the content type must be preserved"
     );
     assert!(
         !lines
             .iter()
             .any(|l| l.chars().next().is_some_and(|c| c.is_ascii_lowercase())),
-        "{head}"
+        "all header names must be title cased"
     );
 }

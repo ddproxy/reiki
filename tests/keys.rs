@@ -139,7 +139,7 @@ async fn the_table_shows_state_cooldown_status_and_streams() {
             .await
             .unwrap();
     assert_eq!(code, 0, "{err}");
-    assert!(out.starts_with("KEY"), "{out}");
+    assert!(out.starts_with("KEY"), "the key table must have a header");
     let a = out.lines().find(|line| line.starts_with("a ")).unwrap();
     assert!(a.contains("zen"), "{a}");
     assert!(a.contains("cooling"), "{a}");
@@ -148,7 +148,10 @@ async fn the_table_shows_state_cooldown_status_and_streams() {
     let b = out.lines().find(|line| line.starts_with("b ")).unwrap();
     assert!(b.contains("ok"), "{b}");
     assert!(b.ends_with('-'), "key b is in no stream: {b}");
-    assert!(!out.contains("upstream-secret"), "{out}");
+    assert!(
+        !out.contains("upstream-secret"),
+        "the key report must not include key contents"
+    );
 }
 
 #[tokio::test]
@@ -174,7 +177,10 @@ async fn the_json_output_reports_disabled_keys_and_their_streams() {
     assert_eq!(b["state"], "ok");
     assert_eq!(b["last_status_code"], serde_json::Value::Null);
     assert_eq!(b["streams"], serde_json::json!([]));
-    assert!(!out.contains("upstream-secret"), "{out}");
+    assert!(
+        !out.contains("upstream-secret"),
+        "the key report must not include key contents"
+    );
 }
 
 #[tokio::test]
@@ -209,9 +215,9 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     assert_eq!(code, 401, "no token");
 
     let (code, body) = rig.admin_get("/v1/failures", true).await;
-    assert_eq!(code, 200, "{body}");
+    assert_eq!(code, 200, "the failures endpoint must answer 200");
     let all: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-    assert!(!all.is_empty(), "{body}");
+    assert!(!all.is_empty(), "the failure ring must have an entry");
     let (code, _bare) = rig.admin_get("/failures", true).await;
     assert_eq!(code, 404, "the bare route is not served");
     let first = &all[0];
@@ -221,16 +227,22 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     assert_eq!(first["class"], "rate_limited");
     assert_eq!(first["retry_after"], "120");
     assert_eq!(first["cooled"], true);
-    assert!(first["time"].as_u64().is_some(), "{first}");
-    assert!(first["note"].as_str().unwrap().contains("mock"), "{first}");
+    assert!(
+        first["time"].as_u64().is_some(),
+        "the failure must have a time"
+    );
+    assert!(
+        first["note"].as_str().unwrap().contains("mock"),
+        "the failure note must be present"
+    );
 
     let (_, body) = rig.admin_get("/v1/failures?limit=1", true).await;
     let one: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-    assert_eq!(one.len(), 1, "{body}");
+    assert_eq!(one.len(), 1, "the limit must return one entry");
 
     let (_, body) = rig.admin_get("/v1/failures?key=b", true).await;
     let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-    assert!(empty.is_empty(), "{body}");
+    assert!(empty.is_empty(), "the key filter must exclude the failure");
 
     for bad in ["?limit=0", "?limit=65", "?limit=x", "?key=%zz", "?other=1"] {
         let (code, _) = rig.admin_get(&format!("/v1/failures{bad}"), true).await;
@@ -255,8 +267,11 @@ async fn the_failures_table_and_json_read_the_same_ring() {
         assert!(header.contains(column), "{header}");
     }
     let row = out.lines().nth(1).unwrap();
-    assert!(row.contains("rate_limited"), "{row}");
-    assert!(row.contains("429"), "{row}");
+    assert!(
+        row.contains("rate_limited"),
+        "the failure class must be shown"
+    );
+    assert!(row.contains("429"), "the failure status must be shown");
 
     let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
     let (code, out, err) = tokio::task::spawn_blocking(move || {
@@ -274,7 +289,7 @@ async fn the_failures_table_and_json_read_the_same_ring() {
     .unwrap();
     assert_eq!(code, 0, "{err}");
     let body: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
-    assert_eq!(body.len(), 1, "{out}");
+    assert_eq!(body.len(), 1, "the JSON limit must return one entry");
 
     let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
     let (code, out, err) = tokio::task::spawn_blocking(move || {
@@ -299,7 +314,10 @@ async fn the_failures_table_is_cut_to_columns() {
     .unwrap();
     assert_eq!(code, 0, "{err}");
     for line in out.lines() {
-        assert!(line.chars().count() <= 30, "{line:?}");
+        assert!(
+            line.chars().count() <= 30,
+            "the failure line must be clipped"
+        );
     }
 }
 
@@ -385,20 +403,23 @@ fn check_reports_missing_empty_and_world_readable_files() {
     )
     .unwrap();
     let path = config.display().to_string();
-    let (code, out, err) = reiki_keys(&["--check", "--config", &path]);
-    assert_eq!(code, 1, "{out}{err}");
-    assert!(out.contains("good: ok"), "{out}");
+    let (code, out, _err) = reiki_keys(&["--check", "--config", &path]);
+    assert_eq!(code, 1, "the key check must fail");
+    assert!(
+        out.contains("good: ok"),
+        "the check must report the good key"
+    );
     assert!(
         out.contains("missing: error: ") && out.contains("does not exist"),
-        "{out}"
+        "the missing key file must be reported"
     );
     assert!(
         out.contains("empty: error: ") && out.contains("is empty"),
-        "{out}"
+        "the empty key file must be reported"
     );
     assert!(
         out.contains("world: warning: ") && out.contains("group or world read/write bits"),
-        "{out}"
+        "the loose key file must be reported"
     );
     assert!(!out.contains("secret-good") && !out.contains("secret-world"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -422,9 +443,12 @@ fn a_clean_check_exits_zero_and_unreadable_config_exits_two() {
     )
     .unwrap();
     let path = config.display().to_string();
-    let (code, out, err) = reiki_keys(&["--check", "--config", &path]);
-    assert_eq!(code, 0, "{out}{err}");
-    assert!(out.contains("good: ok"), "{out}");
+    let (code, out, _err) = reiki_keys(&["--check", "--config", &path]);
+    assert_eq!(code, 0, "the clean key check must pass");
+    assert!(
+        out.contains("good: ok"),
+        "the check must report the good key"
+    );
 
     let missing = dir.join("not-there.toml").display().to_string();
     let (code, _, err) = reiki_keys(&["--check", "--config", &missing]);

@@ -254,9 +254,18 @@ mod tests {
             "abcdef0123456789abcdef"
         );
         let out = redact(&text, 2048);
-        assert!(out.contains("[redacted]"), "{out}");
-        assert!(!out.contains("sk-aaa"), "{out}");
-        assert!(!out.contains("abcdef0123456789abcdef"), "{out}");
+        assert!(
+            out.contains("[redacted]"),
+            "the redaction marker must be present"
+        );
+        assert!(
+            !out.contains("sk-aaa"),
+            "a credential leaked into the journal"
+        );
+        assert!(
+            !out.contains("abcdef0123456789abcdef"),
+            "a credential leaked into the journal"
+        );
     }
 
     #[test]

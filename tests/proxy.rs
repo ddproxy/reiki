@@ -764,7 +764,7 @@ async fn a_request_size_402_fails_over_without_cooling_the_key() {
 
     let failures = failure_ring(&h).await;
     let rows = failures.as_array().unwrap();
-    assert_eq!(rows.len(), 1, "{failures}");
+    assert_eq!(rows.len(), 1, "the failure ring must have one entry");
     assert_eq!(rows[0]["class"], "request_error");
     assert_eq!(rows[0]["cooled"], false);
 }
@@ -790,7 +790,7 @@ async fn a_request_size_402_from_every_key_is_returned_unchanged() {
 
     let failures = failure_ring(&h).await;
     let rows = failures.as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{failures}");
+    assert_eq!(rows.len(), 2, "the failure ring must have two entries");
     assert!(rows.iter().all(|row| row["class"] == "request_error"));
     assert!(rows.iter().all(|row| row["cooled"] == false));
 }
@@ -2090,7 +2090,7 @@ async fn a_post_that_times_out_is_not_replayed_on_the_same_or_another_key() {
     assert_eq!(h.mock.keys_called(), ["up-a"]);
     let body = res.text().await.unwrap();
     assert!(body.contains("gateway_timeout"), "body was {body}");
-    assert!(!body.contains("up-a"), "body leaked a key: {body}");
+    assert!(!body.contains("up-a"), "the timeout body leaked a key");
 }
 
 fn imf_date(epoch_secs: u64) -> String {
@@ -2370,16 +2370,10 @@ async fn admin_status_reports_key_and_stream_state_without_secrets() {
         "body was {body}"
     );
     assert!(body.contains("\"current_key\":\"b\""), "body was {body}");
-    assert!(!body.contains("up-a"), "status leaked a key value: {body}");
-    assert!(!body.contains("tok-a"), "status leaked a token: {body}");
-    assert!(
-        !body.contains(&sha("tok-a")),
-        "status leaked a token hash: {body}"
-    );
-    assert!(
-        !body.contains("/unused/"),
-        "status leaked a file path: {body}"
-    );
+    assert!(!body.contains("up-a"), "status leaked a key value");
+    assert!(!body.contains("tok-a"), "status leaked a token");
+    assert!(!body.contains(&sha("tok-a")), "status leaked a token hash");
+    assert!(!body.contains("/unused/"), "status leaked a file path");
 }
 
 #[tokio::test]
@@ -2434,15 +2428,9 @@ async fn admin_metrics_increment_after_a_failover_without_leaking() {
         text.contains("reiki_keys{state=\"cooling\"} 1"),
         "text was {text}"
     );
-    assert!(!text.contains("up-a"), "metrics leaked a key value: {text}");
-    assert!(
-        !text.contains(&sha("tok-a")),
-        "metrics leaked a token hash: {text}"
-    );
-    assert!(
-        !text.contains("/unused/"),
-        "metrics leaked a file path: {text}"
-    );
+    assert!(!text.contains("up-a"), "metrics leaked a key value");
+    assert!(!text.contains(&sha("tok-a")), "metrics leaked a token hash");
+    assert!(!text.contains("/unused/"), "metrics leaked a file path");
 }
 
 #[tokio::test]

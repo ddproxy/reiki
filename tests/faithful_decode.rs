@@ -309,7 +309,13 @@ async fn an_encoding_reiki_did_not_decode_is_refused_instead_of_relayed_raw() {
         assert_eq!(status, 502, "{coding}: {head}");
         assert!(header(&head, "content-encoding").is_none(), "{head}");
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("content coding"), "{coding}: {text}");
-        assert!(!text.contains("could be in here"), "{coding}: {text}");
+        assert!(
+            text.contains("content coding"),
+            "{coding}: the refusal must name the content coding"
+        );
+        assert!(
+            !text.contains("could be in here"),
+            "{coding}: the upstream body must not be relayed"
+        );
     }
 }

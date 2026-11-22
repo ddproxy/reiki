@@ -201,9 +201,12 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
             text.contains("[toolpolicy] blocked tool call: run"),
-            "{text}"
+            "the block notice must be present"
         );
-        assert!(!text.contains("evil.example.org"), "{text}");
+        assert!(
+            !text.contains("evil.example.org"),
+            "the tool arguments must be removed"
+        );
     }
 
     #[test]

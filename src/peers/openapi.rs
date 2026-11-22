@@ -49,6 +49,8 @@ fn upstream_schema() -> Value {
                     "cooldown_class": {"type": "string",
                         "enum": ["rate_limited", "quota_exhausted", "transient"],
                         "description": "Only while cooling, and only when the class is known"},
+                    "quota_reset_at": {"type": "string", "format": "date-time",
+                        "description": "RFC3339 UTC reset behind a quota cooldown, when the key names a reset schedule or the response supplied Retry-After; only for a cooling quota key"},
                 }},
             },
         },

@@ -155,7 +155,10 @@ impl Rig {
 
     async fn health(&self) -> serde_json::Value {
         let (code, body) = self.peer_get("/v1/health", Some(PEER_TOKEN)).await;
-        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            code, 200,
+            "the peer listener must answer the health request"
+        );
         serde_json::from_str(&body).unwrap()
     }
 }
@@ -163,14 +166,17 @@ impl Rig {
 #[tokio::test]
 async fn only_the_peer_token_opens_the_peer_listener() {
     let rig = Rig::new("").await;
-    for token in [
+    for (i, token) in [
         None,
         Some(ADMIN_TOKEN),
         Some(STREAM_TOKEN),
         Some("not-a-token"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (code, body) = rig.peer_get("/v1/health", token).await;
-        assert_eq!(code, 401, "{token:?}");
+        assert_eq!(code, 401, "token #{i} is refused");
         assert!(body.is_empty(), "a refusal has no body");
     }
     let other_carriers = [
@@ -268,9 +274,12 @@ async fn every_other_path_and_method_on_the_peer_listener_is_404() {
         "/__reiki/healthz",
         "/zen/chat/completions",
     ] {
-        for token in [None, Some(PEER_TOKEN), Some(ADMIN_TOKEN)] {
+        for (i, token) in [None, Some(PEER_TOKEN), Some(ADMIN_TOKEN)]
+            .into_iter()
+            .enumerate()
+        {
             let (code, _) = rig.peer_get(path, token).await;
-            assert_eq!(code, 404, "{path} {token:?}");
+            assert_eq!(code, 404, "unexpected path with token #{i}");
         }
     }
     let res = rig
@@ -322,15 +331,21 @@ async fn health_counts_keys_per_upstream_without_names_paths_or_secrets() {
     assert_eq!(zen["last_status_class"], "4xx");
 
     let text = doc.to_string();
-    for secret in [
+    for (i, secret) in [
         "client-a",
         "zen-a",
         "/unused",
         "upstream-zen-a",
         &sha(PEER_TOKEN),
         &rig.upstream,
-    ] {
-        assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text.contains(secret),
+            "secret #{i} leaked into the health document"
+        );
     }
 }
 
@@ -374,7 +389,7 @@ async fn usage_counts_are_published_by_default_and_can_be_hidden() {
         "request_minutes",
         "token_minutes",
     ] {
-        assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
+        assert!(zen.get(field).is_none(), "{field} must be hidden");
     }
 }
 
@@ -400,7 +415,7 @@ async fn tokens_are_counted_from_each_response_per_upstream() {
     assert_eq!(hidden.send(None).await, 200);
     let zen = &hidden.health().await["upstreams"][0];
     for field in ["tokens_1h", "token_buckets"] {
-        assert!(zen.get(field).is_none(), "{field} is hidden: {zen}");
+        assert!(zen.get(field).is_none(), "{field} must be hidden");
     }
 }
 
@@ -522,11 +537,11 @@ async fn concurrent_stale_logins_still_lock_out_the_shared_address() {
     for (code, _) in futures_util::future::join_all(stale).await {
         assert!(matches!(code, 401 | 429), "{code}");
     }
-    for token in [PEER_TOKEN, second] {
+    for (i, token) in [PEER_TOKEN, second].into_iter().enumerate() {
         assert_eq!(
             rig.peer_get("/v1/health", Some(token)).await.0,
             429,
-            "{token}"
+            "peer token #{i} is refused"
         );
     }
 }
@@ -632,6 +647,8 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
             "{field} stays optional"
         );
     }
+    let key = &upstream["properties"]["keys"]["items"];
+    assert_eq!(key["properties"]["quota_reset_at"]["format"], "date-time");
 }
 
 #[tokio::test]
@@ -712,9 +729,15 @@ async fn cooldowns_are_rounded_up_to_the_bucket_by_default() {
     cool_both(&rig).await;
     let doc = rig.health().await;
     let zen = &doc["upstreams"][0];
-    assert_eq!(zen["soonest_cooldown_seconds"], 300, "{zen}");
+    assert_eq!(
+        zen["soonest_cooldown_seconds"], 300,
+        "the cooldown must be rounded up"
+    );
     for key in zen["keys"].as_array().unwrap() {
-        assert_eq!(key["cooldown_seconds"], 300, "{key}");
+        assert_eq!(
+            key["cooldown_seconds"], 300,
+            "the key cooldown must be bucketed"
+        );
     }
     let rig = Rig::new("expose_key_labels = true\ncooldown_bucket_secs = 20\n").await;
     cool_both(&rig).await;
@@ -730,17 +753,20 @@ async fn any_of_several_named_peer_tokens_opens_health() {
         sha(second)
     ))
     .await;
-    for token in [PEER_TOKEN, second] {
+    for (i, token) in [PEER_TOKEN, second].into_iter().enumerate() {
         let (code, body) = rig.peer_get("/v1/health", Some(token)).await;
-        assert_eq!(code, 200, "{token}: {body}");
+        assert_eq!(code, 200, "peer token #{i} is accepted");
         assert!(
             !body.contains("peer-b"),
             "token names are never published: {body}"
         );
     }
-    for token in [ADMIN_TOKEN, STREAM_TOKEN, "not-a-peer-token"] {
+    for (i, token) in [ADMIN_TOKEN, STREAM_TOKEN, "not-a-peer-token"]
+        .into_iter()
+        .enumerate()
+    {
         let (code, _) = rig.peer_get("/v1/health", Some(token)).await;
-        assert_eq!(code, 401, "{token}");
+        assert_eq!(code, 401, "non-peer token #{i} is refused");
     }
 }
 
@@ -795,7 +821,7 @@ async fn host_stats_and_sessions_stay_out_unless_exposed() {
     let doc = rig.health().await;
     assert!(
         doc.get("host").is_none() && doc.get("sessions").is_none(),
-        "{doc}"
+        "host and session stats stay hidden"
     );
 }
 
@@ -837,7 +863,10 @@ async fn sessions_count_distinct_ids_once_per_request_whatever_the_retries() {
     rig.send(None).await;
     let doc = rig.health().await;
     let sessions = &doc["sessions"];
-    assert_eq!(sessions["active_sessions"], 2, "{sessions}");
+    assert_eq!(
+        sessions["active_sessions"], 2,
+        "the active session count must be two"
+    );
     assert_eq!(sessions["window_seconds"], 300);
     assert!(
         sessions.get("streams").is_none(),
@@ -846,7 +875,7 @@ async fn sessions_count_distinct_ids_once_per_request_whatever_the_retries() {
     let text = doc.to_string();
     assert!(
         !text.contains("ses_alpha") && !text.contains("client-a"),
-        "{text}"
+        "session ids and stream names stay hidden"
     );
 }
 

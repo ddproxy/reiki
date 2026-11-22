@@ -54,7 +54,8 @@ pub(crate) fn load(peers: &PeersConfig) -> Result<Option<Loaded>, String> {
     .map_err(|e| e.to_string())?
     .with_no_client_auth()
     .with_single_cert(chain, key)
-    .map_err(|e| format!("cannot use tls_cert with tls_key: {e}"))?;
+    // rustls reports a fixed description here; do not interpolate the parsed key material.
+    .map_err(|_| "cannot use tls_cert with tls_key".to_owned())?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let mut digest = cert_pem;
     digest.push(b'\n');

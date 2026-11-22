@@ -94,6 +94,8 @@ Quota cooldown takes the first of these that applies:
 
 A quota 429 with `Retry-After` cools the key for that long, not for the 5-hour default. A configured `quota_resets` still wins over the header. With neither, the 5-hour window applies. The test `a_quota_429_with_retry_after_cools_the_key_for_that_long` in `tests/exhausted.rs` covers this.
 
+When the wait comes from a `quota_resets` schedule or a non-zero `Retry-After`, the quota failure also carries the absolute reset instant. Peer health publishes it as `quota_reset_at` on the labelled key view; the fixed 5-hour window has no known reset and publishes nothing. A daily free-tier cap detected from the response body therefore gets a usable reset time when the key names its daily reset schedule.
+
 A cooldown only moves later. A shorter failure does not shorten a longer cooldown. A later, longer failure extends it.
 
 Invalid-credential phrases matched on `403`: `invalid api key`, `incorrect api key`, `api key is invalid`, `api key not valid`, `api key is not valid`, `api key has expired`, `api key has been revoked`, `api key is disabled`, `api_key_invalid`, `invalid_api_key`, `invalid x-api-key`, `invalid credential`, `credential has been revoked`, `credential has expired`, `invalid token`, `token has been revoked`, `token has expired`.

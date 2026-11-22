@@ -977,9 +977,12 @@ mod tests {
         let text = render(&c, Event::Request(event));
         assert!(
             !text.contains("hunter2") && !text.contains("abcdef0123456789abcdef"),
-            "{text}"
+            "the credential must be masked"
         );
-        assert!(text.contains("[REDACTED]"), "{text}");
+        assert!(
+            text.contains("[REDACTED]"),
+            "the masked marker must be present"
+        );
     }
 
     #[test]
@@ -1013,9 +1016,18 @@ mod tests {
                 &config,
                 Event::Response(response_with(Some(body.as_bytes()), false)),
             );
-            assert!(!line.contains("sk-0"), "{mode}: {line}");
-            assert!(!line.contains("abcdef0123456789"), "{mode}: {line}");
-            assert!(line.contains("[REDACTED]"), "{mode}: {line}");
+            assert!(
+                !line.contains("sk-0"),
+                "{mode}: the first secret fragment leaked"
+            );
+            assert!(
+                !line.contains("abcdef0123456789"),
+                "{mode}: the second secret fragment leaked"
+            );
+            assert!(
+                line.contains("[REDACTED]"),
+                "{mode}: the masked marker must be present"
+            );
         }
     }
 
@@ -1026,10 +1038,10 @@ mod tests {
             &response_config(""),
             Event::Response(response_with(Some(cut.as_bytes()), true)),
         );
-        assert!(!line.contains("sk-0123"), "{line}");
+        assert!(!line.contains("sk-0123"), "a cut secret fragment leaked");
         assert!(
             line.contains("[REDACTED]") && line.contains("\"body_truncated\":true"),
-            "{line}"
+            "the cut body must be redacted and marked"
         );
         let line = render(
             &response_config("sse = \"assembled\""),
@@ -1038,7 +1050,7 @@ mod tests {
                 true,
             )),
         );
-        assert!(!line.contains("sk-0123"), "{line}");
+        assert!(!line.contains("sk-0123"), "a cut secret fragment leaked");
     }
 
     #[test]
@@ -1052,7 +1064,10 @@ mod tests {
         event.body_bytes = full.len();
         let record = parsed(&body_config(""), event);
         assert_eq!(record["body_truncated"], true);
-        assert!(!record.to_string().contains("sk-0123"), "{record}");
+        assert!(
+            !record.to_string().contains("sk-0123"),
+            "a cut secret fragment leaked into the record"
+        );
         assert_eq!(record["body_bytes"], full.len());
     }
 

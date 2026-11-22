@@ -136,6 +136,31 @@ pub enum LoadError {
     },
 }
 
+impl LoadError {
+    /// The configured key name. This is an identifier, never the contents of the key file.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Read { key, .. }
+            | Self::Empty(key)
+            | Self::Short { key, .. }
+            | Self::Permissions { key, .. }
+            | Self::Long { key, .. } => key,
+        }
+    }
+
+    /// A fixed description of the failure, safe to print on stderr: unlike `Display`, it carries
+    /// no data read from the key file.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Read { .. } => "cannot read the key file",
+            Self::Empty(_) => "the key file is empty",
+            Self::Short { .. } => "the key is too short",
+            Self::Permissions { .. } => "the key file is accessible to group or others",
+            Self::Long { .. } => "the key is too long",
+        }
+    }
+}
+
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2539,7 +2564,11 @@ fn record(
         quota_phrase_matched,
         ..
     } = note;
-    let quota_cooldown = quota_cooldown(snapshot, key, class, app.wall_now(), quota_hint);
+    let wall_now = app.wall_now();
+    let quota_cooldown = quota_cooldown(snapshot, key, class, wall_now, quota_hint);
+    // The same schedule or `Retry-After` that set the wait gives an absolute reset. A quota
+    // without either keeps the fixed window and has no reset to publish.
+    let quota_reset_at = quota_cooldown.and_then(|wait| wall_now.checked_add(wait));
     let scoped = failure_scope(class, status, scope, quota_phrase_matched);
     let upstream = snapshot
         .config
@@ -2582,6 +2611,9 @@ fn record(
         counted = true;
         ring_cooled = cooled.is_some();
         if let Some(cooled_scope) = cooled {
+            if let Some(reset_at) = quota_reset_at {
+                health.note_quota_reset(key, reset_at, now);
+            }
             app.plugins().on_event(&Event::Cooldown {
                 key,
                 kind: FailureKind::from(class),
@@ -3560,7 +3592,10 @@ mod tests {
             let body = to_bytes(out.into_body(), usize::MAX).await.unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains("content coding"), "{coding}: {body}");
-            assert!(!body.contains(secret), "{coding}: {body}");
+            assert!(
+                !body.contains(secret),
+                "{coding}: the key must not be relayed"
+            );
         }
     }
 
@@ -4277,6 +4312,52 @@ mod tests {
             .lock()
             .unwrap()
             .cooling_class(key, Instant::now())
+    }
+
+    struct FixedClock(SystemTime);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> SystemTime {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_daily_quota_failure_records_its_reset_for_publishers() {
+        // 2026-01-01T23:59:57Z: the configured daily reset is three seconds out.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_311_997);
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.invalid/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
+             quota_resets = \"daily 00:00 UTC\"\n\
+             [streams.client]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n",
+            sha256_hex("tok")
+        );
+        let app = App::with_header_timeout_and_clock(
+            Config::parse(&text).unwrap(),
+            HashMap::from([("a".to_owned(), Secret::new("up-a"))]),
+            Policy::default(),
+            Duration::from_secs(5),
+            Arc::new(FixedClock(now)),
+        );
+        let snapshot = app.snapshot();
+        record(
+            &app,
+            &snapshot,
+            "client",
+            "a",
+            FailureClass::QuotaExhausted,
+            FailureNote::default(),
+        );
+        let health = app.health().lock().unwrap();
+        assert_eq!(
+            health.cooling_reset_at("a", Instant::now()),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(
+            health.cooling_class("a", Instant::now()),
+            Some(FailureClass::QuotaExhausted)
+        );
     }
 
     #[tokio::test]

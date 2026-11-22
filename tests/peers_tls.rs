@@ -141,7 +141,10 @@ async fn the_client_reads_a_tls_listener_through_the_issuing_ca_only() {
     let report = read_with(&dir, addr, &other).await;
     assert_eq!(report.state, "unknown");
     let error = report.error.unwrap().to_ascii_lowercase();
-    assert!(error.contains("certificate"), "{error}");
+    assert!(
+        error.contains("certificate"),
+        "the peer CA must verify the published certificate"
+    );
 }
 
 #[tokio::test]
@@ -174,7 +177,7 @@ async fn a_tls_key_others_can_read_is_refused_unless_warned_about() {
         .expect("refused");
     assert!(
         error.contains("peer TLS key") && error.contains("chmod 600"),
-        "{error}"
+        "the peer TLS key must not be readable by group or others"
     );
     assert!(
         start(|addr| publisher_text(&dir, addr, &files, "tls_key_permissions = \"warn\"\n"))
@@ -194,7 +197,10 @@ async fn a_key_that_does_not_match_the_certificate_is_refused() {
         .await
         .err()
         .expect("refused");
-    assert!(error.contains("tls_cert"), "{error}");
+    assert!(
+        error.contains("tls_cert"),
+        "the TLS key must match the certificate"
+    );
 }
 
 #[tokio::test]

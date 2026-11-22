@@ -73,18 +73,18 @@ async fn call(plugins: &str, tag: &str) -> (reqwest::header::HeaderMap, String) 
 #[tokio::test]
 async fn an_echoed_key_is_scrubbed_with_no_plugins() {
     let (headers, body) = call("", "none").await;
-    assert!(!body.contains(KEY), "{body}");
+    assert!(!body.contains(KEY), "the upstream key was echoed");
     assert!(!headers["x-echo"].to_str().unwrap().contains(KEY));
     assert!(
         body.starts_with("{\"echo\":\"["),
-        "the key was blanked in place: {body}"
+        "the key was blanked in place"
     );
 }
 
 #[tokio::test]
 async fn an_echoed_key_is_scrubbed_before_a_plugin_sees_it() {
     let (headers, body) = call("[plugins.phi]\nmode = \"report\"\n", "plugin").await;
-    assert!(!body.contains(KEY), "{body}");
+    assert!(!body.contains(KEY), "the upstream key was echoed");
     assert!(!headers["x-echo"].to_str().unwrap().contains(KEY));
 }
 

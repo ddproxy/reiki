@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::classify::FailureClass;
 use reiki_plugin::CooldownScope;
@@ -84,6 +84,9 @@ struct KeyHealth {
     cooling_until: Option<Instant>,
     /// The failure that set `cooling_until`. Stale once the deadline passes, so readers gate on it.
     cooling_class: Option<FailureClass>,
+    /// The wall-clock reset behind a quota cooldown, when the caller knows one. Stale with the
+    /// cooldown, and never read from a state file.
+    cooling_reset_at: Option<SystemTime>,
     /// Route-and-model cooldowns; in memory only, never persisted.
     scopes: HashMap<Scope, ScopeHealth>,
     disabled: bool,
@@ -272,6 +275,27 @@ impl KeyState {
         self.health.get(key)?.cooling_class
     }
 
+    /// The wall-clock reset behind a live quota cooldown. `None` for other classes, for a
+    /// restored cooldown, or when the caller had no reset to report.
+    pub fn cooling_reset_at(&self, key: &str, now: Instant) -> Option<SystemTime> {
+        if self.cooling_class(key, now) != Some(FailureClass::QuotaExhausted) {
+            return None;
+        }
+        self.health.get(key)?.cooling_reset_at
+    }
+
+    /// Records the reset behind a quota cooldown that just cooled the whole key. A scoped
+    /// cooldown has no key-level state to publish, and a failure that did not extend the key's
+    /// cooldown must not replace the reset already recorded for it.
+    pub fn note_quota_reset(&mut self, key: &str, reset_at: SystemTime, now: Instant) {
+        if self.cooling_class(key, now) != Some(FailureClass::QuotaExhausted) {
+            return;
+        }
+        if let Some(health) = self.health.get_mut(key) {
+            health.cooling_reset_at = Some(reset_at);
+        }
+    }
+
     /// Every known key's health, for persistence. Cooldowns are expressed as a
     /// remaining duration rather than an instant.
     pub fn snapshot(&self, now: Instant) -> HashMap<String, SavedHealth> {
@@ -297,6 +321,7 @@ impl KeyState {
             KeyHealth {
                 cooling_until: saved.cooling.map(|cooling| now + cooling),
                 cooling_class: None,
+                cooling_reset_at: None,
                 scopes: HashMap::new(),
                 disabled: saved.disabled,
                 transient_failures: saved.transient_failures,
@@ -752,6 +777,55 @@ mod tests {
         assert_eq!(state.cooling_remaining("a", now), Some(secs(5)));
         assert!(!state.is_available("a", now + secs(4)));
         assert!(state.is_available("a", now + secs(5)));
+    }
+
+    #[test]
+    fn a_quota_reset_is_kept_for_a_live_quota_cooldown_only() {
+        let mut state = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let reset = SystemTime::UNIX_EPOCH + secs(86_400);
+        state.record_failure("a", FailureClass::RateLimited(None), &policy, now);
+        state.note_quota_reset("a", reset, now);
+        assert_eq!(
+            state.cooling_reset_at("a", now),
+            None,
+            "not a quota cooldown"
+        );
+
+        state.enable("a");
+        state.record_failure_with(
+            "a",
+            FailureClass::QuotaExhausted,
+            &policy,
+            now,
+            Some(secs(5)),
+        );
+        state.note_quota_reset("a", reset, now);
+        assert_eq!(state.cooling_reset_at("a", now), Some(reset));
+        assert_eq!(state.cooling_reset_at("a", now + secs(5)), None, "expired");
+
+        state.enable("a");
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, now);
+        assert_eq!(
+            state.cooling_reset_at("a", now),
+            None,
+            "no reset was reported"
+        );
+        state.restore(
+            "a",
+            SavedHealth {
+                disabled: false,
+                cooling: Some(secs(60)),
+                transient_failures: 0,
+            },
+            now,
+        );
+        assert_eq!(
+            state.cooling_reset_at("a", now),
+            None,
+            "state file has no reset"
+        );
     }
 
     #[test]

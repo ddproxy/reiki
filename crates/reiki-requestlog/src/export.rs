@@ -511,9 +511,12 @@ mod tests {
         assert!(keys.iter().all(|key| allowed.contains(key)), "{keys:?}");
         assert_eq!(value["event"], "request_summary");
         assert_eq!(value["failure_class"], Value::Null);
-        assert!(!line.contains("body"), "{line}");
-        assert!(!line.contains("header"), "{line}");
-        assert!(!line.contains("query"), "{line}");
+        assert!(!line.contains("body"), "the export must not carry a body");
+        assert!(
+            !line.contains("header"),
+            "the export must not carry headers"
+        );
+        assert!(!line.contains("query"), "the export must not carry a query");
     }
 
     #[test]
@@ -526,7 +529,7 @@ mod tests {
             route: route("/v1/chat?token=sk-0123456789abcdef0123456789"),
             ..s
         });
-        assert!(!line.contains("sk-"), "{line}");
+        assert!(!line.contains("sk-"), "the export must not carry the token");
     }
 
     #[test]

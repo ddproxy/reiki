@@ -959,8 +959,14 @@ mod tests {
         let mut chunk = Bytes::from(stream);
         restorer.feed(&mut chunk, true, &secret_reverse());
         let out = String::from_utf8(chunk.to_vec()).unwrap();
-        assert!(out.contains(&format!("curl {SECRET} Falcon")), "{out}");
-        assert!(out.contains("\"content\":\"tok-123\""), "{out}");
+        assert!(
+            out.contains(&format!("curl {SECRET} Falcon")),
+            "tool-call arguments stayed masked"
+        );
+        assert!(
+            out.contains("\"content\":\"tok-123\""),
+            "the text delta was restored"
+        );
     }
 
     #[test]

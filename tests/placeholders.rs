@@ -161,27 +161,30 @@ async fn the_upstream_and_the_log_see_placeholders_and_the_client_gets_the_origi
     let upstream_body = rig.seen.0.lock().unwrap()[0].clone();
     assert!(
         !upstream_body.contains("Falcon") && !upstream_body.contains(&token),
-        "{upstream_body}"
+        "sensitive values must be masked before upstream"
     );
     assert!(upstream_body.contains("[[REIKI_TERM_") && upstream_body.contains("[[REIKI_SECRET_"));
 
     // The client got them back, byte for byte.
     assert!(
         reply.contains("Is Falcon late?") && reply.contains(&token),
-        "{reply}"
+        "the client must receive the original values"
     );
-    assert!(!reply.contains("REIKI"), "{reply}");
+    assert!(
+        !reply.contains("REIKI"),
+        "masked placeholders must not reach the client"
+    );
 
     // The log holds the masked request and the masked response.
     let log = rig.log();
     assert!(
         !log.contains("Falcon") && !log.contains(&token),
-        "sensitive value in the log: {log}"
+        "a sensitive value leaked into the log"
     );
     assert_eq!(
         log.matches("[[REIKI_TERM_").count(),
         2,
-        "request and response: {log}"
+        "the masked placeholders must be logged"
     );
     let _ = std::fs::remove_dir_all(&rig.dir);
 }
@@ -205,7 +208,10 @@ async fn a_placeholder_split_across_streamed_events_is_restored() {
         })
         .collect();
     assert_eq!(text, "The status of Falcon is green.");
-    assert!(reply.ends_with("data: [DONE]\n\n"), "{reply}");
+    assert!(
+        reply.ends_with("data: [DONE]\n\n"),
+        "the stream must end at DONE"
+    );
 
     let log = rig.log();
     assert!(!log.contains("Falcon"), "sensitive value in the log: {log}");

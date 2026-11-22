@@ -222,7 +222,7 @@ async fn a_stream_starts_with_a_snapshot_then_sends_key_changes() {
 
     rig.cool_both_keys().await;
     let (event, data) = reader.next_change().await;
-    assert_eq!(event, "key", "{data}");
+    assert_eq!(event, "key", "the key change event must be sent");
     let change: serde_json::Value = serde_json::from_str(&data).unwrap();
     assert_eq!(change["upstream"]["name"], "zen");
     assert_eq!(change["upstream"]["cooling_keys"], 2);
@@ -232,7 +232,10 @@ async fn a_stream_starts_with_a_snapshot_then_sends_key_changes() {
         "no labels by default"
     );
     for hidden in ["client-a", "zen-a", "upstream-zen", "ses_stream"] {
-        assert!(!data.contains(hidden), "{hidden} in {data}");
+        assert!(
+            !data.contains(hidden),
+            "a hidden label or session id appeared in the peer stream payload"
+        );
     }
 }
 
@@ -241,11 +244,17 @@ async fn labels_on_the_stream_follow_expose_key_labels() {
     let rig = Rig::new("expose_key_labels = true\n").await;
     let mut reader = Reader::new(rig.open(PEER_TOKEN).await);
     let (_, data) = reader.next().await;
-    assert!(data.contains("\"keys\":[{"), "{data}");
+    assert!(
+        data.contains("\"keys\":[{"),
+        "the snapshot must include key labels when expose_key_labels is enabled"
+    );
     rig.cool_both_keys().await;
     let (event, data) = reader.next_change().await;
     assert_eq!(event, "key");
-    assert!(data.contains("\"name\":\"zen-a\""), "{data}");
+    assert!(
+        data.contains("\"name\":\"zen-a\""),
+        "the key change event must include the key label when expose_key_labels is enabled"
+    );
 }
 
 #[tokio::test]
@@ -254,12 +263,18 @@ async fn host_and_session_events_come_only_with_host_stats() {
     let mut reader = Reader::new(rig.open(PEER_TOKEN).await);
     let (event, data) = reader.next().await;
     assert_eq!(event, "snapshot");
-    assert!(data.contains("\"host\":"), "{data}");
+    assert!(
+        data.contains("\"host\":"),
+        "the snapshot must include host stats when expose_host_stats is enabled"
+    );
     let mut saw_host = false;
     for _ in 0..3 {
         let (event, data) = reader.next().await;
         if event == "host" {
-            assert!(data.contains("\"cores\":"), "{data}");
+            assert!(
+                data.contains("\"cores\":"),
+                "the host event must include the core count"
+            );
             saw_host = true;
             break;
         }
@@ -277,8 +292,7 @@ async fn host_and_session_events_come_only_with_host_stats() {
         .expect("a sessions event");
     assert!(
         sessions.1.contains("\"active_sessions\":1"),
-        "{}",
-        sessions.1
+        "the sessions event must report one active session"
     );
     assert!(!sessions.1.contains("ses_stream"));
 }
@@ -286,8 +300,11 @@ async fn host_and_session_events_come_only_with_host_stats() {
 #[tokio::test]
 async fn the_stream_needs_the_peer_token_and_a_get() {
     let rig = Rig::new("").await;
-    for token in [ADMIN_TOKEN, STREAM_TOKEN, "wrong-token"] {
-        assert_eq!(rig.open(token).await.status(), 401, "{token}");
+    for (i, token) in [ADMIN_TOKEN, STREAM_TOKEN, "wrong-token"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(rig.open(token).await.status(), 401, "token #{i} is refused");
     }
     let res = rig
         .client
@@ -356,12 +373,19 @@ fn peer_b_token() -> String {
 #[tokio::test]
 async fn every_configured_peer_token_opens_a_stream() {
     let rig = Rig::new(&peer_b_token()).await;
-    for token in [PEER_TOKEN, PEER_B_TOKEN] {
+    for (i, token) in [PEER_TOKEN, PEER_B_TOKEN].into_iter().enumerate() {
         let mut reader = Reader::new(rig.open(token).await);
-        assert_eq!(reader.next().await.0, "snapshot", "{token}");
+        assert_eq!(
+            reader.next().await.0,
+            "snapshot",
+            "peer token #{i} is accepted"
+        );
     }
-    for token in [ADMIN_TOKEN, STREAM_TOKEN, "wrong-token"] {
-        assert_eq!(rig.open(token).await.status(), 401, "{token}");
+    for (i, token) in [ADMIN_TOKEN, STREAM_TOKEN, "wrong-token"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(rig.open(token).await.status(), 401, "token #{i} is refused");
     }
 }
 

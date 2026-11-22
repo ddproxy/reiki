@@ -8,11 +8,13 @@
 
 - `requestlog` now records summaries only by default. `body` defaults to `summary`, and a new `capture_bodies` option defaults to `false`; no prompt, response or tool-argument text is written to the file, socket or syslog unless body capture is explicitly enabled. The summary still records method, route, status, durations, byte counts, token-setting counts, key names, attempts and failure findings.
 - Body capture requires `capture_bodies = true`: `body = "full"` and `response = "body"` are config errors without it, and enabling it logs a startup warning. Every captured request, response and failed-attempt body is masked and capped by `max_capture_bytes` and `max_body_bytes`, and the live socket feed follows the same rules as the file and syslog sinks.
+- Security docs now spell out the agent-framework supply-chain scenario: bearer stream tokens have no source binding or built-in expiry, what they buy on the client and intercepted-tunnel listeners, why the global tunnel allow-list is not a per-stream control, and why body masking is not a general cloud-token detector. A regression test confirms that a valid token for another stream cannot authorise an intercepted host.
 ### Added
 
 - `requestlog` gains a summary-only export for log collectors at `[plugins.requestlog.export]`: rotating JSON Lines or RFC 5424 syslog over UDP/Unix datagram, with a bounded non-blocking queue and an allow-listed `request_summary` field set. Drops are counted as `reiki_requestlog_export_dropped_total`, exposed at `GET /v1/requestlog/metrics`, in `GET /v1/status` and in `reiki top`. See [summary export](docs/requestlog.md#summary-export).
 - New `toolpolicy` plugin inspects tool calls in OpenAI Chat and Anthropic Messages responses, in whole bodies and streams. It checks declared tools, user/system host provenance and command tripwires; `report` is the default and `block` replaces flagged calls with a plain-text notice. See [tool policy](docs/toolpolicy.md).
 - `toolpolicy` writes a rotating owner-only JSONL journal and serves counters at `GET /v1/toolpolicy/metrics` on the admin listener.
+- A quota cooldown with a known reset now carries that absolute instant to peer consumers as `quota_reset_at` on the labelled key view in `/v1/health`, with the peer OpenAPI schema and `reiki top` wire reader updated. Daily free tiers need a `quota_resets` schedule for the reset to be known; the fixed window publishes none.
 ### Added
 
 - Cargo-fuzz targets for the SSE/stream parser, scrubbing and redaction, JSON key-invalid detection, config and key-file parsing, percent-decoding and path normalisation, tunnel allow-lists and header parsers. Each target checks for panics, leaked secrets and unbounded output, with hand-written seed corpora and a weekly/manual CI workflow that uploads crash artifacts.
@@ -20,6 +22,7 @@
 
 ### Fixed
 
+- A malformed CA private key can no longer echo its PEM header text into `reiki` startup errors: key parsing reports a fixed description, and short-token and key-file errors likewise print fixed descriptions (with the configured key name) instead of data derived from the secret.
 - Terms in the `placeholders` plugin now match Unicode spellings whose lowercase mapping expands to several characters. A term written as `i` plus a combining dot is masked by `İ`, whose lowercase mapping is two characters, and a match inside the expansion masks the whole original character.
 - The stream scrubber finds a partial secret at a chunk boundary with one reverse-trie walk per byte instead of scanning every form of every key. High-throughput streaming with many configured keys no longer pays a per-form cost on each chunk.
 - Request paths are checked for dot segments and encoded separators through repeated percent-decoding, up to eight layers. Double-encoded forms such as `%252e%252e` are refused, and malformed escapes or undecodable bytes are refused rather than forwarded.

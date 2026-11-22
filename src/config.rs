@@ -2715,12 +2715,21 @@ file = "/etc/reiki/keys/zen-b"
         ];
         for text in cases {
             let error = Config::parse(&text).unwrap_err();
-            assert!(matches!(error, ConfigError::Parse(_)), "{text}: {error}");
+            assert!(
+                matches!(error, ConfigError::Parse(_)),
+                "the config must fail with a parse error"
+            );
             let shown = error.to_string();
-            assert!(!shown.contains(SENTINEL), "{text}: {shown}");
-            assert!(shown.contains("line "), "{shown}");
-            assert!(shown.contains("column "), "{shown}");
-            assert!(!shown.contains('|'), "no source excerpt: {shown}");
+            assert!(
+                !shown.contains(SENTINEL),
+                "the parse error must not quote the source"
+            );
+            assert!(shown.contains("line "), "the error must name the line");
+            assert!(shown.contains("column "), "the error must name the column");
+            assert!(
+                !shown.contains('|'),
+                "the error must not quote a source line"
+            );
         }
         let missing = Config::parse("[upstream.x]\n").unwrap_err().to_string();
         assert!(missing.contains("`base_url`"), "{missing}");

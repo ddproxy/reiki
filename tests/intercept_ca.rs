@@ -172,7 +172,10 @@ async fn startup_and_check_reject_a_ca_whose_key_does_not_match() {
     let config = Config::parse(&text).unwrap();
     let intercept = config.tunnel.as_ref().unwrap().intercept.as_ref().unwrap();
     let error = reiki::intercept::check_ca(intercept).unwrap_err();
-    assert!(error.contains("does not match"), "{error}");
+    assert!(
+        error.contains("does not match"),
+        "the CA key must match its certificate"
+    );
 
     let keys = load_keys(&config).unwrap();
     let app = App::new(config, keys, Policy::default(), PluginChain::default());
@@ -181,7 +184,10 @@ async fn startup_and_check_reject_a_ca_whose_key_does_not_match() {
     let error = Interceptor::new(app, &intercept)
         .err()
         .expect("a mismatched CA is refused");
-    assert!(error.contains("does not match"), "{error}");
+    assert!(
+        error.contains("does not match"),
+        "the CA key must match its certificate"
+    );
 }
 
 #[tokio::test]
@@ -231,7 +237,10 @@ async fn a_refused_ca_leaves_the_running_one_serving() {
         .app
         .reload_from_file(&rig.config)
         .expect_err("a CA that does not cover the host is refused");
-    assert!(error.contains(HOST), "{error}");
+    assert!(
+        error.contains(HOST),
+        "the CA must cover the configured host"
+    );
     let mut tls = rig.tls(&old_pem).await.unwrap();
     assert_eq!(get(&mut tls).await, 200);
 }

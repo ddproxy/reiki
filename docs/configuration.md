@@ -200,7 +200,7 @@ One upstream key. The file holds the key; the config holds only its path.
 | `file` | string | required | Path to the file that holds the key. Read at startup and on reload. The contents are trimmed and must be at least 8 bytes. |
 | `quota_resets` | string | unset | When a quota cooldown ends. `daily HH:MM ZONE` or `monthly D HH:MM ZONE`, where `D` is 1 to 28 and `ZONE` is `UTC` or `+HH:MM` / `-HH:MM`. Without it a quota cooldown lasts 5 hours. |
 
-A quota 429 that carries `Retry-After` cools the key for that long. A `quota_resets` schedule takes precedence over both. See [providers](providers.md).
+A quota 429 that carries `Retry-After` cools the key for that long. A `quota_resets` schedule takes precedence over both. A schedule also gives peer consumers the absolute reset as `quota_reset_at`; without a schedule or a non-zero `Retry-After`, no reset time is published. See [providers](providers.md).
 
 ## `[streams.NAME]`
 

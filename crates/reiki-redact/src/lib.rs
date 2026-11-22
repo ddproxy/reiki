@@ -296,7 +296,10 @@ mod tests {
         ];
         for key in keys {
             let text = format!("k={key};");
-            assert_eq!(found(&text), vec![key.as_str()], "{key}");
+            assert!(
+                found(&text) == vec![key.as_str()],
+                "the provider key shape must be detected"
+            );
         }
         assert!(
             scan("hf_short and sk_live_x and half_0123456789abcdefABCDEFghijklmnopqr").is_empty()

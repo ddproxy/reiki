@@ -155,6 +155,9 @@ mod tests {
         sessions.observe("client-a", "ses_secret_value", WINDOW, Instant::now());
         let seen = sessions.seen.lock().unwrap();
         let text = format!("{seen:?}");
-        assert!(!text.contains("ses_secret_value"), "{text}");
+        assert!(
+            !text.contains("ses_secret_value"),
+            "the session id must be stored as a hash"
+        );
     }
 }

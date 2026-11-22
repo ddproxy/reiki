@@ -648,7 +648,10 @@ async fn main() {
     let logging =
         Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
     reiki::logging::install_panic_hook();
-    let keys = load_keys(&config).unwrap_or_else(|e| fail(&e.to_string()));
+    let keys = load_keys(&config).unwrap_or_else(|e| {
+        // Name the key and the kind of failure; the key file's contents never reach stderr.
+        fail(&format!("cannot load key `{}`: {}", e.key(), e.kind()))
+    });
     let plugin_tables = if checking {
         with_dry_run(&config.plugins)
     } else {

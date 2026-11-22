@@ -57,6 +57,18 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// A fixed description of a CA key parse failure. The parser's own text is deliberately dropped:
+/// for example, a malformed PEM header can echo a line of the private key file back to stderr.
+fn ca_key_error_kind(error: &rcgen::Error) -> &'static str {
+    match error {
+        rcgen::Error::CouldNotParseKeyPair => "the key is not a supported private key",
+        rcgen::Error::RingKeyRejected(_) => "the crypto provider rejected the key",
+        rcgen::Error::PemError(_) => "the key file is not valid PEM",
+        rcgen::Error::X509(_) => "the key file holds invalid X.509 data",
+        _ => "the key file could not be parsed",
+    }
+}
+
 pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -220,7 +232,8 @@ impl Authority {
         let key_pem = std::fs::read_to_string(key_path)
             .map_err(|e| format!("cannot read {key_path}: {e}"))?;
         let fingerprint = crate::auth::sha256_hex(&format!("{cert_pem}\n{key_pem}"));
-        let key = KeyPair::from_pem(&key_pem).map_err(|e| format!("bad CA key: {e}"))?;
+        let key = KeyPair::from_pem(&key_pem)
+            .map_err(|e| format!("bad CA key: {}", ca_key_error_kind(&e)))?;
         let key_spki = key.subject_public_key_info();
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, key)
             .map_err(|e| format!("bad CA certificate: {e}"))?;
@@ -792,8 +805,10 @@ mod tests {
         let text = format!(
             "[upstream.api]\nbase_url = \"https://example.com/v1\"\n\
              [keys.k]\nupstream = \"api\"\nfile = \"/unused\"\n\
-             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
-            crate::auth::sha256_hex(token)
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n\
+             [streams.other]\ntoken_sha256 = \"{}\"\nchain = [\"k\"]\n",
+            crate::auth::sha256_hex(token),
+            crate::auth::sha256_hex("other-stream-token")
         );
         App::new(
             crate::config::Config::parse(&text).unwrap(),
@@ -856,6 +871,11 @@ mod tests {
         assert_eq!(
             interceptor.authorize("api.test", None, Some(peer)),
             InterceptAuth::Refused
+        );
+        assert_eq!(
+            interceptor.authorize("api.test", Some("Bearer other-stream-token"), Some(peer)),
+            InterceptAuth::Refused,
+            "a valid token for another stream does not authorise this host"
         );
         let InterceptAuth::Authorized(target) =
             interceptor.authorize("api.test", Some("Bearer tok"), Some(peer))
@@ -1007,7 +1027,10 @@ mod tests {
         std::fs::copy(b.join("ca.key"), mixed.join("ca.key")).unwrap();
 
         let error = check_ca(&intercept_config(&mixed, &["api.example.com"])).unwrap_err();
-        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            error.contains("does not match"),
+            "the CA key must match its certificate"
+        );
     }
 
     #[test]
@@ -1020,7 +1043,10 @@ mod tests {
         write_ca(&dir, params);
 
         let error = check_ca(&intercept_config(&dir, &["api.example.com"])).unwrap_err();
-        assert!(error.contains("name constraint"), "{error}");
+        assert!(
+            error.contains("name constraint"),
+            "the CA needs a DNS name constraint"
+        );
     }
 
     #[test]
@@ -1037,7 +1063,36 @@ mod tests {
         write_ca(&dir, params);
 
         let error = check_ca(&intercept_config(&dir, &["api.example.com"])).unwrap_err();
-        assert!(error.contains("expired"), "{error}");
+        assert!(error.contains("expired"), "the CA must not be expired");
+    }
+
+    #[test]
+    fn a_bad_ca_key_error_never_echoes_the_key_file() {
+        let dir = scratch("bad-key-message");
+        init_ca(&dir, &["api.example.com".to_owned()], 30, false).unwrap();
+        // A malformed PEM header makes the parser's error include this line of the key file.
+        let marker = "ca-key-marker-must-not-be-printed";
+        let key_pem =
+            format!("-----BEGIN PRIVATE KEY-----\n{marker}\n\nAAAA\n-----END PRIVATE KEY-----\n");
+        std::fs::remove_file(dir.join("ca.key")).unwrap();
+        write_private(&dir.join("ca.key"), key_pem.as_bytes()).unwrap();
+        assert!(
+            rcgen::KeyPair::from_pem(&key_pem)
+                .unwrap_err()
+                .to_string()
+                .contains(marker),
+            "the parser echoes a malformed header; the check must not"
+        );
+
+        let error = check_ca(&intercept_config(&dir, &["api.example.com"])).unwrap_err();
+        assert!(
+            error.contains("bad CA key"),
+            "the CA key check must report the fixed bad-CA-key error kind"
+        );
+        assert!(
+            !error.contains(marker),
+            "the CA key error must not echo the key file"
+        );
     }
 
     #[test]

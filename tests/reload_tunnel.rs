@@ -252,7 +252,10 @@ fn a_ca_that_misses_a_configured_host_refuses_the_reload() {
         ))
         .err()
         .unwrap_or_else(|| panic!("a CA that does not cover every host is refused"));
-    assert!(error.contains("other.test"), "{error}");
+    assert!(
+        error.contains("other.test"),
+        "the CA must cover every configured host"
+    );
 }
 
 #[test]
@@ -264,7 +267,10 @@ fn a_host_the_running_ca_may_not_sign_for_refuses_the_reload() {
         .plan_reload(&rig.config(&["api.test", "other.test", "elsewhere.test"], "", &ca))
         .err()
         .unwrap_or_else(|| panic!("a new host outside the CA's name constraint is refused"));
-    assert!(error.contains("elsewhere.test"), "{error}");
+    assert!(
+        error.contains("elsewhere.test"),
+        "the CA must cover every configured host"
+    );
     rig.tunnel
         .plan_reload(&rig.config(&["api.test", "other.test"], "", &ca))
         .expect("hosts the CA covers still reload");
@@ -288,7 +294,10 @@ fn a_ca_key_that_does_not_match_its_certificate_refuses_the_reload() {
         .plan_reload(&rig.config(&["api.test"], "", &mixed.display().to_string()))
         .err()
         .unwrap_or_else(|| panic!("a mismatched key is refused"));
-    assert!(error.contains("does not match"), "{error}");
+    assert!(
+        error.contains("does not match"),
+        "the CA key must match its certificate"
+    );
 }
 
 #[test]
@@ -307,7 +316,7 @@ fn an_expired_ca_refuses_the_reload() {
         .plan_reload(&rig.config(&["api.test"], "", &old.display().to_string()))
         .err()
         .unwrap_or_else(|| panic!("an expired CA is refused"));
-    assert!(error.contains("expired"), "{error}");
+    assert!(error.contains("expired"), "the CA must not be expired");
 }
 
 #[test]
@@ -320,7 +329,10 @@ fn a_ca_without_a_dns_name_constraint_refuses_the_reload() {
         .plan_reload(&rig.config(&["api.test"], "", &open.display().to_string()))
         .err()
         .unwrap_or_else(|| panic!("an unconstrained CA is refused"));
-    assert!(error.contains("name constraint"), "{error}");
+    assert!(
+        error.contains("name constraint"),
+        "the CA needs a DNS name constraint"
+    );
 }
 
 #[test]

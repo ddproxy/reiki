@@ -515,7 +515,7 @@ async fn sse_thinking_and_signature_deltas_are_relayed_byte_identically() {
         .map(str::to_owned)
         .collect();
     assert_eq!(got_names, names, "SSE framing changed");
-    assert!(reply.contains("id: 7\n"), "the SSE id was dropped: {reply}");
+    assert!(reply.contains("id: 7\n"), "the SSE id was dropped");
     assert!(reply.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
 }
 
@@ -546,8 +546,14 @@ async fn a_second_turn_masks_history_to_the_same_placeholder() {
     )
     .await;
     let reply = rig.post(&turn1).await;
-    assert!(reply.contains(&secret), "{reply}");
-    assert!(!reply.contains("REIKI"), "{reply}");
+    assert!(
+        reply.contains(&secret),
+        "the client must receive the restored secret"
+    );
+    assert!(
+        !reply.contains("REIKI"),
+        "masked placeholders must not reach the client"
+    );
 
     let turn2 = json!({
         "model": "claude-sonnet-4-5",

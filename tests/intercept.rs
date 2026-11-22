@@ -196,10 +196,13 @@ fn blanked() -> String {
 async fn a_request_gets_the_real_key_and_the_plugins() {
     let s = setup("key", "[plugins.tag]", "").await;
     let (status, body) = request(&s, HOST, "POST", "/v1/chat/completions", "{\"a\":1}").await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 200, "the request must succeed");
     // With a plugin configured the response is chunked, so only the payload is compared.
     let expected = format!("/v1/chat/completions|{}|seen|{{\"a\":1}}", blanked());
-    assert!(body.contains(&expected), "{body}");
+    assert!(
+        body.contains(&expected),
+        "the echoed credential must be blanked"
+    );
     assert!(!body.contains("client-supplied"));
 }
 
@@ -245,10 +248,10 @@ async fn the_ca_refuses_names_outside_its_constraint() {
 async fn listed_paths_reach_the_host_as_sent() {
     let s = setup("paths", "", r#", paths = ["/inference"]"#).await;
     let (status, body) = request(&s, HOST, "POST", "/inference/openai/v1/chat", "{}").await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        body,
-        format!("/inference/openai/v1/chat|{}|-|{{}}", blanked())
+    assert_eq!(status, 200, "the request must succeed");
+    assert!(
+        body == format!("/inference/openai/v1/chat|{}|-|{{}}", blanked()),
+        "the echoed credential must be blanked"
     );
     for path in ["/v1/chat", "/inference2/x", "/"] {
         let (status, _) = request(&s, HOST, "GET", path, "").await;

@@ -276,7 +276,8 @@ fn token_minutes<'de, D: Deserializer<'de>>(
     Ok(counts::<D, 10>(deserializer)?.map(narrow))
 }
 
-/// One labelled key. `cooldown_class` is set only for a cooling key whose class is known.
+/// One labelled key. `cooldown_class` is set only for a cooling key whose class is known, and
+/// `quota_reset_at` only for a quota cooldown with a known reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "KeyViewWire")]
 pub struct KeyView {
@@ -287,6 +288,9 @@ pub struct KeyView {
     /// Only published for a cooling key whose class is known, so absence is valid.
     #[serde(default)]
     pub cooldown_class: Option<String>,
+    /// RFC3339 UTC reset, only for a cooling quota key with a reported reset.
+    #[serde(default)]
+    pub quota_reset_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -297,6 +301,8 @@ struct KeyViewWire {
     cooldown_seconds: RequiredNullable<u64>,
     #[serde(default)]
     cooldown_class: Option<String>,
+    #[serde(default)]
+    quota_reset_at: Option<String>,
 }
 
 impl From<KeyViewWire> for KeyView {
@@ -306,6 +312,7 @@ impl From<KeyViewWire> for KeyView {
             state: wire.state,
             cooldown_seconds: wire.cooldown_seconds.0,
             cooldown_class: wire.cooldown_class,
+            quota_reset_at: wire.quota_reset_at,
         }
     }
 }
@@ -727,6 +734,7 @@ mod tests {
                "cooldown_class" : "quota_exhausted",
                "cooldown_seconds" : 300,
                "name" : "b",
+               "quota_reset_at" : "2026-11-14T00:00:00Z",
                "state" : "cooling"
             },
             {
@@ -1623,6 +1631,11 @@ mod tests {
         assert_eq!(keys[1].state, "cooling");
         assert_eq!(keys[1].cooldown_seconds, Some(300));
         assert_eq!(keys[1].cooldown_class.as_deref(), Some("quota_exhausted"));
+        assert_eq!(
+            keys[1].quota_reset_at.as_deref(),
+            Some("2026-11-14T00:00:00Z")
+        );
+        assert_eq!(keys[0].quota_reset_at, None, "available keys have no reset");
         assert_eq!(keys[2].state, "out_of_rotation");
     }
 

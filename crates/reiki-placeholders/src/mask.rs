@@ -512,13 +512,19 @@ mod tests {
         let out = m
             .mask("see Project Falcon Heights now", &mut reverse)
             .unwrap();
-        assert!(!out.contains("Heights") && !out.contains("Falcon"), "{out}");
+        assert!(
+            !out.contains("Heights") && !out.contains("Falcon"),
+            "the overlapping terms must be masked"
+        );
 
         let m = masker(&["Acme-ghp"], true);
         let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
         let mut reverse = HashMap::new();
         let out = m.mask(&format!("Acme-{key} x"), &mut reverse).unwrap();
-        assert!(!out.contains("0123456789abcdef"), "{out}");
+        assert!(
+            !out.contains("0123456789abcdef"),
+            "an API key leaked into the masked body"
+        );
     }
 
     #[test]
@@ -529,7 +535,10 @@ mod tests {
             r#"{{"type":"document","source":{{"type":"text","media_type":"text/plain","data":"use {key}"}}}}"#
         );
         let out = m.mask(&text_doc, &mut HashMap::new()).unwrap();
-        assert!(!out.contains(&key), "{out}");
+        assert!(
+            !out.contains(&key),
+            "an API key leaked into the masked body"
+        );
         let base64_doc = format!(
             r#"{{"type":"document","source":{{"type":"base64","media_type":"application/pdf","data":"{key}"}}}}"#
         );
@@ -703,7 +712,10 @@ mod tests {
         let body = format!(r#"{{"text":"use {key} now"}}"#);
         let mut reverse = HashMap::new();
         let out = m.mask(&body, &mut reverse).unwrap();
-        assert!(!out.contains(&key), "{out}");
+        assert!(
+            !out.contains(&key),
+            "an API key leaked into the masked body"
+        );
         assert_eq!(reverse.values().next().unwrap(), &key);
     }
 

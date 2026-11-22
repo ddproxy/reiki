@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::chain::{KeyState, KeyStatus};
+use crate::classify::FailureClass;
 use crate::config::{Config, PeersConfig};
 use crate::pressure::PressureCounter;
 use crate::proxy::App;
@@ -79,6 +80,11 @@ pub(crate) fn upstreams(
                 if wait.is_some() {
                     if let Some(class) = health.cooling_class(key, now) {
                         item["cooldown_class"] = json!(class.name());
+                        if class == FailureClass::QuotaExhausted {
+                            if let Some(reset_at) = health.cooling_reset_at(key, now) {
+                                item["quota_reset_at"] = json!(crate::reload::rfc3339(reset_at));
+                            }
+                        }
                     }
                 }
                 listed.push(item);
@@ -353,15 +359,21 @@ mod tests {
                 "an upstream with no keys"
             );
             let text = serde_json::to_string(&out).unwrap();
-            for secret in [
+            for (i, secret) in [
                 "model-x",
                 "model-y",
                 "/chat",
                 "/responses",
                 "route",
                 "model",
-            ] {
-                assert!(!text.contains(secret), "`{secret}` leaked: {text}");
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    !text.contains(secret),
+                    "secret #{i} leaked into the health document"
+                );
             }
         }
     }
@@ -415,6 +427,29 @@ mod tests {
             zen["keys"][2].get("cooldown_class").is_none(),
             "c is out of rotation"
         );
+    }
+
+    #[test]
+    fn a_quota_reset_is_published_only_for_a_labelled_quota_key() {
+        let config = config();
+        let mut health = KeyState::default();
+        let now = Instant::now();
+        let policy = Policy::default();
+        let reset = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+        health.record_failure_with("a", FailureClass::QuotaExhausted, &policy, now, None);
+        health.note_quota_reset("a", reset, now);
+        health.record_failure(
+            "b",
+            FailureClass::RateLimited(Some(Duration::from_secs(10))),
+            &policy,
+            now,
+        );
+
+        let zen = &upstreams(&config, &mut health, now, true, 0, None)[1];
+        assert_eq!(zen["keys"][0]["quota_reset_at"], "1970-01-02T00:00:00Z");
+        assert!(zen["keys"][1].get("quota_reset_at").is_none());
+        let unlabelled = &upstreams(&config, &mut health, now, false, 0, None)[1];
+        assert!(!unlabelled.to_string().contains("quota_reset_at"));
     }
 
     #[test]
@@ -524,8 +559,14 @@ mod tests {
         assert_eq!(doc["failures"]["request_error"], 1);
         assert!(doc["failures"].get("not_a_class").is_none());
         let text = doc.to_string();
-        for hidden in ["secret-key-name", "stream-name", "a body", "120"] {
-            assert!(!text.contains(hidden), "`{hidden}` leaked: {text}");
+        for (i, hidden) in ["secret-key-name", "stream-name", "a body", "120"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !text.contains(hidden),
+                "hidden value #{i} leaked into the health document"
+            );
         }
     }
 

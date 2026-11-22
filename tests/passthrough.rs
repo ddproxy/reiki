@@ -104,7 +104,7 @@ async fn the_clients_key_query_parameter_reaches_the_upstream_untouched() {
 
     assert!(
         body.ends_with("/zen/v1/chat/completions?key=client-secret&x=1"),
-        "the client's query key was changed: {body}"
+        "the client's query key must be forwarded unchanged"
     );
 }
 
@@ -119,7 +119,7 @@ async fn no_reiki_token_is_needed_and_none_of_reikis_keys_are_used() {
         .unwrap();
     let body = status.text().await.unwrap();
 
-    assert!(body.starts_with("-|"), "no credential was invented: {body}");
+    assert!(body.starts_with("-|"), "no credential was invented");
     assert!(!body.contains("reiki-held-key"));
 }
 

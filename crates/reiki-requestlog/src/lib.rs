@@ -673,9 +673,12 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("client-secret-token"),
-            "credential leaked: {text}"
+            "credential leaked into the log"
         );
-        assert!(!text.to_lowercase().contains("authorization"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("authorization"),
+            "the credential header must not be logged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -697,10 +700,19 @@ mod tests {
         assert_eq!(records[0]["body_bytes"], body.len());
         assert_eq!(records[0]["body_summary"]["messages"], 1);
         assert_eq!(records[0]["body_summary"]["tools"], 1);
-        assert!(records[0].get("body").is_none(), "{text}");
-        assert!(records[1].get("body").is_none(), "{text}");
-        assert!(!text.contains(&secret), "{text}");
-        assert!(!text.contains("private"), "{text}");
+        assert!(
+            records[0].get("body").is_none(),
+            "the request record must omit the body"
+        );
+        assert!(
+            records[1].get("body").is_none(),
+            "the response record must omit the body"
+        );
+        assert!(!text.contains(&secret), "the secret leaked into the log");
+        assert!(
+            !text.contains("private"),
+            "the tool arguments leaked into the log"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -720,11 +732,23 @@ mod tests {
         let records = lines(&path);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(records.len(), 2);
-        assert!(records[0].get("body").is_some(), "{text}");
-        assert!(!text.contains(&secret), "{text}");
-        assert!(text.contains("[REDACTED]"), "{text}");
+        assert!(
+            records[0].get("body").is_some(),
+            "the opt-in body must be recorded"
+        );
+        assert!(
+            !text.contains(&secret),
+            "the opt-in body leaked into the log"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "the opt-in body must be redacted"
+        );
         let logged = records[0]["body"].as_str().unwrap();
-        assert!(logged.len() <= 64, "{logged}");
+        assert!(
+            logged.len() <= 64,
+            "the logged body must stay within the cap"
+        );
         assert_eq!(records[0]["body_truncated"], true);
         assert_eq!(records[0]["body_bytes"], body.len());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1048,7 +1072,10 @@ mod tests {
         BufReader::new(client).read_line(&mut line).unwrap();
         let record: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(record["body_summary"]["model"], "streamed");
-        assert!(record.get("body").is_none(), "{line}");
+        assert!(
+            record.get("body").is_none(),
+            "the live stream record must omit the body"
+        );
         drop(plugin);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1080,10 +1107,19 @@ mod tests {
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         let record: Value = serde_json::from_str(&line).unwrap();
-        assert!(!line.contains(&secret), "{line}");
+        assert!(
+            !line.contains(&secret),
+            "the opt-in body leaked into the stream"
+        );
         let logged = record["body"].as_str().unwrap_or_default();
-        assert!(logged.contains("[REDACTED]"), "{line}");
-        assert!(logged.len() <= 64, "{logged}");
+        assert!(
+            logged.contains("[REDACTED]"),
+            "the opt-in body must be redacted"
+        );
+        assert!(
+            logged.len() <= 64,
+            "the logged body must stay within the cap"
+        );
         assert_eq!(record["body_truncated"], true);
         drop(plugin);
         let _ = std::fs::remove_dir_all(&dir);

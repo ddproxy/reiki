@@ -625,7 +625,10 @@ mod tests {
         for cut in 0..=body.len() {
             let (a, b) = body.as_bytes().split_at(cut);
             let out = String::from_utf8(run(&[a, b])).unwrap();
-            assert!(!out.contains("secret-1234"), "cut {cut}: {out}");
+            assert!(
+                !out.contains("secret-1234"),
+                "cut {cut}: a secret leaked after the chunk split"
+            );
             assert_eq!(out.len(), body.len(), "cut {cut}");
         }
     }
@@ -633,7 +636,10 @@ mod tests {
     #[test]
     fn a_key_split_across_three_chunks_is_caught() {
         let out = String::from_utf8(run(&[b"a sk-sec", b"ret-", b"1234 b"])).unwrap();
-        assert!(!out.contains("secret"), "{out}");
+        assert!(
+            !out.contains("secret"),
+            "a secret leaked across three chunks"
+        );
         assert_eq!(out.len(), "a sk-secret-1234 b".len());
     }
 
@@ -808,12 +814,15 @@ mod tests {
                     .strip_prefix("x\"[")
                     .and_then(|o| o.strip_suffix("\"y"))
                     .map(|o| o.trim_end_matches('=').trim_end_matches(']'))
-                    .unwrap_or_else(|| panic!("{name} cut {cut}: {out}"));
+                    .unwrap_or_else(|| panic!("{name} cut {cut}: an encoded secret leaked"));
                 assert!(
                     !inner.is_empty() && inner.bytes().all(|b| b == b'*'),
-                    "{name} cut {cut}: {out}"
+                    "{name} cut {cut}: an encoded secret leaked"
                 );
-                assert!(out.len() == body.len(), "{name} cut {cut}: {out}");
+                assert!(
+                    out.len() == body.len(),
+                    "{name} cut {cut}: the scrubbed length changed"
+                );
             }
         }
     }
@@ -857,7 +866,7 @@ mod tests {
         );
         let text = format!("echo {long}");
         let out = scrub_text(&text, &[short, &long]);
-        assert!(!out.contains("-long"), "{out}");
+        assert!(!out.contains("-long"), "a long secret form leaked");
         assert_eq!(out.len(), text.len());
     }
 
@@ -890,8 +899,14 @@ mod tests {
         let text = format!("raw {KEY} json {ODD}");
         let out = scrub_text(&text, &[KEY, ODD]);
         assert_eq!(out.len(), text.len());
-        assert!(!out.contains("secret"), "{out}");
-        assert!(!out.contains("sk-"), "{out}");
+        assert!(
+            !out.contains("secret"),
+            "a secret form leaked into the scrubbed text"
+        );
+        assert!(
+            !out.contains("sk-"),
+            "a secret prefix leaked into the scrubbed text"
+        );
         assert_eq!(scrub_text("nothing to hide", &[KEY]), "nothing to hide");
     }
 

@@ -505,6 +505,8 @@ fn deadline_reached_inside_host_call_is_enforced() {
     let mut table = base_table("no-grant", NO_GRANT, "deadline");
     set_string(&mut table, "role", "security");
     set_string(&mut table, "on_error", "reject");
+    // Load/init uses the wall budget, so a short request deadline cannot make
+    // loading flaky. The fixture's host calls then cross the request deadline.
     set_limits(&mut table, &[("deadline-ms", 1)]);
     let plugin = load(&engine, NO_GRANT, &table).unwrap();
     let out = invoke(&plugin, "/x", b"{}");
@@ -515,6 +517,28 @@ fn deadline_reached_inside_host_call_is_enforced() {
         }
         other => panic!("expected deadline reject, got {other:?}"),
     }
+}
+
+#[test]
+fn init_is_bounded_by_the_wall_budget() {
+    // Keep fuel above what a 1 ms init can burn so the epoch deadline fires first.
+    let bytes = edit_manifest(NO_GRANT, |toml| {
+        toml.replace("fuel_per_call = 10000000", "fuel_per_call = 2000000000")
+    });
+    let engine = engine();
+    let mut table = base_table("no-grant", &bytes, "init-fuel");
+    set_string(&mut table, "on_error", "reject");
+    set_limits(&mut table, &[("wall-budget-ms", 1)]);
+    let err = load(&engine, &bytes, &table)
+        .err()
+        .expect("a spinning init must be bounded");
+    // The 1 ms budget is enforced either by the epoch interrupt or, when a
+    // host call polls first, by the explicit deadline check.
+    assert!(
+        err.contains("init no-grant: deadline exceeded")
+            || err.contains("instantiate no-grant: wasm trap: interrupt"),
+        "{err}"
+    );
 }
 
 #[test]

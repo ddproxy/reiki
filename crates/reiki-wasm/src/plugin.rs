@@ -217,7 +217,7 @@ impl WasmPlugin {
         Ok(plugin)
     }
 
-    fn make_state(&self) -> HostState {
+    fn make_state(&self, budget_ms: u64) -> HostState {
         let limits = StoreLimitsBuilder::new()
             .memory_size((self.limits.memory_mib * 1024 * 1024) as usize)
             // Without this, memory.grow returns -1 and the guest allocator aborts with
@@ -226,7 +226,7 @@ impl WasmPlugin {
             .build();
         // Inert WASI p2: no preopens, empty env/args, stdio sink.
         let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
-        let deadline = Duration::from_millis(self.limits.deadline_ms);
+        let deadline = Duration::from_millis(budget_ms);
         let config_toml = toml::to_string(&self.config.config)
             .unwrap_or_default()
             .into_bytes();
@@ -249,29 +249,28 @@ impl WasmPlugin {
         }
     }
 
-    fn make_store(&self, body_len: usize) -> Store<HostState> {
-        let mut store = Store::new(self.engine.engine(), self.make_state());
+    fn make_store(&self, body_len: usize, budget_ms: u64) -> Store<HostState> {
+        let mut store = Store::new(self.engine.engine(), self.make_state(budget_ms));
         store.limiter(|s| &mut s.limits);
         let fuel = self.limits.fuel_for_body(body_len);
         let _ = store.set_fuel(fuel);
-        store.set_epoch_deadline(Self::budget_ticks(&self.limits));
+        store.set_epoch_deadline(Self::budget_ticks(budget_ms));
         store.epoch_deadline_trap();
         store
     }
 
-    /// Ticks until a store traps, derived from the tightest configured time budget.
-    /// The engine ticks every 10 ms, so this also bounds a pure-Wasm loop that
-    /// never calls a checked host function.
-    fn budget_ticks(limits: &EffectiveLimits) -> u64 {
-        limits
-            .deadline_ms
-            .min(limits.wall_budget_ms)
-            .div_ceil(EPOCH_TICK_MS)
-            .max(1)
+    /// Ticks until a store traps for a given time budget. The engine ticks every
+    /// 10 ms, so this also bounds a pure-Wasm loop that never calls a checked
+    /// host function.
+    fn budget_ticks(budget_ms: u64) -> u64 {
+        budget_ms.div_ceil(EPOCH_TICK_MS).max(1)
     }
 
+    /// Load/init is a separate phase from a request, so it gets the wall budget
+    /// rather than the (possibly much shorter) per-request deadline. It stays
+    /// bounded by the wall budget and its host ceiling.
     fn run_init(&self) -> Result<(), String> {
-        let mut store = self.make_store(0);
+        let mut store = self.make_store(0, self.limits.wall_budget_ms);
         let config_bytes = toml::to_string(&self.config.config)
             .unwrap_or_default()
             .into_bytes();
@@ -314,7 +313,9 @@ impl WasmPlugin {
         }
         self.enforce_tool_allowlist(ctx)?;
 
-        let mut store = self.make_store(body_len);
+        // A request gets its own deadline, still capped by the wall budget.
+        let request_budget = self.limits.deadline_ms.min(self.limits.wall_budget_ms);
+        let mut store = self.make_store(body_len, request_budget);
         store.data_mut().request = Some(HostRequest {
             stream: ctx.stream.to_owned(),
             upstream: ctx.upstream.to_owned(),
@@ -1019,21 +1020,10 @@ mod tests {
     }
 
     #[test]
-    fn epoch_deadline_uses_the_tightest_budget() {
-        let limits = EffectiveLimits {
-            memory_mib: 16,
-            fuel_per_call: 10_000_000,
-            fuel_per_kib: 200_000,
-            deadline_ms: 250,
-            wall_budget_ms: 1_000,
-            max_body_kib: 1024,
-        };
-        assert_eq!(WasmPlugin::budget_ticks(&limits), 25);
-        let limits = EffectiveLimits {
-            wall_budget_ms: 100,
-            ..limits
-        };
-        assert_eq!(WasmPlugin::budget_ticks(&limits), 10);
+    fn epoch_deadline_uses_the_store_budget() {
+        assert_eq!(WasmPlugin::budget_ticks(250), 25);
+        assert_eq!(WasmPlugin::budget_ticks(100), 10);
+        assert_eq!(WasmPlugin::budget_ticks(1), 1);
     }
 
     #[test]

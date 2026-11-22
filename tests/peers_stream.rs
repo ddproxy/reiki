@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 
 const ADMIN_TOKEN: &str = "admin-token-for-stream-tests";
 const STREAM_TOKEN: &str = "stream-token-for-stream-tests";

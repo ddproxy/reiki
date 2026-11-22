@@ -58,7 +58,7 @@ impl Config {
                 return Err(format!(
                     "`terms` must be an array of strings, got {}",
                     other.type_str()
-                ))
+                ));
             }
         };
         let terms = validate_terms(terms)?;
@@ -76,7 +76,7 @@ impl Config {
                 return Err(format!(
                     "`terms_file` must be a string, got {}",
                     other.type_str()
-                ))
+                ));
             }
         };
 

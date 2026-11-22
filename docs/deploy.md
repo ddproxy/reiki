@@ -61,7 +61,7 @@ Every bound listener must have a distinct address. Docs examples use `4099` for 
 | A second `SIGTERM` or `SIGINT` | Exits at once with status `128 + signal`: 143 or 130. |
 | `SIGHUP` | Reloads config, key files, plugin settings, interception CA files and peer TLS files, like `POST /v1/reload`. See [upgrades](upgrades.md#reload-vs-restart). |
 
-A streamed response still running when the drain ends is cut. Open tunnel connections get the same drain time. Keep `TimeoutStopSec` above `shutdown_timeout_secs`.
+A streamed response still running when the drain ends is cut. With `[tunnel] close_idle_on_stop = true` (the default), tunnels with no bytes in either direction for at least one second close as soon as the stop begins; active tunnel connections get the same drain time and are then cut. Keep `TimeoutStopSec` above `shutdown_timeout_secs`.
 
 With `Type=notify`, Reiki sends `READY=1` after every listener binds and `STOPPING=1` when a stop begins. With `WatchdogSec=`, it sends `WATCHDOG=1` at half the period while the async runtime is alive. Without `NOTIFY_SOCKET` these calls do nothing, so the same binary runs under any manager or none. Each client and upstream connection uses a file descriptor; the client listener admits 1024 connections by default. Reiki warns at start when the soft limit is below 4096.
 

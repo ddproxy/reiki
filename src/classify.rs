@@ -9,9 +9,7 @@ const BUILTIN_QUOTA_400_PHRASES: &[&str] = &["credit balance is too low"];
 const BUILTIN_QUOTA_429_PHRASES: &[&str] = &[
     "usage exceeded",
     "quota",
-    "subscribe to go",
     "free usage limit",
-    "free-models-per-day",
     "insufficient",
 ];
 const BUILTIN_RATE_LIMIT_PHRASES: &[&str] = &["rate limit"];
@@ -485,6 +483,19 @@ mod tests {
     }
 
     #[test]
+    fn a_vendor_name_in_a_429_body_does_not_change_the_class() {
+        assert_eq!(
+            classify(429, None, "subscribe to go"),
+            Outcome::KeyFailure(FailureClass::RateLimited(None)),
+            "a vendor phrase is not a built-in quota rule"
+        );
+        assert_eq!(
+            classify_phrases(429, None, "subscribe to go", &[], &["subscribe to go"], &[]).outcome,
+            Outcome::KeyFailure(FailureClass::QuotaExhausted)
+        );
+    }
+
+    #[test]
     fn openrouter_402_request_too_large_is_a_request_error() {
         let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 256000 tokens, but can only afford 199460. ..."}}"#;
         assert_eq!(classify(402, None, body), Outcome::RequestError);
@@ -529,10 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn a_daily_free_model_429_is_a_quota_not_a_rate_limit() {
+    fn a_vendor_specific_429_phrase_needs_configuration() {
         let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day"}}"#;
         assert_eq!(
             classify(429, None, body),
+            Outcome::KeyFailure(FailureClass::RateLimited(None)),
+            "a vendor phrase is not a built-in quota rule"
+        );
+        assert_eq!(
+            classify_phrases(429, None, body, &[], &["free-models-per-day"], &[]).outcome,
             Outcome::KeyFailure(FailureClass::QuotaExhausted)
         );
     }

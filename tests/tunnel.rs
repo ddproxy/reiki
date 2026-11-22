@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use reiki::config::TunnelConfig;
-use reiki::tunnel::{serve, Tunnel};
+use reiki::tunnel::{Tunnel, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -32,6 +32,7 @@ async fn tunnel(allow: &[String], allow_loopback: bool) -> String {
         allow: allow.to_vec(),
         connect_timeout_secs: 5,
         allow_loopback,
+        close_idle_on_stop: true,
         intercept: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -169,4 +170,119 @@ async fn one_peer_cannot_hold_more_than_its_share_of_tunnels() {
     let mut extra = TcpStream::connect(&addr).await.unwrap();
     assert!(status_line(&mut extra).await.contains("503"));
     drop(held);
+}
+
+#[test]
+fn the_tunnel_stop_mode_defaults_to_the_safe_behaviour_and_rejects_unknown_keys() {
+    use reiki::config::Config;
+
+    let base = "[upstream.u]\nbase_url = \"https://a.example/v1\"\n\
+                [tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\"a.example\"]\n";
+    let enabled = Config::parse(base).unwrap().tunnel.unwrap();
+    assert!(enabled.close_idle_on_stop);
+    let explicit = Config::parse(&format!("{base}close_idle_on_stop = false\n"))
+        .unwrap()
+        .tunnel
+        .unwrap();
+    assert!(!explicit.close_idle_on_stop);
+    assert!(Config::parse(&format!("{base}unknown = true\n")).is_err());
+}
+
+#[test]
+fn changing_the_tunnel_stop_mode_is_a_live_reload_change() {
+    use reiki::config::Config;
+
+    let base = "[upstream.u]\nbase_url = \"https://a.example/v1\"\n\
+                [tunnel]\nlisten = \"127.0.0.1:4099\"\nallow = [\"a.example\"]\n";
+    let running = Config::parse(base).unwrap().tunnel.unwrap();
+    let wanted = Config::parse(&format!("{base}close_idle_on_stop = false\n"))
+        .unwrap()
+        .tunnel
+        .unwrap();
+    let plan = Tunnel::new(&running).plan_reload(&wanted).unwrap();
+    assert!(
+        plan.changed
+            .iter()
+            .any(|line| line.contains("close_idle_on_stop")),
+        "{:?}",
+        plan.changed
+    );
+}
+
+#[tokio::test]
+async fn stopping_closes_idle_tunnels_at_once_and_cuts_active_ones_after_the_drain() {
+    use std::time::Duration;
+
+    use reiki::tunnel::serve_until;
+
+    let port = echo().await;
+    let config = TunnelConfig {
+        deny_private: false,
+        listen: String::new(),
+        allow: vec![format!("127.0.0.1:{port}")],
+        connect_timeout_secs: 5,
+        allow_loopback: true,
+        close_idle_on_stop: true,
+        intercept: None,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_until(
+        listener,
+        Arc::new(Tunnel::new(&config)),
+        async {
+            let _ = rx.await;
+        },
+        Duration::from_millis(800),
+    ));
+
+    let mut idle = TcpStream::connect(addr).await.unwrap();
+    let mut active = TcpStream::connect(addr).await.unwrap();
+    for client in [&mut idle, &mut active] {
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            status_line(client).await,
+            "HTTP/1.1 200 Connection Established"
+        );
+    }
+    active.write_all(b"alive").await.unwrap();
+    let mut buf = [0u8; 5];
+    active.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"alive");
+    // The idle tunnel has no byte moving in either direction for longer than the idle window.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    active.write_all(b"still").await.unwrap();
+    let mut buf = [0u8; 5];
+    active.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"still");
+    tx.send(()).unwrap();
+
+    let mut one = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_millis(250), idle.read(&mut one))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(closed, 0, "idle tunnels close as soon as the stop begins");
+
+    active.write_all(b"later").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_millis(250), active.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &buf, b"later",
+        "active tunnels keep working during the drain"
+    );
+
+    let closed = tokio::time::timeout(Duration::from_millis(1_200), active.read(&mut one))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(closed, 0, "active tunnels are cut at the drain deadline");
+    server.await.unwrap();
 }

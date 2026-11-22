@@ -1,4 +1,4 @@
-use std::future::{poll_fn, Future};
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -6,13 +6,13 @@ use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder,
 use axum::body::Bytes;
 use axum::http::request::Parts;
 use axum::http::{
-    header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Version,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Version, header,
 };
 use futures_core::Stream;
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use tokio::io::BufReader;
 use tokio_util::io::{ReaderStream, StreamReader};
 

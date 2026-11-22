@@ -5,29 +5,29 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::{to_bytes, Body, Bytes};
+use axum::Router;
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use axum::Router;
 use futures_core::Stream;
 
 use crate::auth::{
-    constant_time_eq, extract_token, sha256_hex, strip_query_key, LoginThrottle, Peer,
-    ThrottleSettings,
+    LoginThrottle, Peer, ThrottleSettings, constant_time_eq, extract_token, sha256_hex,
+    strip_query_key,
 };
-use crate::chain::{scope_route, Chain, KeyState, Policy, SavedHealth, Scope};
-use crate::classify::{classify_with, Classification, ExtraPhrases, FailureClass, Outcome};
-use crate::config::{Config, PeersConfig, DEFAULT_SCOPE_ESCALATE_AFTER};
+use crate::chain::{Chain, KeyState, Policy, SavedHealth, Scope, scope_route};
+use crate::classify::{Classification, ExtraPhrases, FailureClass, Outcome, classify_with};
+use crate::config::{Config, DEFAULT_SCOPE_ESCALATE_AFTER, PeersConfig};
 use crate::forward::Forwarder;
 use crate::plugins::{
-    PluginChain, PluginSession, RequestMeta, PLUGIN_FAILURE_MESSAGE, PLUGIN_FAILURE_STATUS,
+    PLUGIN_FAILURE_MESSAGE, PLUGIN_FAILURE_STATUS, PluginChain, PluginSession, RequestMeta,
 };
 use crate::pressure::PressureCounter;
 use crate::rewrite::{request_model, rewrite_body};
 use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
-use crate::shaper::headers::{observe, Observed};
+use crate::shaper::headers::{Observed, observe};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use crate::usage::Usage;
@@ -204,21 +204,20 @@ pub(crate) fn key_file_verdict(
     strict: bool,
 ) -> Result<String, LoadError> {
     #[cfg(unix)]
-    if let Some(mode) = mode {
-        if let Some(crate::keys::CheckIssue::GroupOrWorldReadable(_)) =
+    if let Some(mode) = mode
+        && let Some(crate::keys::CheckIssue::GroupOrWorldReadable(_)) =
             crate::keys::permission_verdict(mode)
-        {
-            if strict {
-                return Err(LoadError::Permissions {
-                    key: name.to_owned(),
-                    mode,
-                });
-            }
-            tracing::warn!(
-                key = %name,
-                "key file has group or world read/write bits (mode {mode:04o}); set strict_key_permissions = true to refuse it"
-            );
+    {
+        if strict {
+            return Err(LoadError::Permissions {
+                key: name.to_owned(),
+                mode,
+            });
         }
+        tracing::warn!(
+            key = %name,
+            "key file has group or world read/write bits (mode {mode:04o}); set strict_key_permissions = true to refuse it"
+        );
     }
     #[cfg(not(unix))]
     let _ = (mode, strict);
@@ -774,10 +773,10 @@ impl App {
                 .shaper_saved
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(saved_at) = saved.1 {
-                if shaper_unchanged(&saved.0, saved_at, now, &shaper) {
-                    return;
-                }
+            if let Some(saved_at) = saved.1
+                && shaper_unchanged(&saved.0, saved_at, now, &shaper)
+            {
+                return;
             }
         }
         self.persist_state();
@@ -1454,10 +1453,10 @@ async fn dispatch(
 ) -> Response {
     use tracing::Instrument;
     #[cfg(feature = "peers")]
-    if let (Some(publisher), Some(peers)) = (app.peer_publisher.get(), &snapshot.config.peers) {
-        if stream != PASSTHROUGH_STREAM {
-            publisher.observe_session(peers, stream, &parts.headers);
-        }
+    if let (Some(publisher), Some(peers)) = (app.peer_publisher.get(), &snapshot.config.peers)
+        && stream != PASSTHROUGH_STREAM
+    {
+        publisher.observe_session(peers, stream, &parts.headers);
     }
     let id = reiki_plugin::new_request_id();
     let span = tracing::info_span!("req", id = %id);
@@ -1612,7 +1611,10 @@ async fn dispatch_body(
         method: &parts.method,
         path: parts.uri.path(),
     };
-    if let Err(blocked) = plugin_states.on_request(&meta, &mut parts.headers, &mut body) {
+    if let Err(blocked) = plugin_states
+        .on_request_blocking(&meta, &mut parts.headers, &mut body)
+        .await
+    {
         return json_error(blocked.status, "blocked", &blocked.message);
     }
     if body.len() > MAX_REQUEST_BODY {
@@ -1657,35 +1659,34 @@ async fn dispatch_body(
 
     // One hop only: when nothing is left to try here, hand the request to the
     // fallback upstream, re-mapped for it, instead of failing the client.
-    if let (Err(spent), Some(fallback)) = (&mut result, &upstream.fallback) {
-        if let Some(target) = snapshot
+    if let (Err(spent), Some(fallback)) = (&mut result, &upstream.fallback)
+        && let Some(target) = snapshot
             .config
             .upstream
             .get(&fallback.upstream)
             .filter(|_| !spent.link_failed)
-        {
-            tracing::warn!(stream = %stream, from = upstream_name, to = %fallback.upstream, "falling back");
-            let body = rewrite_body(body, &fallback.model_aliases, &[]);
-            let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
-            let used = fallback.upstream.as_str();
-            serving_upstream = used;
-            request_done.set_upstream(used);
-            result = forward(
-                app,
-                Forward {
-                    snapshot,
-                    stream,
-                    upstream_name: used,
-                    upstream: target,
-                    parts: &parts,
-                    rest,
-                    plugin_states: std::mem::take(&mut spent.plugin_states),
-                    faithful,
-                },
-                body,
-            )
-            .await;
-        }
+    {
+        tracing::warn!(stream = %stream, from = upstream_name, to = %fallback.upstream, "falling back");
+        let body = rewrite_body(body, &fallback.model_aliases, &[]);
+        let body = rewrite_body(body, &target.model_aliases, &target.drop_params);
+        let used = fallback.upstream.as_str();
+        serving_upstream = used;
+        request_done.set_upstream(used);
+        result = forward(
+            app,
+            Forward {
+                snapshot,
+                stream,
+                upstream_name: used,
+                upstream: target,
+                parts: &parts,
+                rest,
+                plugin_states: std::mem::take(&mut spent.plugin_states),
+                faithful,
+            },
+            body,
+        )
+        .await;
     }
     match result {
         Ok(response) => response,
@@ -1806,10 +1807,10 @@ fn note_reported_remaining(bucket: &Bucket, observed: Observed, now: SystemTime)
         (observed.requests_remaining, observed.requests_reset),
         (observed.tokens_remaining, observed.tokens_reset),
     ] {
-        if remaining == Some(0) {
-            if let Some(until) = reset.and_then(|reset| now.checked_add(reset)) {
-                bucket.note_window_closed(now, until);
-            }
+        if remaining == Some(0)
+            && let Some(until) = reset.and_then(|reset| now.checked_add(reset))
+        {
+            bucket.note_window_closed(now, until);
         }
     }
 }
@@ -2142,38 +2143,35 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             && upstream.confirm_quota
             && status == StatusCode::TOO_MANY_REQUESTS
             && !confirmed.contains(&key_name);
-        if !confirming {
-            if let (Some(bucket), Some(observed)) = (&shaping, observed) {
-                let now = app.wall_now();
-                note_reported_remaining(bucket, observed, now);
-                // A failure that only cools one model on the key says nothing about the
-                // key's own budget, so it must not pause or close the whole bucket.
-                if let Outcome::KeyFailure(class) = outcome {
-                    let key_wide = failure_scope(
-                        class,
-                        Some(status.as_u16()),
-                        scope.as_ref(),
-                        classified.quota_phrase_matched,
-                    )
-                    .is_none();
-                    match class {
-                        FailureClass::RateLimited(retry_after) if key_wide => {
-                            bucket.note_rate_limited(now, retry_after);
-                        }
-                        FailureClass::QuotaExhausted if key_wide => {
-                            let hint =
-                                crate::classify::parse_retry_after(retry_after.as_deref(), now);
-                            let cooldown = quota_cooldown(snapshot, &key_name, class, now, hint)
-                                .unwrap_or(app.policy.quota_exhausted);
-                            if let Some(until) = now.checked_add(cooldown) {
-                                bucket.note_window_closed(now, until);
-                            }
-                        }
-                        _ => {}
+        if !confirming && let (Some(bucket), Some(observed)) = (&shaping, observed) {
+            let now = app.wall_now();
+            note_reported_remaining(bucket, observed, now);
+            // A failure that only cools one model on the key says nothing about the
+            // key's own budget, so it must not pause or close the whole bucket.
+            if let Outcome::KeyFailure(class) = outcome {
+                let key_wide = failure_scope(
+                    class,
+                    Some(status.as_u16()),
+                    scope.as_ref(),
+                    classified.quota_phrase_matched,
+                )
+                .is_none();
+                match class {
+                    FailureClass::RateLimited(retry_after) if key_wide => {
+                        bucket.note_rate_limited(now, retry_after);
                     }
+                    FailureClass::QuotaExhausted if key_wide => {
+                        let hint = crate::classify::parse_retry_after(retry_after.as_deref(), now);
+                        let cooldown = quota_cooldown(snapshot, &key_name, class, now, hint)
+                            .unwrap_or(app.policy.quota_exhausted);
+                        if let Some(until) = now.checked_add(cooldown) {
+                            bucket.note_window_closed(now, until);
+                        }
+                    }
+                    _ => {}
                 }
-                app.persist_shaper();
             }
+            app.persist_shaper();
         }
         match outcome {
             Outcome::Success | Outcome::PassThrough => {
@@ -2632,10 +2630,8 @@ fn record(
             "upstream key failed"
         );
     }
-    if counted {
-        if let Some(upstream) = upstream {
-            app.pressure.record(&upstream, limited, now);
-        }
+    if counted && let Some(upstream) = upstream {
+        app.pressure.record(&upstream, limited, now);
     }
     record_ring(
         app,
@@ -3391,9 +3387,10 @@ mod tests {
         assert!(out.get("x-goog-api-key").is_none());
         assert!(out.get("connection").is_none());
         assert!(out.get("host").is_none());
-        assert!(!out
-            .values()
-            .any(|v| v.to_str().is_ok_and(|s| s.contains("caller-token"))));
+        assert!(
+            !out.values()
+                .any(|v| v.to_str().is_ok_and(|s| s.contains("caller-token")))
+        );
     }
 
     #[test]
@@ -3470,9 +3467,11 @@ mod tests {
             snapshot.pick(&health, "s", "zen", &[], None),
             Some("a".to_owned())
         );
-        assert!(snapshot
-            .soonest_recovery(&health, "s", "zen", None)
-            .is_some());
+        assert!(
+            snapshot
+                .soonest_recovery(&health, "s", "zen", None)
+                .is_some()
+        );
     }
 
     #[test]
@@ -4369,12 +4368,13 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
         assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
-        assert!(rig
-            .app
-            .health()
-            .lock()
-            .unwrap()
-            .is_available("a", Instant::now()));
+        assert!(
+            rig.app
+                .health()
+                .lock()
+                .unwrap()
+                .is_available("a", Instant::now())
+        );
         assert_eq!(cooling(&rig.app, "a"), None);
 
         let rows = rig.app.failures().snapshot(10, Some("a"));
@@ -4396,20 +4396,22 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), last);
         assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
         for key in ["a", "b"] {
-            assert!(rig
-                .app
-                .health()
-                .lock()
-                .unwrap()
-                .is_available(key, Instant::now()));
+            assert!(
+                rig.app
+                    .health()
+                    .lock()
+                    .unwrap()
+                    .is_available(key, Instant::now())
+            );
             assert_eq!(cooling(&rig.app, key), None);
         }
 
         let rows = rig.app.failures().snapshot(10, None);
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|row| row.class == FailureKind::RequestError.label()));
+        assert!(
+            rows.iter()
+                .all(|row| row.class == FailureKind::RequestError.label())
+        );
         assert!(rows.iter().all(|row| !row.cooled));
     }
 
@@ -4445,12 +4447,13 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
         assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
         assert_eq!(cooling(&rig.app, "a"), Some(FailureClass::QuotaExhausted));
-        assert!(!rig
-            .app
-            .health()
-            .lock()
-            .unwrap()
-            .is_available("a", Instant::now()));
+        assert!(
+            !rig.app
+                .health()
+                .lock()
+                .unwrap()
+                .is_available("a", Instant::now())
+        );
 
         let rows = rig.app.failures().snapshot(10, Some("a"));
         assert_eq!(rows.len(), 1);

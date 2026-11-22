@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::peers::client::{poll, PeerReport};
+use reiki::peers::client::{PeerReport, poll};
 use reiki::proxy::{App, Secret};
 
 const PEER_TOKEN: &str = "peer-token-for-tls-tests";

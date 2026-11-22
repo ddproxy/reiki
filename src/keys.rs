@@ -353,14 +353,18 @@ mod tests {
     #[test]
     fn a_status_document_without_scopes_or_with_unknown_fields_is_rejected() {
         let missing = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available"}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
-        assert!(parse_status(missing)
-            .unwrap_err()
-            .contains("cannot read /v1/status"));
+        assert!(
+            parse_status(missing)
+                .unwrap_err()
+                .contains("cannot read /v1/status")
+        );
 
         let unknown = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available","scopes":[],"old":1}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
-        assert!(parse_status(unknown)
-            .unwrap_err()
-            .contains("cannot read /v1/status"));
+        assert!(
+            parse_status(unknown)
+                .unwrap_err()
+                .contains("cannot read /v1/status")
+        );
     }
 
     #[test]

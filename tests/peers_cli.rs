@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::peers::client::{poll, PeerReport};
+use reiki::peers::client::{PeerReport, poll};
 use reiki::proxy::{App, Secret};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

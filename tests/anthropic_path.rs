@@ -7,16 +7,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::{to_bytes, Body, Bytes};
+use axum::Router;
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method};
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::plugins::{builtin, PluginChain, RequestMeta};
-use reiki::proxy::{router, App, Secret};
-use serde_json::{json, Value};
+use reiki::plugins::{PluginChain, RequestMeta, builtin};
+use reiki::proxy::{App, Secret, router};
+use serde_json::{Value, json};
 
 mod common;
 use common::serve;
@@ -272,10 +272,12 @@ async fn request_masking_covers_string_blocks_and_tool_results() {
         parsed["messages"][0]["content"],
         format!("my key is {placeholder}")
     );
-    assert!(parsed["messages"][1]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains(&placeholder));
+    assert!(
+        parsed["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&placeholder)
+    );
     assert_eq!(
         parsed["messages"][1]["content"][1]["content"][0]["text"],
         format!("tool output {placeholder}")
@@ -346,10 +348,12 @@ async fn thinking_blocks_reach_the_upstream_byte_identical() {
     assert_eq!(content[0]["signature"], signature);
     assert_eq!(content[1]["data"], redacted);
     assert!(!content[2]["text"].as_str().unwrap().contains(&secret));
-    assert!(content[2]["text"]
-        .as_str()
-        .unwrap()
-        .contains("[[REIKI_SECRET_"));
+    assert!(
+        content[2]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[[REIKI_SECRET_")
+    );
 }
 
 #[tokio::test]
@@ -842,22 +846,30 @@ async fn cache_control_system_tools_and_stop_sequences_stay_valid_json() {
     assert_eq!(parsed["tools"][0]["name"], "lookup");
     assert_eq!(parsed["tools"][0]["cache_control"]["type"], "ephemeral");
     assert_eq!(parsed["tools"][0]["input_schema"]["type"], "object");
-    assert!(parsed["system"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains(&placeholder));
-    assert!(parsed["tools"][0]["description"]
-        .as_str()
-        .unwrap()
-        .contains(&placeholder));
-    assert!(parsed["stop_sequences"][0]
-        .as_str()
-        .unwrap()
-        .contains(&placeholder));
-    assert!(parsed["stop_sequences"][1]
-        .as_str()
-        .unwrap()
-        .contains("[[REIKI_TERM_"));
+    assert!(
+        parsed["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&placeholder)
+    );
+    assert!(
+        parsed["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains(&placeholder)
+    );
+    assert!(
+        parsed["stop_sequences"][0]
+            .as_str()
+            .unwrap()
+            .contains(&placeholder)
+    );
+    assert!(
+        parsed["stop_sequences"][1]
+            .as_str()
+            .unwrap()
+            .contains("[[REIKI_TERM_")
+    );
 
     let string_system = json!({
         "system": format!("system secret {secret}"),

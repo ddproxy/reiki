@@ -3,15 +3,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::{to_bytes, Body, Bytes};
+use axum::Router;
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::{PluginChain, Registration};
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 use reiki::reiki_plugin::{ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
 mod common;

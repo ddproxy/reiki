@@ -22,7 +22,7 @@ use reiki_plugin::{
 };
 
 use crate::config::ConfigError;
-use crate::reload::{file_stamp, stamps, Stamps};
+use crate::reload::{Stamps, file_stamp, stamps};
 
 /// A plugin admin path in the form the admin router matches: absolute, already normalised.
 fn admin_path(path: &str) -> Option<&str> {
@@ -132,7 +132,7 @@ pub(crate) fn streams_of(
             return Err(err(&format!(
                 "`streams` must be a list of stream names, got {}",
                 other.type_str()
-            )))
+            )));
         }
     };
     if items.is_empty() {
@@ -147,7 +147,7 @@ pub(crate) fn streams_of(
                 return Err(err(&format!(
                     "`streams` must list stream names as strings, got {}",
                     other.type_str()
-                )))
+                )));
             }
         }
     }
@@ -194,6 +194,39 @@ pub struct RequestMeta<'a> {
     pub method: &'a Method,
     /// The request path without its query string.
     pub path: &'a str,
+}
+
+/// Owned copy of [`RequestMeta`] for a blocking task, which cannot borrow the request.
+struct OwnedRequestMeta {
+    id: String,
+    stream: String,
+    upstream: String,
+    method: Method,
+    path: String,
+}
+
+impl<'a> From<&RequestMeta<'a>> for OwnedRequestMeta {
+    fn from(meta: &RequestMeta<'a>) -> Self {
+        Self {
+            id: meta.id.to_owned(),
+            stream: meta.stream.to_owned(),
+            upstream: meta.upstream.to_owned(),
+            method: meta.method.clone(),
+            path: meta.path.to_owned(),
+        }
+    }
+}
+
+impl OwnedRequestMeta {
+    fn borrowed(&self) -> RequestMeta<'_> {
+        RequestMeta {
+            id: &self.id,
+            stream: &self.stream,
+            upstream: &self.upstream,
+            method: &self.method,
+            path: &self.path,
+        }
+    }
 }
 
 /// The configured plugins in chain order, run on every request.
@@ -776,6 +809,56 @@ impl PluginSession {
         self.chain.on_request(&mut self.states, meta, headers, body)
     }
 
+    /// Same as [`Self::on_request`], but runs the synchronous hooks on Tokio's
+    /// blocking pool so a CPU-heavy plugin cannot stall the runtime.
+    pub async fn on_request_blocking(
+        &mut self,
+        meta: &RequestMeta<'_>,
+        headers: &mut HeaderMap,
+        body: &mut Bytes,
+    ) -> Result<(), Blocked> {
+        self.scope = self.chain.scope(Some(meta.stream));
+        if self.failed {
+            return Err(Blocked {
+                status: PLUGIN_FAILURE_STATUS,
+                message: PLUGIN_FAILURE_MESSAGE.to_owned(),
+            });
+        }
+        if !self.scope.iter().any(|&runs| runs) {
+            return Ok(());
+        }
+
+        let chain = Arc::clone(&self.chain);
+        let mut states = std::mem::take(&mut self.states);
+        let owned_meta = OwnedRequestMeta::from(meta);
+        let mut owned_headers = headers.clone();
+        let mut owned_body = body.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let meta = owned_meta.borrowed();
+            let result = chain.on_request(&mut states, &meta, &mut owned_headers, &mut owned_body);
+            (states, owned_headers, owned_body, result)
+        })
+        .await;
+        match joined {
+            Ok((states, returned_headers, returned_body, result)) => {
+                self.states = states;
+                *headers = returned_headers;
+                *body = returned_body;
+                result
+            }
+            Err(_) => {
+                // A panic that escaped the chain's per-plugin guard means no part of
+                // this request's plugin work can be trusted. Do not forward it.
+                self.failed = true;
+                self.states = self.chain.states();
+                Err(Blocked {
+                    status: PLUGIN_FAILURE_STATUS,
+                    message: PLUGIN_FAILURE_MESSAGE.to_owned(),
+                })
+            }
+        }
+    }
+
     pub fn on_attempt(&mut self, key: &str, status: Option<u16>, body: &[u8]) {
         self.chain
             .on_attempt(&mut self.states, &self.scope, key, status, body);
@@ -1202,12 +1285,14 @@ mod tests {
         let registry = rebuild_registry();
         let first = PluginChain::build(&configured("[append]\n"), &registry).unwrap();
         assert!(first.rebuild(&configured("[nope]\n"), &registry).is_err());
-        assert!(first
-            .rebuild(
-                &configured("[append]\non_error = \"sideways\"\n"),
-                &registry
-            )
-            .is_err());
+        assert!(
+            first
+                .rebuild(
+                    &configured("[append]\non_error = \"sideways\"\n"),
+                    &registry
+                )
+                .is_err()
+        );
         assert_eq!(first.names().collect::<Vec<_>>(), ["append"]);
     }
 
@@ -1663,6 +1748,76 @@ mod tests {
         let mut chunk = Bytes::from_static(b"secret");
         assert!(session.on_response_chunk(&mut chunk, true));
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[cfg(feature = "plugin-placeholders")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn offloaded_request_hooks_do_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let registry = builtin();
+        if !registry
+            .iter()
+            .any(|registration| registration.name == "placeholders")
+        {
+            return;
+        }
+        let terms: Vec<String> = (0..300).map(|i| format!("secret{i:06}")).collect();
+        let source = format!(
+            "[placeholders]\nbuiltin = false\nterms = [{}]\n",
+            terms
+                .iter()
+                .map(|term| format!("\"{term}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let chain = Arc::new(PluginChain::build(&configured(&source), &registry).unwrap());
+        let mut session = chain.session();
+
+        let mut text = String::from("{\"text\":\"");
+        for i in 0..200_000 {
+            text.push_str(&terms[i % terms.len()]);
+            text.push(' ');
+        }
+        text.push_str("\"}");
+        let mut body = Bytes::from(text);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "test",
+            stream: "default",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/chat",
+        };
+        session
+            .on_request_blocking(&meta, &mut HeaderMap::new(), &mut body)
+            .await
+            .unwrap();
+        heartbeat.abort();
+        let _ = heartbeat.await;
+
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the runtime did not tick while the request hooks ran"
+        );
+        let masked = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!masked.contains("secret"), "body was not masked");
+        assert!(
+            masked.contains("[[REIKI_TERM_"),
+            "masked body has no placeholder"
+        );
     }
 
     #[test]

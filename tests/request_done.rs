@@ -1,14 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::{PluginChain, Registration};
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 use reiki_plugin::{Event, Plugin};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -30,10 +30,9 @@ impl Plugin for Recorder {
         if let Event::RequestDone {
             upstream, status, ..
         } = event
+            && let Some(done) = DONE.lock().unwrap().as_ref()
         {
-            if let Some(done) = DONE.lock().unwrap().as_ref() {
-                done.lock().unwrap().push(((*upstream).to_owned(), *status));
-            }
+            done.lock().unwrap().push(((*upstream).to_owned(), *status));
         }
     }
 }

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::http::{header, HeaderName, HeaderValue, Method, Request, StatusCode, Version};
+use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Version, header};
 use futures_core::Stream;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::Forward;
 use crate::proxy::{passthrough_headers, upstream_headers};
-use crate::upstream::{strip_hop_by_hop, Call, ErrMap, SendFuture, Transport, UpstreamResponse};
+use crate::upstream::{Call, ErrMap, SendFuture, Transport, UpstreamResponse, strip_hop_by_hop};
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 128;
@@ -506,15 +506,14 @@ pub fn socket_warnings(config: &crate::config::Config) -> Vec<String> {
         let Some(path) = forward.socket.as_ref() else {
             continue;
         };
-        if forward.expect_uid.is_none() {
-            if let Some(meta) = path.parent().and_then(|p| std::fs::metadata(p).ok()) {
-                if meta.mode() & 0o022 != 0 {
-                    warnings.push(format!(
+        if forward.expect_uid.is_none()
+            && let Some(meta) = path.parent().and_then(|p| std::fs::metadata(p).ok())
+            && meta.mode() & 0o022 != 0
+        {
+            warnings.push(format!(
                         "upstream `{name}`: {} is in a directory others can write to; set `expect_uid` so the key is not sent to another process's socket",
                         path.display()
                     ));
-                }
-            }
         }
         match std::fs::symlink_metadata(path) {
             Err(_) => warnings.push(format!(
@@ -550,7 +549,7 @@ mod tests {
     use crate::config::{Config, ConfigError};
     use crate::upstream::{Call, Transport};
 
-    use super::{socket_warnings, Forwarder};
+    use super::{Forwarder, socket_warnings};
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -659,9 +658,11 @@ file = "/etc/reiki/keys/zen-a"
         ));
         let config = Config::parse(&text).unwrap();
         let warnings = socket_warnings(&config);
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("exists but is not a socket")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("exists but is not a socket"))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1,11 +1,11 @@
 [workspace]
-members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog", "crates/reiki-toolpolicy", "crates/reiki-top"]
+members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-health", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog", "crates/reiki-toolpolicy", "crates/reiki-top"]
 resolver = "2"
 
 [package]
 name = "reiki"
 version = "0.13.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.99"
 description = "Security proxy for agent and LLM traffic: isolates keys, filters what leaves, keeps access reliable"
 license = "MIT"
@@ -70,6 +70,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "json"] }
 reiki-plugin = { path = "crates/reiki-plugin" }
+reiki-health = { path = "crates/reiki-health" }
 reiki-detect = { path = "crates/reiki-detect" }
 reiki-phi = { path = "crates/reiki-phi", optional = true }
 reiki-finance = { path = "crates/reiki-finance", optional = true }

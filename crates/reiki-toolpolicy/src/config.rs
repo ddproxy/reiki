@@ -69,7 +69,7 @@ pub fn parse(table: &toml::Table) -> Result<Config, String> {
         Some(other) => {
             return Err(format!(
                 "`mode` must be \"report\" or \"block\", got {other}"
-            ))
+            ));
         }
     };
     let block_severity = match table.get("block_severity") {
@@ -79,7 +79,7 @@ pub fn parse(table: &toml::Table) -> Result<Config, String> {
         Some(other) => {
             return Err(format!(
                 "`block_severity` must be \"high\" or \"medium\", got {other}"
-            ))
+            ));
         }
     };
     Ok(Config {
@@ -106,7 +106,7 @@ pub fn parse(table: &toml::Table) -> Result<Config, String> {
             Some(other) => {
                 return Err(format!(
                     "`journal_max_bytes` must be a positive integer, got {other}"
-                ))
+                ));
             }
         },
         upstreams: table

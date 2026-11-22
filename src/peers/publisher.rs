@@ -4,20 +4,20 @@ use std::net::IpAddr;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
-use axum::response::Response;
 use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::response::Response;
 
 use crate::admin::{text_response, throttled, unauthorized};
 use crate::auth::{
-    bearer_token, constant_time_eq, sha256_hex, LoginThrottle, Peer, ThrottleSettings,
+    LoginThrottle, Peer, ThrottleSettings, bearer_token, constant_time_eq, sha256_hex,
 };
 use crate::config::{PeerToken, PeersConfig};
 use crate::proxy::App;
 
 use super::sessions::Sessions;
-use super::stream::{ensure_ticker, Frames, Hub, Limits, Refused, HEARTBEAT, STREAM_PATH};
+use super::stream::{Frames, HEARTBEAT, Hub, Limits, Refused, STREAM_PATH, ensure_ticker};
 
 pub(crate) const HEALTH_PATH: &str = "/v1/health";
 

@@ -3,16 +3,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::any;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{load_keys, router, App};
+use reiki::proxy::{App, load_keys, router};
 
 mod common;
 use common::serve;
@@ -208,10 +208,12 @@ async fn a_bad_config_changes_nothing_and_the_status_says_why() {
 
     std::fs::write(&rig.config, "this is not toml [").unwrap();
     let app = Arc::clone(&rig.app);
-    assert!(tokio::task::spawn_blocking(move || app.reload_now())
-        .await
-        .unwrap()
-        .is_err());
+    assert!(
+        tokio::task::spawn_blocking(move || app.reload_now())
+            .await
+            .unwrap()
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -290,10 +292,11 @@ async fn post_reload_needs_the_admin_token_and_reports_the_generation() {
         "{body}"
     );
     assert!(body.contains("\"changed\":[\"plugins phi\"]"), "{body}");
-    assert!(rig
-        .admin_get("/v1/status")
-        .await
-        .contains("\"generation\":1"));
+    assert!(
+        rig.admin_get("/v1/status")
+            .await
+            .contains("\"generation\":1")
+    );
     assert_eq!(rig.send(SSN_BODY).await, 422);
 
     std::fs::write(&rig.config, "broken [").unwrap();
@@ -387,10 +390,11 @@ async fn the_watcher_reloads_when_the_config_file_changes() {
         }
     }
     assert_eq!(status, 422, "the watcher applied the edit on its own");
-    assert!(rig
-        .admin_get("/v1/status")
-        .await
-        .contains("\"generation\":1"));
+    assert!(
+        rig.admin_get("/v1/status")
+            .await
+            .contains("\"generation\":1")
+    );
 
     // A bad edit is tried once and left alone until the file changes again.
     std::fs::write(&rig.config, "broken [").unwrap();

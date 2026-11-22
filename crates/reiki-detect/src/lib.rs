@@ -5,8 +5,8 @@
 //! Luhn checksum and the hit type. The `guard` module is the plugin shell, and `columnar` the table
 //! scanner, that the detection plugins share.
 
-use http::header::CONTENT_ENCODING;
 use http::HeaderMap;
+use http::header::CONTENT_ENCODING;
 
 pub mod columnar;
 pub mod guard;
@@ -167,11 +167,7 @@ pub fn luhn(digits: &[u8]) -> bool {
             let d = u32::from(*d - b'0');
             if i % 2 == 1 {
                 let x = d * 2;
-                if x > 9 {
-                    x - 9
-                } else {
-                    x
-                }
+                if x > 9 { x - 9 } else { x }
             } else {
                 d
             }

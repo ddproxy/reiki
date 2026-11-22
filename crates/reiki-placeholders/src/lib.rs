@@ -13,8 +13,8 @@ use std::any::Any;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use http::header::CONTENT_TYPE;
 use http::StatusCode;
+use http::header::CONTENT_TYPE;
 use reiki_plugin::{ChunkCtx, Plugin, PluginError, RequestCtx, ResponseHeadCtx};
 
 pub use config::Config;
@@ -25,8 +25,8 @@ use restore::Restorer;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
     pub use crate::config::validate_terms;
-    pub use crate::mask::{Masker, HEAD, TAIL};
-    pub use crate::restore::{incomplete_start, restore_text, Restorer};
+    pub use crate::mask::{HEAD, Masker, TAIL};
+    pub use crate::restore::{Restorer, incomplete_start, restore_text};
 }
 
 /// The `[plugins.placeholders]` table this plugin reads.

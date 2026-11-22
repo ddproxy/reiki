@@ -58,7 +58,7 @@ pub async fn stopped() {
 /// shell's `128 + signal` status, so an operator is never stuck behind a long drain.
 #[cfg(unix)]
 pub fn spawn_signal_handler() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
@@ -117,14 +117,14 @@ pub const RECOMMENDED_OPEN_FILES: u64 = 4096;
 /// Logs a warning when the soft open-file limit is below [`RECOMMENDED_OPEN_FILES`]. systemd's
 /// default of 1024 equals the client listener's own connection cap.
 pub fn warn_if_open_files_low() {
-    if let Some(limit) = open_files_soft_limit() {
-        if limit < RECOMMENDED_OPEN_FILES {
-            tracing::warn!(
-                limit,
-                recommended = RECOMMENDED_OPEN_FILES,
-                "the open-file limit is low for the connection caps; raise `LimitNOFILE` in the unit or `ulimit -n`"
-            );
-        }
+    if let Some(limit) = open_files_soft_limit()
+        && limit < RECOMMENDED_OPEN_FILES
+    {
+        tracing::warn!(
+            limit,
+            recommended = RECOMMENDED_OPEN_FILES,
+            "the open-file limit is low for the connection caps; raise `LimitNOFILE` in the unit or `ulimit -n`"
+        );
     }
 }
 

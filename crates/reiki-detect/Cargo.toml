@@ -1,7 +1,7 @@
 [package]
 name = "reiki-detect"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.99"
 description = "Shared text detection helpers for Reiki plugins"
 license = "MIT"

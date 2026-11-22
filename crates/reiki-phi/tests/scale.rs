@@ -1,7 +1,7 @@
 //! Large bodies must scan in time linear in their size: a request can be megabytes, and the
 //! check runs on the request path.
 
-use reiki_phi::{scan, Kind};
+use reiki_phi::{Kind, scan};
 use std::time::{Duration, Instant};
 
 /// Far above a linear scan even in a debug build, far below the quadratic scans this guards against.

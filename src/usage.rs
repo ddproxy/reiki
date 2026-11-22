@@ -111,10 +111,10 @@ impl Usage {
             if !self.discarding {
                 self.read_event_line(&rest);
             }
-        } else if !self.exceeded {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.buffer) {
-                self.take(usage_in(&value));
-            }
+        } else if !self.exceeded
+            && let Ok(value) = serde_json::from_slice::<Value>(&self.buffer)
+        {
+            self.take(usage_in(&value));
         }
     }
 

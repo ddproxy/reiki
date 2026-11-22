@@ -5,8 +5,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::plugins::{builtin, with_dry_run, PluginChain};
-use reiki::proxy::{load_keys, router, App};
+use reiki::plugins::{PluginChain, builtin, with_dry_run};
+use reiki::proxy::{App, load_keys, router};
 
 #[derive(Parser)]
 #[command(

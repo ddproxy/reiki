@@ -30,6 +30,8 @@ flowchart LR
 
 `on_request`, `on_attempt` and `on_event` run in registry order. Response hooks run in reverse, so the plugin that changed the request first sees the response last and can undo its change. `on_event` is stream-scoped like request hooks; a `Cooldown` event has no stream and reaches only plugins without `streams`.
 
+`on_request` is called on Tokio's blocking pool with this request's headers, body and per-plugin state, so CPU-heavy work such as masking a large body does not stall health checks, admin requests or other connections. It is still synchronous and has no timeout; a panic that escapes the chain fails the request closed with 503. The other hooks run on the request's task.
+
 The final `on_response_chunk` call with `is_last = true` happens on normal end of body, on an upstream stream error, and when a client disconnects. Make the call safe to repeat. The body is capped at 8 MiB before and after `on_request`; a larger body gets 413 and no upstream call.
 
 ## Support methods
@@ -100,7 +102,7 @@ Its `Cargo.toml` needs the plugin API, `toml` for the builder argument, and the 
 [package]
 name = "reiki-tag"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 publish = false

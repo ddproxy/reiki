@@ -1,6 +1,6 @@
 //! Trims a parsed JSON body before it is logged: drops or summarizes chosen paths and cuts long strings.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// A path is a top-level key (`tools`) or a JSON pointer (`/messages/0`).
 fn pointer(path: &str) -> String {

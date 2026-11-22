@@ -138,7 +138,7 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
 
 #[cfg(test)]
 mod tests {
-    use crate::detect::{scan, Kind};
+    use crate::detect::{Kind, scan};
 
     fn all() -> Vec<Kind> {
         let mut k = Kind::DEFAULT.to_vec();

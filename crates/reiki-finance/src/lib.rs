@@ -10,7 +10,7 @@ mod detect;
 use reiki_detect::guard::{self, Spec};
 use reiki_plugin::Plugin;
 
-pub use detect::{scan, Hit, Kind};
+pub use detect::{Hit, Kind, scan};
 
 /// The `[plugins.finance]` table this plugin reads.
 pub const NAME: &str = "finance";
@@ -91,39 +91,47 @@ mod tests {
     #[test]
     fn report_mode_lets_the_request_through() {
         let p = plugin("mode = \"report\"").unwrap();
-        assert!(send(
-            p.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "iban GB82WEST12345698765432"
-        )
-        .is_ok());
+        assert!(
+            send(
+                p.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "iban GB82WEST12345698765432"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn clean_bodies_and_other_upstreams_pass() {
         let p = plugin("mode = \"block\"\nupstreams = [\"zen\"]").unwrap();
-        assert!(send(
-            p.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "{\"q\":\"hello\"}"
-        )
-        .is_ok());
-        assert!(send(
-            p.as_ref(),
-            "git-host",
-            &mut HeaderMap::new(),
-            "iban GB82WEST12345698765432"
-        )
-        .is_ok());
-        assert!(send(
-            p.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "iban GB82WEST12345698765432"
-        )
-        .is_err());
+        assert!(
+            send(
+                p.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "{\"q\":\"hello\"}"
+            )
+            .is_ok()
+        );
+        assert!(
+            send(
+                p.as_ref(),
+                "git-host",
+                &mut HeaderMap::new(),
+                "iban GB82WEST12345698765432"
+            )
+            .is_ok()
+        );
+        assert!(
+            send(
+                p.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "iban GB82WEST12345698765432"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -142,21 +150,25 @@ mod tests {
     #[test]
     fn kinds_narrow_and_extend_the_default_set() {
         let iban_only = plugin("mode = \"block\"\nkinds = [\"iban\"]").unwrap();
-        assert!(send(
-            iban_only.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "cusip 037833100"
-        )
-        .is_ok());
+        assert!(
+            send(
+                iban_only.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "cusip 037833100"
+            )
+            .is_ok()
+        );
         let with_account = plugin("mode = \"block\"\nkinds = [\"account\"]").unwrap();
-        assert!(send(
-            with_account.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "account number: 000123456789"
-        )
-        .is_err());
+        assert!(
+            send(
+                with_account.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "account number: 000123456789"
+            )
+            .is_err()
+        );
     }
 
     #[test]

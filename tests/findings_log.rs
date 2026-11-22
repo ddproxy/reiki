@@ -4,12 +4,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::any;
 use axum::Router;
+use axum::routing::any;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::plugins::{builtin, PluginChain};
-use reiki::proxy::{load_keys, router, App};
+use reiki::plugins::{PluginChain, builtin};
+use reiki::proxy::{App, load_keys, router};
 
 mod common;
 use common::serve;

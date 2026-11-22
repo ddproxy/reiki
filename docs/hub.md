@@ -29,7 +29,7 @@ keys = ["zen-a"]                         # key names from [keys.*], tried in ord
 shared = false
 
 [accounts.acct-a.limits]                # absent means no shaping
-preset = "zen-free"                      # one of zen-free, openrouter-free
+preset = "zen-free"                      # optional named examples: zen-free, openrouter-free
 rpm = 20                                 # 0 means unlimited, for every field below
 tpm = 60000
 concurrent = 2

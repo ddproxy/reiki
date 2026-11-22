@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{reload, EnvFilter, Layer, Registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
 use crate::config::{LogConfig, LogFormat};
 
@@ -312,10 +312,10 @@ impl Logging {
 
     /// Reopens the log file, so a rotation tool can move it away, without touching the level.
     pub fn reopen(&self) {
-        if let Some(file) = &self.file {
-            if let Err(error) = file.reopen() {
-                tracing::warn!(%error, "cannot reopen the log file");
-            }
+        if let Some(file) = &self.file
+            && let Err(error) = file.reopen()
+        {
+            tracing::warn!(%error, "cannot reopen the log file");
         }
     }
 

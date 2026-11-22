@@ -1,6 +1,6 @@
 //! The peer routes in the v1 OpenAPI description, present only while publishing.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::Config;
 
@@ -21,6 +21,9 @@ fn upstream_schema() -> Value {
             "soonest_cooldown_seconds": {"type": ["integer", "null"], "minimum": 1,
                 "description": "Rounded up to a multiple of cooldown_bucket_secs, unless it is 0"},
             "last_status_class": {"enum": ["2xx", "4xx", "5xx", null]},
+            "capacity_group": {"type": "string", "maxLength": 64,
+                "pattern": "^[ -~]+$",
+                "description": "Opaque, operator-set group for this upstream; only when [upstream.NAME] capacity_group is configured, never derived from a key label or response"},
             "requests_1h": {"type": "integer", "minimum": 0,
                 "description": "Attempts in the last 60 minutes; only with expose_usage, a count only"},
             "limited_1h": {"type": "integer", "minimum": 0,

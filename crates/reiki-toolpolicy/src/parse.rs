@@ -212,13 +212,13 @@ pub fn extract_calls(format: Format, body: &[u8]) -> Extracted {
                         }
                     }
                 }
-                if let Some(function_call) = message.get("function_call") {
-                    if !function_call.is_null() {
-                        let name = function_call.get("name").and_then(Value::as_str);
-                        let arguments = function_call.get("arguments");
-                        if !push_openai(&mut extracted, name, arguments) {
-                            return extracted;
-                        }
+                if let Some(function_call) = message.get("function_call")
+                    && !function_call.is_null()
+                {
+                    let name = function_call.get("name").and_then(Value::as_str);
+                    let arguments = function_call.get("arguments");
+                    if !push_openai(&mut extracted, name, arguments) {
+                        return extracted;
                     }
                 }
             }
@@ -397,10 +397,10 @@ fn block_openai(root: &mut Value, blocked: &BTreeSet<usize>) {
         if names.is_empty() {
             continue;
         }
-        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-            if tool_calls.is_empty() {
-                message.as_object_mut().map(|m| m.remove("tool_calls"));
-            }
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
+            && tool_calls.is_empty()
+        {
+            message.as_object_mut().map(|m| m.remove("tool_calls"));
         }
         append_notice(message, &names);
         if let Some(choice) = choice.as_object_mut() {
@@ -453,13 +453,12 @@ fn block_anthropic(root: &mut Value, blocked: &BTreeSet<usize>) {
     }
     if !blocked_names.is_empty()
         && root.get("stop_reason").and_then(Value::as_str) == Some("tool_use")
+        && let Some(root) = root.as_object_mut()
     {
-        if let Some(root) = root.as_object_mut() {
-            root.insert(
-                "stop_reason".to_owned(),
-                Value::String("end_turn".to_owned()),
-            );
-        }
+        root.insert(
+            "stop_reason".to_owned(),
+            Value::String("end_turn".to_owned()),
+        );
     }
 }
 

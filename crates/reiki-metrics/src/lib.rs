@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
-    AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, KeyCounts, Plugin,
-    RequestCtx, ResponseHeadCtx, UpstreamUsage, HOST_KEYS,
+    AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, HOST_KEYS, KeyCounts,
+    Plugin, RequestCtx, ResponseHeadCtx, UpstreamUsage,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
@@ -263,10 +263,10 @@ impl RequestState {
             if !self.discarding {
                 self.read_event_line(&rest);
             }
-        } else if !self.exceeded {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buffer) {
-                self.take(usage_in(&value));
-            }
+        } else if !self.exceeded
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&self.buffer)
+        {
+            self.take(usage_in(&value));
         }
         if self.input.is_none() && self.output.is_none() {
             return;
@@ -844,9 +844,11 @@ mod tests {
         assert!(reply.body.contains(
             "reiki_requests_total{stream=\"s\",upstream=\"u\",status=\"server_error\"} 1"
         ));
-        assert!(reply
-            .body
-            .contains("reiki_cooldowns_total{key=\"k\",class=\"rate_limited\",scope=\"key\"} 1"));
+        assert!(
+            reply.body.contains(
+                "reiki_cooldowns_total{key=\"k\",class=\"rate_limited\",scope=\"key\"} 1"
+            )
+        );
         assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
         assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
         assert!(!plugin.uses_bodies());

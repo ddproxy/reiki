@@ -4,7 +4,7 @@
 //! level with a `//` caveat chain. Identifiers with no usable checksum are only reported next to
 //! their own label. A hit never carries the matched text, only its position.
 
-use reiki_detect::{digit_run, keyed, word_at, word_before, KeyedStyle};
+use reiki_detect::{KeyedStyle, digit_run, keyed, word_at, word_before};
 
 /// Controlled identifiers keep their own separator grammar (no `.`, any ASCII whitespace).
 const KEYED: KeyedStyle = KeyedStyle {
@@ -276,10 +276,10 @@ fn marking_in_line(line: &[u8], rel: usize, token: &[u8]) -> bool {
         if rel > start && !matches!(line.get(rel - 1), Some(&b'/') | Some(&b' ') | Some(&b'\t')) {
             return false;
         }
-        if let Some(&c) = line.get(rel + token.len()) {
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
-                return false;
-            }
+        if let Some(&c) = line.get(rel + token.len())
+            && (c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        {
+            return false;
         }
     }
     if portion {
@@ -379,11 +379,10 @@ fn classification(bytes: &[u8], hits: &mut Vec<Hit>) {
                 && !word_at(bytes, end)
                 && bytes[i..end] == *level
                 && bytes[end..].starts_with(b"//")
+                && let Some(banner) = banner_end(bytes, end)
             {
-                if let Some(banner) = banner_end(bytes, end) {
-                    matched = Some(banner);
-                    break;
-                }
+                matched = Some(banner);
+                break;
             }
         }
         match matched {

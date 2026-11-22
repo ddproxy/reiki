@@ -57,7 +57,7 @@ fn open_append(path: &Path) -> io::Result<File> {
     }
     #[cfg(unix)]
     {
-        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
         // O_NONBLOCK only kept the open of a FIFO we then reject from hanging. The descriptor is
         // now known to be a regular file; make it blocking again, because some network
@@ -177,7 +177,7 @@ mod unix {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -199,13 +199,13 @@ mod unix {
 
     impl SocketHub {
         pub fn bind(path: &Path) -> io::Result<Self> {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                if std::fs::metadata(parent)?.permissions().mode() & 0o002 != 0 {
-                    return Err(io::Error::new(
-                        ErrorKind::PermissionDenied,
-                        "the socket's directory is writable by everyone",
-                    ));
-                }
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+                && std::fs::metadata(parent)?.permissions().mode() & 0o002 != 0
+            {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "the socket's directory is writable by everyone",
+                ));
             }
             match std::fs::symlink_metadata(path) {
                 Ok(meta) if !meta.file_type().is_socket() => {

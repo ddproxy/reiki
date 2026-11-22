@@ -11,7 +11,7 @@ mod detect;
 use reiki_detect::guard::{self, Spec};
 use reiki_plugin::Plugin;
 
-pub use detect::{scan, Hit, Kind};
+pub use detect::{Hit, Kind, scan};
 
 /// The `[plugins.phi]` table this plugin reads.
 pub const NAME: &str = "phi";
@@ -105,20 +105,24 @@ mod tests {
     #[test]
     fn clean_bodies_and_other_upstreams_pass() {
         let p = plugin("mode = \"block\"\nupstreams = [\"zen\"]").unwrap();
-        assert!(send(
-            p.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "{\"q\":\"hello\"}"
-        )
-        .is_ok());
-        assert!(send(
-            p.as_ref(),
-            "git-host",
-            &mut HeaderMap::new(),
-            "ssn 123-45-6789"
-        )
-        .is_ok());
+        assert!(
+            send(
+                p.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "{\"q\":\"hello\"}"
+            )
+            .is_ok()
+        );
+        assert!(
+            send(
+                p.as_ref(),
+                "git-host",
+                &mut HeaderMap::new(),
+                "ssn 123-45-6789"
+            )
+            .is_ok()
+        );
         assert!(send(p.as_ref(), "zen", &mut HeaderMap::new(), "ssn 123-45-6789").is_err());
     }
 
@@ -138,21 +142,25 @@ mod tests {
     #[test]
     fn kinds_narrow_and_extend_the_default_set() {
         let ssn_only = plugin("mode = \"block\"\nkinds = [\"ssn\"]").unwrap();
-        assert!(send(
-            ssn_only.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "card 4111 1111 1111 1111"
-        )
-        .is_ok());
+        assert!(
+            send(
+                ssn_only.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "card 4111 1111 1111 1111"
+            )
+            .is_ok()
+        );
         let with_email = plugin("mode = \"block\"\nkinds = [\"email\"]").unwrap();
-        assert!(send(
-            with_email.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "a@example.com"
-        )
-        .is_err());
+        assert!(
+            send(
+                with_email.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "a@example.com"
+            )
+            .is_err()
+        );
     }
 
     #[test]

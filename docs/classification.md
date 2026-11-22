@@ -24,7 +24,7 @@ This page is the single source for upstream response classes, key effects and co
 | 400 | anything else (after the request-size, credential, quota and configured rate-limit checks) | pass-through | None | Response is relayed |
 | 402 | JSON `error.message` or `message` contains `fewer max_tokens` or `can only afford`; whole-body substring match only when the body is not JSON | `request_error` | None; the key is not cooled | Next key; the last upstream 402 is relayed unchanged if no key serves |
 | 402 | anything else (after the request-size, quota and configured rate-limit checks) | `quota_exhausted` | Cooling for `(route, model)` | Next key |
-| 429 | `usage exceeded`, `quota`, `subscribe to go`, `free usage limit`, `free-models-per-day` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
+| 429 | `usage exceeded`, `quota`, `free usage limit` or `insufficient` | `quota_exhausted` | Cooling, whole key | Next key |
 | 429 | none of the above | `rate_limited` | Cooling for `(route, model)` | Next key |
 | 403 | `error code: 10` (edge block page) | pass-through | None | Response is relayed |
 | 403 | `access is disabled`, `free tier` or `not enabled` | `access_disabled` | None | Skip key for this request |
@@ -55,14 +55,14 @@ Each upstream may add body phrases to the built-in lists:
 [upstream.zen]
 base_url = "https://opencode.ai/zen/v1"
 request_error_phrases = ["fewer max_tokens", "your max_tokens is too high"]
-quota_phrases = ["plan limit reached", "top up your balance"]
+quota_phrases = ["plan limit reached", "top up your balance", "free-models-per-day"]
 rate_limit_phrases = ["slow down"]
 ```
 
 - Each list holds at most 16 unique phrases of 3 to 120 non-control characters. A bad list is a config error naming the upstream and the phrase.
 - Matching is case-insensitive, against a substring of the first 64 KiB of the body. Configured phrases extend, never replace, the built-ins above.
 - `request_error_phrases` apply to 400, 402 and 413 only. The response is relayed and the key stays healthy. Built-ins: `fewer max_tokens`, `can only afford`.
-- `quota_phrases` cool the whole key, like a quota 429. Built-ins: `credit balance is too low` on 400 and the six 429 phrases in the table above. A configured 402 quota phrase also cools the whole key; the built-in 402 request-size phrases still pass through.
+- `quota_phrases` cool the whole key, like a quota 429. Built-ins: `credit balance is too low` on 400 and the four 429 phrases in the table above. A configured 402 quota phrase also cools the whole key; the built-in 402 request-size phrases still pass through. Vendor-specific phrases such as `free-models-per-day` belong here, not in the built-in rules.
 - `rate_limit_phrases` cool the `(route, model)` scope. A configured match on `400`, `402` or `413` classifies the response as `rate_limited` when no request-size or quota phrase matched; built-in: `rate limit` on 5xx.
 - When lists overlap in one response, the order is request error, then quota, then rate limit.
 

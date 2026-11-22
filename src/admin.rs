@@ -2,16 +2,16 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, State};
 use axum::http::Method;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
-use axum::routing::{get, post, MethodRouter};
-use axum::Router;
+use axum::routing::{MethodRouter, get, post};
 use serde_json::Value;
 
-use crate::auth::{bearer_token, constant_time_eq, sha256_hex, Peer};
+use crate::auth::{Peer, bearer_token, constant_time_eq, sha256_hex};
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::StrategyConfig;
 use crate::proxy::{App, Snapshot};

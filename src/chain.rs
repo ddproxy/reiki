@@ -154,15 +154,14 @@ impl KeyHealth {
             existing.class = class;
             return true;
         }
-        if self.scopes.len() >= MAX_SCOPES {
-            if let Some(victim) = self
+        if self.scopes.len() >= MAX_SCOPES
+            && let Some(victim) = self
                 .scopes
                 .iter()
                 .min_by_key(|(_, health)| health.cooling_until)
                 .map(|(scope, _)| scope.clone())
-            {
-                self.scopes.remove(&victim);
-            }
+        {
+            self.scopes.remove(&victim);
         }
         self.scopes.insert(
             scope.clone(),
@@ -1288,10 +1287,12 @@ mod tests {
             );
         }
         assert_eq!(health.scopes.len(), MAX_SCOPES);
-        assert!(health
-            .scopes
-            .values()
-            .all(|h| h.cooling_until >= now + secs(20)));
+        assert!(
+            health
+                .scopes
+                .values()
+                .all(|h| h.cooling_until >= now + secs(20))
+        );
     }
 
     #[test]

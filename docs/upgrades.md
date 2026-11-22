@@ -27,7 +27,7 @@ This is the complete map for every config table and key. "Live" means the change
 | `[reload]`: `watch`, `interval_secs` | Live | — | Apply to the watcher on the next reload. |
 | `[log]`: `level` | Live | — | `RUST_LOG`, when set at startup, keeps overriding `level` after reload. The log file is reopened. |
 | `[log]`: `file`, `format`, `stderr`, `file_max_bytes`, `file_keep` | — | Yes | Labels `log.file`, `log.format`, `log.stderr`, `log.file_max_bytes`, `log.file_keep`. |
-| `[upstream.NAME]`: `base_url`, `auth_header`, `auth_format`, `model_aliases`, `drop_params`, `http2`, `forward_accept_encoding`, `max_decoded_bytes`, `response_idle_timeout_secs`, `response_timeout_secs`, `title_case_headers`, `send_keep_alive`, `pass_errors`, `confirm_quota`, `scope_escalate_after`, `hold_unauthorized`, `passthrough` | Live | — | The upstream is rebuilt for new requests. In-flight requests keep the old route. |
+| `[upstream.NAME]`: `base_url`, `auth_header`, `auth_format`, `model_aliases`, `drop_params`, `http2`, `forward_accept_encoding`, `max_decoded_bytes`, `response_idle_timeout_secs`, `response_timeout_secs`, `title_case_headers`, `send_keep_alive`, `pass_errors`, `confirm_quota`, `scope_escalate_after`, `hold_unauthorized`, `passthrough`, `capacity_group` | Live | — | The upstream is rebuilt for new requests. In-flight requests keep the old route. |
 | `[upstream.NAME.fallback]`: `upstream`, `model_aliases` | Live | — | Applied with the upstream. |
 | `[upstream.NAME.forward]`: `command`, `args`, `pass_env`, `socket`, `expect_uid`, `max_concurrent`, `streaming`, `max_stream_bytes`, `stream_timeout_secs` | Live | — | Applied with the upstream. Existing forwarder links keep their starting config. |
 | `[upstream.NAME.limits]`: `preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs` | Live | — | Applied with the upstream. Saved shaping state is tied to the key digest and upstream. |
@@ -35,7 +35,7 @@ This is the complete map for every config table and key. "Live" means the change
 | `[keys.NAME]`: `upstream` | Live | — | A re-pointed key also starts healthy. |
 | `[streams.NAME]`: `token_sha256`, `chain`, `strategy`, `rate_limit_per_minute` | Live | — | The stream rate-limit counter resets on reload. |
 | `[tunnel]`: `listen` | — | Yes | Label `tunnel.listen`. |
-| `[tunnel]`: `allow`, `connect_timeout_secs`, `allow_loopback`, `deny_private` | Live | — | Open tunnels keep their starting policy. |
+| `[tunnel]`: `allow`, `connect_timeout_secs`, `allow_loopback`, `deny_private`, `close_idle_on_stop` | Live | — | Open tunnels keep their starting policy; new tunnels use the reloaded one. |
 | Adding or removing `[tunnel]` | — | Yes | No tunnel listener exists until restart. |
 | `[tunnel.intercept]`: `ca_cert`, `ca_key`, `leaf_ttl_hours`, `require_auth` | Live | — | Reiki validates the new CA before swap. Open connections keep their old certificate; clients must trust the new CA. |
 | `[tunnel.intercept]`: `ca_key_permissions` | Check only | — | The CA key mode check runs on each reload. The policy has no running state to swap. |

@@ -14,15 +14,13 @@ pub fn secrets(text: &str) -> Cow<'_, str> {
 /// Like [`secrets`], for text that was cut short: a credential cut off at the end is masked too.
 pub fn secrets_cut(text: &str, cut: bool) -> Cow<'_, str> {
     let mut spans = spans_of(text);
-    if cut {
-        if let Some(start) = reiki_redact::partial_tail(text) {
-            spans.push(Span {
-                start,
-                end: text.len(),
-                private_key: false,
-            });
-            spans = merge(spans);
-        }
+    if cut && let Some(start) = reiki_redact::partial_tail(text) {
+        spans.push(Span {
+            start,
+            end: text.len(),
+            private_key: false,
+        });
+        spans = merge(spans);
     }
     mask_spans(text, spans)
 }
@@ -253,15 +251,13 @@ pub fn stream_deltas(events: &mut [Value], cut: bool) {
         }
         let joined: String = pieces.iter().map(|(_, p)| p.as_str()).collect();
         let mut spans = spans_of(&joined);
-        if cut {
-            if let Some(start) = reiki_redact::partial_tail(&joined) {
-                spans.push(Span {
-                    start,
-                    end: joined.len(),
-                    private_key: false,
-                });
-                spans = merge(spans);
-            }
+        if cut && let Some(start) = reiki_redact::partial_tail(&joined) {
+            spans.push(Span {
+                start,
+                end: joined.len(),
+                private_key: false,
+            });
+            spans = merge(spans);
         }
         if spans.is_empty() {
             continue;
@@ -280,10 +276,10 @@ pub fn stream_deltas(events: &mut [Value], cut: bool) {
                 cursor = span.end.min(to);
             }
             text.push_str(&joined[cursor..to]);
-            if text != piece {
-                if let Some(slot) = events[index].pointer_mut(pointer) {
-                    *slot = Value::String(text);
-                }
+            if text != piece
+                && let Some(slot) = events[index].pointer_mut(pointer)
+            {
+                *slot = Value::String(text);
             }
         }
     }

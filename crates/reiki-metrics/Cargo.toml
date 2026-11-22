@@ -1,7 +1,7 @@
 [package]
 name = "reiki-metrics"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.99"
 description = "Reiki plugin that serves Prometheus metrics on the admin listener"
 license = "MIT"

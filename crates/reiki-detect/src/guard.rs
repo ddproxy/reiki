@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use http::StatusCode;
-use reiki_plugin::{Plugin, PluginError, RequestCtx, HOST_KEYS};
+use reiki_plugin::{HOST_KEYS, Plugin, PluginError, RequestCtx};
 use toml::Value;
 
 use crate::Hit;
@@ -63,7 +63,7 @@ pub fn build<K: Kind>(spec: Spec<K>, table: &toml::Table) -> Result<Box<dyn Plug
         Some(other) => {
             return Err(format!(
                 "{name}: `mode` must be \"block\" or \"report\", got {other}"
-            ))
+            ));
         }
         None => return Err(format!("{name}: set `mode` to \"block\" or \"report\"")),
     };

@@ -1235,7 +1235,9 @@ mod tests {
         let peer_a: Vec<&str> = lines[1].split_whitespace().collect();
         assert_eq!(
             peer_a,
-            ["peer-a", "peer-a", "zen", "cooling", "0", "1", "0", "42s", "2s"]
+            [
+                "peer-a", "peer-a", "zen", "cooling", "0", "1", "0", "42s", "2s"
+            ]
         );
         let peer_b: Vec<&str> = lines[2].split_whitespace().collect();
         assert_eq!(

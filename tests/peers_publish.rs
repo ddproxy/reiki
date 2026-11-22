@@ -9,12 +9,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 
 const ADMIN_TOKEN: &str = "admin-token-for-peer-tests";
 const STREAM_TOKEN: &str = "stream-token-for-peer-tests";
@@ -625,8 +625,8 @@ async fn the_openapi_document_describes_health_on_the_peer_listener() {
             "{field} is required in the current wire shape"
         );
     }
-    let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-        ["properties"]["upstreams"]["items"];
+    let upstream = &health["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+        ["upstreams"]["items"];
     for field in [
         "requests_1h",
         "limited_1h",

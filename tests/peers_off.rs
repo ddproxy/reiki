@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 
 mod common;
 use common::serve;

@@ -146,9 +146,13 @@ mod tests {
         assert!(body.contains("action=\"blocked\"} 1"));
         assert!(body.contains("cli\\\"one"));
         assert!(body.contains("rule=\"unapproved_host\",severity=\"high\"} 1"));
-        assert!(body.contains("reiki_toolpolicy_unparsed_total{stream=\"cli\",upstream=\"zen\"} 1"));
-        assert!(metrics
-            .reply(&AdminCtx::new("/other", KeyCounts::default()))
-            .is_none());
+        assert!(
+            body.contains("reiki_toolpolicy_unparsed_total{stream=\"cli\",upstream=\"zen\"} 1")
+        );
+        assert!(
+            metrics
+                .reply(&AdminCtx::new("/other", KeyCounts::default()))
+                .is_none()
+        );
     }
 }

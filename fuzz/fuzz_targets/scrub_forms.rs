@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
-use reiki::scrub::{contains_key_material, forms, scrub_text, StreamScrubber};
+use reiki::scrub::{StreamScrubber, contains_key_material, forms, scrub_text};
 
 // Long keys are covered by the crate's unit tests; a shorter bound keeps libFuzzer's throughput
 // useful while still crossing the eight-byte minimum and every form family's budget.

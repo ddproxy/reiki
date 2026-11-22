@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use reiki_plugin::format_utc;
 
-use crate::proxy::{json_escape, App};
+use crate::proxy::{App, json_escape};
 
 /// The outcome of a successful reload.
 #[derive(Debug, Clone, PartialEq, Eq)]

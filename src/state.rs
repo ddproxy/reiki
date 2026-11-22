@@ -649,9 +649,11 @@ mod tests {
 
         // A u64 beyond i64 is rejected or capped, never an unbounded cooldown.
         write("18446744073709551615");
-        assert!(load(&path, &config)
-            .get("a")
-            .is_none_or(|s| s.cooling == Some(MAX_RESTORED_COOLDOWN)));
+        assert!(
+            load(&path, &config)
+                .get("a")
+                .is_none_or(|s| s.cooling == Some(MAX_RESTORED_COOLDOWN))
+        );
 
         // Zero and a deadline that has already passed never become a cooldown.
         write("0");

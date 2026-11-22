@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use reiki_requestlog::fuzzing::{form, header, json, path, secrets_cut, sse_events, stream_deltas};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);

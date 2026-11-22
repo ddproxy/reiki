@@ -66,10 +66,17 @@ struct Rig {
 
 impl Rig {
     async fn new(peers_extra: &str) -> Self {
+        Self::new_with(peers_extra, None).await
+    }
+
+    async fn new_with(peers_extra: &str, group: Option<&str>) -> Self {
         let upstream = limited_upstream().await;
         let (peer_listener, peer_addr) = bind().await;
+        let group = group
+            .map(|value| format!("capacity_group = \"{value}\"\n"))
+            .unwrap_or_default();
         let text = format!(
-            "[upstream.zen]\nbase_url = \"{upstream}/v1\"\n\
+            "[upstream.zen]\nbase_url = \"{upstream}/v1\"\n{group}\
              [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused/zen-a\"\n\
              [keys.zen-b]\nupstream = \"zen\"\nfile = \"/unused/zen-b\"\n\
              [streams.client-a]\ntoken_sha256 = \"{}\"\nchain = [\"zen-a\", \"zen-b\"]\n\
@@ -237,6 +244,25 @@ async fn a_stream_starts_with_a_snapshot_then_sends_key_changes() {
             "a hidden label or session id appeared in the peer stream payload"
         );
     }
+}
+
+#[tokio::test]
+async fn a_configured_group_is_read_from_the_snapshot_and_key_events() {
+    let rig = Rig::new_with("", Some("team-a")).await;
+    let mut reader = Reader::new(rig.open(PEER_TOKEN).await);
+    let (event, data) = reader.next().await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(snapshot["upstreams"][0]["capacity_group"], "team-a");
+
+    rig.cool_both_keys().await;
+    let (event, data) = reader.next_change().await;
+    assert_eq!(
+        event, "key",
+        "the key change event must be accepted with a group"
+    );
+    let key: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(key["upstream"]["capacity_group"], "team-a");
 }
 
 #[tokio::test]

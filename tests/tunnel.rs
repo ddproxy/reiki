@@ -1,9 +1,41 @@
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use reiki::config::TunnelConfig;
 use reiki::tunnel::{Tunnel, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogBuffer {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(Arc::clone(&self.0))
+    }
+}
 
 /// Echoes every byte back, standing in for a TLS server the tunnel must not read.
 async fn echo() -> u16 {
@@ -285,4 +317,120 @@ async fn stopping_closes_idle_tunnels_at_once_and_cuts_active_ones_after_the_dra
         .unwrap();
     assert_eq!(closed, 0, "active tunnels are cut at the drain deadline");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_connection_still_sending_its_connect_head_is_cut_with_the_drain() {
+    use std::time::Duration;
+
+    use reiki::tunnel::serve_until;
+
+    let config = TunnelConfig {
+        deny_private: false,
+        listen: String::new(),
+        allow: vec!["*".to_owned()],
+        connect_timeout_secs: 5,
+        allow_loopback: true,
+        close_idle_on_stop: true,
+        intercept: None,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_until(
+        listener,
+        Arc::new(Tunnel::new(&config)),
+        async {
+            let _ = rx.await;
+        },
+        Duration::from_millis(200),
+    ));
+
+    // The handler is still waiting for a request head when the stop begins; it must not keep
+    // this socket alive until the ten-second head timeout.
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    tx.send(()).unwrap();
+    let mut one = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_millis(2_000), client.read(&mut one))
+        .await
+        .expect("the unfinished CONNECT is cut with the drain")
+        .unwrap();
+    assert_eq!(closed, 0, "a half-open head is closed at the cut");
+    server.await.unwrap();
+}
+
+#[test]
+fn a_shutdown_cut_logs_the_bytes_already_moved() {
+    use std::time::Duration;
+
+    use reiki::tunnel::serve_until;
+
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let port = echo().await;
+            let config = TunnelConfig {
+                deny_private: false,
+                listen: String::new(),
+                allow: vec![format!("127.0.0.1:{port}")],
+                connect_timeout_secs: 5,
+                allow_loopback: true,
+                close_idle_on_stop: true,
+                intercept: None,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(serve_until(
+                listener,
+                Arc::new(Tunnel::new(&config)),
+                async {
+                    let _ = rx.await;
+                },
+                Duration::from_millis(300),
+            ));
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(
+                    format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                status_line(&mut client).await,
+                "HTTP/1.1 200 Connection Established"
+            );
+            client.write_all(b"hello").await.unwrap();
+            let mut echoed = [0u8; 5];
+            client.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"hello");
+
+            tx.send(()).unwrap();
+            let mut one = [0u8; 1];
+            let closed = tokio::time::timeout(Duration::from_millis(2_000), client.read(&mut one))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed, 0, "the cut closes the tunnel");
+            server.await.unwrap();
+        });
+    });
+
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("tunnel closed"))
+        .unwrap_or_else(|| panic!("no tunnel close line was logged: {text}"));
+    assert!(line.contains("bytes_up=5"), "lost upload total: {line}");
+    assert!(line.contains("bytes_down=5"), "lost download total: {line}");
 }

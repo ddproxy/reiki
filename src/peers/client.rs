@@ -1,13 +1,10 @@
 //! `reiki peers`: read each configured peer's `/v1/health` with a client of its own, trusting
 //! only that peer's CA, and report anything unanswered or old as unknown.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::config::{PeerEntry, PeersConfig};
@@ -17,10 +14,9 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest `/v1/health` body read; a bigger one is refused, not truncated.
 pub const MAX_BODY: usize = 64 * 1024;
 
-/// One upstream as a peer publishes it. The wire shape is validated by [`UpstreamWire`]; this is
-/// only the part `reiki peers` displays.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One upstream as a peer publishes it. The wire shape is owned by `reiki-health` and shared with
+/// the publisher; this is only the part `reiki peers` displays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpstreamHealth {
     pub name: String,
     pub healthy_keys: u32,
@@ -28,6 +24,8 @@ pub struct UpstreamHealth {
     pub disabled_keys: u32,
     pub soonest_cooldown_seconds: Option<u64>,
     pub last_status_class: Option<String>,
+    /// Operator-set group, validated on both sides by `reiki-health`.
+    pub capacity_group: Option<String>,
 }
 
 impl UpstreamHealth {
@@ -45,74 +43,6 @@ impl UpstreamHealth {
     }
 }
 
-/// The current `/v1/health` wire shape. Every required figure must be present; fields a
-/// publisher omits by configuration are optional, and unknown fields are an error.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct HealthDocWire {
-    instance: String,
-    reiki_version: String,
-    observed_at: String,
-    age_seconds: u64,
-    upstreams: Vec<UpstreamWire>,
-    failures: BTreeMap<String, u64>,
-    #[serde(default)]
-    host: Option<Value>,
-    #[serde(default)]
-    sessions: Option<Value>,
-}
-
-/// An `Option` that must be present in JSON; `null` is still a valid value. Serde would otherwise
-/// accept a missing `Option` field as `None`, making an absent field read as `null`.
-#[allow(dead_code)]
-#[derive(Debug)]
-struct RequiredNullable<T>(Option<T>);
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for RequiredNullable<T> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // `Option::deserialize` would also accept serde's missing-field deserializer, making an
-        // absent field look like `null`. Reading a `Value` first keeps absence an error.
-        let value = Value::deserialize(deserializer)?;
-        let inner = if value.is_null() {
-            None
-        } else {
-            Some(T::deserialize(value).map_err(D::Error::custom)?)
-        };
-        Ok(Self(inner))
-    }
-}
-
-/// One upstream in the current wire shape, including fields this reader does not display.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct UpstreamWire {
-    name: String,
-    healthy_keys: u32,
-    cooling_keys: u32,
-    disabled_keys: u32,
-    cooling_combinations: u32,
-    soonest_cooldown_seconds: RequiredNullable<u64>,
-    last_status_class: RequiredNullable<String>,
-    #[serde(default)]
-    keys: Option<Value>,
-    #[serde(default)]
-    requests_1h: Option<Value>,
-    #[serde(default)]
-    limited_1h: Option<Value>,
-    #[serde(default)]
-    request_buckets: Option<Value>,
-    #[serde(default)]
-    tokens_1h: Option<Value>,
-    #[serde(default)]
-    token_buckets: Option<Value>,
-    #[serde(default)]
-    request_minutes: Option<Value>,
-    #[serde(default)]
-    token_minutes: Option<Value>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct HealthDoc {
     pub(crate) instance: String,
@@ -121,41 +51,30 @@ pub(crate) struct HealthDoc {
     pub(crate) upstreams: Vec<UpstreamHealth>,
 }
 
-impl From<UpstreamWire> for UpstreamHealth {
-    fn from(wire: UpstreamWire) -> Self {
+impl From<reiki_health::Upstream> for UpstreamHealth {
+    fn from(upstream: reiki_health::Upstream) -> Self {
         Self {
-            name: wire.name,
-            healthy_keys: wire.healthy_keys,
-            cooling_keys: wire.cooling_keys,
-            disabled_keys: wire.disabled_keys,
-            soonest_cooldown_seconds: wire.soonest_cooldown_seconds.0,
-            last_status_class: wire.last_status_class.0,
+            name: upstream.name,
+            healthy_keys: upstream.healthy_keys,
+            cooling_keys: upstream.cooling_keys,
+            disabled_keys: upstream.disabled_keys,
+            soonest_cooldown_seconds: upstream.soonest_cooldown_seconds,
+            last_status_class: upstream.last_status_class,
+            capacity_group: upstream.capacity_group,
         }
     }
 }
 
-/// Keeps an uncontrolled peer version out of logs and tables, as in `reiki top`.
-fn check_version(text: &str) -> Result<(), String> {
-    let clean: String = text
-        .chars()
-        .filter(|c| (' '..='~').contains(c))
-        .take(32)
-        .collect();
-    if clean.is_empty() {
-        return Err("reiki_version has no printable characters".to_owned());
-    }
-    Ok(())
-}
-
+/// Parses through the shared wire type, so the publisher and every reader enforce the same
+/// required fields, unknown-field rule and `capacity_group` validation.
 impl<'de> Deserialize<'de> for HealthDoc {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = HealthDocWire::deserialize(deserializer)?;
-        check_version(&wire.reiki_version).map_err(D::Error::custom)?;
+        let health = reiki_health::Health::deserialize(deserializer)?;
         Ok(Self {
-            instance: wire.instance,
-            observed_at: wire.observed_at,
-            age_seconds: wire.age_seconds,
-            upstreams: wire.upstreams.into_iter().map(Into::into).collect(),
+            instance: health.instance,
+            observed_at: health.observed_at,
+            age_seconds: health.age_seconds,
+            upstreams: health.upstreams.into_iter().map(Into::into).collect(),
         })
     }
 }
@@ -632,12 +551,12 @@ impl SseParser {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyEvent {
     observed_at: String,
     age_seconds: u64,
-    upstream: UpstreamWire,
+    upstream: reiki_health::Upstream,
 }
 
 enum Watched {
@@ -667,7 +586,7 @@ fn apply_key_event(doc: &mut HealthDoc, key: KeyEvent, drops: &mut u64) -> bool 
     }
     doc.observed_at = key.observed_at;
     doc.age_seconds = key.age_seconds;
-    let upstream = key.upstream.into();
+    let upstream = UpstreamHealth::from(key.upstream);
     match existing {
         Some(index) => doc.upstreams[index] = upstream,
         None => doc.upstreams.push(upstream),
@@ -995,6 +914,7 @@ mod tests {
                 disabled_keys: 0,
                 soonest_cooldown_seconds: Some(42),
                 last_status_class: Some("4xx".to_owned()),
+                capacity_group: None,
             }],
         }
     }
@@ -1008,23 +928,19 @@ mod tests {
             disabled_keys: 0,
             soonest_cooldown_seconds: None,
             last_status_class: None,
+            capacity_group: None,
         };
-        let wire = |name: &str| UpstreamWire {
-            name: name.to_owned(),
-            healthy_keys: 1,
-            cooling_keys: 0,
-            disabled_keys: 0,
-            cooling_combinations: 0,
-            soonest_cooldown_seconds: RequiredNullable(None),
-            last_status_class: RequiredNullable(None),
-            keys: None,
-            requests_1h: None,
-            limited_1h: None,
-            request_buckets: None,
-            tokens_1h: None,
-            token_buckets: None,
-            request_minutes: None,
-            token_minutes: None,
+        let wire = |name: &str| {
+            serde_json::from_value::<reiki_health::Upstream>(serde_json::json!({
+                "name": name,
+                "healthy_keys": 1,
+                "cooling_keys": 0,
+                "disabled_keys": 0,
+                "cooling_combinations": 0,
+                "soonest_cooldown_seconds": null,
+                "last_status_class": null,
+            }))
+            .unwrap()
         };
         let mut watched = doc("2026-11-13T09:59:58Z");
         for n in 1..MAX_KEY_UPSTREAMS {
@@ -1214,6 +1130,86 @@ mod tests {
                 serde_json::from_str::<KeyEvent>(old).is_err(),
                 "{old} is not a current key event"
             );
+        }
+    }
+
+    /// A document exactly as the shared health publisher writes it, with an operator-set group.
+    fn grouped_document(group: &str) -> serde_json::Value {
+        serde_json::json!({
+            "instance": "peer-a",
+            "reiki_version": "0.13.0",
+            "observed_at": "2026-11-13T10:00:00Z",
+            "age_seconds": 0,
+            "failures": {},
+            "upstreams": [{
+                "name": "zen",
+                "healthy_keys": 1,
+                "cooling_keys": 0,
+                "disabled_keys": 0,
+                "cooling_combinations": 0,
+                "soonest_cooldown_seconds": null,
+                "last_status_class": null,
+                "capacity_group": group,
+            }],
+        })
+    }
+
+    fn grouped_key_event(group: &str) -> serde_json::Value {
+        serde_json::json!({
+            "observed_at": "2026-11-13T10:01:00Z",
+            "age_seconds": 0,
+            "upstream": grouped_document(group)["upstreams"][0].clone(),
+        })
+    }
+
+    #[test]
+    fn a_configured_group_survives_polling_snapshots_and_key_events() {
+        let document = grouped_document("team-a");
+        let polled = serde_json::from_value::<HealthDoc>(document.clone()).unwrap();
+        assert_eq!(
+            polled.upstreams[0].capacity_group.as_deref(),
+            Some("team-a")
+        );
+        let report = assess("peer-a", polled, Duration::from_secs(30));
+        assert_eq!(
+            report.upstreams[0].capacity_group.as_deref(),
+            Some("team-a"),
+            "a polled report keeps the group"
+        );
+        let snapshot = serde_json::from_value::<HealthDoc>(document).unwrap();
+        assert_eq!(
+            snapshot.upstreams[0].capacity_group.as_deref(),
+            Some("team-a"),
+            "a streamed snapshot keeps the group"
+        );
+        let mut watched = doc("2026-11-13T09:59:58Z");
+        let key = serde_json::from_value::<KeyEvent>(grouped_key_event("team-b")).unwrap();
+        let mut drops = 0;
+        assert!(apply_key_event(&mut watched, key, &mut drops));
+        assert_eq!(
+            watched.upstreams[0].capacity_group.as_deref(),
+            Some("team-b"),
+            "a streamed key event keeps the group"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_group_is_refused_on_polls_snapshots_and_key_events() {
+        for group in ["", "   ", "a\nb", "a\u{1b}[2J", &"x".repeat(65)] {
+            let error = serde_json::from_value::<HealthDoc>(grouped_document(group))
+                .expect_err(&format!("{group:?} must be refused on a poll"))
+                .to_string();
+            assert!(error.contains("capacity_group"), "{error}");
+            let error = serde_json::from_str::<HealthDoc>(
+                &serde_json::to_string(&grouped_document(group)).unwrap(),
+            )
+            .expect_err(&format!("{group:?} must be refused in a snapshot"))
+            .to_string();
+            assert!(error.contains("capacity_group"), "{error}");
+            let error = serde_json::from_value::<KeyEvent>(grouped_key_event(group))
+                .expect_err(&format!("{group:?} must be refused in a key event"))
+                .to_string();
+            assert!(error.contains("capacity_group"), "{error}");
         }
     }
 

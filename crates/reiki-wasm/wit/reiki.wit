@@ -1,0 +1,139 @@
+package reiki:plugin@1.0.0;
+
+/// Phase 1 host interface for Wasm plugins.
+/// Data is pulled through gated capability interfaces (D1/P3), not passed as
+/// wide record fields. The component's import list is the capability request.
+interface types {
+    /// The host returns this when a capability is not granted.
+    enum deny-reason {
+        not-granted,
+        invalid-argument,
+        limit-exceeded,
+        poisoned,
+    }
+
+    record finding {
+        kind: string,
+        /// Sanitized by host; detail-vocab plugins must use manifest/config vocab.
+        detail: option<string>,
+        count: u32,
+        blocked: bool,
+    }
+
+    /// Verdict from on-request. `skip` means the plugin declined this request.
+    variant verdict {
+        pass,
+        /// (status, template-id). Status is limited by the host manifest templates.
+        reject(tuple<u16, string>),
+        skip(string),
+    }
+
+    /// A literal id declared in the manifest `[literals]` table.
+    type literal-id = string;
+
+    /// A JSON pointer (RFC 6901) into the request body.
+    type json-pointer = string;
+
+    /// An edit operation applied by the host after the hook returns.
+    variant edit-op {
+        remove(json-pointer),
+        set(tuple<json-pointer, literal-id>),
+        mask(tuple<json-pointer, literal-id>),
+    }
+
+    record request-edit {
+        /// Edits are applied in order by the host; host re-validates JSON.
+        ops: list<edit-op>,
+    }
+}
+
+/// Default-allowed request metadata (low risk).
+interface request-meta {
+    resource request {
+        stream-name: func() -> string;
+        upstream: func() -> string;
+        method: func() -> string;
+        /// Path without query string.
+        path: func() -> string;
+    }
+}
+
+/// Gated request body read (med risk).
+interface request-body-read {
+    use types.{deny-reason};
+    use request-meta.{request};
+    /// Returns the full request body bytes as currently visible to the plugin.
+    body: func(req: borrow<request>) -> result<list<u8>, deny-reason>;
+}
+
+/// Gated request body edit (med risk). The guest returns edit ops; host applies.
+interface request-body-edit {
+    /// Marker import: when present, the plugin may return request-edit from on-request.
+    enabled: func() -> bool;
+}
+
+/// Default-allowed finding report.
+interface finding {
+    use types.{finding as finding-record};
+    /// Report a finding for the current request.
+    report: func(f: finding-record);
+}
+
+/// Gated finding detail vocabulary.
+interface finding-detail-vocab {
+    /// When present, details must be in vocab.
+    allowed: func(detail: string) -> bool;
+}
+
+/// Default-allowed structured log (template-id + u32 args).
+interface log {
+    /// level: 0=error,1=warn,2=info,3=debug,4=trace
+    log: func(level: u8, template-id: string, args: list<u32>);
+}
+
+/// Default-allowed reject templates (manifest-defined).
+interface reject {
+    /// Marker for capability derivation; actual reject is verdict.
+    has: func(template-id: string) -> bool;
+}
+
+/// Default-allowed coarse monotonic clock (request-relative, ms resolution).
+interface clock {
+    now-ms: func() -> u64;
+}
+
+/// Default-allowed randomness (host CSPRNG).
+interface random {
+    fill: func(len: u32) -> list<u8>;
+    next-u64: func() -> u64;
+}
+
+/// Default-allowed request state: per-request key/value bytes in host store.
+interface request-state {
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>);
+}
+
+world plugin {
+    import types;
+    import request-meta;
+    // Gated imports - host links deny stubs unless granted/derived.
+    import request-body-read;
+    import request-body-edit;
+    import finding;
+    import finding-detail-vocab;
+    import log;
+    import reject;
+    import clock;
+    import random;
+    import request-state;
+
+    use types.{verdict, request-edit};
+    use request-meta.{request};
+
+    /// Called once per store with operator config as TOML bytes.
+    export init: func(config: list<u8>) -> result<_, string>;
+
+    /// Phase 1 request hook. Returns verdict and optional body edit ops.
+    export on-request: func(req: borrow<request>) -> result<tuple<verdict, option<request-edit>>, string>;
+}

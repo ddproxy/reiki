@@ -103,6 +103,14 @@ A plugin is trusted code that runs inside the Reiki process.
 - A final `on_response_chunk` call with `is_last` set follows the last chunk. It also happens on an upstream stream error and when a client disconnects, so make the call safe to repeat.
 - The request body is limited to 8 MiB before the plugins run and again after they have run; a body a plugin makes larger is refused with 413 and the upstream is not called.
 
+## Runtime Wasm plugins
+
+Binaries built with `plugin-wasm` can load runtime Wasm component plugins from
+`[plugins.<name>]` tables with `wasm = ...` and `sha256 = ...`. Phase 1 supports
+request-side hooks, capability-derived imports, manifest pinning, host-applied
+JSON edit ops, limits, reload narrowing, inspect, and request-side tool
+allowlists. See [Wasm plugins](wasm-plugins.md).
+
 ## Write a plugin
 
-The `Plugin` trait, hook timing, contexts, errors, tests and build-time registration are documented in [plugin authoring](plugin-authoring.md). Plugins are compiled into the binary; Reiki never loads code at runtime.
+The `Plugin` trait, hook timing, contexts, errors, tests and build-time registration are documented in [plugin authoring](plugin-authoring.md). Compiled-in plugins are built into the binary; Reiki never loads native code at runtime. Runtime Wasm plugins are described in [Wasm plugins](wasm-plugins.md).

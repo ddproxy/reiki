@@ -1,32 +1,57 @@
 # Traffic shaping
 
-Shaping limits what Reiki sends. It keeps a stream within budgets that a provider or a free tier sets. There are two layers:
+Shaping limits what Reiki sends. It keeps a stream within budgets that a provider or a free tier sets, and keeps one tenant from crowding another. There are two layers:
 
-- `rate_limit_per_minute` on a stream caps the upstream attempts that stream can make.
-- `[upstream.NAME.limits]` gives each key of that upstream its own budget: requests per minute, tokens per minute, concurrency and daily totals.
+- The gateway admits a client request once, using `[streams.NAME.limits]`, `[streams.NAME].allowed_*` and `weight`. It runs before a key is chosen, so failover and fallback attempts do not spend another stream request.
+- `[upstream.NAME.limits]` gives each key of that upstream its own budget: requests per minute, tokens per minute, concurrency and daily totals. It counts every upstream attempt and can wait or move to the next key.
 
-Both count upstream attempts. Neither is a per-client limit. A request that does not fit a budget waits briefly or moves to the next key.
+The two layers answer different `429`s. See [response classification](classification.md#response-rules) for the status and `error.type` mapping.
 
-## Stream limit
+## Gateway admission
 
 ```toml
+[gateway]
+on_store_error = "closed"   # or "open"
+usage_rpm = 60
+
 [streams.client-a]
 token_sha256 = "<sha256 of the stream token>"
 chain = ["zen-a", "zen-b"]
-rate_limit_per_minute = 60
+allowed_upstreams = ["zen*", "openrouter"]
+allowed_models = ["gpt-*", "claude-*"]
+weight = 2
+
+[streams.client-a.limits]
+rpm = 60
+tpm = 100000
+concurrent = 4
+daily_requests = 1000
+daily_tokens = 500000
+monthly_requests = 20000
+monthly_tokens = 10000000
+period_zone = "+02:00"
 ```
 
-- Each upstream attempt counts. That includes every key tried, every failover retry and every fallback attempt.
-- Windows are fixed at 60 seconds. The first one starts at startup or reload. A new window starts with the first attempt after the previous one ends.
-- A rejected attempt is not counted, and it does not reach an upstream. No key is cooled.
-- Over the limit, Reiki answers `429` with JSON code `rate_limited` and the message `stream request rate limit exceeded`. `Retry-After` is the whole seconds left in the window, at least 1. The fallback upstream is not tried.
-- This response has no `x-reiki-origin` header. Only the shaped-out 429 described below has one.
-- A reload resets the counter.
-- A value of `0` is refused at startup.
+Every limit is optional; an omitted one is not enforced. `rpm` and `tpm` use fixed 60-second windows. Daily and monthly windows start at local midnight in `period_zone` (`UTC` by default, or a fixed offset). A request is charged one request and an estimated `body bytes / 4` tokens when admitted; when the response body ends, the provider's measured token count replaces the estimate in every window.
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `[streams.NAME] rate_limit_per_minute` | unset: no limit | Upstream attempts per 60-second window for the stream. `0` is refused. |
+`allowed_upstreams` and `allowed_models` match names and declared models with `*` and `?`. Omitting a list means unrestricted; an explicit empty list denies everything. With `allowed_models` set, a request whose model cannot be determined is refused. Unknown upstream names are refused before any key is picked.
+
+`weight` is the stream's relative share of a key's contested rate and concurrency budget. Fairness only engages when two or more streams with recent traffic on the same key could use the same route and model; it compares admitted requests divided by weight. An idle stream does not hold a share, and a key used by only one active stream is not throttled by fairness.
+
+Refusals carry a fixed JSON `error.type` and message; no model name, token, request body or upstream key appears in either. Allowlist failures are `403`; limit failures are `429` with `Retry-After` as the whole seconds left in the window, at least 1. No key is cooled, no fallback is tried and no `x-reiki-origin` header is added by the gateway.
+
+| `error.type` | Reason |
+| --- | --- |
+| `gateway_forbidden`, `gateway_upstream_forbidden`, `gateway_model_unknown`, `gateway_model_forbidden` | Unknown stream, upstream or model outside the allowlists, or no determinable model |
+| `gateway_rate_limited`, `gateway_token_limited` | `rpm` or `tpm` reached |
+| `gateway_daily_requests`, `gateway_daily_tokens`, `gateway_monthly_requests`, `gateway_monthly_tokens` | A calendar quota reached |
+| `gateway_concurrent_limited` | Too many requests from the stream are in flight |
+| `gateway_fairness_limited` | Another stream's turn on the shared key |
+| `gateway_store_unavailable` | Counter state is unavailable in `closed` mode; fixed `503` |
+
+`on_store_error = "closed"` (the default) is fail-closed. `"open"` serves requests without a reliable counter and emits `GatewayStoreError` events and `reiki_gateway_store_errors_total{stream}`; the mode can be overridden per stream in `[streams.NAME.limits]`.
+
+Each stream's token can call `GET /v1/usage` on the client listener to see only its own request and token totals. That route has its own budget, `[gateway] usage_rpm`, separate from request admission. See [monitoring](monitoring.md#get-v1usage-client-listener).
 
 ## Key limits
 
@@ -126,17 +151,17 @@ Rate headers do not lower the learned cap. They only close the bucket when `rema
 
 ## Persisting across restarts
 
-The state file sits next to the config file, as `<config>.state`. It has a `shaper` table with an entry for each key that has something to save:
+The state file sits next to the config file, as `<config>.state`, written atomically with mode `0600`. It has a `shaper` table with an entry for each key that has something to save:
 
 - `learned_rpm`
 - `pause_secs` and `closed_secs`, the time left when written, rounded up
 - `daily`, with the window start, requests and tokens
 
-Writes happen after shaper events. Counter-only changes are saved at most once a minute.
+It also has a `gateway` table with one entry per stream: the token hash already present in the config (never the token itself), lifetime request and token totals, and the current minute, day and month counters. Writes are coalesced through a background writer and flushed at shutdown.
 
-Not saved: the minute log and the in-flight count.
+Not saved: the shaper's minute log and in-flight count, and the gateway's concurrency slots, fairness history and usage-route counters.
 
-Reiki restores this state at startup, and only when the key file and the upstream are unchanged. Restored values are limited:
+Reiki restores shaper state at startup, and only when the key file and the upstream are unchanged. Gateway counters restore for streams whose name and token hash are unchanged. Restored shaper values are limited:
 
 - A pause is capped at 24 hours. A closed time is capped at 31 days.
 - Daily counts restore only into the same UTC day, and are capped at the configured limits.
@@ -148,7 +173,7 @@ Reiki restores this state at startup, and only when the key file and the upstrea
 - If the window changed, the bucket is new and starts empty. The saved state for that key is replaced at the next save.
 - If the key is no longer shaped, its bucket is dropped.
 - A changed key secret resets key health, but not the bucket, if the window is the same. A changed key's saved shaper state is not restored at the next start.
-- The stream's `rate_limit_per_minute` counter resets on every reload.
+- Gateway counters survive a reload while a stream and its `token_sha256` stay the same. A rotated token starts with fresh counters; a removed stream's state is dropped. In-flight requests keep their concurrency slots until they finish.
 
 ## When every key is shaped out
 

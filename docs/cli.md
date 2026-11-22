@@ -264,6 +264,28 @@ Exit codes:
 | `--enable` | Key re-enabled. | Refused, such as an unknown key (`404`). | As above. |
 | `--check` | Every key OK. | Any error or warning. | Config unreadable or does not parse. |
 
+## streams
+
+Manages opt-in dynamic streams when `[stream_admin]` is configured. The token comes from `--token-file` or the config's `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`), never from an argument. See the [command examples](README.md#stream-admin-api).
+
+```
+reiki streams [--url URL] [--token-file PATH] [--reason TEXT] [--idempotency-key KEY] COMMAND
+```
+
+| Command | Meaning |
+| --- | --- |
+| `list` | List dynamic streams. |
+| `show NAME` | Show one dynamic stream and its token ids. |
+| `create NAME KEY [--ttl SECS]` | Create a stream with an assignable key; print the first token once. |
+| `update NAME [--key KEY] [--rpm N] [--tpm N]` | Change the assignable key or per-stream ceilings. |
+| `revoke NAME` | Revoke every token on the stream. |
+| `token add NAME [--ttl SECS]` | Add a token; print it once. |
+| `token revoke NAME TOKEN_ID` | Revoke one token by id from `show`. |
+| `audit verify FILE` | Verify a JSONL audit log, its hash chain and its sibling `audit.head` sidecar offline. |
+| `audit head FILE [--n N]` | Print the first `N` audit records (default 10) offline. |
+
+`--reason` is required for every mutation and is written to the audit log; `--idempotency-key` is generated when omitted. With two-party confirmation configured, the second raw token is read from `confirm_env`. `audit` needs no running instance and no token, but both audit commands require the sibling `audit.head` sidecar next to the JSONL file. Exit `0` on success, `1` when the API refuses a request, and `2` for a usage, config, transport or audit-verification error. There is no CLI delete command and no audit HTTP route. See [monitoring](monitoring.md#stream-administration-routes).
+
 ## failures
 
 Shows the running instance's last key failures, from the same in-memory ring as `GET /v1/failures`.
@@ -300,6 +322,23 @@ TIME               STREAM  KEY    STATUS  CLASS         COOLED  NOTE
 Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. `--json` prints an array whether or not `--limit` was given.
 
 Exit codes: `0` on success; `1` when the admin listener refuses the token or answer; `2` when it cannot be reached or no admin token or address is available.
+
+## cost
+
+Exports the `cost` plugin's estimate report from the running instance. The command exists only in a binary built with `--features plugin-cost`.
+
+```
+reiki cost export --period YYYY-MM --format csv|json [--url URL] [--token-file PATH]
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--period YYYY-MM` | current UTC month | Period to export. The endpoint also accepts day and hour periods; this command requires a month. |
+| `--format` | `json` | `csv` or `json`. |
+| `--url URL` | `[admin] listen` from the config | Admin address. |
+| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. Never pass the token as an argument. |
+
+The body is printed unchanged, so CSV has the same columns and JSON the same fields as `GET /v1/cost`; see [cost](cost.md#export). Exit codes: `0` on success, `1` when the admin listener refuses the answer, `2` for a bad period, missing token/address or a transport error. Without the running plugin the route returns `404` and the command exits `1`.
 
 ## peers
 

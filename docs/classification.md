@@ -123,13 +123,17 @@ Unparseable numbers and resets beyond 24 hours are ignored. The observed view ap
 | --- | --- | --- |
 | `400` | `bad_path` | Malformed request path |
 | `401` | `unauthorized` | Missing or unknown stream token |
+| `403` | `gateway_forbidden`, `gateway_upstream_forbidden`, `gateway_model_unknown`, `gateway_model_forbidden` | Stream, upstream or model outside its allowlist, or no determinable model |
 | `404` | `not_found` | No upstream prefix, or unknown upstream |
 | `408` | `body_timeout` | Request body timed out |
 | `413` | `too_large` | Request body over 8 MiB |
-| `429` | `rate_limited` | Stream `rate_limit_per_minute` exceeded; `Retry-After` at least 1 |
-| `429` | `reiki_shaped` | Local shaping held the request; `x-reiki-origin: local` |
+| `429` | `gateway_rate_limited`, `gateway_token_limited`, `gateway_daily_*`, `gateway_monthly_*`, `gateway_concurrent_limited`, `gateway_fairness_limited` | A stream limit or fair-share turn; `Retry-After` at least 1 |
+| `429` | `gateway_usage_limited` | The client listener's `/v1/usage` route exceeded `[gateway] usage_rpm` |
+| `429` | `rate_limited` | Failed-login backoff after repeated wrong tokens from one address |
+| `429` | `reiki_shaped` | Local key shaping held the request; `x-reiki-origin: local` |
 | `502` | `bad_gateway` | Unreachable upstream, oversized buffered response, unreadable body, or failed forwarder link |
+| `503` | `gateway_store_unavailable` | Counter state is unavailable and the stream is fail-closed |
 | `503` | `reiki_exhausted` | Every key in the stream's chain is unavailable |
 | `504` | `gateway_timeout` | Upstream headers or buffered body timed out |
 
-After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. A `429` from the stream limit or local shaping leaves every key available. See [troubleshooting](troubleshooting.md) for first commands for each symptom.
+After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Gateway and local-shaping `429`s leave every key available. See [troubleshooting](troubleshooting.md) for first commands for each symptom.

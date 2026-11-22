@@ -25,6 +25,7 @@ pub(crate) struct Usage {
     unaccounted: bool,
     input: Option<u64>,
     output: Option<u64>,
+    cached: Option<u64>,
     total: Option<u64>,
     done: bool,
 }
@@ -39,6 +40,7 @@ impl Usage {
             unaccounted: false,
             input: None,
             output: None,
+            cached: None,
             total: None,
             done: false,
         }
@@ -100,9 +102,13 @@ impl Usage {
         }
     }
 
-    fn take(&mut self, (input, output, total): (Option<u64>, Option<u64>, Option<u64>)) {
+    fn take(
+        &mut self,
+        (input, output, cached, total): (Option<u64>, Option<u64>, Option<u64>, Option<u64>),
+    ) {
         self.input = input.or(self.input);
         self.output = output.or(self.output);
+        self.cached = cached.or(self.cached);
         self.total = total.or(self.total);
     }
 
@@ -129,6 +135,22 @@ impl Usage {
         self.unaccounted
     }
 
+    /// Measured prompt tokens, after [`Self::total`] has finished the parse.
+    pub(crate) fn input(&self) -> u64 {
+        self.input.unwrap_or(0)
+    }
+
+    /// Measured completion tokens, after [`Self::total`] has finished the parse.
+    pub(crate) fn output(&self) -> u64 {
+        self.output.unwrap_or(0)
+    }
+
+    /// Cached prompt tokens, when the response reported them. Always no more than
+    /// [`Self::input`] before it is used for pricing.
+    pub(crate) fn cached(&self) -> u64 {
+        self.cached.unwrap_or(0).min(self.input())
+    }
+
     /// Prompt + completion when either was reported, otherwise `total_tokens`.
     pub(crate) fn total(&mut self) -> Option<u64> {
         self.finish();
@@ -144,21 +166,34 @@ impl Usage {
     }
 }
 
-/// Input, output and total tokens from a response or an event, in OpenAI
-/// (`prompt_tokens`/`completion_tokens`/`total_tokens`) or Anthropic
-/// (`input_tokens`/`output_tokens`) naming. Anthropic's `message_start` nests
-/// them under `message.usage`.
-fn usage_in(value: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
+/// Input, output, cached-input and total tokens from a response or an event. The
+/// accepted field names are generic token names, never a provider or product name.
+/// Nested usage details are searched without naming the object they live under.
+fn usage_in(value: &Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
     let usage = value
         .get("usage")
         .or_else(|| value.pointer("/message/usage"));
     let Some(usage) = usage else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let count = |names: &[&str]| names.iter().find_map(|n| usage.get(*n)?.as_u64());
+    let cached = count(&[
+        "cached_input_tokens",
+        "cached_prompt_tokens",
+        "cached_tokens",
+    ])
+    .or_else(|| {
+        usage.as_object().and_then(|fields| {
+            fields
+                .values()
+                .filter(|field| field.is_object())
+                .find_map(|details| details.get("cached_tokens")?.as_u64())
+        })
+    });
     (
         count(&["prompt_tokens", "input_tokens"]),
         count(&["completion_tokens", "output_tokens"]),
+        cached,
         usage.get("total_tokens").and_then(Value::as_u64),
     )
 }

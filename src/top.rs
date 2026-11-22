@@ -36,6 +36,8 @@ pub(crate) enum FeedEvent {
         instance: String,
         failures: Vec<reiki_top::Failure>,
     },
+    /// The local instance's estimated cost, from its admin listener. Not a peer event.
+    LocalCost(reiki_top::LocalCost),
 }
 
 /// Where the local instance's admin listener is, and which published name is ours.
@@ -79,6 +81,26 @@ impl LocalFailures {
             return Err(format!("the admin listener answered {status}"));
         }
         serde_json::from_str(&body).map_err(|e| format!("bad failure list: {e}"))
+    }
+
+    /// Fetches estimated spend from the cost plugin. A 404 means the plugin is not compiled
+    /// in or not configured, which is normal and must not look like a peer failure.
+    async fn fetch_cost(&self) -> Result<reiki_top::LocalCost, String> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/v1/cost", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err("cost plugin is not enabled".to_owned());
+        }
+        if !status.is_success() {
+            return Err(format!("the admin listener answered {status}"));
+        }
+        reiki_top::LocalCost::from_json(&body)
     }
 }
 
@@ -201,6 +223,9 @@ async fn run_once_to_with_local(
         if let Ok(failures) = local.fetch().await {
             fleet.set_local_failures(&local.instance, failures);
         }
+        if let Ok(cost) = local.fetch_cost().await {
+            fleet.set_local_cost(cost);
+        }
     }
 
     // No history on a single poll, so the matrix draws no sparklines.
@@ -219,6 +244,9 @@ async fn run_once_to_with_local(
             None => (matrix, None),
         };
         let mut lines = view::render_matrix(&matrix, &History::new(0), None, 100, filter_name);
+        if let Some(cost) = view::cost_line(&fleet, 100) {
+            lines.push(cost);
+        }
         lines.extend(view::cooling_panel(&fleet, &names, filter_name, now, 100));
         lines
     };
@@ -246,6 +274,7 @@ pub(crate) fn apply_feed(fleet: &mut Fleet, name: &str, feed: FeedEvent, now: In
         FeedEvent::LocalFailures { instance, failures } => {
             fleet.set_local_failures(&instance, failures)
         }
+        FeedEvent::LocalCost(cost) => fleet.set_local_cost(cost),
     }
 }
 
@@ -283,6 +312,14 @@ async fn feed_local(local: LocalFailures, poll: Duration, tx: mpsc::Sender<(Stri
             if tx.send((local.instance.clone(), event)).await.is_err() {
                 return;
             }
+        }
+        if let Ok(cost) = local.fetch_cost().await
+            && tx
+                .send((local.instance.clone(), FeedEvent::LocalCost(cost)))
+                .await
+                .is_err()
+        {
+            return;
         }
         tokio::time::sleep(poll).await;
     }

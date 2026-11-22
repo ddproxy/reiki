@@ -80,7 +80,8 @@ Inside the Peers panel:
 - `u` switches the gauge between requests and tokens; `w` switches the window between the last hour and the last five minutes, drawn as five cells, one per minute. The fleet line ends with the mode, such as `[req 1h]` or `[tok 5m]`. Both modes take the same column width.
 - The cooling panel lists each (peer, provider) with cooling keys: its drain bar, time left and last status class, soonest first, six lines then `+N more`. `--once` prints it too.
 - A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it; the request total is never in the matrix.
-- The detail pane adds `last hour: N requests, M limited` and a twelve-cell five-minute trend for each upstream.
+- The detail pane adds `last hour: N requests, M limited` and a twelve-cell five-minute trend for each upstream. When peers publish gateway counts (`expose_usage`), `ALL` adds a `gateway (N peers)` line with admitted requests, charged tokens and store errors; a peer card adds `gateway N req, N tok, N store errors`. These are counts only; no stream or model names appear.
+- With the local admin token, the same local-only fetch adds one `cost (period currency, estimate)` line: the estimated current-month spend and request count. Unpriced requests and an unhealthy cost state are named when present. It comes from the local `GET /v1/cost` answer; peer health documents never carry prices, spend or model names, and no cost line appears when the plugin is off. See [cost](cost.md#reiki-top).
 - Observed passthrough entries appear as display-only columns named `observed/{account}` when a peer publishes them. They show the last observed status class and retry hint, carry no key state, and are left out of key counts and fleet tallies. Duplicate observed entries for one account are collapsed by worst state; the detail pane says `observed` and lists the account, status class, remaining retry and quota figures.
 - `Ver` is the version each peer publishes (`reiki_version`), after the provider columns and before the host figures, clipped to twelve characters. `?` means the peer does not publish one. The detail card shows it after the instance name, as `v0.10.3`.
 - `load` is the one-minute load with a sparkline of recent samples. `disk` is the fullest disk: green under 75%, yellow to 89%, red from 90%. `sess` is active sessions. A `-` means the peer does not publish that figure.
@@ -137,3 +138,5 @@ The screen gives up its panels before it cuts the matrix. As the height drops it
 ### `--once`
 
 `--once` polls each peer once and prints the matrix as plain text, 100 columns wide and without colour, including the `ALL` fleet row. `--once --full` prints the per-peer text view instead. It exits 0 when at least one peer answered, 1 when none did, and 2 on a config problem.
+
+The full text view also prints `Streams: N static, M dynamic` when peers publish stream counts with `expose_usage` (on by default). It sums fresh peers that publish the counts; peers that do not are left out, and no stream names are shown.

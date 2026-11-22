@@ -4,6 +4,8 @@ The `finance` plugin stops financial identifiers from leaving in an outbound req
 
 It is a safeguard that catches common identifiers. It does not prove a request is free of financial data. Read [What it does not cover](#what-it-does-not-cover) before relying on it.
 
+It does not estimate monetary spend. The separate, opt-in [cost](cost.md) plugin prices measured token usage from an operator table.
+
 Compiled in by the default `plugin-finance` feature; inactive until a `[plugins.finance]` table exists.
 
 ## Configure

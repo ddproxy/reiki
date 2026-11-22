@@ -7,6 +7,7 @@ pub mod failures;
 pub mod forward;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+pub mod gateway;
 pub mod intercept;
 pub mod keys;
 pub mod lifecycle;
@@ -26,6 +27,7 @@ pub mod scrub;
 pub mod serve;
 pub mod shaper;
 pub mod state;
+pub mod stream_admin;
 #[cfg(feature = "top")]
 pub mod top;
 pub mod tunnel;

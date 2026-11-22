@@ -27,6 +27,9 @@ flowchart LR
 | `on_shutdown` | After listeners drain on a clean stop, in registry order | none | Anything the plugin owns, synchronously | No return value. A panic is logged and skipped; the other plugins still shut down. |
 | `on_event` | On relay facts: request done, failover, cooldown, stream rate limit, plugin rejection, finding | `Event` | Nothing; read-only | No return value. A panic is logged and skipped. |
 | `on_admin` | An authenticated `GET` on a path from `admin_paths` | `AdminCtx` | Returns `Option<AdminReply>` | `None` or a panic gives an empty 404. |
+| `admission_refusal` | After allowlists, before any request counter is reserved | stream name and `SystemTime` | Returns a static `AdmissionRefusal` | The host turns it into the same 429 as a stream limit. Kind and message must be static; never include request data, prices or secrets. |
+| `metrics_text` | When `/v1/metrics` is built | none | Returns Prometheus text | Appended by the host; use bounded labels and no secret values. |
+| `usage_cost_fragment` | When an authenticated stream reads its own `/v1/usage` | stream name | Returns an optional JSON object | The host inserts it only into that stream's row. |
 
 `on_request`, `on_attempt` and `on_event` run in registry order. Response hooks run in reverse, so the plugin that changed the request first sees the response last and can undo its change. `on_event` is stream-scoped like request hooks; a `Cooldown` event has no stream and reaches only plugins without `streams`.
 
@@ -49,6 +52,10 @@ The final `on_response_chunk` call with `is_last = true` happens on normal end o
 | `on_admin(&self, &AdminCtx) -> Option<AdminReply>` | `None` | Answer for one of those paths. |
 | `status_fragment(&self) -> Option<serde_json::Value>` | `None` | JSON object merged into `GET /v1/status`; a panic or a non-object is skipped. |
 | `health_gauge(&self) -> Option<(&'static str, u64)>` | `None` | One monotonic count published in `/v1/health` for peers and `reiki top`. |
+| `configure(&mut self, &PluginHost)` | no-op | Receives a private state-file path before use. Plugins that persist state should use it and never derive a path from a request. |
+| `admission_refusal(&self, &str, SystemTime) -> Option<AdmissionRefusal>` | `None` | Static 429 request; routed through the gateway refusal path. |
+| `metrics_text(&self) -> String` | empty | Extra Prometheus text appended by the host to `/v1/metrics`. |
+| `usage_cost_fragment(&self, &str) -> Option<Value>` | `None` | JSON object merged into the caller's own `/v1/usage` row. |
 
 `HOST_KEYS` is `["enabled", "on_error", "dry_run", "streams"]`. The host passes the whole config table to `build`, including these keys. A plugin should accept and ignore them; `HOST_KEYS` helps reject only unknown plugin settings. `reiki check` adds `dry_run = true` to every plugin table, so a build should validate settings without opening files, sockets or threads.
 
@@ -64,12 +71,12 @@ The context types are `#[non_exhaustive]`. Use their constructors in tests; do n
 | `AttemptCtx` | `key`, `status`, `body`, `state` | `new(key, status, body, state)` |
 | `ResponseHeadCtx` | `key`, `upstream`, `status`, `headers`, `state` | `new(key, status, headers, state)` then `.with_upstream(name)` |
 | `ChunkCtx` | `chunk`, `is_last`, `state` | `new(chunk, is_last, state)` |
-| `AdminCtx` | `path`, `keys`, `usage` | `new(path, keys)` then `.with_usage(...)` |
+| `AdminCtx` | `path`, `query`, `keys`, `usage` | `new(path, keys)` then `.with_query(...)` and `.with_usage(...)` |
 | `AdminReply` | `content_type`, `body` | plain struct |
 
-`RequestCtx::path` has no query string. `AttemptCtx::key` is a config name, never a secret; passthrough uses `-`. `RequestCtx::id` is 32 hex digits shared with the logs. `new_request_id()` creates such an id, but the host normally does it.
+`RequestCtx::path` has no query string. `AdminCtx::query` is the raw admin query without `?`; validate it strictly and never echo values into errors. `AttemptCtx::key` is a config name, never a secret; passthrough uses `-`. `RequestCtx::id` is 32 hex digits shared with the logs. `new_request_id()` creates such an id, but the host normally does it.
 
-`Event` is `#[non_exhaustive]`, so match with a wildcard arm. Its variants are `RequestDone`, `Failover`, `Cooldown`, `RateLimited`, `PluginRejected` and `Finding`. `Finding` carries a sanitised `detail` label from `report_detail`. `FailureKind` is also non-exhaustive; `CooldownScope` is `Key` or `Model`.
+`Event` is `#[non_exhaustive]`, so match with a wildcard arm. Its variants are `RequestDone`, `Failover`, `Cooldown`, `RateLimited`, `GatewayRejected`, `GatewayStoreError`, `Usage`, `PluginRejected`, `Observed` and `Finding`. `Usage` carries the stream, upstream, declared model, operator key name, total, input, output and cached-input token counts and a bounded status class; it has no credential. `Finding` carries a sanitised `detail` label from `report_detail`. `FailureKind` is also non-exhaustive; `CooldownScope` is `Key` or `Model`.
 
 Admin paths must start with `/`, must not be `/`, have no trailing slash, `%`, or empty, `.` or `..` segment. A duplicate path, or one Reiki reserves (`/v1/status`, `/v1/failures`, `/v1/reload`, `/v1/keys/enable`, `/v1/openapi.json`), fails plugin chain construction at startup; a bad reload is refused. Reiki authenticates the caller before calling the hook.
 

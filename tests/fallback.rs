@@ -86,7 +86,7 @@ async fn start_refusing_with_limit(
     )
     .await;
     let limit = rate_limit
-        .map(|limit| format!("rate_limit_per_minute = {limit}\n"))
+        .map(|limit| format!("[streams.client-a.limits]\nrpm = {limit}\n"))
         .unwrap_or_default();
     let text = format!(
         "[upstream.zen]\nbase_url = \"{zen_url}/v1\"\n{fallback}\n\

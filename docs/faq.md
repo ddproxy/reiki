@@ -4,11 +4,11 @@ Short answers. The linked pages are the source of truth.
 
 ## Why do I get a 429 when every key looks fine?
 
-`reiki keys` shows key health, not client limits. Three different gates answer `429`:
+`reiki keys` shows key health, not client limits. Four different gates answer `429`:
 
 | Where | What it means | What it does to keys |
 | --- | --- | --- |
-| Stream limit | `rate_limit_per_minute` exceeded; `error.type` is `rate_limited`, with `Retry-After` at least 1 | None |
+| Gateway admission | A `[streams.NAME.limits]` budget or fair-share turn was reached; `error.type` starts with `gateway_`, with `Retry-After` at least 1 | None |
 | Local shaping | An upstream `limits` budget held the request; `reiki_shaped` with `x-reiki-origin: local` | None |
 | Login backoff | Too many wrong stream or admin tokens from one address | None |
 | Upstream | A `rate_limited` or `quota_exhausted` ring row | Cools a scope or the key |
@@ -44,7 +44,7 @@ For a key that is merely disabled, `reiki keys --enable NAME` clears its cooldow
 | Cost | Where it shows |
 | --- | --- |
 | One extra upstream attempt per skipped key | `attempts` in the request log; `reiki_failovers_total` with the metrics plugin |
-| The attempt counts against `rate_limit_per_minute` and outbound budgets | Stream and upstream limits |
+| The request spends one gateway admission; each attempt spends an outbound budget | Stream and upstream limits |
 | A cooldown shared by every stream that lists the key | `reiki keys`, `/v1/status`, `reiki top` |
 | A 3-second wait and one repeated request when `confirm_quota = true` | First quota `429` only; it still enters the failure ring |
 

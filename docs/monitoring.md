@@ -14,6 +14,8 @@ Both fields are required. The address is bound at startup, so moving `[admin]` n
 
 Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The built-in routes and plugin routes are served under `/v1`. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
 
+The `/v1/streams*` routes are the exception: they exist only with `[stream_admin]` and require the dedicated stream-management token instead of the admin token. See [stream administration routes](#stream-administration-routes).
+
 ```bash
 export ADMIN_TOKEN='...'
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status
@@ -61,7 +63,21 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
       "strategy": "sticky",
       "chain": ["zen-a", "zen-b"],
       "current_key": "zen-a",
-      "rate_limit_per_minute": 120
+      "limits": {
+        "rpm": 120,
+        "tpm": null,
+        "concurrent": null,
+        "daily_requests": null,
+        "daily_tokens": null,
+        "monthly_requests": null,
+        "monthly_tokens": null
+      },
+      "usage": {
+        "requests": 42,
+        "tokens": 2100,
+        "minute_requests": 12,
+        "minute_tokens": 600
+      }
     }
   ],
   "config": {
@@ -113,7 +129,7 @@ Key fields:
 
 `observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `retry_after_seconds` counts down and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA files with `file`, `ca_not_after` (Unix seconds) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted.
 
-Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
+Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`), `limits` and `usage`. `limits` lists each configured numeric limit or `null`, plus `period_zone` when set; `usage` holds lifetime `requests` and `tokens` and the current `minute_requests` and `minute_tokens`. `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
 
 `reiki keys` reads this route and prints a table; `reiki keys --json` prints a derived key-only document with remapped states and a `streams` name list per key. See [key health](troubleshooting.md#key-health).
 
@@ -203,9 +219,26 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/v1/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
 
+## Stream administration routes
+
+With `[stream_admin]` configured, the admin listener also serves these routes. All of them require `Authorization: Bearer <stream-admin token>`: the ordinary admin token and a stream token are refused. There is no HTTP route for the audit log.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/streams` | List dynamic streams. |
+| `GET /v1/streams/{name}` | Show one dynamic stream. |
+| `PUT /v1/streams/{name}` | Change a dynamic stream's assignable key or limits. |
+| `DELETE /v1/streams/{name}` | Delete a dynamic stream. |
+| `POST /v1/streams/create` | Create a dynamic stream and return its first token once. |
+| `POST /v1/streams/{name}/tokens` | Add a token and return it once. |
+| `POST /v1/streams/{name}/tokens/{token_id}/revoke` | Revoke one token. |
+| `POST /v1/streams/{name}/revoke` | Revoke every token on a stream. |
+
+Every write needs an `Idempotency-Key` header and a `reason` in the JSON body; strict JSON parsing rejects unknown fields, and a configured second party also requires `X-Confirm-Token`. Keys must be listed in `[stream_admin.allowed_keys]` with `assignable = true`, and limits must stay within `[stream_admin.ceilings]`. Failed attempts are throttled per source, and a failed audit write refuses the mutation. The [route list and CLI examples](README.md#stream-admin-api) cover the `reiki streams` commands. With the feature on, `GET /v1/status` adds a `stream_admin` object with `enabled`, `streams` and `state_error`.
+
 ## GET /v1/openapi.json
 
-Method `GET`. Auth: bearer token. Query: none. Returns the OpenAPI 3.1 document built from the route table. While publishing, it also lists the peer listener's `/v1/health` and `/v1/health/stream` with that listener as their server.
+Method `GET`. Auth: bearer token. Query: none. Returns the OpenAPI 3.1 document built from the route table. While publishing, it also lists the peer listener's `/v1/health` and `/v1/health/stream` with that listener as their server. The `/v1/streams*` paths and the `streamAdminAuth` scheme appear only when `[stream_admin]` is configured.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi.json \
@@ -228,14 +261,17 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | Route | Location | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET /__reiki/healthz` | Client listener | None | Returns `200` with body `ok` while Reiki is up |
+| `GET /v1/usage` | Client listener | Stream token | JSON request and token totals for that stream only |
 | `GET /v1/metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
 | `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Bearer token | Prometheus summary-export drop counter |
 | `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Bearer token | Prometheus tool-call counters |
 | `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
+| `GET /v1/cost` | Admin listener, `cost` plugin | Bearer token | Estimated spend with period, stream and upstream filters |
+| `GET /v1/cost/metrics` | Admin listener, `cost` plugin | Bearer token | Cost estimate metrics in Prometheus text |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 
-The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]`, `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`, and `/v1/requestlog/metrics` needs `[plugins.requestlog]`. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
+The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]`, `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`, `/v1/requestlog/metrics` needs `[plugins.requestlog]`, and `/v1/cost` and `/v1/cost/metrics` need `[plugins.cost]` plus the `plugin-cost` build feature. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
 
 ## GET /v1/metrics
 
@@ -267,7 +303,9 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_requests_total` | counter | `stream`, `upstream`, `status` | Requests once each, by client-visible class and serving upstream; a client that disconnects first counts as `client_error` |
 | `reiki_failovers_total` | counter | `stream`, `key`, `class` | Key failures handled by trying another key |
 | `reiki_cooldowns_total` | counter | `key`, `class`, `scope` | Keys put on cooldown or out of rotation; `scope` is `key` or `model` |
-| `reiki_rate_limit_rejections_total` | counter | `stream` | Requests rejected by the stream's own rate limit |
+| `reiki_rate_limit_rejections_total` | counter | `stream` | Requests rejected when every key was shaped out locally (`reiki_shaped`) |
+| `reiki_gateway_rejections_total` | counter | `stream`, `reason` | Requests refused by stream limits or allowlists; `reason` is a fixed label such as `rate`, `tokens`, `model`, `model_unknown`, `concurrent`, `quota_requests`, `quota_tokens`, `fairness` or `store_closed` |
+| `reiki_gateway_store_errors_total` | counter | `stream` | Counter-store failures while serving in `open` mode |
 | `reiki_plugin_rejections_total` | counter | `plugin`, `stream` | Plugin rejections, plus skips and panics under `on_error = "reject"` |
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` | Identifiers found in bodies by `phi`, `finance` or `controlled`; `action` is `blocked` or `reported` |
 | `reiki_tokens_total` | counter | `stream`, `upstream`, `direction` | Input and output tokens reported by providers |
@@ -276,10 +314,17 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_upstream_limited_1h` | gauge | `upstream` | Attempts in the last hour that were rate-limited or began a cooldown |
 | `reiki_upstream_tokens_1h` | gauge | `upstream` | Input plus output tokens in the last hour |
 | `reiki_upstream_unaccounted_1h` | gauge | `upstream` | Attempts in the last hour with no readable usage figures |
+| `reiki_cost_estimated_spend_micros` | gauge | `stream`, `upstream`, `currency` | Estimated spend in integer micro-units; only with the `cost` plugin |
+| `reiki_cost_requests_total` | gauge | `stream`, `upstream`, `currency` | Requests with a recorded cost row; only with the `cost` plugin |
+| `reiki_cost_unpriced_requests_total` | gauge | `stream`, `upstream`, `currency` | Requests whose model had no price; only with the `cost` plugin |
+| `reiki_cost_model_spend_micros` | gauge | `stream`, `upstream`, `currency`, `model` | Spend for an allowlisted model; only with `model_label_allowlist` |
 | `reiki_passthrough_requests_total` | counter | `upstream`, `status_class` | Passthrough answers by fixed observed class; no credential, account or key label is exported |
 | `reiki_observed_cooldown_seconds` | gauge | `upstream`, `class` | Longest remaining informational cooldown across that upstream's observed accounts; `0` when none |
+| `reiki_stream_admin_actions_total` | counter | `result` | Management actions by result, including denied and failed attempts; only with `[stream_admin]` |
+| `reiki_dynamic_streams` | gauge | none | Active dynamic streams; only with `[stream_admin]` |
+| `reiki_stream_tokens_expiring_soon` | gauge | none | Unexpired dynamic stream tokens expiring within one hour; only with `[stream_admin]` |
 
-`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The four `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists). The observed series come from the in-memory observation store; `account` stays out of metrics to keep cardinality bounded by upstream and class.
+`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The four `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists). The observed series come from the in-memory observation store; `account` stays out of metrics to keep cardinality bounded by upstream and class. The three stream-management series are appended to this same route when `[stream_admin]` is configured and are absent otherwise. The cost plugin's series are appended when `[plugins.cost]` is active. Their `stream` and `upstream` labels are capped at 64 bytes, at most 64 series are emitted, and a `model` label appears only for names in `model_label_allowlist`; no price, token or request value is ever a label.
 
 ## GET /v1/toolpolicy/metrics
 
@@ -305,7 +350,21 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/request
 
 The same value is published as `requestlog.export_dropped_total` in `GET /v1/status` and as `requestlog_export_dropped_total` in `/v1/health`, which `reiki top` shows when it is above zero.
 
-## GET /v1/usage
+## GET /v1/usage (client listener)
+
+Method `GET`. Auth: this stream's bearer token, the same one used for proxy requests. Query: none. A stream sees only its own row; there is no admin token and no way to ask for another stream. The route has its own `[gateway] usage_rpm` budget (default 60 per minute): over it the response is `429` `gateway_usage_limited` with `Retry-After`. A missing or unknown token gets `401`.
+
+```bash
+curl -s -H "Authorization: Bearer $STREAM_TOKEN" http://127.0.0.1:4097/v1/usage
+```
+
+```json
+{"streams":[{"name":"client-a","requests":42,"tokens":2100,"minute_requests":12,"minute_tokens":600,"cost":{"currency":"USD","period":"2026-11","estimated_micros":"12500000","estimated_display":"12.500000","unpriced_requests":0,"note":"Estimates from the operator price table, not provider invoices."}}]}
+```
+
+`requests` and `tokens` are lifetime totals from admitted requests; `tokens` uses the provider's measured usage when present and the request-size estimate otherwise. The minute values come from the current fixed 60-second window. The `cost` object appears only when the `cost` plugin is active, and only on the authenticated caller's row; see [cost](cost.md#self-service-get-v1usage). The body contains only configured stream names and counts, never token hashes, key values, upstream credentials or model names. This route is separate from the admin plugin route below.
+
+## GET /v1/usage (admin listener)
 
 Method `GET`. Auth: bearer token. Query: none. Same plugin as `/v1/metrics`. Totals come from provider `usage` objects: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`; event streams combine the events that carry `usage`. Bodies over 1 MiB and compressed responses count nothing.
 
@@ -316,6 +375,10 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/usage
 ```json
 {"stream":{"upstream":{"input":10,"output":20,"requests":1}}}
 ```
+
+## GET /v1/cost and GET /v1/cost/metrics
+
+Served by the `cost` plugin with the same bearer auth as `/v1/status`. Both routes return `404` without `[plugins.cost]`, and the plugin is off by default and needs the `plugin-cost` build feature. `/v1/cost` takes the strict query filters `period`, `stream`, `upstream` and `format` (`json` or `csv`). `/v1/cost/metrics` returns the bounded cost series appended to `/v1/metrics`; it takes no query. When the plugin is active, `GET /v1/openapi.json` describes both routes with their filters and a response note that the figures are estimates; `/v1/status` gains a `cost` object for the current UTC month. See [cost](cost.md#read-the-figures) for the worked example, CSV columns and budgets.
 
 ## Scrape configuration
 
@@ -359,3 +422,5 @@ groups:
 ```
 
 Reiki publishes `reiki_keys` globally, with no `stream` label. The two `reiki_status_*` and `reiki_stream_healthy_keys` series come from a JSON exporter that reads `GET /v1/status` with the admin token: `reiki_status_intercept_ca_days_left` from `intercept.ca_days_left`, and `reiki_stream_healthy_keys{stream="..."}` from the keys named in each `streams[].chain` whose `state` is `available`. Those names are exporter series, not built-in Reiki metrics. Reiki logs a CA warning within 30 days of expiry and reports `ca_days_left` on `/v1/status`; see [tunnel](tunnel.md#interception).
+
+When `[peers] expose_usage` is on (the default), peer health publishes `streams.static_streams` and `streams.dynamic_streams` as counts only. `reiki top` sums fresh peers into a `Streams: N static, M dynamic` line in its full text view; it never shows stream names, since a dynamic name can identify a tenant. See [reiki top](top.md#--once).

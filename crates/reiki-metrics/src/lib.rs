@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
-    AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, HOST_KEYS, KeyCounts,
-    ObservedCooldown, Plugin, RequestCtx, ResponseHeadCtx, UpstreamUsage,
+    AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, GatewayRejectReason,
+    HOST_KEYS, KeyCounts, ObservedCooldown, Plugin, RequestCtx, ResponseHeadCtx, UpstreamUsage,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
@@ -59,6 +59,12 @@ impl Plugin for MetricsPlugin {
                 self.metrics.record_cooldown(key, kind, scope);
             }
             Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
+            Event::GatewayRejected { stream, reason } => {
+                self.metrics.record_gateway_rejection(stream, reason);
+            }
+            Event::GatewayStoreError { stream } => {
+                self.metrics.record_gateway_store_error(stream);
+            }
             Event::Observed {
                 upstream,
                 status_class,
@@ -126,9 +132,13 @@ impl Plugin for MetricsPlugin {
         if ctx.path == "/metrics" {
             Some(AdminReply {
                 content_type: "text/plain; version=0.0.4; charset=utf-8",
-                body: self
-                    .metrics
-                    .render(ctx.keys, ctx.usage.as_deref(), &ctx.observed),
+                body: {
+                    let mut text =
+                        self.metrics
+                            .render(ctx.keys, ctx.usage.as_deref(), &ctx.observed);
+                    text.push_str(&ctx.extra_metrics);
+                    text
+                },
             })
         } else if ctx.path == "/usage" {
             Some(AdminReply {
@@ -327,6 +337,8 @@ struct Inner {
     failovers: BTreeMap<(String, String, &'static str), u64>,
     cooldowns: BTreeMap<(String, &'static str, &'static str), u64>,
     rate_limit_rejections: BTreeMap<String, u64>,
+    gateway_rejections: BTreeMap<(String, &'static str), u64>,
+    gateway_store_errors: BTreeMap<String, u64>,
     plugin_rejections: BTreeMap<(String, String), u64>,
     findings: BTreeMap<(String, String, String, &'static str), u64>,
     tokens: BTreeMap<(String, String, &'static str), u64>,
@@ -410,6 +422,24 @@ impl Metrics {
         self.with(|inner| {
             *inner
                 .rate_limit_rejections
+                .entry(stream.to_owned())
+                .or_insert(0) += 1;
+        });
+    }
+
+    pub fn record_gateway_rejection(&self, stream: &str, reason: GatewayRejectReason) {
+        self.with(|inner| {
+            *inner
+                .gateway_rejections
+                .entry((stream.to_owned(), reason.label()))
+                .or_insert(0) += 1;
+        });
+    }
+
+    pub fn record_gateway_store_error(&self, stream: &str) {
+        self.with(|inner| {
+            *inner
+                .gateway_store_errors
                 .entry(stream.to_owned())
                 .or_insert(0) += 1;
         });
@@ -553,6 +583,33 @@ impl Metrics {
             let _ = writeln!(
                 out,
                 "reiki_rate_limit_rejections_total{{stream=\"{}\"}} {}",
+                escape_label(stream),
+                count
+            );
+        }
+
+        out.push_str(
+            "# HELP reiki_gateway_rejections_total Requests refused by a stream's configured limits or allowlists.\n",
+        );
+        out.push_str("# TYPE reiki_gateway_rejections_total counter\n");
+        for ((stream, reason), count) in &inner.gateway_rejections {
+            let _ = writeln!(
+                out,
+                "reiki_gateway_rejections_total{{stream=\"{}\",reason=\"{}\"}} {}",
+                escape_label(stream),
+                reason,
+                count
+            );
+        }
+
+        out.push_str(
+            "# HELP reiki_gateway_store_errors_total Counter-store failures while serving, counted only in open mode.\n",
+        );
+        out.push_str("# TYPE reiki_gateway_store_errors_total counter\n");
+        for (stream, count) in &inner.gateway_store_errors {
+            let _ = writeln!(
+                out,
+                "reiki_gateway_store_errors_total{{stream=\"{}\"}} {}",
                 escape_label(stream),
                 count
             );
@@ -959,6 +1016,44 @@ mod tests {
         assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
         assert!(!plugin.uses_bodies());
         assert!(plugin.needs_response_hooks());
+    }
+
+    #[test]
+    fn gateway_events_drive_the_rejection_and_store_error_metrics() {
+        let plugin = build(&toml::Table::new()).unwrap();
+        plugin.on_event(&Event::GatewayRejected {
+            stream: "tenant",
+            reason: GatewayRejectReason::Rate,
+        });
+        plugin.on_event(&Event::GatewayRejected {
+            stream: "tenant",
+            reason: GatewayRejectReason::Rate,
+        });
+        plugin.on_event(&Event::GatewayRejected {
+            stream: "tenant",
+            reason: GatewayRejectReason::ModelUnknown,
+        });
+        plugin.on_event(&Event::GatewayStoreError { stream: "tenant" });
+        let reply = plugin
+            .on_admin(&AdminCtx::new("/metrics", KeyCounts::default()))
+            .unwrap();
+        assert!(
+            reply
+                .body
+                .contains("reiki_gateway_rejections_total{stream=\"tenant\",reason=\"rate\"} 2"),
+            "{}",
+            reply.body
+        );
+        assert!(reply.body.contains(
+            "reiki_gateway_rejections_total{stream=\"tenant\",reason=\"model_unknown\"} 1"
+        ));
+        assert!(
+            reply
+                .body
+                .contains("reiki_gateway_store_errors_total{stream=\"tenant\"} 1")
+        );
+        // Refusal metrics use only configured stream names and fixed reasons.
+        assert!(!reply.body.contains("secret"));
     }
 
     #[test]

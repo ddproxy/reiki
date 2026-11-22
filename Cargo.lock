@@ -2001,6 +2001,7 @@ dependencies = [
  "libc",
  "rcgen",
  "reiki-controlled",
+ "reiki-cost",
  "reiki-detect",
  "reiki-finance",
  "reiki-health",
@@ -2039,6 +2040,16 @@ dependencies = [
  "reiki-plugin",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "reiki-cost"
+version = "0.13.0"
+dependencies = [
+ "reiki-plugin",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -73,6 +73,12 @@ pub fn parse_dry_run(query: &str) -> Result<bool, ()> {
     crate::admin::parse_dry_run(query)
 }
 
+/// Strict decoding of every stream-management request body. Malformed bytes are ignored; the
+/// helper asserts that unknown fields stay rejected on otherwise valid requests.
+pub fn fuzz_stream_admin_request(data: &[u8]) {
+    crate::admin::fuzz_decode_stream_requests(data)
+}
+
 /// Canonical host and port parsing shared by tunnel rules and CONNECT targets.
 pub fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(String, u16)> {
     crate::tunnel::split_host_port(text, default_port)

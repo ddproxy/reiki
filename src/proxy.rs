@@ -19,8 +19,9 @@ use crate::auth::{
 };
 use crate::chain::{Chain, KeyState, Policy, SavedHealth, Scope, scope_route};
 use crate::classify::{Classification, ExtraPhrases, FailureClass, Outcome, classify_with};
-use crate::config::{Config, DEFAULT_SCOPE_ESCALATE_AFTER, PeersConfig};
+use crate::config::{Config, DEFAULT_SCOPE_ESCALATE_AFTER, PeersConfig, StreamConfig};
 use crate::forward::Forwarder;
+use crate::gateway::{Gateway, Permit as GatewayPermit, Refusal as GatewayRefusal};
 use crate::observed::{self, ObservedStore};
 use crate::plugins::{
     PLUGIN_FAILURE_MESSAGE, PLUGIN_FAILURE_STATUS, PluginChain, PluginSession, RequestMeta,
@@ -46,7 +47,6 @@ pub(crate) const PASSTHROUGH_STREAM: &str = "passthrough";
 /// Stands in for the key name on a request that used none of Reiki's keys.
 const PASSTHROUGH_KEY: &str = "-";
 const HEALTH_PATH: &str = "/__reiki/healthz";
-const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 /// Source of the wall clock. Production reads the system clock; tests inject one they can pin.
 pub trait Clock: Send + Sync {
@@ -61,41 +61,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Fixed-window request counter for one stream. A window is a minute long; the
-/// first request starts it. Counters live in the snapshot, so a reload resets them.
-struct RateLimiter {
-    limit: u32,
-    window_start: Instant,
-    used: u32,
-}
-
-impl RateLimiter {
-    fn new(limit: u32, now: Instant) -> Self {
-        Self {
-            limit,
-            window_start: now,
-            used: 0,
-        }
-    }
-
-    /// Counts one request against the window. Returns the wait until the window
-    /// resets when the request is over the limit; the counter is not advanced then.
-    fn check(&mut self, now: Instant) -> Result<(), Duration> {
-        let elapsed = now.saturating_duration_since(self.window_start);
-        if elapsed >= RATE_LIMIT_WINDOW {
-            self.window_start = now;
-            self.used = 0;
-        }
-        if self.used >= self.limit {
-            return Err(
-                RATE_LIMIT_WINDOW.saturating_sub(now.saturating_duration_since(self.window_start))
-            );
-        }
-        self.used += 1;
-        Ok(())
-    }
-}
-
+#[derive(Clone)]
 pub struct Secret(String);
 
 impl Secret {
@@ -310,7 +276,6 @@ pub(crate) struct Snapshot {
     pub(crate) config: Config,
     pub(crate) keys: HashMap<String, Secret>,
     pub(crate) chains: HashMap<String, Mutex<Chain>>,
-    limiters: HashMap<String, Mutex<RateLimiter>>,
 }
 
 impl Snapshot {
@@ -325,41 +290,33 @@ impl Snapshot {
                 )
             })
             .collect();
-        let now = Instant::now();
-        let limiters = config
-            .streams
-            .iter()
-            .filter_map(|(name, stream)| {
-                stream
-                    .rate_limit_per_minute
-                    .map(|limit| (name.clone(), Mutex::new(RateLimiter::new(limit, now))))
-            })
-            .collect();
         Self {
             config,
             keys,
             chains,
-            limiters,
         }
-    }
-
-    /// Counts a request against the stream's rate limit, if it has one. Returns
-    /// the wait until the window resets when the stream is over the limit.
-    fn rate_limit_retry_after(&self, stream: &str, now: Instant) -> Option<Duration> {
-        let mut limiter = self
-            .limiters
-            .get(stream)?
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        limiter.check(now).err()
     }
 
     pub(crate) fn authenticate(&self, token: &str) -> Option<&str> {
         let hash = sha256_hex(token);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
         let mut found = None;
-        // Check every stream so timing does not reveal which one matched.
+        // Check every credential so timing does not reveal which one matched. A dynamic stream
+        // never falls back to its first hash: an expired or revoked token must stop working.
         for (name, stream) in &self.config.streams {
-            if constant_time_eq(&stream.token_sha256.to_ascii_lowercase(), &hash) {
+            if let Some(tokens) = stream.dynamic.as_ref().map(|_| &stream.dynamic_tokens)
+                && !tokens.is_empty()
+            {
+                for candidate in tokens {
+                    let live = candidate.expires_at.is_none_or(|expires| expires > now);
+                    if live && constant_time_eq(&candidate.token_sha256.to_ascii_lowercase(), &hash)
+                    {
+                        found = Some(name.as_str());
+                    }
+                }
+            } else if constant_time_eq(&stream.token_sha256.to_ascii_lowercase(), &hash) {
                 found = Some(name.as_str());
             }
         }
@@ -414,6 +371,8 @@ const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
     health: Mutex<KeyState>,
+    /// Per-stream gateway counters, kept across reloads and persisted in the state file.
+    gateway: Arc<Gateway>,
     /// Per-upstream attempts and tokens for the last hour, in memory only. Shared with the
     /// response bodies, which record their tokens when they end.
     pressure: Arc<PressureCounter>,
@@ -445,6 +404,11 @@ pub struct App {
     logins: LoginThrottle,
     /// Separate counts, so failed admin logins cannot lock out client requests from the same peer.
     admin_logins: LoginThrottle,
+    /// Separate again: stream management has its own rate limit and lockout.
+    stream_logins: LoginThrottle,
+    stream_rpm: LoginThrottle,
+    /// Set only when `[stream_admin]` is configured.
+    stream_admin: OnceLock<Arc<crate::stream_admin::Manager>>,
     /// Replaced by a reload; a request holds the chain it started with through its [`PluginSession`].
     plugins: RwLock<Arc<PluginChain>>,
     /// The tunnel, once started, so a reload can change its policy.
@@ -535,9 +499,10 @@ impl App {
         let throttle = ThrottleSettings::from(&config.auth);
         let shaper = Shaper::new();
         shaper.sync(&shaped_keys(&config));
-        Arc::new(Self {
+        let app = Arc::new(Self {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
+            gateway: Arc::new(Gateway::new()),
             pressure: Arc::new(PressureCounter::new()),
             observed: ObservedStore::new(),
             failures: crate::failures::FailureRing::new(),
@@ -556,6 +521,9 @@ impl App {
             peer_ca: RwLock::new(Vec::new()),
             logins: LoginThrottle::new(throttle),
             admin_logins: LoginThrottle::new(throttle),
+            stream_logins: LoginThrottle::new(throttle),
+            stream_rpm: LoginThrottle::new(throttle),
+            stream_admin: OnceLock::new(),
             plugins: RwLock::new(Arc::new(plugins)),
             tunnel: OnceLock::new(),
             config_path: OnceLock::new(),
@@ -565,7 +533,9 @@ impl App {
             swap: std::sync::RwLock::new(()),
             #[cfg(feature = "peers")]
             peer_publisher: OnceLock::new(),
-        })
+        });
+        app.gateway.set_owner(Arc::downgrade(&app));
+        app
     }
 
     /// Forward wins when configured; otherwise faithful keeps the client request, standard rebuilds it.
@@ -606,6 +576,10 @@ impl App {
         &self.health
     }
 
+    pub(crate) fn gateway(&self) -> &Arc<Gateway> {
+        &self.gateway
+    }
+
     pub(crate) fn pressure(&self) -> &PressureCounter {
         &self.pressure
     }
@@ -623,6 +597,106 @@ impl App {
     /// Failed admin token checks, kept apart from the client listener's counts.
     pub(crate) fn admin_logins(&self) -> &LoginThrottle {
         &self.admin_logins
+    }
+
+    /// Stream management uses separate counters: a flood there cannot lock out client traffic,
+    /// or the ordinary admin API, from the same loopback source.
+    pub(crate) fn stream_logins(&self) -> &LoginThrottle {
+        &self.stream_logins
+    }
+
+    pub(crate) fn stream_rpm(&self) -> &LoginThrottle {
+        &self.stream_rpm
+    }
+
+    pub(crate) fn stream_admin(&self) -> Option<&Arc<crate::stream_admin::Manager>> {
+        self.stream_admin.get()
+    }
+
+    /// Counts of configured and dynamically managed streams in the current snapshot.
+    pub(crate) fn stream_counts(&self) -> (u64, u64) {
+        let snapshot = self.snapshot();
+        let mut static_streams = 0;
+        let mut dynamic_streams = 0;
+        for stream in snapshot.config.streams.values() {
+            if stream.dynamic.is_some() {
+                dynamic_streams += 1;
+            } else {
+                static_streams += 1;
+            }
+        }
+        (static_streams, dynamic_streams)
+    }
+
+    pub fn set_stream_admin(self: &Arc<Self>, manager: Arc<crate::stream_admin::Manager>) {
+        let settings = crate::auth::ThrottleSettings {
+            enabled: true,
+            max_failures: manager.config().lockout_threshold,
+            window: Duration::from_secs(manager.config().lockout_secs),
+        };
+        let rpm = crate::auth::ThrottleSettings {
+            enabled: true,
+            max_failures: manager.config().rpm,
+            window: Duration::from_secs(60),
+        };
+        self.stream_logins.configure(settings);
+        self.stream_rpm.configure(rpm);
+        if self.stream_admin.set(manager.clone()).is_ok() {
+            manager.attach(Arc::downgrade(self));
+        }
+    }
+
+    /// Rebuilds the live snapshot from the current config plus dynamic streams. In-flight
+    /// requests keep their old `Arc<Snapshot>`; new ones see the change immediately.
+    pub(crate) fn apply_stream_config(
+        &self,
+        mut config: Config,
+        streams: Vec<(String, StreamConfig)>,
+    ) {
+        config.streams.retain(|_, stream| stream.dynamic.is_none());
+        for (name, stream) in streams {
+            config.streams.insert(name, stream);
+        }
+        self.swap_snapshot(config, self.snapshot().keys.clone());
+    }
+
+    fn swap_snapshot(&self, config: Config, keys: HashMap<String, Secret>) {
+        let throttle = ThrottleSettings::from(&config.auth);
+        let wanted_shapes = shaped_keys(&config);
+        let next = Arc::new(Snapshot::new(config, keys));
+        self.gateway.reconcile(&next.config);
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        health.retain_keys(|name| next.keys.contains_key(name));
+        for (name, secret) in &next.keys {
+            let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
+            if !unchanged {
+                health.enable(name);
+            }
+        }
+        self.shaper.sync(&wanted_shapes);
+        *current = next;
+        self.logins.configure(throttle);
+        self.admin_logins.configure(throttle);
+        if let Some(manager) = self.stream_admin.get() {
+            self.stream_logins.configure(crate::auth::ThrottleSettings {
+                enabled: true,
+                max_failures: manager.config().lockout_threshold,
+                window: Duration::from_secs(manager.config().lockout_secs),
+            });
+            self.stream_rpm.configure(crate::auth::ThrottleSettings {
+                enabled: true,
+                max_failures: manager.config().rpm,
+                window: Duration::from_secs(60),
+            });
+        }
+        #[cfg(feature = "peers")]
+        if let Some(publisher) = self.peer_publisher.get() {
+            publisher.logins().configure(throttle);
+        }
     }
 
     /// The peer publisher, created on first use by the peer listener.
@@ -684,7 +758,8 @@ impl App {
         self.clock.now()
     }
 
-    /// Apply persisted key health and shaper state. Missing or corrupt state is ignored.
+    /// Apply persisted key health, shaper and gateway counters. Missing state is fine; an
+    /// unreadable file applies the gateway's configured store-error policy.
     pub fn load_persisted_state(&self) {
         let Some(path) = self.state_path.get() else {
             return;
@@ -694,6 +769,10 @@ impl App {
         let now = self.wall_now();
         self.shaper.restore(&loaded.shaper, now);
         self.restore_state(loaded.health);
+        self.gateway.restore(loaded.gateway, &config.config);
+        if loaded.store_error {
+            self.gateway.store_failed();
+        }
         *self
             .shaper_saved
             .lock()
@@ -739,7 +818,7 @@ impl App {
     }
 
     /// Saves the state, by waking the writer thread when there is one.
-    fn persist_state(&self) {
+    pub(crate) fn persist_state(&self) {
         if let Some(tx) = self.persist_tx.get() {
             match tx.try_send(()) {
                 Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => return,
@@ -760,7 +839,7 @@ impl App {
         self.persist_state_now();
     }
 
-    fn persist_state_now(&self) {
+    pub(crate) fn persist_state_now(&self) {
         let Some(path) = self.state_path.get() else {
             return;
         };
@@ -775,8 +854,20 @@ impl App {
             .snapshot(Instant::now());
         let now = self.wall_now();
         let shaper = self.shaper.snapshot(now);
+        let gateway = self.gateway.snapshot();
         let config = self.snapshot();
-        crate::state::save_with_shaper(path, &health, &shaper, &config.keys, &config.config);
+        let written = crate::state::save_with_shaper(
+            path,
+            &health,
+            &shaper,
+            &gateway,
+            &config.keys,
+            &config.config,
+        );
+        match written {
+            Ok(()) => self.gateway.write_succeeded(),
+            Err(_) => self.gateway.write_failed(),
+        }
         *self
             .shaper_saved
             .lock()
@@ -823,30 +914,11 @@ impl App {
     /// Swap in a new config and key set. A request keeps the snapshot it started
     /// with. Plugins are built at startup and are not rebuilt here.
     pub fn reload(&self, config: Config, keys: HashMap<String, Secret>) {
-        let throttle = ThrottleSettings::from(&config.auth);
-        let wanted_shapes = shaped_keys(&config);
-        let next = Arc::new(Snapshot::new(config, keys));
-        // Health first, then the snapshot: `record` takes them in the same order, so a
-        // failure from a request on the old snapshot cannot land after the re-enable.
-        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut current = self
-            .snapshot
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        health.retain_keys(|name| next.keys.contains_key(name));
-        for (name, secret) in &next.keys {
-            let unchanged = current.keys.get(name).is_some_and(|old| old.0 == secret.0);
-            if !unchanged {
-                health.enable(name);
-            }
-        }
-        self.shaper.sync(&wanted_shapes);
-        *current = next;
-        self.logins.configure(throttle);
-        self.admin_logins.configure(throttle);
-        #[cfg(feature = "peers")]
-        if let Some(publisher) = self.peer_publisher.get() {
-            publisher.logins().configure(throttle);
+        // Swap first so dynamic state is validated against the new config. An invalid file drops
+        // dynamic access but never stops the static streams loaded from that config.
+        self.swap_snapshot(config, keys);
+        if let Some(manager) = self.stream_admin.get() {
+            manager.reload_from_disk();
         }
     }
 
@@ -1032,6 +1104,9 @@ impl App {
             restart_needed.push("admin.listen".to_owned());
         }
         restart_needed.extend(current.config.server.restart_needed(&config.server));
+        if current.config.stream_admin != config.stream_admin {
+            restart_needed.push("stream_admin".to_owned());
+        }
         if current.config.service != config.service {
             restart_needed.push("service.shutdown_timeout_secs".to_owned());
         }
@@ -1131,7 +1206,46 @@ impl App {
 }
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new().fallback(handle).with_state(app)
+    Router::new()
+        .route("/v1/usage", axum::routing::get(usage))
+        .fallback(handle)
+        .with_state(app)
+}
+
+/// Self-service usage for the stream that owns the token. The admin listener's plugin-provided
+/// `/v1/usage` route stays separate and reports aggregate upstream totals.
+async fn usage(State(app): State<Arc<App>>, req: Request) -> Response {
+    let (parts, _) = req.into_parts();
+    let snapshot = app.snapshot();
+    let Some(token) = extract_token(&parts.headers, parts.uri.query()) else {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "missing token");
+    };
+    let Some(stream) = snapshot.authenticate(&token) else {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "unknown token");
+    };
+    if let Some(wait) = app
+        .gateway()
+        .usage_rpm_wait(stream, &snapshot.config, app.wall_now())
+    {
+        let mut response = json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "gateway_usage_limited",
+            "too many usage requests",
+        );
+        if let Ok(value) = HeaderValue::from_str(&wait.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    let states = app.gateway().all_states();
+    let cost = app.plugins().usage_cost_fragment(stream);
+    let body = crate::gateway::usage_view(&states, Some(stream), cost.as_ref());
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// How many percent-decoding layers are inspected. Each valid decode shortens the path, so a
@@ -1234,6 +1348,16 @@ fn rate_limited_response(wait: Duration) -> Response {
     );
     let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
     if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn gateway_refusal_response(refusal: GatewayRefusal) -> Response {
+    let mut response = json_error(refusal.status, refusal.kind, refusal.message);
+    if let Some(wait) = refusal.retry_after
+        && let Ok(value) = HeaderValue::from_str(&wait.to_string())
+    {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
@@ -1943,6 +2067,10 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     let mut shaped_wait: Option<Duration> = None;
     // Time already slept on this request, across keys: the wait budget is per request.
     let mut waited = Duration::ZERO;
+    // One slot per selected key, held until the final body ends. Failover is charged like a
+    // separate attempt, matching how the old per-stream limiter counted it.
+    let mut gateway_permits: Vec<GatewayPermit> = Vec::new();
+    let estimate = (body.len() / 4) as u64;
     for _ in 0..max_attempts {
         let Some(key_name) =
             snapshot.pick(&app.health, stream, upstream_name, &skip, scope.as_ref())
@@ -1961,17 +2089,44 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
         let Some(secret) = snapshot.keys.get(&key_name) else {
             break;
         };
-        // Count every selected-key attempt, so a failover or fallback cannot spend more
-        // upstream calls than the stream's limit allows.
-        if let Some(wait) = snapshot.rate_limit_retry_after(stream, Instant::now()) {
-            tracing::warn!(stream = %stream, "stream rate limit exceeded");
-            app.plugins().on_event(&Event::RateLimited { stream });
-            return Ok(rate_limited_response(wait));
+        // Gateway admission is per stream, not per upstream. Passthrough traffic has no
+        // configured stream and is deliberately outside this accounting.
+        if stream != PASSTHROUGH_STREAM {
+            let store_errors_before = app.gateway().store_errors();
+            let now = app.wall_now();
+            let budget = app.plugins().admission_refusal(stream, now);
+            match app.gateway().admit_with_budget(
+                &snapshot.config,
+                stream,
+                upstream_name,
+                &key_name,
+                scope.as_ref().map(|scope| scope.model.as_str()),
+                now,
+                estimate,
+                budget,
+            ) {
+                Ok(permit) => {
+                    if app.gateway().store_errors() > store_errors_before {
+                        app.plugins().on_event(&Event::GatewayStoreError { stream });
+                    }
+                    gateway_permits.push(permit);
+                }
+                Err(refusal) => {
+                    let reason = refusal.reason.into();
+                    let store_error = refusal.reason == crate::gateway::RejectReason::StoreClosed;
+                    if store_error {
+                        app.plugins().on_event(&Event::GatewayStoreError { stream });
+                    }
+                    app.plugins()
+                        .on_event(&Event::GatewayRejected { stream, reason });
+                    tracing::warn!(stream = %stream, reason = reason.label(), "gateway refused the request");
+                    return Ok(gateway_refusal_response(refusal));
+                }
+            }
         }
 
         // Outbound shaping for this key's own upstream. A wait within its budget is
         // slept off; anything longer skips the key without touching its health.
-        let estimate = (body.len() / 4) as u64;
         let mut permit: Option<Permit> = None;
         let mut shaped_out = false;
         let budget = app
@@ -2136,12 +2291,30 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
                 Err(response) => return Ok(*response),
             };
             let permit = if buffered { None } else { permit };
+            let gateway = if buffered {
+                for mut admitted in gateway_permits {
+                    admitted.complete(0);
+                }
+                Vec::new()
+            } else {
+                gateway_permits
+            };
             let accounting = Accounting {
                 permit,
                 pressure: snapshot
                     .config
                     .tracks_usage()
                     .then(|| Arc::clone(&app.pressure)),
+                gateway,
+                plugins: Some(plugin_states.chain().clone()),
+                stream: stream.to_owned(),
+                upstream: upstream_name.to_owned(),
+                model: scope
+                    .as_ref()
+                    .map(|scope| scope.model.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                key: key_name.clone(),
             };
             return Ok(stream_response(
                 plugin_states,
@@ -3077,6 +3250,12 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap) {
 struct Accounting {
     permit: Option<Permit>,
     pressure: Option<Arc<PressureCounter>>,
+    gateway: Vec<GatewayPermit>,
+    plugins: Option<Arc<PluginChain>>,
+    stream: String,
+    upstream: String,
+    model: String,
+    key: String,
 }
 
 /// Holds a shaping permit for as long as its body is streamed. Dropping the body
@@ -3087,11 +3266,18 @@ struct Permitted<S> {
     usage: Option<Usage>,
     /// The counter and the upstream its tokens are attributed to.
     tokens: Option<(Arc<PressureCounter>, String)>,
+    gateway: Vec<GatewayPermit>,
+    plugins: Option<Arc<PluginChain>>,
+    stream: String,
+    upstream: String,
+    model: String,
+    key: String,
+    status: u16,
 }
 
 impl<S> Permitted<S> {
-    /// Settles with the usage seen so far. Without usage the permit is left to drop, keeping
-    /// the estimate, and no tokens are counted.
+    /// Settles with the usage seen so far. Without usage the estimate stays charged and no
+    /// usage event is emitted; the gateway permits still release their concurrency slots.
     fn finish(&mut self) {
         let Some(mut usage) = self.usage.take() else {
             return;
@@ -3101,14 +3287,34 @@ impl<S> Permitted<S> {
         if unaccounted && let Some((pressure, upstream)) = &self.tokens {
             pressure.record_unaccounted(upstream, Instant::now());
         }
-        let Some(actual) = actual else {
-            return;
-        };
-        if let Some(permit) = self.permit.take() {
-            permit.complete(actual);
-        }
-        if let Some((pressure, upstream)) = self.tokens.take() {
-            pressure.record_tokens(&upstream, actual, Instant::now());
+        if let Some(actual) = actual {
+            if let Some(permit) = self.permit.take() {
+                permit.complete(actual);
+            }
+            if let Some((pressure, upstream)) = self.tokens.take() {
+                pressure.record_tokens(&upstream, actual, Instant::now());
+            }
+            if let Some(plugins) = &self.plugins {
+                plugins.on_event(&Event::Usage {
+                    stream: &self.stream,
+                    upstream: &self.upstream,
+                    model: &self.model,
+                    key: &self.key,
+                    tokens: actual,
+                    input_tokens: usage.input(),
+                    output_tokens: usage.output(),
+                    cached_input_tokens: usage.cached(),
+                    status_class: reiki_plugin::status_class(self.status),
+                });
+            }
+            let last = self.gateway.len().saturating_sub(1);
+            for (index, mut permit) in self.gateway.drain(..).enumerate() {
+                if index == last {
+                    permit.complete(actual);
+                } else {
+                    permit.complete(0);
+                }
+            }
         }
     }
 }
@@ -3199,11 +3405,20 @@ fn stream_response(
     };
     // A compressed body is not the upstream's bytes, so its usage cannot be read here.
     let watch = !response.is_decoded() && !is_encoded(&response.headers);
-    let Accounting { permit, pressure } = accounting;
-    let usage = (watch && (permit.is_some() || pressure.is_some()))
+    let Accounting {
+        permit,
+        pressure,
+        gateway,
+        plugins,
+        stream,
+        upstream,
+        model,
+        key: key_name,
+    } = accounting;
+    let usage = (watch && (permit.is_some() || pressure.is_some() || !gateway.is_empty()))
         .then(|| Usage::new(is_event_stream(&response.headers)));
     let tokens = pressure.map(|pressure| (pressure, upstream.to_owned()));
-    let stream = |response: UpstreamResponse| -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    let body_stream = |response: UpstreamResponse| -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
         match scrubber {
             Some(scrubber) => Box::pin(crate::scrub::ScrubbedStream::new(response.into_stream(), scrubber)),
             None => response.into_stream(),
@@ -3211,15 +3426,22 @@ fn stream_response(
     };
     let body = if !plugin_states.needs_response_hooks() {
         Body::from_stream(Permitted {
-            inner: stream(response),
+            inner: body_stream(response),
             permit,
             usage,
             tokens,
+            gateway,
+            plugins,
+            stream,
+            upstream: upstream.to_owned(),
+            model,
+            key: key_name,
+            status: status.as_u16(),
         })
     } else {
         let mut session = plugin_states;
         // A plugin that changes the body length must drop content-length here.
-        session.on_response_head(key, upstream, &mut status, &mut headers);
+        session.on_response_head(key, &upstream, &mut status, &mut headers);
         if session.failed() {
             return json_error(
                 PLUGIN_FAILURE_STATUS,
@@ -3238,12 +3460,19 @@ fn stream_response(
         Body::from_stream(Permitted {
             inner: PluginBody {
                 session,
-                inner: stream(response),
+                inner: body_stream(response),
                 done: false,
             },
             permit,
             usage,
             tokens,
+            gateway,
+            plugins,
+            stream,
+            upstream: upstream.to_owned(),
+            model,
+            key: key_name,
+            status: status.as_u16(),
         })
     };
     let mut out = Response::new(body);
@@ -3447,30 +3676,64 @@ mod tests {
         assert!(!is_pre_send(&timed_out));
     }
 
-    #[test]
-    fn rate_limiter_allows_the_limit_then_reports_a_reset_wait() {
-        let now = Instant::now();
-        let mut limiter = RateLimiter::new(2, now);
-        assert_eq!(limiter.check(now), Ok(()));
-        assert_eq!(limiter.check(now), Ok(()));
-        let wait = limiter.check(now).unwrap_err();
-        assert!(wait > Duration::ZERO && wait <= RATE_LIMIT_WINDOW);
-
-        // The wait shrinks as the window advances, then the window resets.
-        let later = limiter.check(now + Duration::from_secs(45)).unwrap_err();
-        assert!(later < wait, "{later:?} was not shorter than {wait:?}");
-        assert_eq!(limiter.check(now + RATE_LIMIT_WINDOW), Ok(()));
+    fn gateway_test_config(limits: &str, gateway: &str) -> Config {
+        Config::parse(&format!(
+            "{gateway}\n[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
+             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\n{limits}\n",
+            crate::auth::sha256_hex("tok")
+        ))
+        .unwrap()
     }
 
     #[test]
-    fn a_rejected_request_does_not_advance_the_used_count() {
-        let now = Instant::now();
-        let mut limiter = RateLimiter::new(1, now);
-        assert_eq!(limiter.check(now), Ok(()));
+    fn gateway_admission_enforces_rpm_and_refusals_do_not_spend_budget() {
+        let config = gateway_test_config("[streams.s.limits]\nrpm = 2\n", "");
+        let gateway = Gateway::new();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(60 * 1_000);
+        assert!(
+            gateway
+                .admit(&config, "s", "zen", "a", None, now, 0)
+                .is_ok()
+        );
+        assert!(
+            gateway
+                .admit(&config, "s", "zen", "a", None, now, 0)
+                .is_ok()
+        );
         for _ in 0..5 {
-            assert!(limiter.check(now).is_err());
+            let refusal = gateway
+                .admit(&config, "s", "zen", "a", None, now, 0)
+                .unwrap_err();
+            assert_eq!(refusal.reason, crate::gateway::RejectReason::Rate);
         }
-        assert_eq!(limiter.check(now + RATE_LIMIT_WINDOW), Ok(()));
+        assert_eq!(gateway.stream_state("s").requests_total, 2);
+        assert!(
+            gateway
+                .admit(
+                    &config,
+                    "s",
+                    "zen",
+                    "a",
+                    None,
+                    now + Duration::from_secs(60),
+                    0
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_usage_route_has_its_own_rate_limit() {
+        let config = gateway_test_config("", "[gateway]\nusage_rpm = 2\n");
+        let gateway = Gateway::new();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(60 * 1_000);
+        assert_eq!(gateway.usage_rpm_wait("s", &config, now), None);
+        assert_eq!(gateway.usage_rpm_wait("s", &config, now), None);
+        let wait = gateway.usage_rpm_wait("s", &config, now).unwrap();
+        assert!((1..=60).contains(&wait));
+        // A different stream has its own budget.
+        assert_eq!(gateway.usage_rpm_wait("other", &config, now), None);
     }
 
     #[test]
@@ -3670,31 +3933,6 @@ mod tests {
             snapshot
                 .soonest_recovery(&health, "s", "zen", None)
                 .is_some()
-        );
-    }
-
-    #[test]
-    fn a_poisoned_rate_limiter_lock_still_enforces_the_limit() {
-        let text = format!(
-            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
-             [keys.a]\nupstream = \"zen\"\nfile = \"/unused/a\"\n\
-             [streams.s]\ntoken_sha256 = \"{}\"\nchain = [\"a\"]\nrate_limit_per_minute = 1\n",
-            crate::auth::sha256_hex("tok")
-        );
-        let snapshot = Arc::new(Snapshot::new(Config::parse(&text).unwrap(), HashMap::new()));
-        let poisoner = Arc::clone(&snapshot);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.limiters.get("s").unwrap().lock().unwrap();
-            panic!("poison the limiter lock");
-        })
-        .join();
-        assert!(snapshot.limiters.get("s").unwrap().is_poisoned());
-
-        let now = Instant::now();
-        assert!(snapshot.rate_limit_retry_after("s", now).is_none());
-        assert!(
-            snapshot.rate_limit_retry_after("s", now).is_some(),
-            "a poisoned lock must not fail open"
         );
     }
 

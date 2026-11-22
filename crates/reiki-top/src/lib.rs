@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-pub use reiki_health::{Failure, Health, KeyView, Upstream};
+pub use reiki_health::{Failure, GatewayCounts, Health, KeyView, Upstream};
+
+mod cost;
+pub use cost::{CostTotals, LocalCost};
 
 pub mod matrix;
 #[cfg(feature = "tui")]
@@ -34,6 +37,8 @@ pub struct Fleet {
     /// Full recent failures for the local instance's published name, when its admin listener
     /// was reachable. Keyed by `Health::instance`, never by the local peer label.
     local_failures: HashMap<String, Vec<Failure>>,
+    /// Estimated spend from the local admin listener. Never accepted from peers.
+    local_cost: Option<LocalCost>,
 }
 
 /// One upstream row of the provider summary: counts summed over every fresh peer.
@@ -42,6 +47,16 @@ pub struct ProviderRow {
     pub upstream: String,
     pub healthy_keys: u32,
     pub total_keys: u32,
+    pub peer_count: u32,
+}
+
+/// Gateway totals summed over every fresh peer that exposes them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewayTotals {
+    pub requests: u64,
+    pub tokens: u64,
+    pub store_errors: u64,
+    /// How many fresh peers published gateway counts.
     pub peer_count: u32,
 }
 
@@ -62,7 +77,18 @@ impl Fleet {
             peers: HashMap::new(),
             errors: HashMap::new(),
             local_failures: HashMap::new(),
+            local_cost: None,
         }
+    }
+
+    /// Replaces the local instance's estimated cost summary.
+    pub fn set_local_cost(&mut self, cost: LocalCost) {
+        self.local_cost = Some(cost);
+    }
+
+    /// The local instance's estimated cost summary, when its admin listener provided one.
+    pub fn local_cost(&self) -> Option<&LocalCost> {
+        self.local_cost.as_ref()
     }
 
     /// Replaces the full failure list for one published instance.
@@ -228,6 +254,25 @@ impl Fleet {
         }
         let mut out: Vec<ProviderRow> = rows.into_values().collect();
         out.sort_by(|a, b| a.upstream.cmp(&b.upstream));
+        out
+    }
+
+    /// Aggregate gateway counts over the fresh peers that publish them. Peers with usage hidden
+    /// contribute nothing and are not counted, so a zero from a hidden peer never looks like
+    /// real data.
+    pub fn gateway_totals(&self, now: Instant) -> GatewayTotals {
+        let mut out = GatewayTotals::default();
+        for (name, peer) in &self.peers {
+            if self.stale(name, now, self.max_age) {
+                continue;
+            }
+            if let Some(counts) = peer.health.gateway {
+                out.requests = out.requests.saturating_add(counts.requests);
+                out.tokens = out.tokens.saturating_add(counts.tokens);
+                out.store_errors = out.store_errors.saturating_add(counts.store_errors);
+                out.peer_count += 1;
+            }
+        }
         out
     }
 
@@ -1675,6 +1720,46 @@ mod tests {
             rows.iter().map(|r| r.upstream.as_str()).collect::<Vec<_>>(),
             ["gem", "open", "zen"]
         );
+    }
+
+    /// A document with aggregate gateway counts but no request data.
+    const GATEWAY_DOC: &str = r#"{
+    "age_seconds" : 0,
+    "observed" : [],
+    "failures" : {},
+    "instance" : "peer-a",
+    "observed_at" : "2026-11-13T09:30:00Z",
+    "reiki_version" : "0.10.3",
+    "gateway" : {"requests": 10, "tokens": 200, "store_errors": 1},
+    "upstreams" : []
+}
+"#;
+
+    #[test]
+    fn gateway_totals_sum_fresh_publishers_only() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        fleet.apply_snapshot("peer-a", Health::from_json(GATEWAY_DOC).unwrap(), now);
+        let doc = GATEWAY_DOC.replace("\"requests\": 10", "\"requests\": 7");
+        fleet.apply_snapshot("peer-b", Health::from_json(&doc).unwrap(), now);
+        // A peer with usage hidden publishes no counts.
+        fleet.apply_snapshot("peer-c", Health::from_json(BARE_DOC).unwrap(), now);
+        // And a stale peer's counts are not included.
+        fleet.apply_snapshot(
+            "peer-d",
+            Health::from_json(GATEWAY_DOC).unwrap(),
+            now - Duration::from_secs(200),
+        );
+        assert_eq!(
+            fleet.gateway_totals(now),
+            GatewayTotals {
+                requests: 17,
+                tokens: 400,
+                store_errors: 2,
+                peer_count: 2,
+            }
+        );
+        assert!(Health::from_json(BARE_DOC).unwrap().gateway.is_none());
     }
 
     #[test]

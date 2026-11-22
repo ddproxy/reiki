@@ -251,10 +251,10 @@ fn config_with_limits(
         let limit = limits
             .iter()
             .find(|(limited, _)| limited == name)
-            .map(|(_, limit)| format!("\nrate_limit_per_minute = {limit}"))
+            .map(|(_, limit)| format!("[streams.{name}.limits]\nrpm = {limit}\n"))
             .unwrap_or_default();
         text.push_str(&format!(
-            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]{limit}\n",
+            "[streams.{name}]\ntoken_sha256 = \"{}\"\nchain = [{chain}]\n{limit}",
             sha(token)
         ));
     }

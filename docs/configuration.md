@@ -14,9 +14,11 @@ Conventions in this page:
 | --- | --- | --- |
 | `listen` | Client listener address | no |
 | `[admin]` | Admin listener and its token | no |
+| `[stream_admin]` | Opt-in dynamic stream management on the admin listener | no |
 | `[auth]` | Failed-token backoff on the client, admin, peer and intercepted-tunnel listeners | no |
 | `[server]` | Connection caps on the client and admin listeners | no |
 | `[service]` | Shutdown drain time | no |
+| `[gateway]` | Defaults for per-stream admission and the self-service usage route | no |
 | `[reload]` | Reload on file change | no |
 | `[log]` | Reiki's own log output | no |
 | `[upstream.NAME]` | A provider endpoint and how requests reach it | no |
@@ -27,6 +29,7 @@ Conventions in this page:
 | `[peers]` | Health sharing between instances | no |
 | `[peers.NAME]` | A peer whose health `reiki peers` reads | no |
 | `[plugins.NAME]` | A compiled-in plugin | no |
+| `[plugins.cost]` | Opt-in estimated spend from operator prices; needs `plugin-cost` | no |
 | `[hubs.NAME]`, `[hub]`, `[accounts.LABEL]` | Hub configuration; see [hub](hub.md) | no |
 
 There is no top-level `[limits]` table. Outbound limits are set per upstream in `[upstream.NAME.limits]` and per account in `[accounts.LABEL.limits]`.
@@ -38,7 +41,7 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | Listener | Setting | Default | Notes |
 | --- | --- | --- | --- |
 | Client | `listen` | `127.0.0.1:4097` | Serves the proxy API. |
-| Admin | `[admin].listen` | none | Enabled only with an `[admin]` table. Loopback only; terminate TLS in front for remote access. |
+| Admin | `[admin].listen` | none | Enabled only with an `[admin]` table. Loopback only; terminate TLS in front for remote access. Also serves `/v1/streams*` when `[stream_admin]` is configured. |
 | Tunnel | `[tunnel].listen` | none | Enabled only with a `[tunnel]` table. |
 | Peers | `[peers].listen` | none | Used when `[peers]` publishes health. Loopback unless TLS is configured. |
 | Hub | `[hub].listen` | none | Parsed and validated; not served in this release. Loopback only. |
@@ -56,12 +59,85 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 
 ## `[admin]`
 
-The admin listener serves `GET /v1/status`, `GET /v1/failures`, `POST /v1/reload`, `POST /v1/keys/enable`, plugin routes such as `GET /v1/metrics`, and `GET /v1/openapi.json`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener.
+The admin listener serves `GET /v1/status`, `GET /v1/failures`, `POST /v1/reload`, `POST /v1/keys/enable`, plugin routes such as `GET /v1/metrics`, and `GET /v1/openapi.json`. See [monitoring](monitoring.md). The table is optional; without it there is no admin listener. When `[stream_admin]` is configured, the same listener also serves the `/v1/streams*` management routes with a dedicated token, not the ordinary admin token.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `listen` | string | required | Admin listener address: a literal loopback IP and port, such as `127.0.0.1:9090` or `[::1]:9090`. Hostnames such as `localhost:9090` and non-loopback IPs are config errors. Must differ from `listen`. There is no admin TLS option; terminate TLS in front and bind on loopback for remote access. |
 | `token_sha256` | string | required | SHA-256 hex of the admin token, 64 characters. Must differ from every stream token. Make it with `reiki hash-token`, from a token of at least 16 characters. |
+
+## `[stream_admin]`
+
+Opt-in management of dynamic streams on the admin listener. **Absence of the table means the feature is off**: no management routes, no dynamic streams, and no state or audit file access. The table needs an `[admin]` table, and the configured `[admin].listen` must appear in `allowed_listen`. Management requests use a dedicated token, not `[admin].token_sha256`; see [keys](keys.md#dynamic-stream-credentials) and the [API route list](README.md#stream-admin-api).
+
+Required keys:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `audit_log` | string | required | Append-only JSONL audit file, a relative name ending in `.jsonl` in the state directory (the directory holding `<config>.state`). Reiki also keeps a small `audit.head` sidecar beside it with the last sequence number and hash. Must differ from `state_file`. Management fails closed when a record cannot be written. |
+| `max_streams` | integer | required | Hard cap on dynamic streams. Range 1 to 10000. |
+| `allowed_keys` | table of tables | required | Key labels from `[keys.*]` the API may assign. Each `[stream_admin.allowed_keys.NAME]` entry must set `assignable = true`; an unknown key or `false` is a config error. The API never creates keys. |
+| `ceilings` | table | required | Upper bounds for every dynamic stream; see below. Each present field must be at least 1. |
+| `allowed_listen` | array of strings | required | Literal loopback `IP:port` values where these routes may be served. Must contain the configured `[admin].listen` exactly; hostnames such as `localhost:4098` are refused. |
+| `token_sha256` | string | required | SHA-256 hex of the dedicated stream-management token, 64 characters. Must differ from `[admin].token_sha256`, every stream token and every two-party confirmation hash. Make it with `reiki hash-token`. |
+| `actor_id_sha256` | string | required | SHA-256 hex, 64 characters, of the operator identity written to audit records. It is a hash, not a token, and must differ from `token_sha256` and the confirmation hashes. |
+
+`[stream_admin.ceilings]` accepts these optional integer fields. An omitted field is not a ceiling.
+
+| Field | Meaning |
+| --- | --- |
+| `rpm`, `tpm` | Requests and estimated tokens per 60-second window. |
+| `concurrent` | Requests in flight at once. |
+| `daily_requests`, `daily_tokens` | Requests and tokens per calendar day. |
+| `monthly_requests`, `monthly_tokens` | Requests and tokens per calendar month. |
+
+Optional keys:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `token_env` | string | `"REIKI_STREAM_ADMIN_TOKEN"` | Environment variable the CLI reads the raw token from. The token is never a CLI argument. |
+| `confirm_env` | string | `"REIKI_STREAM_ADMIN_CONFIRM_TOKEN"` | Environment variable holding the second token when `require_two_party` is set. Must differ from `token_env`. |
+| `state_file` | string | `"stream-admin.json"` | Relative name ending in `.json` in the state directory. Written atomically with mode `0600`. |
+| `max_tokens_per_stream` | integer | `3` | Maximum tokens per dynamic stream, including the first one. Range 1 to 100. |
+| `default_ttl` | integer | `3600` | Token lifetime in seconds when a request omits `ttl`. At least 1 and no greater than `max_ttl`. |
+| `max_ttl` | integer | `86400` | Hard cap on token lifetime in seconds. At most 2592000 (30 days). |
+| `default_limits` | table | unset | Limits for new streams unless the request provides its own. Uses the same fields as `[streams.NAME.limits]`; each present numeric limit must stay within the matching `ceilings`. |
+| `require_two_party` | array of strings | `[]` | Extra SHA-256 token hashes whose bearer must send `X-Confirm-Token` on every mutation. Hashes must be unique and differ from the admin, stream-management and actor hashes. |
+| `max_body_bytes` | integer | `16384` | Largest management request body. Range 1024 to 1048576. |
+| `lockout_threshold` | integer | `5` | Failed attempts from one source before a lockout. At least 1. |
+| `lockout_secs` | integer | `900` | Lockout length in seconds. Range 1 to 86400. |
+| `rpm` | integer | `60` | Management requests per minute from one source. At least 1. |
+
+```toml
+[admin]
+listen = "127.0.0.1:4098"
+token_sha256 = "<64 hex admin token hash>"
+
+[stream_admin]
+token_sha256 = "<64 hex dedicated management token hash>"
+actor_id_sha256 = "<64 hex operator id hash>"
+audit_log = "stream-admin-audit.jsonl"
+max_streams = 20
+allowed_listen = ["127.0.0.1:4098"]
+
+# zen-a must already exist as a [keys.zen-a] label
+[stream_admin.allowed_keys.zen-a]
+assignable = true
+
+[stream_admin.ceilings]
+rpm = 120
+tpm = 100000
+concurrent = 8
+daily_requests = 10000
+daily_tokens = 1000000
+monthly_requests = 100000
+monthly_tokens = 10000000
+
+[stream_admin.default_limits]
+rpm = 60
+```
+
+Both file names are relative names, not paths: a separator, `..`, or a wrong suffix is refused. State and audit files live beside `<config>.state`, along with the audit sidecar (`stream-admin-audit.head` in this example). Copy the sidecar with the JSONL file when archiving it for verification. A reload or restart re-reads the state file; if it is invalid, dynamic streams are dropped while static streams continue. The table itself is startup-only: adding, removing or changing `[stream_admin]` needs a restart and is reported in `restart_needed` on a reload preview. See [upgrades](upgrades.md#dynamic-stream-state) and [monitoring](monitoring.md#stream-administration-routes).
 
 ## `[auth]`
 
@@ -91,6 +167,15 @@ Connection caps, read at startup. A changed value on reload is reported as needi
 | `shutdown_timeout_secs` | integer | `25` | After SIGTERM or SIGINT, time allowed for requests in flight before the listeners close. Range 1 to 300. Keep the unit's `TimeoutStopSec` above it. |
 
 See [deploy](deploy.md).
+
+## `[gateway]`
+
+Shared defaults for the multi-user gateway. See [traffic shaping](shaping.md#gateway-admission) for the admission order, refusals and persistence.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `on_store_error` | `"closed"` or `"open"` | `"closed"` | What to do when per-stream counter state cannot be read or written. `closed` refuses with a fixed `503`; `open` serves and counts `GatewayStoreError` events and `reiki_gateway_store_errors_total`. A `[streams.NAME.limits]` setting overrides it for one stream. |
+| `usage_rpm` | integer | `60` | Requests per minute allowed against the client listener's `GET /v1/usage` route, per stream. Range 1 to 3600. |
 
 ## `[reload]`
 
@@ -215,9 +300,30 @@ A stream is a client identity. Its token authenticates the client, and its chain
 | `token_sha256` | string | required | SHA-256 hex of the client token, 64 characters. Unique across streams. Make it with `reiki hash-token`, from a token of at least 16 characters. |
 | `chain` | array of strings | required | Key names from `[keys.*]`, tried in order. Must not be empty. |
 | `strategy` | `"sticky"` or `"round_robin"` | `"sticky"` | `sticky` keeps the current key until it cannot serve, then moves to the next usable key. `round_robin` starts each request on the key after the one the last request used. |
-| `rate_limit_per_minute` | integer | unset | Requests per minute for this stream. Counted per attempt, so retries and fallback count too. At least 1. |
+| `limits` | table | unset | Per-stream admission limits. See below. |
+| `allowed_upstreams` | array of strings | unset | Glob patterns for upstream names this stream may use. Omitted means any; an explicit empty list denies all. `*` and `?` are supported. |
+| `allowed_models` | array of strings | unset | Glob patterns for declared model names this stream may use. Omitted means any; an explicit empty list denies all. A request with no determinable model is refused whenever this is set. |
+| `weight` | integer | `1` | Relative share of a key's contested rate and concurrency budget when several streams use that key. At least 1. |
 
 The stream name `passthrough` is reserved for unauthenticated passthrough traffic. See [security](security.md).
+
+### `[streams.NAME.limits]`
+
+All fields are optional; an omitted limit is not enforced. Unset `period_zone` means `UTC`. A fixed offset such as `+02:00` or `-05:30` is also accepted.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `rpm` | integer | Requests admitted per fixed 60-second window. At least 1. |
+| `tpm` | integer | Tokens charged per fixed 60-second window, using the request-size estimate until measured usage arrives. |
+| `concurrent` | integer | Requests in flight for this stream at once. |
+| `daily_requests` | integer | Requests per calendar day in `period_zone`. |
+| `daily_tokens` | integer | Tokens per calendar day in `period_zone`. |
+| `monthly_requests` | integer | Requests per calendar month in `period_zone`. |
+| `monthly_tokens` | integer | Tokens per calendar month in `period_zone`. |
+| `period_zone` | string | `UTC` or a fixed `+HH:MM` / `-HH:MM` offset for the daily and monthly windows. |
+| `on_store_error` | `"closed"` or `"open"` | Overrides `[gateway] on_store_error` for this stream. |
+
+A token rotation (a changed `token_sha256`) resets that stream's counters on reload; unchanged tokens keep their counters. See [traffic shaping](shaping.md#persisting-across-restarts).
 
 ## `[tunnel]`
 
@@ -332,6 +438,7 @@ Plugin-specific keys are documented on each plugin's page:
 | Finance | `[plugins.finance]` | [finance](finance.md) |
 | Controlled information | `[plugins.controlled]` | [controlled](controlled.md) |
 | Metrics | `[plugins.metrics]` | [monitoring](monitoring.md) |
+| Cost | `[plugins.cost]` | [cost](cost.md) |
 
 The `requestlog` plugin records summaries only by default: `body = "summary"` and `capture_bodies = false`. Request, response and error body text requires the explicit `capture_bodies = true` opt-in together with `body = "full"` or `response = "body"`; the opt-in warns at startup and applies to every configured sink. A separate summary-only export for a log collector is configured at `[plugins.requestlog.export]` and can be the plugin's only sink. See [requestlog](requestlog.md#configure) and [summary export](requestlog.md#summary-export).
 
@@ -421,13 +528,15 @@ Rules, by section:
 - **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `max_stream_bytes` and `stream_timeout_secs` are at least 1 when set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
 - **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
-- **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
+- **Gateway.** `usage_rpm` is 1 to 3600 and `on_store_error` is `closed` or `open`.
+- **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `weight` is at least 1. Every limit in `[streams.NAME.limits]` is positive, `period_zone` is `UTC` or a fixed offset, and `on_store_error` is `closed` or `open`. Allowlist patterns use only `*` and `?`. If an upstream falls back, the chain holds a key for the target.
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
+- **Stream admin.** Needs `[admin]`; `allowed_listen` contains that literal loopback address. Both hashes are 64 hex characters and distinct from each other, the admin and stream tokens, and the two-party hashes. Environment variable names are valid and differ; file names are relative with the required suffix and differ. Ranges: `max_streams` 1 to 10000, `max_tokens_per_stream` 1 to 100, `default_ttl` at least 1 and no greater than `max_ttl` (at most 2592000), `max_body_bytes` 1024 to 1048576, `lockout_secs` 1 to 86400, and `lockout_threshold` and `rpm` at least 1. Every `allowed_keys` entry names a known key and sets `assignable = true`; each present ceiling is positive, and `default_limits` stay within the ceilings.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
 - **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `allowed_urls` entry is a plain base URL without credentials, query or fragment. Each `[peers.NAME]` has a valid URL and `token_file`, matches `allowed_urls` when that list is set, and does not point at one of this instance's literal loopback listeners. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset. Invalid URLs are reported without echoing them, so credentials in a malformed URL cannot reach logs.
-- **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`.
+- **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`. `cost` needs at least one price table, a shared uppercase currency label, decimal string prices and budgets, and a `report` or `block` value for `on_exceed`.
 - **Hub.** Only with the `hub` feature. Names, URLs and token hashes are valid, edge tokens are unique and differ from every other credential, accounts and keys exist, and no key is used by two accounts.
-- **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature.
+- **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature. A `[plugins.cost]` table needs the `plugin-cost` feature; cost is not in the default build.
 
 Startup also fails when a key file cannot be read or is too short. `reiki check` reports the same failures.
 

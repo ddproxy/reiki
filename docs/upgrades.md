@@ -21,6 +21,7 @@ This is the complete map for every config table and key. "Live" means the change
 | Top level: `strict_key_permissions` | Live | — | Applies to key files read on the next reload; already-loaded keys keep running. |
 | `[admin]`: `token_sha256` | Live | — | New bearer hash applies on reload. |
 | `[admin]`: `listen` | — | Yes | Label `admin.listen`. Adding or removing `[admin]` also needs a restart. |
+| `[stream_admin]`: all keys | — | Yes | The management settings are read when the manager is created. Adding or removing `[stream_admin]` also needs a restart; its routes appear only when configured. A reload re-reads the dynamic state file and re-applies dynamic streams. |
 | `[auth]`: `backoff`, `max_failures`, `window_secs` | Live | — | Failed-token throttle settings. |
 | `[server]`: `max_connections`, `max_connections_per_addr`, `admin_max_connections`, `admin_max_connections_per_addr` | — | Yes | Labels `server.*`. Client and admin caps are bound at start; loopback is exempt from the per-address caps. |
 | `[service]`: `shutdown_timeout_secs` | — | Yes | Label `service.shutdown_timeout_secs`. |
@@ -33,7 +34,9 @@ This is the complete map for every config table and key. "Live" means the change
 | `[upstream.NAME.limits]`: `preset`, `rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `min_rpm`, `max_wait_secs` | Live | — | Applied with the upstream. Saved shaping state is tied to the key digest and upstream. |
 | `[keys.NAME]`: `file`, `quota_resets` | Live | — | Key files are re-read. A changed file digest starts that key healthy. |
 | `[keys.NAME]`: `upstream` | Live | — | A re-pointed key also starts healthy. |
-| `[streams.NAME]`: `token_sha256`, `chain`, `strategy`, `rate_limit_per_minute` | Live | — | The stream rate-limit counter resets on reload. |
+| `[gateway]`: `on_store_error`, `usage_rpm` | Live | — | Applies to new admissions and usage-route requests. |
+| `[streams.NAME]`: `token_sha256`, `chain`, `strategy`, `weight`, `allowed_upstreams`, `allowed_models` | Live | — | A changed `token_sha256` starts that stream's gateway counters fresh; unchanged tokens keep them. In-flight requests keep the old chain. |
+| `[streams.NAME.limits]`: all fields | Live | — | Counters for unchanged streams are kept; limits are read from the new config. |
 | `[tunnel]`: `listen` | — | Yes | Label `tunnel.listen`. |
 | `[tunnel]`: `allow`, `connect_timeout_secs`, `allow_loopback`, `deny_private`, `close_idle_on_stop` | Live | — | Open tunnels keep their starting policy; new tunnels use the reloaded one. |
 | Adding or removing `[tunnel]` | — | Yes | No tunnel listener exists until restart. |
@@ -75,6 +78,12 @@ Key health lives in `<config>.state`, beside the config. The state file is TOML 
 | Config path | State path follows the config path. Copy `<config>.state` when moving the config if health must survive the move. |
 
 A reload does not read the state file again. It prunes keys removed from the config and starts new or changed keys healthy. `reiki keys --enable NAME` clears health and persists it. See [keys](keys.md) and [troubleshooting](troubleshooting.md#key-health).
+
+### Dynamic stream state
+
+With `[stream_admin]`, dynamic streams live in `stream-admin.json` (or the configured `state_file`) in the same state directory. Reiki writes it atomically with mode `0600`; it holds token hashes, not token values. Startup, reload and restart re-read the file and restore dynamic streams. An unreadable, oversized, invalid or unsupported-version file drops dynamic access while static streams from the config keep working. Check the condition with `GET /v1/status` (`stream_admin.state_error`) and repair it before relying on dynamic streams again. See [configuration](configuration.md#stream_admin).
+
+Reiki does not rotate either file. Copy the state file only when the instance is stopped or immediately after a successful write; renaming it under a running instance can leave no usable restore point for the next reload or restart. The audit log (`audit_log`, required) is append-only JSONL created with mode `0600`, with a sibling `audit.head` sidecar holding the last sequence number and hash: do not truncate or edit either file, because a missing or changed record breaks verification. If you archive it, keep the old JSONL and sidecar together for offline verification with `reiki streams audit verify FILE`; a fresh file starts a new chain at record 1. Any change that adds, removes or edits `[stream_admin]` needs a restart; a reload reports `stream_admin` in `restart_needed`. See [keys](keys.md#dynamic-stream-credentials) and [monitoring](monitoring.md#stream-administration-routes).
 
 ## Single-machine upgrade
 
@@ -140,3 +149,5 @@ Keep the previous binary and config until verification passes. Restore both toge
 - Roll a fleet back in the reverse order; verify each host before moving to the next.
 
 If the state file was written after a key rotation, the config and key files decide which saved health entries match. A key whose file or upstream changed starts healthy.
+
+The dynamic stream state file has its own format version: an unsupported version leaves static streams running but drops dynamic access. Roll back with the config that matches it, or restore a compatible file before relying on dynamic streams. Audit logs are append-only per config; keep the log from the version you are verifying.

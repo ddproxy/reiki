@@ -83,3 +83,9 @@ name = "headers"
 path = "fuzz_targets/headers.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "stream_admin_request"
+path = "fuzz_targets/stream_admin_request.rs"
+test = false
+doc = false

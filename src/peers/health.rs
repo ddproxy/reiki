@@ -195,6 +195,21 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         // Counts over the same bounded ring as `/v1/failures`; bodies and key names never leave.
         "failures": app.failures().counts(),
     });
+    // Aggregate gateway counters: fixed names and counts only, gated by the same usage switch as
+    // per-upstream traffic figures. No stream, model or key name ever reaches the wire.
+    if peers.expose_usage {
+        let counts = crate::gateway::GatewayCounts::sample(app.gateway());
+        doc["gateway"] = json!({
+            "requests": counts.requests,
+            "tokens": counts.tokens,
+            "store_errors": counts.store_errors,
+        });
+        let (static_streams, dynamic_streams) = app.stream_counts();
+        doc["streams"] = json!({
+            "static_streams": static_streams,
+            "dynamic_streams": dynamic_streams,
+        });
+    }
     for (name, value) in app.plugins().health_gauges() {
         doc[name] = json!(value);
     }
@@ -625,6 +640,63 @@ mod tests {
                 "hidden value #{i} leaked into the health document"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn gateway_counts_are_published_as_names_only_counts_when_exposure_is_on() {
+        let text = concat!(
+            "[upstream.zen]\nbase_url = \"https://example.com\"\n",
+            "[keys.k]\nupstream = \"zen\"\nfile = \"/unused\"\n",
+            "[streams.tenant]\ntoken_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nchain = [\"k\"]\n",
+            "[peers]\n",
+        );
+        let config = Config::parse(text).unwrap();
+        let app = crate::proxy::App::new(
+            config,
+            [("k".to_owned(), crate::proxy::Secret::new("secret"))].into(),
+            Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let snapshot = app.snapshot();
+        let admitted = app
+            .gateway()
+            .admit(
+                &snapshot.config,
+                "tenant",
+                "zen",
+                "k",
+                Some("secret-model"),
+                app.wall_now(),
+                17,
+            )
+            .expect("admission succeeds");
+        drop(admitted);
+        let peers = snapshot.config.peers.clone().unwrap();
+        let doc = document(&app, &peers).await;
+        assert_eq!(doc["gateway"]["requests"], 1);
+        assert_eq!(doc["gateway"]["tokens"], 17);
+        assert_eq!(doc["gateway"]["store_errors"], 0);
+        let body = doc.to_string();
+        for hidden in ["tenant", "secret-model", "secret"] {
+            assert!(
+                !body.contains(hidden),
+                "{hidden} leaked into the health document"
+            );
+        }
+
+        let hidden = Config::parse(&format!("{text}expose_usage = false\n")).unwrap();
+        let app = crate::proxy::App::new(
+            hidden,
+            [("k".to_owned(), crate::proxy::Secret::new("secret"))].into(),
+            Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let peers = app.snapshot().config.peers.clone().unwrap();
+        let doc = document(&app, &peers).await;
+        assert!(
+            doc.get("gateway").is_none(),
+            "counts are gated by expose_usage"
+        );
     }
 
     #[test]

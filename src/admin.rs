@@ -3,18 +3,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
-use axum::body::Body;
-use axum::extract::{Extension, State};
+use axum::body::{Body, to_bytes};
+use axum::extract::{Extension, Path, State};
 use axum::http::Method;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::{MethodRouter, get, post};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::auth::{Peer, bearer_token, constant_time_eq, sha256_hex};
 use crate::chain::{KeyState, KeyStatus};
 use crate::config::StrategyConfig;
+use crate::gateway::Gateway;
 use crate::proxy::{App, Snapshot};
+use crate::stream_admin::{self, ApiError, Mutation};
 use reiki_plugin::KeyCounts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,7 +32,7 @@ const ROUTES: &[(&str, &str, &str)] = &[
     (
         "/status",
         "get",
-        "Key, observed upstream, stream and config status",
+        "Key, observed upstream, stream limits, usage, config and reload status",
     ),
     (
         "/reload",
@@ -51,7 +55,10 @@ pub(crate) fn is_reserved_path(path: &str) -> bool {
         .strip_prefix(V1)
         .filter(|rest| rest.starts_with('/'))
         .unwrap_or(path);
-    bare == "/openapi.json" || ROUTES.iter().any(|(route, _, _)| bare == *route)
+    bare == "/openapi.json"
+        || bare == "/streams"
+        || bare.starts_with("/streams/")
+        || ROUTES.iter().any(|(route, _, _)| bare == *route)
 }
 
 fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
@@ -71,6 +78,24 @@ pub fn router(app: Arc<App>) -> Router {
         router = router.route(&format!("{V1}{path}"), handler(path, method));
     }
     router
+        .route(&format!("{V1}/streams"), get(stream_list))
+        .route(&format!("{V1}/streams/create"), post(stream_create))
+        .route(
+            &format!("{V1}/streams/{{name}}"),
+            get(stream_show).put(stream_update).delete(stream_delete),
+        )
+        .route(
+            &format!("{V1}/streams/{{name}}/tokens"),
+            post(stream_token_add),
+        )
+        .route(
+            &format!("{V1}/streams/{{name}}/tokens/{{token_id}}/revoke"),
+            post(stream_token_revoke),
+        )
+        .route(
+            &format!("{V1}/streams/{{name}}/revoke"),
+            post(stream_revoke_all),
+        )
         .route(&format!("{V1}/openapi.json"), get(openapi))
         .fallback(plugin_route)
         .layer(axum::middleware::map_response(with_version))
@@ -145,10 +170,42 @@ async fn openapi(
         paths.insert(format!("{V1}{path}"), serde_json::json!({ *method: op }));
     }
     for path in app.plugins().admin_paths() {
-        paths.insert(
-            format!("{V1}{path}"),
-            serde_json::json!({"get": operation("Provided by a plugin")}),
-        );
+        let mut op = operation("Provided by a plugin");
+        if path == "/cost" {
+            op["summary"] = serde_json::json!(
+                "Estimated spend from the operator price table, not provider invoices"
+            );
+            op["parameters"] = serde_json::json!([
+                {
+                    "name": "period", "in": "query", "required": false,
+                    "schema": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}(-[0-9]{2}(T[0-9]{2})?)?$"},
+                    "description": "UTC month (default), day or hour to report",
+                },
+                {
+                    "name": "stream", "in": "query", "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Only this configured stream",
+                },
+                {
+                    "name": "upstream", "in": "query", "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Only this upstream",
+                },
+                {
+                    "name": "format", "in": "query", "required": false,
+                    "schema": {"type": "string", "enum": ["json", "csv"]},
+                    "description": "JSON (default) or CSV export",
+                },
+            ]);
+            op["responses"]["200"]["description"] =
+                serde_json::json!("application/json or text/csv; figures are estimates");
+            op["responses"]["400"] =
+                serde_json::json!({"description": "Invalid or unknown filter"});
+        } else if path == "/cost/metrics" {
+            op["summary"] =
+                serde_json::json!("Prometheus text for estimated spend, with bounded labels");
+        }
+        paths.insert(format!("{V1}{path}"), serde_json::json!({"get": op}));
     }
     paths.insert(
         format!("{V1}/openapi.json"),
@@ -162,6 +219,10 @@ async fn openapi(
             .iter()
             .map(|(p, item)| (p.clone(), item.clone())),
     );
+    let stream_admin_enabled = app.stream_admin().is_some();
+    if stream_admin_enabled {
+        paths.extend(stream_admin_openapi_paths());
+    }
     #[allow(unused_mut)]
     let mut document = serde_json::json!({
         "openapi": "3.1.0",
@@ -174,6 +235,12 @@ async fn openapi(
         document["components"]["securitySchemes"]["peerAuth"] = serde_json::json!({
             "type": "http", "scheme": "bearer",
             "description": "The read-only peer token; accepted on the peer listener only",
+        });
+    }
+    if stream_admin_enabled {
+        document["components"]["securitySchemes"]["streamAdminAuth"] = serde_json::json!({
+            "type": "http", "scheme": "bearer",
+            "description": "Dedicated stream-management token; never the ordinary admin token",
         });
     }
     text_response(StatusCode::OK, "application/json", document.to_string())
@@ -195,7 +262,7 @@ async fn status(
             .health()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        build_status(&snapshot, &mut health, now)
+        build_status(&snapshot, app.gateway(), &mut health, now)
     };
     let config = app.reload_status_json();
     let intercept = app.ca_not_after().map(|not_after| {
@@ -249,6 +316,17 @@ async fn status(
         fields.push(("intercept", intercept));
     }
     fields.push(("log", &log));
+    let stream_status = app.stream_admin().map(|manager| {
+        serde_json::json!({
+            "enabled": true,
+            "streams": manager.list().len(),
+            "state_error": manager.state_error(),
+        })
+        .to_string()
+    });
+    if let Some(status) = &stream_status {
+        fields.push(("stream_admin", status));
+    }
     let Some(body) = merge_status_objects(&body, &fields) else {
         // An unmergeable status must not become a corrupt JSON document on the wire.
         return text_response(
@@ -557,7 +635,18 @@ async fn plugin_route(
         .exposes_usage()
         .then(|| crate::pressure::upstream_usage(&snapshot.config, app.pressure(), now));
     let observed = app.observed().cooldowns(SystemTime::now());
-    match app.plugins().on_admin(path, keys, usage, observed) {
+    let mut extra = app
+        .stream_admin()
+        .map_or_else(String::new, |manager| manager.metrics().render());
+    extra.push_str(&app.plugins().metrics_text());
+    match app.plugins().on_admin_with_extra(
+        path,
+        uri.query().unwrap_or_default(),
+        keys,
+        usage,
+        observed,
+        extra,
+    ) {
         Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
         None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
     }
@@ -646,6 +735,69 @@ pub(crate) fn text_response(
     response
 }
 
+/// OpenAPI descriptions for the opt-in stream-management API. Included only when the feature is
+/// configured, so an unconfigured instance documents exactly the routes it serves.
+fn stream_admin_openapi_paths() -> serde_json::Map<String, Value> {
+    let mut paths = serde_json::Map::new();
+    let read = |summary: &str| {
+        serde_json::json!({
+            "summary": summary,
+            "security": [{"streamAdminAuth": []}],
+            "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or wrong credential"}},
+        })
+    };
+    let write = |summary: &str| {
+        let mut op = read(summary);
+        op["parameters"] = serde_json::json!([
+            {
+                "name": "Idempotency-Key", "in": "header", "required": true,
+                "schema": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+            {
+                "name": "X-Confirm-Token", "in": "header", "required": false,
+                "description": "Second token, required when two-party confirmation is configured",
+            },
+        ]);
+        op["responses"]["400"] =
+            serde_json::json!({"description": "Invalid body, reason or idempotency key"});
+        op["responses"]["409"] = serde_json::json!({"description": "Duplicate idempotency key with a different request"});
+        op["responses"]["422"] =
+            serde_json::json!({"description": "A configured ceiling was exceeded"});
+        op["responses"]["503"] =
+            serde_json::json!({"description": "Audit log or state file write failed"});
+        op
+    };
+    paths.insert(
+        format!("{V1}/streams"),
+        serde_json::json!({"get": read("List dynamic streams")}),
+    );
+    paths.insert(
+        format!("{V1}/streams/create"),
+        serde_json::json!({"post": write("Create a dynamic stream and return its first token once")}),
+    );
+    paths.insert(
+        format!("{V1}/streams/{{name}}"),
+        serde_json::json!({
+            "get": read("Show one dynamic stream"),
+            "put": write("Update a dynamic stream's key or limits"),
+            "delete": write("Delete a dynamic stream"),
+        }),
+    );
+    paths.insert(
+        format!("{V1}/streams/{{name}}/tokens"),
+        serde_json::json!({"post": write("Add a token to a dynamic stream")}),
+    );
+    paths.insert(
+        format!("{V1}/streams/{{name}}/tokens/{{token_id}}/revoke"),
+        serde_json::json!({"post": write("Revoke one token")}),
+    );
+    paths.insert(
+        format!("{V1}/streams/{{name}}/revoke"),
+        serde_json::json!({"post": write("Revoke every token on a dynamic stream")}),
+    );
+    paths
+}
+
 /// Merges JSON object fragments into a status document without mutating its text. Every fragment
 /// is parsed before it is appended, so an invalid fragment fails closed instead of producing a
 /// corrupt document. The original text is kept verbatim to preserve the status field order.
@@ -673,7 +825,12 @@ fn merge_status_objects(body: &str, fields: &[(&str, &str)]) -> Option<String> {
 
 /// Snapshot of key health and stream routing for operators. Carries no key
 /// material, token hashes or file paths.
-fn build_status(snapshot: &Snapshot, health: &mut KeyState, now: Instant) -> String {
+fn build_status(
+    snapshot: &Snapshot,
+    gateway: &Gateway,
+    health: &mut KeyState,
+    now: Instant,
+) -> String {
     let mut out = String::from("{\"keys\":[");
     for (index, (name, key)) in snapshot.config.keys.iter().enumerate() {
         if index > 0 {
@@ -756,11 +913,54 @@ fn build_status(snapshot: &Snapshot, health: &mut KeyState, now: Instant) -> Str
             Some(key) => out.push_str(&json_string(key)),
             None => out.push_str("null"),
         }
-        out.push_str(",\"rate_limit_per_minute\":");
-        match stream.rate_limit_per_minute {
-            Some(limit) => out.push_str(&limit.to_string()),
-            None => out.push_str("null"),
+        out.push_str(",\"limits\":{");
+        let limits = stream.limits.as_ref();
+        let numeric = [
+            ("rpm", limits.and_then(|l| l.rpm).map(u64::from)),
+            ("tpm", limits.and_then(|l| l.tpm)),
+            (
+                "concurrent",
+                limits.and_then(|l| l.concurrent).map(u64::from),
+            ),
+            (
+                "daily_requests",
+                limits.and_then(|l| l.daily_requests).map(u64::from),
+            ),
+            ("daily_tokens", limits.and_then(|l| l.daily_tokens)),
+            (
+                "monthly_requests",
+                limits.and_then(|l| l.monthly_requests).map(u64::from),
+            ),
+            ("monthly_tokens", limits.and_then(|l| l.monthly_tokens)),
+        ];
+        for (index, (field, value)) in numeric.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(field));
+            out.push(':');
+            match value {
+                Some(value) => out.push_str(&value.to_string()),
+                None => out.push_str("null"),
+            }
         }
+        if let Some(limits) = limits
+            && let Some(zone) = &limits.period_zone
+        {
+            out.push_str(",\"period_zone\":");
+            out.push_str(&json_string(zone));
+        }
+        out.push_str("},\"usage\":{");
+        let usage = gateway.stream_state(name);
+        out.push_str("\"requests\":");
+        out.push_str(&usage.requests_total.to_string());
+        out.push_str(",\"tokens\":");
+        out.push_str(&usage.tokens_total.to_string());
+        out.push_str(",\"minute_requests\":");
+        out.push_str(&usage.minute.requests.to_string());
+        out.push_str(",\"minute_tokens\":");
+        out.push_str(&usage.minute.tokens.to_string());
+        out.push('}');
         out.push('}');
     }
     out.push_str("]}");
@@ -785,6 +985,601 @@ fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in stream management. These routes are mounted on the admin listener only and use a
+// credential separate from the ordinary admin token.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestLimits {
+    #[serde(default)]
+    rpm: Option<u32>,
+    #[serde(default)]
+    tpm: Option<u64>,
+    #[serde(default)]
+    concurrent: Option<u32>,
+    #[serde(default)]
+    daily_requests: Option<u32>,
+    #[serde(default)]
+    daily_tokens: Option<u64>,
+    #[serde(default)]
+    monthly_requests: Option<u32>,
+    #[serde(default)]
+    monthly_tokens: Option<u64>,
+}
+
+impl RequestLimits {
+    fn into_stream_limits(self) -> crate::config::StreamLimits {
+        crate::config::StreamLimits {
+            rpm: self.rpm,
+            tpm: self.tpm,
+            concurrent: self.concurrent,
+            daily_requests: self.daily_requests,
+            daily_tokens: self.daily_tokens,
+            monthly_requests: self.monthly_requests,
+            monthly_tokens: self.monthly_tokens,
+            period_zone: None,
+            on_store_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateStreamRequest {
+    name: String,
+    key: String,
+    reason: String,
+    #[serde(default)]
+    ttl: Option<u64>,
+    #[serde(default)]
+    limits: Option<RequestLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateStreamRequest {
+    reason: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    limits: Option<RequestLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenRequest {
+    reason: String,
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReasonRequest {
+    reason: String,
+}
+
+/// Fuzz-only entry point for the strict stream request DTOs. Kept beside the private types so
+/// they do not have to become public; the `fuzzing` module forwards to it.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_stream_requests(data: &[u8]) {
+    // Arbitrary bytes are refused through the same strict DTOs the admin routes use.
+    let _ = serde_json::from_slice::<CreateStreamRequest>(data);
+    let _ = serde_json::from_slice::<UpdateStreamRequest>(data);
+    let _ = serde_json::from_slice::<TokenRequest>(data);
+    let _ = serde_json::from_slice::<ReasonRequest>(data);
+
+    // Independently of whether the fuzz input decoded, a well-formed request with one extra
+    // property must still be refused. The prefix cannot collide with any real DTO field.
+    let text: String = String::from_utf8_lossy(data).chars().take(256).collect();
+    let unknown = format!("__reiki_fuzz_unknown__{text}__");
+    macro_rules! assert_strict {
+        ($dto:ty, $payload:expr, $label:expr) => {{
+            let payload = $payload;
+            let valid = serde_json::to_vec(&payload).expect("fuzz payload serializes");
+            assert!(
+                serde_json::from_slice::<$dto>(&valid).is_ok(),
+                concat!($label, " baseline must decode")
+            );
+            let mut with_unknown = payload;
+            with_unknown
+                .as_object_mut()
+                .expect("fuzz payload is an object")
+                .insert(unknown.clone(), Value::Null);
+            let mutated = serde_json::to_vec(&with_unknown).expect("fuzz payload serializes");
+            assert!(
+                serde_json::from_slice::<$dto>(&mutated).is_err(),
+                concat!($label, " accepted an unknown field")
+            );
+        }};
+    }
+    assert_strict!(
+        CreateStreamRequest,
+        serde_json::json!({"name": text, "key": text, "reason": text}),
+        "CreateStreamRequest"
+    );
+    assert_strict!(
+        UpdateStreamRequest,
+        serde_json::json!({"reason": text}),
+        "UpdateStreamRequest"
+    );
+    assert_strict!(
+        TokenRequest,
+        serde_json::json!({"reason": text, "ttl": 1_u64}),
+        "TokenRequest"
+    );
+    assert_strict!(
+        ReasonRequest,
+        serde_json::json!({"reason": text}),
+        "ReasonRequest"
+    );
+}
+
+fn stream_source(peer: Option<IpAddr>) -> IpAddr {
+    peer.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// Authenticates one stream-management request with its own token and throttle. Missing and
+/// wrong credentials are deliberately indistinguishable on the wire.
+fn authorize_stream(
+    app: &App,
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    action: &'static str,
+    stream: &str,
+    mutating: bool,
+) -> Result<(), Box<Response>> {
+    let source = stream_source(peer);
+    let Some(manager) = app.stream_admin() else {
+        return Err(Box::new(unauthorized()));
+    };
+    let now = Instant::now();
+    if let Err(wait) = app.stream_rpm().reserve(source, now) {
+        manager.note_denied(source, action, stream, "rate_limited");
+        return Err(Box::new(throttled(wait)));
+    }
+    if let Err(wait) = app.stream_logins().reserve(source, now) {
+        manager.note_denied(source, action, stream, "locked_out");
+        return Err(Box::new(throttled(wait)));
+    }
+    let expected = manager.config().token_sha256.to_ascii_lowercase();
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    let matched = supplied.is_some_and(|token| constant_time_eq(&expected, &sha256_hex(token)));
+    if !matched {
+        manager.note_denied(source, action, stream, "credential_refused");
+        return Err(Box::new(unauthorized()));
+    }
+    if mutating && !manager.config().require_two_party.is_empty() {
+        let supplied = headers
+            .get("x-confirm-token")
+            .and_then(|value| value.to_str().ok())
+            .map(sha256_hex);
+        let mut confirmed = false;
+        if let Some(hash) = supplied {
+            for candidate in &manager.config().require_two_party {
+                if constant_time_eq(&candidate.to_ascii_lowercase(), &hash) {
+                    confirmed = true;
+                }
+            }
+        }
+        if !confirmed {
+            manager.note_denied(source, action, stream, "confirmation_refused");
+            return Err(Box::new(unauthorized()));
+        }
+    }
+    app.stream_rpm().succeed(source);
+    app.stream_logins().succeed(source);
+    Ok(())
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    text_response(
+        status,
+        "application/json",
+        serde_json::to_string(&body)
+            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into()),
+    )
+}
+
+fn api_error_response(error: ApiError) -> Response {
+    json_response(
+        error.status,
+        serde_json::json!({"error": {"type": "stream_admin_refused", "message": error.message}}),
+    )
+}
+
+fn error_code(error: ApiError) -> &'static str {
+    match error.status {
+        StatusCode::BAD_REQUEST => "body_refused",
+        StatusCode::NOT_FOUND => "unknown_target",
+        StatusCode::CONFLICT => "conflict",
+        StatusCode::UNPROCESSABLE_ENTITY => "ceiling_refused",
+        StatusCode::SERVICE_UNAVAILABLE => "store_failed",
+        _ => "refused",
+    }
+}
+
+fn finish_mutation(
+    manager: &stream_admin::Manager,
+    source: IpAddr,
+    action: &'static str,
+    stream: &str,
+    result: Result<serde_json::Value, ApiError>,
+) -> Response {
+    match result {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(error) => {
+            manager.note_failed(source, action, stream, error_code(error));
+            api_error_response(error)
+        }
+    }
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<String, Box<Response>> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Idempotency-Key is required",
+        })));
+    };
+    let Ok(key) = value.to_str() else {
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Idempotency-Key is invalid",
+        })));
+    };
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Idempotency-Key is invalid",
+        })));
+    }
+    Ok(key.to_owned())
+}
+
+fn valid_reason(reason: &str) -> bool {
+    !reason.is_empty() && reason.len() <= 500 && !reason.chars().any(char::is_control)
+}
+
+async fn read_json<T: DeserializeOwned>(
+    manager: &stream_admin::Manager,
+    source: IpAddr,
+    action: &'static str,
+    stream: &str,
+    headers: &HeaderMap,
+    body: Body,
+    max: usize,
+) -> Result<T, Box<Response>> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
+    {
+        manager.note_failed(source, action, stream, "content_type_refused");
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "application/json is required",
+        })));
+    }
+    if let Some(length) = headers.get(header::CONTENT_LENGTH)
+        && length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|value| value > max)
+    {
+        manager.note_failed(source, action, stream, "body_too_large");
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "request body too large",
+        })));
+    }
+    let bytes = to_bytes(body, max.saturating_add(1)).await.map_err(|_| {
+        Box::new(api_error_response(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "request body could not be read",
+        }))
+    })?;
+    if bytes.len() > max {
+        manager.note_failed(source, action, stream, "body_too_large");
+        return Err(Box::new(api_error_response(ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "request body too large",
+        })));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        manager.note_failed(source, action, stream, "body_refused");
+        Box::new(api_error_response(ApiError::BAD_REQUEST))
+    })
+}
+
+async fn stream_list(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "list", "", false) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({"streams": manager.list()}),
+    )
+}
+
+async fn stream_show(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "show", &name, false) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    match manager.show(&name) {
+        Some(stream) => json_response(StatusCode::OK, stream),
+        None => api_error_response(ApiError::NOT_FOUND),
+    }
+}
+
+async fn stream_create(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "create", "", true) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: CreateStreamRequest =
+        match read_json(manager, source, "create", "", &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "create", "", "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::Create {
+        name: request.name,
+        key: request.key,
+        ttl: request.ttl,
+        limits: request.limits.map(RequestLimits::into_stream_limits),
+    };
+    finish_mutation(
+        manager,
+        source,
+        "create",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
+}
+
+async fn stream_update(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "update", &name, true) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: UpdateStreamRequest =
+        match read_json(manager, source, "update", &name, &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "update", &name, "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::Update {
+        name,
+        key: request.key,
+        limits: request.limits.map(RequestLimits::into_stream_limits),
+    };
+    finish_mutation(
+        manager,
+        source,
+        "update",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
+}
+
+async fn stream_token_add(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "token.add", &name, true) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: TokenRequest =
+        match read_json(manager, source, "token.add", &name, &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "token.add", &name, "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::AddToken {
+        name,
+        ttl: request.ttl,
+    };
+    finish_mutation(
+        manager,
+        source,
+        "token.add",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
+}
+
+async fn stream_token_revoke(
+    State(app): State<Arc<App>>,
+    Path((name, token_id)): Path<(String, String)>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) =
+        authorize_stream(&app, Some(source), &headers, "token.revoke", &name, true)
+    {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: ReasonRequest =
+        match read_json(manager, source, "token.revoke", &name, &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "token.revoke", &name, "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::RevokeToken { name, token_id };
+    finish_mutation(
+        manager,
+        source,
+        "token.revoke",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
+}
+
+async fn stream_revoke_all(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "revoke", &name, true) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: ReasonRequest =
+        match read_json(manager, source, "revoke", &name, &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "revoke", &name, "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::RevokeAll { name };
+    finish_mutation(
+        manager,
+        source,
+        "revoke",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
+}
+
+async fn stream_delete(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let source = stream_source(peer.map(|Extension(peer)| peer.0));
+    if let Err(refusal) = authorize_stream(&app, Some(source), &headers, "delete", &name, true) {
+        return *refusal;
+    }
+    let Some(manager) = app.stream_admin() else {
+        return unauthorized();
+    };
+    let max = manager.config().max_body_bytes;
+    let request: ReasonRequest =
+        match read_json(manager, source, "delete", &name, &headers, body, max).await {
+            Ok(request) => request,
+            Err(refusal) => return *refusal,
+        };
+    if !valid_reason(&request.reason) {
+        manager.note_failed(source, "delete", &name, "reason_refused");
+        return api_error_response(ApiError::BAD_REQUEST);
+    }
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(refusal) => return *refusal,
+    };
+    let mutation = Mutation::Delete { name };
+    finish_mutation(
+        manager,
+        source,
+        "delete",
+        mutation.stream(),
+        manager.mutate(source, &key, &request.reason, &mutation),
+    )
 }
 
 #[cfg(test)]

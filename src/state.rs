@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::SavedHealth;
 use crate::config::Config;
+use crate::gateway::StreamState;
 use crate::proxy::Secret;
 use crate::shaper::bucket::{BucketSnapshot, QuotaSnapshot};
 
@@ -71,6 +72,10 @@ fn probe_file(dir: &Path, name: &str) -> Result<(), String> {
 pub struct LoadedState {
     pub health: HashMap<String, SavedHealth>,
     pub shaper: BTreeMap<String, BucketSnapshot>,
+    pub gateway: BTreeMap<String, StreamState>,
+    /// True when the file existed but could not be read or parsed. The gateway uses this to
+    /// apply its closed/open counter-store policy instead of silently starting fresh.
+    pub store_error: bool,
 }
 
 pub fn load(path: &Path, config: &Config) -> HashMap<String, SavedHealth> {
@@ -81,20 +86,31 @@ pub fn load_shaper(path: &Path, config: &Config) -> BTreeMap<String, BucketSnaps
     load_state(path, config).shaper
 }
 
+pub fn load_gateway(path: &Path, config: &Config) -> (BTreeMap<String, StreamState>, bool) {
+    let loaded = load_state(path, config);
+    (loaded.gateway, loaded.store_error)
+}
+
 pub fn load_state(path: &Path, config: &Config) -> LoadedState {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return LoadedState::default(),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "cannot read key state; starting fresh");
-            return LoadedState::default();
+            return LoadedState {
+                store_error: true,
+                ..LoadedState::default()
+            };
         }
     };
     let file: File = match toml::from_str(&text) {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "ignoring key state in an unsupported format; starting fresh");
-            return LoadedState::default();
+            return LoadedState {
+                store_error: true,
+                ..LoadedState::default()
+            };
         }
     };
 
@@ -127,6 +143,19 @@ pub fn load_state(path: &Path, config: &Config) -> LoadedState {
             out.shaper.insert(name, snapshot);
         }
     }
+    for (name, mut state) in file.gateway {
+        let Some(stream) = config.streams.get(&name) else {
+            continue;
+        };
+        if !stream
+            .token_sha256
+            .eq_ignore_ascii_case(&state.token_sha256)
+        {
+            continue;
+        }
+        state.token_sha256 = stream.token_sha256.to_ascii_lowercase();
+        out.gateway.insert(name, state);
+    }
     out
 }
 
@@ -145,17 +174,26 @@ pub fn save(
     snapshot: &HashMap<String, SavedHealth>,
     keys: &HashMap<String, Secret>,
     config: &Config,
-) {
-    save_with_shaper(path, snapshot, &BTreeMap::new(), keys, config);
+) -> Result<(), String> {
+    save_with_shaper(
+        path,
+        snapshot,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        keys,
+        config,
+    )
 }
 
+/// Writes key health, shaper facts and gateway counters in one atomic file.
 pub fn save_with_shaper(
     path: &Path,
     snapshot: &HashMap<String, SavedHealth>,
     shaper: &BTreeMap<String, BucketSnapshot>,
+    gateway: &BTreeMap<String, StreamState>,
     keys: &HashMap<String, Secret>,
     config: &Config,
-) {
+) -> Result<(), String> {
     let now = unix_millis(SystemTime::now());
     let entries = snapshot
         .iter()
@@ -198,20 +236,27 @@ pub fn save_with_shaper(
             ))
         })
         .collect();
+    let gateway: BTreeMap<String, StreamState> = gateway
+        .iter()
+        .filter(|(name, state)| {
+            config.streams.get(name.as_str()).is_some_and(|stream| {
+                stream
+                    .token_sha256
+                    .eq_ignore_ascii_case(&state.token_sha256)
+            })
+        })
+        .map(|(name, state)| (name.clone(), state.clone()))
+        .collect();
     let file = File {
         keys: entries,
         shaper,
+        gateway,
     };
-    let text = match toml::to_string(&file) {
-        Ok(text) => text,
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot serialise key state");
-            return;
-        }
-    };
-    if let Err(e) = write_atomically(path, &text) {
+    let text = toml::to_string(&file).map_err(|e| format!("cannot serialise key state: {e}"))?;
+    write_atomically(path, &text).map_err(|e| {
         tracing::warn!(path = %path.display(), error = %e, "cannot write key state");
-    }
+        format!("cannot write key state: {e}")
+    })
 }
 
 /// A key whose secret changed after the state was written starts healthy. The recorded digest
@@ -228,7 +273,7 @@ static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// Write to a sibling temporary file, then rename over the target and sync the directory, so a
 /// reader never sees a partial file and the rename survives a crash.
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let mut attempts = 0;
     let (temp, mut file) = loop {
         let mut name: OsString = path.as_os_str().to_owned();
@@ -283,6 +328,8 @@ struct File {
     keys: BTreeMap<String, Entry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     shaper: BTreeMap<String, ShaperEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gateway: BTreeMap<String, StreamState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -485,6 +532,7 @@ mod tests {
         let file = File {
             keys,
             shaper: BTreeMap::new(),
+            gateway: BTreeMap::new(),
         };
         write_atomically(path, &toml::to_string(&file).unwrap()).unwrap();
     }
@@ -514,7 +562,8 @@ mod tests {
             &state.snapshot(now),
             &crate::proxy::load_keys(&config).unwrap(),
             &config,
-        );
+        )
+        .unwrap();
         let loaded = load(&path, &config);
 
         assert!(loaded["a"].cooling.unwrap() > Duration::from_secs(40));
@@ -590,7 +639,8 @@ mod tests {
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&config).unwrap(),
             &config,
-        );
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("sk-fake-secret"));
@@ -749,7 +799,8 @@ mod tests {
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&config).unwrap(),
             &config,
-        );
+        )
+        .unwrap();
         assert!(load(&path, &config)["a"].disabled, "same file is restored");
 
         crate::keys::write_key(&key_file, "a-longer-replacement-secret");
@@ -776,7 +827,8 @@ mod tests {
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&zen).unwrap(),
             &zen,
-        );
+        )
+        .unwrap();
         assert!(load(&path, &zen)["a"].disabled, "same upstream is restored");
 
         // Same name, same secret, different upstream: the saved health must not follow.
@@ -804,7 +856,8 @@ mod tests {
             &state.snapshot(Instant::now()),
             &crate::proxy::load_keys(&config).unwrap(),
             &config,
-        );
+        )
+        .unwrap();
         let loaded = load(&path, &config);
         assert!(loaded["a"].cooling.unwrap() > Duration::from_secs(40));
         let _ = std::fs::remove_file(&path);
@@ -856,9 +909,11 @@ mod tests {
             &path,
             &HashMap::new(),
             &shaper,
+            &BTreeMap::new(),
             &crate::proxy::load_keys(&config).unwrap(),
             &config,
-        );
+        )
+        .unwrap();
 
         assert_eq!(load_shaper(&path, &config), shaper);
         assert_eq!(load_state(&path, &config).shaper, shaper);
@@ -880,7 +935,15 @@ mod tests {
             },
         )]);
         let keys = crate::proxy::load_keys(&config).unwrap();
-        save_with_shaper(&path, &HashMap::new(), &shaper, &keys, &config);
+        save_with_shaper(
+            &path,
+            &HashMap::new(),
+            &shaper,
+            &BTreeMap::new(),
+            &keys,
+            &config,
+        )
+        .unwrap();
         assert_eq!(load_shaper(&path, &config).len(), 1);
 
         crate::keys::write_key(&key_file, "a-different-secret");
@@ -906,9 +969,11 @@ mod tests {
             &path,
             &HashMap::new(),
             &shaper,
+            &BTreeMap::new(),
             &crate::proxy::load_keys(&zen).unwrap(),
             &zen,
-        );
+        )
+        .unwrap();
         assert_eq!(load_shaper(&path, &zen), shaper);
 
         let other = config_with_keys_upstream("other", &[("a", key_file.to_str().unwrap())]);

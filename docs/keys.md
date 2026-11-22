@@ -19,6 +19,9 @@ flowchart LR
 | Upstream key | `[keys.NAME] file = "/path/to/key"` | File holds the key, trimmed on load | Read at startup and on every reload |
 | Stream token | `[streams.NAME] token_sha256 = "<64 hex>"` | Client sends the token in a header or `?key=` | Hash made with `reiki hash-token` |
 | Admin token | `[admin] token_sha256 = "<64 hex>"` | Caller supplies the raw token with `--token-file` or `REIKI_ADMIN_TOKEN` | No raw token in the config |
+| Stream-admin token | `[stream_admin] token_sha256 = "<64 hex>"` | CLI reads the raw token from `--token-file` or `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`), never an argument | Dedicated to dynamic stream management; distinct hash required |
+| Two-party confirm token | `[stream_admin] require_two_party = ["<64 hex>"]` | CLI reads the second raw token from `confirm_env` and sends `X-Confirm-Token` | Required for mutations when configured |
+| Audit actor id | `[stream_admin] actor_id_sha256 = "<64 hex>"` | No raw form; a hash of the operator id | Written to audit records; not a credential |
 | Peer token | `[peers.NAME] token_file = "/path/to/token"` or `[[peers.tokens]] token_sha256 = "..."` | Raw token file for this instance, hash for tokens it accepts | See [peers](peers.md) |
 | Hub token | `[hubs.NAME] token_file = "/path/to/token"` | Raw token file | Hub tables are parsed and validated only in this release; see [hub](hub.md) |
 
@@ -32,6 +35,7 @@ There is no `apiKey` config key and no `{file:...}` reference syntax. Use `file`
 | Key file, for example `/etc/reiki/keys/zen-a` | `reiki:reiki`, `0600` | Startup, reload and `reiki keys --check` refuse a file with group or other read or write bits set (the mode is checked on the same handle used to read the key). Set `strict_key_permissions = false` to downgrade this to a warning. |
 | Config file, for example `/etc/reiki/reiki.toml` | `reiki:reiki`, `0640` | It holds paths and hashes, not raw keys. |
 | State file `<config>.state` | `reiki:reiki`, `0600` | Reiki writes it through a temporary file and rename. It holds key digests and health, not key values. |
+| Cost state `<config>.state.cost.state` | `reiki:reiki`, `0600` | Written by the optional cost plugin with the same atomic pattern; holds period totals and names, never credentials or prices. See [cost](cost.md#what-is-recorded). |
 
 Create a file with no trailing newline ambiguity:
 
@@ -75,7 +79,10 @@ file = "/etc/reiki/keys/zen-a"
 token_sha256 = "<64 hex characters from hash-token>"
 chain = ["zen-a"]
 strategy = "sticky"
-rate_limit_per_minute = 60
+
+[streams.client-a.limits]
+rpm = 60
+concurrent = 4
 ```
 
 | Field | Rule |
@@ -83,9 +90,27 @@ rate_limit_per_minute = 60
 | `token_sha256` | Required. 64 hex characters. Unique across streams and different from the admin token. |
 | `chain` | Required. One or more `[keys.NAME]` labels, tried in order. |
 | `strategy` | `sticky` or `round_robin`. Default `sticky`. |
-| `rate_limit_per_minute` | Optional. Counts selected-key attempts, including retries and fallback. |
+| `limits` | Optional per-stream request, token, concurrency and calendar budgets. See [traffic shaping](shaping.md#gateway-admission). |
+| `allowed_upstreams`, `allowed_models` | Optional glob allowlists. Omitted means any; an empty list denies all. |
+| `weight` | Optional relative share of a contested key, at least 1. Default `1`. |
 
 Clients may send the token as `Authorization: Bearer <token>`, `x-api-key`, `x-goog-api-key` or `?key=`. The first form found wins. On key-backed routes, Reiki removes client credential headers and the `key` query parameter before the request goes upstream. A `passthrough` upstream has no Reiki token and forwards the client's own credentials and query unchanged. See [security](security.md#clients-and-keys) and [providers](providers.md).
+
+## Dynamic stream credentials
+
+`[stream_admin]` is opt-in; without it there are no dynamic streams and no management routes. It uses a dedicated bearer token whose hash is `token_sha256`, kept distinct from the admin, stream and two-party hashes by config validation. The CLI reads the raw token from `--token-file` or the configured `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`); it is never a command-line argument. With `require_two_party`, a mutation also needs a second raw token from `confirm_env` (default `REIKI_STREAM_ADMIN_CONFIRM_TOKEN`), sent as `X-Confirm-Token`. See [configuration](configuration.md#stream_admin) for the table and defaults.
+
+`actor_id_sha256` is the hash written as the actor on every audit record. It is a configured operator label, not a per-user identity and not a credential: all management calls under one config share it.
+
+`streams create` and `streams token add` print the new raw token once. The config, state file and audit records hold hashes only; API read routes expose token ids and expiry, never token values. No route or command returns a token after that first response. Store the printed token in the client's secret store; if it is lost, revoke its token id and issue a new one. The token is never a CLI argument.
+
+Audit records are JSONL with `seq`, a UTC `time`, the actor hash, `source`, `action`, `stream`, `outcome`, `reason`, field-level `changes` with old and new values, `prev` and `hash`. `hash` is a SHA-256 over the canonical JSON of every other field, and `prev` links a record to its predecessor. A sibling `audit.head` file stores the last sequence number and hash; `reiki streams audit verify FILE` checks both the chain and that sidecar, so it also detects deletion or truncation of the tail. Copy the sidecar with the JSONL file when archiving it. The reason text is sanitized before it is written: long hex strings and credential-shaped prefixes become `[redacted]`. Raw tokens, raw actor ids and upstream key values never enter the log. There is no HTTP audit route; `reiki streams audit verify FILE` checks the files offline and `reiki streams audit head FILE` prints records. See [monitoring](monitoring.md#stream-administration-routes) for the API surface.
+
+Management fails closed if an audit record cannot be written: the mutation is refused. Denied attempts are rate-limited per source and recorded in the audit log at most once per lockout window.
+
+The chain is tamper-*evident*, not a proof of identity or intent. It does not prove who held the token: the actor hash is a fixed label and `source` is only the peer address seen on the plain-HTTP admin listener. It does not prove that a reason is truthful, that a token was not copied after its one-time display, or anything about proxied traffic; the log covers management actions only. There is no external signing key, timestamp authority or append-only storage. Someone with filesystem access can delete or replace the log and its sidecar, and a replacement starts a fresh chain that verification cannot distinguish from a new log. Preserve archived logs and their sidecars separately, where processes that can call the API cannot rewrite them, when continuity matters.
+
+Dynamic stream state is written atomically with mode `0600` and holds token hashes, not raw values. Startup, reload and restart restore dynamic streams from that file; an invalid file drops dynamic access while static streams keep working. See [upgrades](upgrades.md#dynamic-stream-state).
 
 ## Chains and strategies
 

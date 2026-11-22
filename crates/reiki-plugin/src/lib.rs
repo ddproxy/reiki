@@ -14,6 +14,7 @@ use std::any::Any;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -41,11 +42,32 @@ pub fn new_request_id() -> String {
     format!("{nonce:016x}{counter:016x}")
 }
 
+/// Host facts a plugin may need that are not part of its config table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PluginHost {
+    /// Private, append-only path the plugin may use for its own counters, derived
+    /// from the config path by the host. No plugin may choose an arbitrary path.
+    pub state_path: Option<PathBuf>,
+}
+
+impl PluginHost {
+    /// Builds host facts with a private state path. No plugin may choose its own path.
+    pub fn with_state_path(path: PathBuf) -> Self {
+        Self {
+            state_path: Some(path),
+        }
+    }
+}
+
 /// Hooks into the request and response path. `Send + Sync` so a single
 /// instance can serve concurrent requests.
 pub trait Plugin: Send + Sync {
     /// Stable name used in config and logs.
     fn name(&self) -> &str;
+
+    /// Receives host-supplied facts after construction and before the chain is used.
+    fn configure(&mut self, _host: &PluginHost) {}
 
     /// True when a failure of this plugin must stop the request, because letting it through
     /// would send data the plugin was meant to mask. The host rejects a request that this
@@ -131,6 +153,27 @@ pub trait Plugin: Send + Sync {
     fn health_gauge(&self) -> Option<(&'static str, u64)> {
         None
     }
+
+    /// A refusal this plugin wants at admission time. The host converts it to the
+    /// gateway's own refusal path, so it cannot bypass stream limits or produce a
+    /// different response shape. Messages must be static: no request data, prices
+    /// or token counts can reach a client or a log through this hook.
+    fn admission_refusal(&self, _stream: &str, _now: SystemTime) -> Option<AdmissionRefusal> {
+        None
+    }
+
+    /// Extra Prometheus text appended to the metrics plugin's answer. The host
+    /// supplies it to `/v1/metrics`; no plugin answers on the metrics path itself.
+    /// Implementations must use bounded label values and never include secrets.
+    fn metrics_text(&self) -> String {
+        String::new()
+    }
+
+    /// A JSON object merged into the authenticated stream's own `/v1/usage`
+    /// answer. The host calls this only for the stream the token belongs to.
+    fn usage_cost_fragment(&self, _stream: &str) -> Option<Value> {
+        None
+    }
 }
 
 /// Why a key left rotation, as a stable label.
@@ -174,6 +217,62 @@ impl CooldownScope {
     }
 }
 
+/// Why the multi-user gateway refused a request. Fixed labels only; safe as metric values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum GatewayRejectReason {
+    Upstream,
+    Model,
+    ModelUnknown,
+    Rate,
+    Tokens,
+    Concurrent,
+    QuotaRequests,
+    QuotaTokens,
+    Fairness,
+    StoreClosed,
+    CostBudget,
+}
+
+impl GatewayRejectReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Model => "model",
+            Self::ModelUnknown => "model_unknown",
+            Self::Rate => "rate",
+            Self::Tokens => "tokens",
+            Self::Concurrent => "concurrent",
+            Self::QuotaRequests => "quota_requests",
+            Self::QuotaTokens => "quota_tokens",
+            Self::Fairness => "fairness",
+            Self::StoreClosed => "store_closed",
+            Self::CostBudget => "cost_budget",
+        }
+    }
+}
+
+/// A plugin's request for admission refusal. Both strings are static so a plugin
+/// cannot put request data, prices or credentials into a client-visible message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    /// Stable error kind, for example `budget_monthly`.
+    pub kind: &'static str,
+    /// Public message. It may name a budget but never an amount or a secret.
+    pub message: &'static str,
+}
+
+/// Maps an HTTP status to one of the four bounded classes used by events and metrics.
+pub fn status_class(status: u16) -> &'static str {
+    match status / 100 {
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
+}
+
 /// Something the relay did; key names come from the config, never secrets.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -198,6 +297,29 @@ pub enum Event<'a> {
     },
     /// A stream's rate limit turned a request away before any key was picked.
     RateLimited { stream: &'a str },
+    /// The gateway refused a request for one of its own configured stream limits or allowlists.
+    /// The reason is a fixed label, never request data.
+    GatewayRejected {
+        stream: &'a str,
+        reason: GatewayRejectReason,
+    },
+    /// Counter state was unavailable; in `open` mode the request is still served.
+    GatewayStoreError { stream: &'a str },
+    /// Final token usage of a response, emitted when its body ends. Separate from `RequestDone`,
+    /// which fires as soon as response headers are available. `model` is empty when the request
+    /// did not declare one; `key` is the operator's key name, never a credential. Counts are the
+    /// measured values read from the response body, not the admission estimate.
+    Usage {
+        stream: &'a str,
+        upstream: &'a str,
+        model: &'a str,
+        key: &'a str,
+        tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        status_class: &'static str,
+    },
     /// A plugin stopped a request: it returned `Reject`, or it skipped under `on_error = "reject"`.
     PluginRejected { stream: &'a str, plugin: &'a str },
     /// A passthrough response was classified for observation. The account is an operator label;
@@ -259,21 +381,33 @@ pub struct ObservedCooldown {
 #[non_exhaustive]
 pub struct AdminCtx<'a> {
     pub path: &'a str,
+    /// Raw query string without the leading `?`. Plugins that need filters parse it themselves.
+    pub query: &'a str,
     pub keys: KeyCounts,
     /// Per-upstream usage, sampled for this request; `None` when the operator hides usage.
     pub usage: Option<Vec<UpstreamUsage>>,
     /// Remaining cooldowns of observed passthrough accounts, sampled for this request.
     pub observed: Vec<ObservedCooldown>,
+    /// Extra Prometheus text supplied by the host, for features outside the plugin set.
+    /// Empty for ordinary callers and tests.
+    pub extra_metrics: String,
 }
 
 impl<'a> AdminCtx<'a> {
     pub fn new(path: &'a str, keys: KeyCounts) -> Self {
         Self {
             path,
+            query: "",
             keys,
             usage: None,
             observed: Vec::new(),
+            extra_metrics: String::new(),
         }
+    }
+
+    pub fn with_query(mut self, query: &'a str) -> Self {
+        self.query = query;
+        self
     }
 
     pub fn with_usage(mut self, usage: Option<Vec<UpstreamUsage>>) -> Self {
@@ -283,6 +417,11 @@ impl<'a> AdminCtx<'a> {
 
     pub fn with_observed(mut self, observed: Vec<ObservedCooldown>) -> Self {
         self.observed = observed;
+        self
+    }
+
+    pub fn with_extra_metrics(mut self, extra: String) -> Self {
+        self.extra_metrics = extra;
         self
     }
 }

@@ -67,6 +67,10 @@ Each fetch has a 5 s deadline, including connect. Redirects are refused so the t
 | `upstreams[].token_buckets` | array of 12 integers | Five-minute token counts, oldest first. |
 | `upstreams[].request_minutes` | array of 10 integers | One-minute attempt counts, oldest first; the newest is the current minute. Counts saturate at `u32`. |
 | `upstreams[].token_minutes` | array of 10 integers | One-minute token counts, oldest first; the newest is the current minute. Counts saturate at `u32`. |
+| `gateway` | object | Aggregate gateway counts, present with `expose_usage = true` (the default). Counts only: no stream, model or key names. |
+| `gateway.requests` | integer | Requests admitted across all streams. |
+| `gateway.tokens` | integer | Tokens charged across all streams, measured or estimated. |
+| `gateway.store_errors` | integer | Counter-store failures observed by the gateway. |
 | `upstreams[].keys` | array of object | Per-key states, present with `expose_key_labels = true`. |
 | `upstreams[].keys[].name` | string | Key name. |
 | `upstreams[].keys[].state` | `available`, `cooling` or `out_of_rotation` | Key state at build time. |

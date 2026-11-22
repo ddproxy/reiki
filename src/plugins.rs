@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -17,8 +18,8 @@ use serde_json::Value as JsonValue;
 use toml::Value;
 
 use reiki_plugin::{
-    AdminCtx, AdminReply, AttemptCtx, ChunkCtx, Event, KeyCounts, ObservedCooldown, Plugin,
-    PluginError, RequestCtx, ResponseHeadCtx, UpstreamUsage,
+    AdminCtx, AdminReply, AdmissionRefusal, AttemptCtx, ChunkCtx, Event, KeyCounts,
+    ObservedCooldown, Plugin, PluginError, PluginHost, RequestCtx, ResponseHeadCtx, UpstreamUsage,
 };
 
 use crate::config::ConfigError;
@@ -174,6 +175,9 @@ fn event_stream<'a>(event: &Event<'a>) -> Option<&'a str> {
         Event::RequestDone { stream, .. }
         | Event::Failover { stream, .. }
         | Event::RateLimited { stream }
+        | Event::GatewayRejected { stream, .. }
+        | Event::GatewayStoreError { stream }
+        | Event::Usage { stream, .. }
         | Event::PluginRejected { stream, .. }
         | Event::Finding { stream, .. } => Some(*stream),
         _ => None,
@@ -253,6 +257,16 @@ impl PluginChain {
         configured: &BTreeMap<String, toml::Table>,
         registry: &[Registration],
     ) -> Result<Self, ConfigError> {
+        Self::build_with_host(configured, registry, &PluginHost::default())
+    }
+
+    /// Like [`Self::build`], with host facts such as the private state path each
+    /// plugin may use. Only the process entry point supplies these facts.
+    pub fn build_with_host(
+        configured: &BTreeMap<String, toml::Table>,
+        registry: &[Registration],
+        host: &PluginHost,
+    ) -> Result<Self, ConfigError> {
         let mut builtin_entries = Vec::new();
         #[cfg(feature = "plugin-wasm")]
         let mut wasm_entries: Vec<String> = Vec::new();
@@ -289,10 +303,11 @@ impl PluginChain {
             }
             let explicit = on_error(reg.name, table)?;
             let streams = streams_of(reg.name, table)?;
-            let plugin = (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
+            let mut plugin = (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
                 name: reg.name.to_string(),
                 message,
             })?;
+            plugin.configure(host);
             let plugin: Arc<dyn Plugin> = Arc::from(plugin);
             let on_error = resolve_on_error(reg.name, explicit, plugin.as_ref());
             builtin_entries.push(Entry {
@@ -746,13 +761,28 @@ impl PluginChain {
         usage: Option<Vec<UpstreamUsage>>,
         observed: Vec<ObservedCooldown>,
     ) -> Option<AdminReply> {
+        self.on_admin_with_extra(path, "", keys, usage, observed, String::new())
+    }
+
+    /// Like [`Self::on_admin`], with host-supplied metric text for the metrics endpoint.
+    pub fn on_admin_with_extra(
+        &self,
+        path: &str,
+        query: &str,
+        keys: KeyCounts,
+        usage: Option<Vec<UpstreamUsage>>,
+        observed: Vec<ObservedCooldown>,
+        extra_metrics: String,
+    ) -> Option<AdminReply> {
         let entry = self
             .entries
             .iter()
             .find(|e| e.plugin.admin_paths().contains(&path))?;
         let ctx = AdminCtx::new(path, keys)
+            .with_query(query)
             .with_usage(usage)
-            .with_observed(observed);
+            .with_observed(observed)
+            .with_extra_metrics(extra_metrics);
         guard(entry.plugin.name(), "on_admin", || {
             entry.plugin.on_admin(&ctx)
         })
@@ -765,6 +795,50 @@ impl PluginChain {
             .iter()
             .flat_map(|e| e.plugin.admin_paths())
             .collect()
+    }
+
+    /// Extra Prometheus text from plugins, appended by the host to `/v1/metrics`.
+    pub fn metrics_text(&self) -> String {
+        self.entries
+            .iter()
+            .filter(|e| e.runs_for(None))
+            .filter_map(|e| guard(e.plugin.name(), "metrics_text", || e.plugin.metrics_text()))
+            .collect()
+    }
+
+    /// The cost fragment for one stream's own `/v1/usage` answer, if a plugin has one.
+    pub fn usage_cost_fragment(&self, stream: &str) -> Option<JsonValue> {
+        self.entries
+            .iter()
+            .filter(|e| e.runs_for(Some(stream)))
+            .filter_map(|e| {
+                guard(e.plugin.name(), "usage_cost_fragment", || {
+                    e.plugin.usage_cost_fragment(stream)
+                })
+                .flatten()
+            })
+            .reduce(|mut all, next| {
+                if let (Some(object), Some(add)) = (all.as_object_mut(), next.as_object()) {
+                    for (key, value) in add {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
+                all
+            })
+    }
+
+    /// A plugin's admission refusal, still routed through the gateway's refusal path.
+    pub fn admission_refusal(&self, stream: &str, now: SystemTime) -> Option<AdmissionRefusal> {
+        self.entries
+            .iter()
+            .filter(|e| e.runs_for(Some(stream)))
+            .filter_map(|e| {
+                guard(e.plugin.name(), "admission_refusal", || {
+                    e.plugin.admission_refusal(stream, now)
+                })
+                .flatten()
+            })
+            .next()
     }
 
     /// JSON objects to merge into the admin status document. A panicking or

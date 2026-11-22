@@ -137,7 +137,7 @@ fn parse_day_of_month(value: &str) -> Result<u32, String> {
     Ok(day)
 }
 
-fn parse_zone(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_zone(value: &str) -> Result<i64, String> {
     if value.eq_ignore_ascii_case("UTC") {
         return Ok(0);
     }

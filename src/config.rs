@@ -12,7 +12,7 @@ use crate::quota::Reset;
 use crate::shaper::bucket;
 use crate::shaper::headers::{preset_limits, preset_names};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     Parse(String),
     UnknownUpstream {
@@ -27,7 +27,9 @@ pub enum ConfigError {
     BadTokenHash(String),
     DuplicateToken(String, String),
     InsecureUpstream(String),
-    InvalidRateLimit(String),
+    BadStreamLimits(String),
+    BadStreamAllowlist(String),
+    BadGateway(String),
     BadQuotaResets {
         key: String,
         reason: String,
@@ -57,6 +59,8 @@ pub enum ConfigError {
     },
     BadAdminTokenHash,
     AdminTokenReused(String),
+    /// `[stream_admin]` is present but not safe to enable.
+    BadStreamAdmin(String),
     ReservedStreamName(String),
     AdminListenConflict,
     /// The admin listener would serve plain HTTP on a reachable address.
@@ -114,12 +118,11 @@ impl fmt::Display for ConfigError {
             Self::InsecureUpstream(name) => {
                 write!(f, "upstream `{name}` must use an https base_url")
             }
-            Self::InvalidRateLimit(stream) => {
-                write!(
-                    f,
-                    "stream `{stream}` has a rate_limit_per_minute of 0; it must be at least 1"
-                )
+            Self::BadStreamLimits(reason) => write!(f, "invalid stream limits: {reason}"),
+            Self::BadStreamAllowlist(reason) => {
+                write!(f, "invalid stream allowlist: {reason}")
             }
+            Self::BadGateway(reason) => write!(f, "invalid [gateway]: {reason}"),
             Self::BadQuotaResets { key, reason } => {
                 write!(f, "key `{key}` has an invalid quota_resets: {reason}")
             }
@@ -167,6 +170,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "admin token_sha256 is the same as the token of stream `{stream}`, which would give that stream admin access"
             ),
+            Self::BadStreamAdmin(reason) => write!(f, "invalid [stream_admin]: {reason}"),
             Self::ReservedStreamName(name) => {
                 write!(
                     f,
@@ -218,7 +222,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -232,8 +236,14 @@ pub struct Config {
     pub strict_key_permissions: bool,
     #[serde(default)]
     pub streams: BTreeMap<String, StreamConfig>,
+    /// Defaults for multi-user gateway behaviour, including counter-store failure policy.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// Opt-in dynamic stream management. None means the API is disabled.
+    #[serde(default)]
+    pub stream_admin: Option<StreamAdminConfig>,
     /// Optional CONNECT-only forward proxy that copies bytes without reading them.
     #[serde(default)]
     pub tunnel: Option<TunnelConfig>,
@@ -332,7 +342,7 @@ pub struct PeerToken {
 pub const DEFAULT_PEER_TOKEN: &str = "default";
 
 /// Kept apart from the peer sub-tables so a misspelt setting is refused.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeersSettings {
     #[serde(default)]
@@ -986,7 +996,7 @@ fn default_auth_format() -> String {
     "Bearer {key}".to_owned()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
     pub upstream: String,
@@ -995,26 +1005,277 @@ pub struct KeyConfig {
     pub quota_resets: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// What happens when per-stream counter state cannot be read or written.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreErrorMode {
+    /// Refuse requests with 503 while the counters are unavailable.
+    Closed,
+    /// Serve requests without a reliable counter and count the event in metrics.
+    Open,
+}
+
+impl StoreErrorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+}
+
+fn default_store_error_mode() -> StoreErrorMode {
+    StoreErrorMode::Closed
+}
+
+/// `[gateway]`: defaults shared by every stream.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    /// Default for `[streams.NAME.limits] on_store_error`.
+    #[serde(default = "default_store_error_mode")]
+    pub on_store_error: StoreErrorMode,
+    /// Requests per minute allowed against the self-service `GET /v1/usage` route.
+    #[serde(default = "default_usage_rpm")]
+    pub usage_rpm: u32,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            on_store_error: default_store_error_mode(),
+            usage_rpm: default_usage_rpm(),
+        }
+    }
+}
+
+fn default_usage_rpm() -> u32 {
+    60
+}
+
+/// `[streams.NAME.limits]`: admission limits for one tenant. Unset means no limit.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamLimits {
+    #[serde(default)]
+    pub rpm: Option<u32>,
+    #[serde(default)]
+    pub tpm: Option<u64>,
+    #[serde(default)]
+    pub concurrent: Option<u32>,
+    #[serde(default)]
+    pub daily_requests: Option<u32>,
+    #[serde(default)]
+    pub daily_tokens: Option<u64>,
+    #[serde(default)]
+    pub monthly_requests: Option<u32>,
+    #[serde(default)]
+    pub monthly_tokens: Option<u64>,
+    /// Calendar periods use this zone: `UTC` or a fixed `+HH:MM` / `-HH:MM` offset.
+    #[serde(default)]
+    pub period_zone: Option<String>,
+    /// Overrides `[gateway] on_store_error` for this stream.
+    #[serde(default)]
+    pub on_store_error: Option<StoreErrorMode>,
+}
+
+impl StreamLimits {
+    /// The limit name of the first configured limit, for configuration checks and views.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (set, name) in [
+            (self.rpm.is_some(), "rpm"),
+            (self.tpm.is_some(), "tpm"),
+            (self.concurrent.is_some(), "concurrent"),
+            (self.daily_requests.is_some(), "daily_requests"),
+            (self.daily_tokens.is_some(), "daily_tokens"),
+            (self.monthly_requests.is_some(), "monthly_requests"),
+            (self.monthly_tokens.is_some(), "monthly_tokens"),
+        ] {
+            if set {
+                names.push(name);
+            }
+        }
+        names
+    }
+}
+
+/// Runtime-only metadata for a stream created through the opt-in stream admin API.
+/// It is never read from TOML and never serialized back into the config file.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DynamicStreamMeta {
+    pub key: String,
+    pub token_ids: Vec<String>,
+    pub created_at: u64,
+}
+
+/// One hashed, expiring credential of a dynamic stream. Raw token values exist only in the
+/// response to the single request that created them; the hash is what runtime auth compares.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DynamicToken {
+    pub id: String,
+    pub token_sha256: String,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamConfig {
     pub token_sha256: String,
     pub chain: Vec<String>,
     #[serde(default = "default_strategy")]
     pub strategy: StrategyConfig,
+    /// Admission limits. Unset means no limit.
     #[serde(default)]
-    pub rate_limit_per_minute: Option<u32>,
+    pub limits: Option<StreamLimits>,
+    /// Glob patterns for the upstream names this stream may use. Omitted means any;
+    /// an explicit empty list denies every upstream.
+    #[serde(default)]
+    pub allowed_upstreams: Option<Vec<String>>,
+    /// Glob patterns for request model names this stream may use. Omitted means any;
+    /// an explicit empty list denies every model, and a request whose model cannot be
+    /// determined is refused whenever this is set.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    /// Relative share of a shared key's contested concurrency and rate budget. At least 1.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    /// Set only for streams created at runtime. Static streams are read-only to the API.
+    #[serde(skip)]
+    pub dynamic: Option<DynamicStreamMeta>,
+    /// Hashes and expiry times of every live credential on a dynamic stream.
+    #[serde(skip)]
+    pub dynamic_tokens: Vec<DynamicToken>,
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 fn default_strategy() -> StrategyConfig {
     StrategyConfig::Sticky
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     pub listen: String,
     pub token_sha256: String,
+}
+
+/// Opt-in runtime stream administration. Absent means the feature is off: no
+/// routes, no state file reads/writes, and no dynamic streams.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamAdminConfig {
+    /// Hash of the dedicated stream-admin bearer token. Distinct from every
+    /// other configured credential.
+    pub token_sha256: String,
+    /// Hash identifying the CLI/operator actor written to audit records.
+    pub actor_id_sha256: String,
+    /// Environment variable the CLI reads the raw admin token from. The token
+    /// is never accepted as a CLI argument.
+    #[serde(default = "default_stream_admin_token_env")]
+    pub token_env: String,
+    /// Environment variable for the second token when two-party confirmation
+    /// is required.
+    #[serde(default = "default_stream_admin_confirm_env")]
+    pub confirm_env: String,
+    /// Dynamic stream state file, relative to the config file's state dir,
+    /// written atomically with mode 0600. Rationale: tamper-resistant state.
+    #[serde(default = "default_stream_admin_state_file")]
+    pub state_file: String,
+    /// Required append-only audit log file name, relative to the state dir.
+    /// Management fails closed if the audit log cannot be written.
+    pub audit_log: String,
+    /// Hard cap on dynamic streams.
+    pub max_streams: u32,
+    /// Keys that may be assigned by the API, each with an explicit flag. The
+    /// API never creates keys; all candidates are configured by the operator.
+    #[serde(default)]
+    pub allowed_keys: BTreeMap<String, AssignableKey>,
+    /// Ceilings every dynamic stream must stay within.
+    pub ceilings: StreamCeilings,
+    /// Maximum tokens (including the initial key) per stream.
+    #[serde(default = "default_max_tokens_per_stream")]
+    pub max_tokens_per_stream: u32,
+    /// Default TTL for new tokens when the request omits it.
+    #[serde(default = "default_stream_admin_default_ttl")]
+    pub default_ttl: u64,
+    /// Hard cap on token TTL in seconds.
+    #[serde(default = "default_stream_admin_max_ttl")]
+    pub max_ttl: u64,
+    /// Limits applied to new streams unless the request provides its own.
+    #[serde(default)]
+    pub default_limits: Option<StreamLimits>,
+    /// Loopback admin addresses explicitly allowed to expose these routes.
+    /// The configured `admin.listen` must be one of these.
+    pub allowed_listen: Vec<String>,
+    /// Additional token hashes whose bearer must confirm each mutation.
+    #[serde(default)]
+    pub require_two_party: Vec<String>,
+    /// Max management request body size in bytes. Rationale: bounded bodies.
+    #[serde(default = "default_stream_admin_body_limit")]
+    pub max_body_bytes: usize,
+    /// Failed attempts from one source before it is locked out.
+    #[serde(default = "default_stream_admin_lockout_threshold")]
+    pub lockout_threshold: u32,
+    /// Lockout duration in seconds.
+    #[serde(default = "default_stream_admin_lockout_secs")]
+    pub lockout_secs: u64,
+    /// Requests per source per minute for the management API.
+    #[serde(default = "default_stream_admin_rpm")]
+    pub rpm: u32,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssignableKey {
+    /// Whether the API may assign this key to a dynamic stream.
+    pub assignable: bool,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StreamCeilings {
+    pub rpm: Option<u32>,
+    pub tpm: Option<u64>,
+    pub concurrent: Option<u32>,
+    pub daily_requests: Option<u32>,
+    pub daily_tokens: Option<u64>,
+    pub monthly_requests: Option<u32>,
+    pub monthly_tokens: Option<u64>,
+}
+
+fn default_stream_admin_token_env() -> String {
+    "REIKI_STREAM_ADMIN_TOKEN".to_owned()
+}
+fn default_stream_admin_confirm_env() -> String {
+    "REIKI_STREAM_ADMIN_CONFIRM_TOKEN".to_owned()
+}
+fn default_stream_admin_state_file() -> String {
+    "stream-admin.json".to_owned()
+}
+fn default_max_tokens_per_stream() -> u32 {
+    3
+}
+fn default_stream_admin_default_ttl() -> u64 {
+    3600
+}
+fn default_stream_admin_max_ttl() -> u64 {
+    86_400
+}
+fn default_stream_admin_body_limit() -> usize {
+    16 * 1024
+}
+fn default_stream_admin_lockout_threshold() -> u32 {
+    5
+}
+fn default_stream_admin_lockout_secs() -> u64 {
+    900
+}
+fn default_stream_admin_rpm() -> u32 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1266,6 +1527,226 @@ pub fn check_admin_listen(listen: &str) -> Result<std::net::SocketAddr, String> 
     Ok(addr)
 }
 
+fn stream_admin_safe_name(name: &str, suffix: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains(['/', '\\'])
+        && name != "."
+        && name != ".."
+        && (suffix.is_empty() || name.ends_with(suffix))
+}
+
+fn stream_admin_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn validate_stream_admin_config(
+    config: &Config,
+    admin: &AdminConfig,
+    sa: &StreamAdminConfig,
+) -> Result<(), ConfigError> {
+    let fail = |reason: String| ConfigError::BadStreamAdmin(reason);
+    let admin_hash = admin.token_sha256.to_ascii_lowercase();
+    let sa_hash = sa.token_sha256.to_ascii_lowercase();
+    if !is_sha256_hex(&sa.token_sha256) {
+        return Err(fail("token_sha256 is not a SHA-256 hex digest".to_owned()));
+    }
+    if !is_sha256_hex(&sa.actor_id_sha256) {
+        return Err(fail(
+            "actor_id_sha256 is not a SHA-256 hex digest".to_owned(),
+        ));
+    }
+    if sa_hash == admin_hash {
+        return Err(fail(
+            "token_sha256 must differ from [admin].token_sha256".to_owned(),
+        ));
+    }
+    if sa_hash == sa.actor_id_sha256.to_ascii_lowercase() {
+        return Err(fail(
+            "token_sha256 must differ from actor_id_sha256".to_owned(),
+        ));
+    }
+    if config
+        .streams
+        .values()
+        .any(|stream| stream.token_sha256.to_ascii_lowercase() == sa_hash)
+    {
+        return Err(fail(
+            "token_sha256 must not equal any configured stream token".to_owned(),
+        ));
+    }
+    if config
+        .streams
+        .values()
+        .any(|stream| stream.token_sha256.to_ascii_lowercase() == admin_hash)
+    {
+        return Err(fail(
+            "[admin].token_sha256 must not equal any configured stream token".to_owned(),
+        ));
+    }
+    if !stream_admin_env_name(&sa.token_env) {
+        return Err(fail(
+            "token_env is not a valid environment variable name".to_owned(),
+        ));
+    }
+    if !stream_admin_env_name(&sa.confirm_env) {
+        return Err(fail(
+            "confirm_env is not a valid environment variable name".to_owned(),
+        ));
+    }
+    if sa.token_env == sa.confirm_env {
+        return Err(fail("token_env and confirm_env must differ".to_owned()));
+    }
+    if !stream_admin_safe_name(&sa.state_file, ".json") {
+        return Err(fail(
+            "state_file must be a relative file name ending in .json".to_owned(),
+        ));
+    }
+    if !stream_admin_safe_name(&sa.audit_log, ".jsonl") {
+        return Err(fail(
+            "audit_log must be a relative file name ending in .jsonl".to_owned(),
+        ));
+    }
+    if sa.audit_log == sa.state_file {
+        return Err(fail("audit_log must differ from state_file".to_owned()));
+    }
+    if sa.max_streams == 0 || sa.max_streams > 10_000 {
+        return Err(fail("max_streams must be between 1 and 10000".to_owned()));
+    }
+    if sa.max_tokens_per_stream == 0 || sa.max_tokens_per_stream > 100 {
+        return Err(fail(
+            "max_tokens_per_stream must be between 1 and 100".to_owned(),
+        ));
+    }
+    if sa.default_ttl == 0 || sa.default_ttl > sa.max_ttl || sa.max_ttl > 2_592_000 {
+        return Err(fail(
+            "default_ttl must be at least 1 and no greater than max_ttl (max 2592000)".to_owned(),
+        ));
+    }
+    if !(1024..=1_048_576).contains(&sa.max_body_bytes) {
+        return Err(fail(
+            "max_body_bytes must be between 1024 and 1048576".to_owned(),
+        ));
+    }
+    if sa.lockout_threshold == 0 || sa.rpm == 0 {
+        return Err(fail(
+            "lockout_threshold and rpm must be at least 1".to_owned(),
+        ));
+    }
+    if sa.lockout_secs == 0 || sa.lockout_secs > 86_400 {
+        return Err(fail("lockout_secs must be between 1 and 86400".to_owned()));
+    }
+    if sa.allowed_listen.is_empty() || !sa.allowed_listen.iter().any(|addr| addr == &admin.listen) {
+        return Err(fail(
+            "allowed_listen must contain the configured admin.listen address".to_owned(),
+        ));
+    }
+    for addr in &sa.allowed_listen {
+        check_admin_listen(addr).map_err(|reason| fail(format!("allowed_listen: {reason}")))?;
+    }
+    for (name, entry) in &sa.allowed_keys {
+        if !config.keys.contains_key(name) {
+            return Err(fail(format!(
+                "allowed_keys references unknown key `{name}`"
+            )));
+        }
+        if !entry.assignable {
+            return Err(fail(format!(
+                "allowed_keys entry `{name}` must set assignable = true"
+            )));
+        }
+    }
+    for (value, label) in [
+        (sa.actor_id_sha256.to_ascii_lowercase(), "actor_id_sha256"),
+        (sa_hash.clone(), "token_sha256"),
+    ] {
+        for other in &sa.require_two_party {
+            if other.to_ascii_lowercase() == value {
+                return Err(fail(format!(
+                    "{label} must differ from require_two_party hashes"
+                )));
+            }
+        }
+    }
+    let mut confirmers = std::collections::BTreeSet::new();
+    for hash in &sa.require_two_party {
+        if !is_sha256_hex(hash) {
+            return Err(fail(
+                "require_two_party contains an invalid SHA-256 hash".to_owned(),
+            ));
+        }
+        if !confirmers.insert(hash.to_ascii_lowercase()) {
+            return Err(fail(
+                "require_two_party contains duplicate hashes".to_owned(),
+            ));
+        }
+    }
+    for (value, label) in [
+        (sa.ceilings.rpm.map(u64::from), "rpm"),
+        (sa.ceilings.tpm, "tpm"),
+        (sa.ceilings.concurrent.map(u64::from), "concurrent"),
+        (sa.ceilings.daily_requests.map(u64::from), "daily_requests"),
+        (sa.ceilings.daily_tokens, "daily_tokens"),
+        (
+            sa.ceilings.monthly_requests.map(u64::from),
+            "monthly_requests",
+        ),
+        (sa.ceilings.monthly_tokens, "monthly_tokens"),
+    ] {
+        if value == Some(0) {
+            return Err(fail(format!("ceilings.{label} must be at least 1")));
+        }
+    }
+    if let Some(limits) = &sa.default_limits {
+        for (value, ceiling, label) in [
+            (
+                limits.rpm.map(u64::from),
+                sa.ceilings.rpm.map(u64::from),
+                "rpm",
+            ),
+            (limits.tpm, sa.ceilings.tpm, "tpm"),
+            (
+                limits.concurrent.map(u64::from),
+                sa.ceilings.concurrent.map(u64::from),
+                "concurrent",
+            ),
+            (
+                limits.daily_requests.map(u64::from),
+                sa.ceilings.daily_requests.map(u64::from),
+                "daily_requests",
+            ),
+            (
+                limits.daily_tokens,
+                sa.ceilings.daily_tokens,
+                "daily_tokens",
+            ),
+            (
+                limits.monthly_requests.map(u64::from),
+                sa.ceilings.monthly_requests.map(u64::from),
+                "monthly_requests",
+            ),
+            (
+                limits.monthly_tokens,
+                sa.ceilings.monthly_tokens,
+                "monthly_tokens",
+            ),
+        ] {
+            if let (Some(value), Some(ceiling)) = (value, ceiling)
+                && value > ceiling
+            {
+                return Err(fail(format!(
+                    "default_limits.{label} exceeds ceilings.{label}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// Whether per-upstream usage is kept, for the peer document and `/v1/metrics`: `[peers]
     /// expose_usage`, which is on when there is no `[peers]` table.
@@ -1277,7 +1758,11 @@ impl Config {
     /// response, so it happens only when something consumes the figures: the peer document
     /// (`[peers]`) or the `metrics` plugin.
     pub fn tracks_usage(&self) -> bool {
-        self.exposes_usage() && (self.peers.is_some() || self.plugins.contains_key("metrics"))
+        let shared =
+            self.exposes_usage() && (self.peers.is_some() || self.plugins.contains_key("metrics"));
+        // Cost is local accounting the operator opted into; `[peers] expose_usage`
+        // controls what leaves the instance, not what its own admin can measure.
+        shared || self.plugins.contains_key("cost")
     }
 
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -1687,6 +2172,12 @@ impl Config {
                 });
             }
         }
+        if !(1..=3600).contains(&self.gateway.usage_rpm) {
+            return Err(ConfigError::BadGateway(format!(
+                "usage_rpm must be between 1 and 3600, got {}",
+                self.gateway.usage_rpm
+            )));
+        }
         let mut seen: Vec<(&str, &str)> = Vec::new();
         if self.streams.contains_key("passthrough") {
             return Err(ConfigError::ReservedStreamName("passthrough".to_owned()));
@@ -1720,8 +2211,44 @@ impl Config {
                     });
                 }
             }
-            if stream.rate_limit_per_minute == Some(0) {
-                return Err(ConfigError::InvalidRateLimit(name.clone()));
+            if let Some(limits) = &stream.limits {
+                for (value, limit) in [
+                    (limits.rpm.map(u64::from), "rpm"),
+                    (limits.tpm, "tpm"),
+                    (limits.concurrent.map(u64::from), "concurrent"),
+                    (limits.daily_requests.map(u64::from), "daily_requests"),
+                    (limits.daily_tokens, "daily_tokens"),
+                    (limits.monthly_requests.map(u64::from), "monthly_requests"),
+                    (limits.monthly_tokens, "monthly_tokens"),
+                ] {
+                    if value == Some(0) {
+                        return Err(ConfigError::BadStreamLimits(format!(
+                            "stream `{name}` has {limit} of 0; it must be at least 1"
+                        )));
+                    }
+                }
+                if let Some(zone) = &limits.period_zone
+                    && !valid_period_zone(zone)
+                {
+                    return Err(ConfigError::BadStreamLimits(format!(
+                        "stream `{name}` has an invalid period_zone: {zone:?}"
+                    )));
+                }
+            }
+            if stream.weight == 0 {
+                return Err(ConfigError::BadStreamLimits(format!(
+                    "stream `{name}` has weight of 0; it must be at least 1"
+                )));
+            }
+            for patterns in [&stream.allowed_upstreams, &stream.allowed_models] {
+                let Some(patterns) = patterns else {
+                    continue;
+                };
+                if let Some(pattern) = patterns.iter().find(|pattern| !valid_glob(pattern)) {
+                    return Err(ConfigError::BadStreamAllowlist(format!(
+                        "stream `{name}` has an invalid glob pattern: {pattern:?}"
+                    )));
+                }
             }
             let hash = stream.token_sha256.as_str();
             if !is_sha256_hex(hash) {
@@ -1764,6 +2291,13 @@ impl Config {
                 return Err(ConfigError::AdminListenConflict);
             }
             check_admin_listen(&admin.listen).map_err(ConfigError::BadAdminListen)?;
+            if let Some(sa) = &self.stream_admin {
+                validate_stream_admin_config(self, admin, sa)?;
+            }
+        } else if self.stream_admin.is_some() {
+            return Err(ConfigError::BadStreamAdmin(
+                "[admin] must be configured to enable [stream_admin]".to_owned(),
+            ));
         }
         if !(1..=300).contains(&self.service.shutdown_timeout_secs) {
             return Err(ConfigError::BadService(format!(
@@ -2405,6 +2939,20 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A stream allowlist entry is a small, printable glob: `*` and `?` are the only wildcards.
+pub(crate) fn valid_glob(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= 128
+        && pattern
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'[' && b != b']' && b != b'\\')
+}
+
+/// `UTC` or a fixed offset, the same forms `[keys.NAME] quota_resets` accepts.
+pub(crate) fn valid_period_zone(value: &str) -> bool {
+    value.eq_ignore_ascii_case("UTC") || crate::quota::parse_zone(value).is_ok()
+}
+
 /// True for an `http://` URL whose host is exactly a loopback name. A prefix
 /// match would also accept `http://localhost.example` or `http://127.0.0.1@evil`.
 fn is_loopback_http(url: &str) -> bool {
@@ -2459,7 +3007,7 @@ pub struct HubEntry {
 }
 
 /// `[hub]`: this instance is a hub, serving edge streams on its own listener.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HubConfig {
     /// Address of the hub listener; loopback only, since no TLS is supported yet.
@@ -2643,7 +3191,11 @@ file = "/etc/reiki/keys/zen-b"
         assert_eq!(config.upstream["zen"].response_idle_timeout_secs, 300);
         assert_eq!(config.upstream["zen"].response_timeout_secs, None);
         assert_eq!(config.streams["client-a"].strategy, StrategyConfig::Sticky);
-        assert_eq!(config.streams["client-a"].rate_limit_per_minute, None);
+        assert_eq!(config.streams["client-a"].limits, None);
+        assert_eq!(config.streams["client-a"].allowed_upstreams, None);
+        assert_eq!(config.streams["client-a"].allowed_models, None);
+        assert_eq!(config.streams["client-a"].weight, 1);
+        assert_eq!(config.gateway, GatewayConfig::default());
     }
 
     #[test]
@@ -2758,21 +3310,22 @@ file = "/etc/reiki/keys/zen-b"
     }
 
     #[test]
-    fn parses_a_stream_rate_limit_and_rejects_zero() {
+    fn parses_stream_limits_and_rejects_zero() {
         let limited = base(&format!(
-            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\nrate_limit_per_minute = 60\n"
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[streams.s.limits]\nrpm = 60\ntpm = 1000\nperiod_zone = \"+02:00\"\n"
         ));
-        assert_eq!(
-            Config::parse(&limited).unwrap().streams["s"].rate_limit_per_minute,
-            Some(60)
-        );
+        let config = Config::parse(&limited).unwrap();
+        let limits = config.streams["s"].limits.as_ref().unwrap();
+        assert_eq!(limits.rpm, Some(60));
+        assert_eq!(limits.tpm, Some(1000));
+        assert_eq!(limits.period_zone.as_deref(), Some("+02:00"));
         let zero = base(&format!(
-            "[streams.s]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"zen-a\"]\nrate_limit_per_minute = 0\n"
+            "[streams.s]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"zen-a\"]\n[streams.s.limits]\nrpm = 0\n"
         ));
-        assert_eq!(
+        assert!(matches!(
             Config::parse(&zero).unwrap_err(),
-            ConfigError::InvalidRateLimit("s".into())
-        );
+            ConfigError::BadStreamLimits(_)
+        ));
     }
 
     #[test]
@@ -4611,6 +5164,161 @@ socket = "/run/forwarder.sock"
             assert!(error.contains(field), "{field}: {error}");
             assert!(error.contains("16"), "{field}: {error}");
         }
+    }
+
+    const HASH_SA_TOKEN: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const HASH_SA_ACTOR: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const HASH_SA_CONFIRM: &str =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    fn stream_admin_base(extra: &str) -> String {
+        format!(
+            r#"
+[admin]
+listen = "127.0.0.1:4098"
+token_sha256 = "{HASH_A}"
+
+[upstream.zen]
+base_url = "https://opencode.ai/zen/v1"
+
+[keys.zen-a]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-a"
+
+[keys.zen-b]
+upstream = "zen"
+file = "/etc/reiki/keys/zen-b"
+
+[streams.client-a]
+token_sha256 = "{HASH_B}"
+chain = ["zen-a"]
+{extra}
+"#
+        )
+    }
+
+    fn stream_admin_table(extra: &str) -> String {
+        format!(
+            r#"
+[stream_admin]
+token_sha256 = "{HASH_SA_TOKEN}"
+actor_id_sha256 = "{HASH_SA_ACTOR}"
+audit_log = "audit.jsonl"
+max_streams = 8
+allowed_listen = ["127.0.0.1:4098"]
+
+[stream_admin.allowed_keys.zen-a]
+assignable = true
+
+[stream_admin.ceilings]
+rpm = 100
+tpm = 10000
+concurrent = 4
+daily_requests = 1000
+daily_tokens = 100000
+monthly_requests = 10000
+monthly_tokens = 1000000
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn stream_admin_is_opt_in() {
+        assert!(
+            Config::parse(&stream_admin_base(""))
+                .unwrap()
+                .stream_admin
+                .is_none()
+        );
+        let config = Config::parse(&stream_admin_base(&stream_admin_table(""))).unwrap();
+        let admin = config.stream_admin.as_ref().unwrap();
+        assert_eq!(admin.max_tokens_per_stream, 3);
+        assert_eq!(admin.default_ttl, 3600);
+        assert_eq!(admin.max_ttl, 86_400);
+        assert_eq!(admin.state_file, "stream-admin.json");
+        assert_eq!(admin.max_body_bytes, 16 * 1024);
+        assert_eq!(admin.rpm, 60);
+        assert!(admin.require_two_party.is_empty());
+    }
+
+    #[test]
+    fn stream_admin_rejects_unknown_and_missing_fields() {
+        let bad = stream_admin_base(&stream_admin_table("surprise = 1\n"));
+        assert!(
+            Config::parse(&bad).is_err(),
+            "unknown field must stay an error"
+        );
+        let missing = stream_admin_base(
+            "[stream_admin]\ntoken_sha256 = \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n",
+        );
+        assert!(Config::parse(&missing).is_err());
+    }
+
+    #[test]
+    fn stream_admin_credentials_must_be_distinct() {
+        let same_admin = stream_admin_base(&stream_admin_table("").replace(HASH_SA_TOKEN, HASH_A));
+        let error = Config::parse(&same_admin).unwrap_err();
+        assert!(matches!(error, ConfigError::BadStreamAdmin(_)), "{error}");
+        let same_stream = stream_admin_base(&stream_admin_table("").replace(HASH_SA_TOKEN, HASH_B));
+        assert!(Config::parse(&same_stream).is_err());
+        let same_actor =
+            stream_admin_base(&stream_admin_table("").replace(HASH_SA_ACTOR, HASH_SA_TOKEN));
+        assert!(Config::parse(&same_actor).is_err());
+        let two_party = stream_admin_base(&stream_admin_table("").replace(
+            "max_streams = 8\n",
+            &format!("max_streams = 8\nrequire_two_party = [\"{HASH_SA_CONFIRM}\"]\n"),
+        ));
+        assert!(Config::parse(&two_party).is_ok());
+        let colliding = stream_admin_base(&stream_admin_table("").replace(
+            "max_streams = 8\n",
+            &format!("max_streams = 8\nrequire_two_party = [\"{HASH_SA_TOKEN}\"]\n"),
+        ));
+        assert!(Config::parse(&colliding).is_err());
+    }
+
+    #[test]
+    fn stream_admin_listen_and_keys_are_checked() {
+        let no_match = stream_admin_base(&stream_admin_table("").replace(
+            "allowed_listen = [\"127.0.0.1:4098\"]",
+            "allowed_listen = [\"127.0.0.1:4099\"]",
+        ));
+        assert!(Config::parse(&no_match).is_err());
+        let routable = stream_admin_base(&stream_admin_table("").replace(
+            "allowed_listen = [\"127.0.0.1:4098\"]",
+            "allowed_listen = [\"0.0.0.0:4098\"]",
+        ));
+        assert!(Config::parse(&routable).is_err());
+        let non_assignable = stream_admin_base(
+            &stream_admin_table("").replace("assignable = true", "assignable = false"),
+        );
+        assert!(Config::parse(&non_assignable).is_err());
+        let unknown_key = stream_admin_base(&stream_admin_table("").replace(
+            "[stream_admin.allowed_keys.zen-a]",
+            "[stream_admin.allowed_keys.missing]",
+        ));
+        assert!(Config::parse(&unknown_key).is_err());
+    }
+
+    #[test]
+    fn stream_admin_file_names_and_limits_are_checked() {
+        let path = stream_admin_base(&stream_admin_table("").replace(
+            "audit_log = \"audit.jsonl\"",
+            "audit_log = \"../audit.jsonl\"",
+        ));
+        assert!(Config::parse(&path).is_err());
+        let same_file = stream_admin_base(&stream_admin_table("").replace(
+            "audit_log = \"audit.jsonl\"",
+            "audit_log = \"stream-admin.json\"",
+        ));
+        assert!(Config::parse(&same_file).is_err());
+        let zero_ceiling =
+            stream_admin_base(&stream_admin_table("").replace("rpm = 100", "rpm = 0"));
+        assert!(Config::parse(&zero_ceiling).is_err());
+        let over_ceiling = stream_admin_base(&stream_admin_table(
+            "[stream_admin.default_limits]\nrpm = 101\n",
+        ));
+        assert!(Config::parse(&over_ceiling).is_err());
     }
 
     #[test]

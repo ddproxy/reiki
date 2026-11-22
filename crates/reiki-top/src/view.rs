@@ -294,6 +294,27 @@ fn fmt_num(n: f64) -> String {
     format!("{n}")
 }
 
+/// Local estimated spend, when the cost plugin answered the admin listener. This is a
+/// bounded copy of the operator's own figures; peer documents never carry it.
+pub fn cost_line(fleet: &Fleet, width: usize) -> Option<Line> {
+    let cost = fleet.local_cost()?;
+    let mut text = format!(
+        "cost ({} {}, estimate): {} {} · {} requests",
+        cost.period,
+        cost.currency,
+        cost.totals.estimated_display,
+        cost.currency,
+        cost.totals.requests
+    );
+    if cost.totals.unpriced_requests > 0 {
+        text.push_str(&format!(" · {} unpriced", cost.totals.unpriced_requests));
+    }
+    if !cost.state_healthy {
+        text.push_str(" · state unavailable");
+    }
+    Some(line(vec![span(text, Style::Plain)], width))
+}
+
 /// Renders the fleet as lines: a title, a providers block, then one card per peer in `peer_order`.
 pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) -> Vec<Line> {
     let mut out = Vec::new();
@@ -320,6 +341,35 @@ pub fn render(fleet: &Fleet, peer_order: &[String], now: Instant, width: usize) 
         )],
         width,
     ));
+
+    // Only peers that publish stream counts contribute; older peers are simply absent. Names are
+    // never shown, since a dynamic stream name may identify a tenant.
+    let mut static_streams = 0_u64;
+    let mut dynamic_streams = 0_u64;
+    let mut any_stream_counts = false;
+    for name in peer_order {
+        let Some(peer) = fleet.peer(name, now).filter(|peer| !peer.stale) else {
+            continue;
+        };
+        if let Some(counts) = peer.health.streams {
+            any_stream_counts = true;
+            static_streams = static_streams.saturating_add(counts.static_streams);
+            dynamic_streams = dynamic_streams.saturating_add(counts.dynamic_streams);
+        }
+    }
+    if any_stream_counts {
+        out.push(line(
+            vec![span(
+                format!("Streams: {static_streams} static, {dynamic_streams} dynamic"),
+                Style::Plain,
+            )],
+            width,
+        ));
+    }
+
+    if let Some(cost) = cost_line(fleet, width) {
+        out.push(cost);
+    }
 
     out.push(line(vec![span("Providers", Style::Title)], width));
     let rows = fleet.provider_summary(now);
@@ -465,6 +515,39 @@ pub fn fleet_detail(fleet: &Fleet, peers: &[String], now: Instant, width: usize)
             width,
         ));
     }
+    let totals = fleet.gateway_totals(now);
+    if totals.peer_count > 0 {
+        out.push(line(
+            vec![
+                span(
+                    format!(
+                        "  gateway ({} {}): ",
+                        totals.peer_count,
+                        if totals.peer_count == 1 {
+                            "peer"
+                        } else {
+                            "peers"
+                        }
+                    ),
+                    Style::Title,
+                ),
+                span(format!("{} requests", totals.requests), Style::Plain),
+                span(format!("  {} tokens", totals.tokens), Style::Plain),
+                span(
+                    format!("  {} store errors", totals.store_errors),
+                    if totals.store_errors > 0 {
+                        Style::Warn
+                    } else {
+                        Style::Plain
+                    },
+                ),
+            ],
+            width,
+        ));
+    }
+    if let Some(cost) = cost_line(fleet, width) {
+        out.push(cost);
+    }
     out
 }
 
@@ -533,6 +616,15 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
         .and_then(Value::as_u64)
     {
         header.push(span(format!("  sessions {n}"), Style::Plain));
+    }
+    if let Some(counts) = peer.health.gateway {
+        header.push(span(
+            format!(
+                "  gateway {} req, {} tok, {} store errors",
+                counts.requests, counts.tokens, counts.store_errors
+            ),
+            Style::Plain,
+        ));
     }
     if peer.stale {
         header.push(span(
@@ -3934,6 +4026,36 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("peer-c")),
             "stale peers are excluded: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_counts_show_on_a_peer_card_and_in_the_all_detail() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = |name: &str, requests| {
+            format!(
+                r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
+                     "observed":[],"failures":{{}},"upstreams":[],
+                     "gateway":{{"requests":{requests},"tokens":200,"store_errors":1}}}}"#
+            )
+        };
+        add(&mut f, "peer-a", &doc("peer-a", 10), t0);
+        add(&mut f, "peer-b", &doc("peer-b", 5), t0);
+        let peers = names(&["peer-a", "peer-b"]);
+        let detail = texts(&fleet_detail(&f, &peers, t0, 100));
+        assert!(
+            detail.iter().any(|l| l.contains("gateway (2 peers)")
+                && l.contains("15 requests")
+                && l.contains("400 tokens")
+                && l.contains("2 store errors")),
+            "{detail:?}"
+        );
+        let card = texts(&peer_detail(&f, "peer-a", t0, 100));
+        assert!(
+            card.iter()
+                .any(|l| l.contains("gateway 10 req, 200 tok, 1 store errors")),
+            "{card:?}"
         );
     }
 }

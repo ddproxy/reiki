@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-health", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog", "crates/reiki-toolpolicy", "crates/reiki-top", "crates/reiki-wasm"]
+members = ["crates/reiki-cost", "crates/reiki-detect", "crates/reiki-finance", "crates/reiki-controlled", "crates/reiki-health", "crates/reiki-metrics", "crates/reiki-phi", "crates/reiki-placeholders", "crates/reiki-plugin", "crates/reiki-redact", "crates/reiki-requestlog", "crates/reiki-toolpolicy", "crates/reiki-top", "crates/reiki-wasm"]
 resolver = "2"
 
 [package]
@@ -55,6 +55,12 @@ name = "toolpolicy"
 feature = "plugin-toolpolicy"
 crate = "reiki_toolpolicy"
 
+[[package.metadata.reiki.plugin]]
+# Off by default: cost accounting needs operator prices before it can report anything.
+name = "cost"
+feature = "plugin-cost"
+crate = "reiki_cost"
+
 [build-dependencies]
 toml = "1.2"
 
@@ -78,6 +84,7 @@ reiki-controlled = { path = "crates/reiki-controlled", optional = true }
 reiki-placeholders = { path = "crates/reiki-placeholders", optional = true }
 reiki-requestlog = { path = "crates/reiki-requestlog", optional = true }
 reiki-metrics = { path = "crates/reiki-metrics", optional = true }
+reiki-cost = { path = "crates/reiki-cost", optional = true }
 reiki-toolpolicy = { path = "crates/reiki-toolpolicy", optional = true }
 reiki-top = { path = "crates/reiki-top", optional = true, default-features = false }
 reiki-wasm = { path = "crates/reiki-wasm", optional = true }
@@ -92,7 +99,7 @@ async-compression = { version = "0.4", default-features = false, features = ["to
 http-body-util = "0.1"
 tower-service = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["parsing", "formatting"] }
 x509-parser = { version = "0.18", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
@@ -110,6 +117,7 @@ plugin-controlled = ["dep:reiki-controlled"]
 plugin-placeholders = ["dep:reiki-placeholders"]
 plugin-requestlog = ["dep:reiki-requestlog"]
 plugin-metrics = ["dep:reiki-metrics"]
+plugin-cost = ["dep:reiki-cost"]
 plugin-toolpolicy = ["dep:reiki-toolpolicy"]
 # Runtime Wasm plugins (phase 1 host); off by default.
 plugin-wasm = ["dep:reiki-wasm"]

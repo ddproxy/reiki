@@ -67,7 +67,7 @@ The `cooling_combinations` count in a peer's view is the number of combinations 
 | A refusal was recorded during the walk (`access_disabled`, a transient 5xx, or a second 401) | The upstream's own status and body from the last refusal |
 | No key can serve, and the last refusal was a request-size 402 (`request_error`) | The last upstream's own 402 and body, unchanged |
 | The chain is out and a fallback is configured | The fallback's answer, under the same rules |
-| The stream's `rate_limit_per_minute` is exceeded | `429`, `rate_limited`, `Retry-After` |
+| A stream limit or allowlist refuses the request before key selection | `429` or `403`, JSON code `gateway_*`, with `Retry-After` on a `429` |
 | Every key is shaped out and no refusal was recorded | `429`, `reiki_shaped`, `Retry-After`, `x-reiki-origin: local` |
 
 `Retry-After` on `reiki_exhausted` is the shortest wait until any non-disabled key recovers. It is rounded up to whole seconds and is at least 1. When the request has a model, the wait accounts for that model's cooldowns too.

@@ -38,6 +38,35 @@ pub struct Health {
     /// Only present when the peer sets `expose_host_stats`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Value>,
+    /// Aggregate gateway counters, absent with `expose_usage = false`. Counts only: never stream
+    /// names, model names or anything derived from a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayCounts>,
+    /// Stream counts, absent with `expose_usage = false` or on peers running an older version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<StreamCounts>,
+}
+
+/// Aggregate stream counts published to peers. Names are omitted: a dynamic stream name can
+/// identify a tenant, while a count says only how many streams a peer serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamCounts {
+    pub static_streams: u64,
+    pub dynamic_streams: u64,
+}
+
+/// Aggregate gateway counters published to peers. Every field is a count with a fixed name, so a
+/// peer sees how much traffic a gateway admitted without learning who sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCounts {
+    /// Requests admitted across all streams.
+    pub requests: u64,
+    /// Tokens charged across all streams, measured or estimated.
+    pub tokens: u64,
+    /// Counter-store failures observed by the gateway.
+    pub store_errors: u64,
 }
 
 impl Health {
@@ -508,6 +537,32 @@ mod tests {
         assert!(value["upstreams"][0]["keys"][0]
             .get("capacity_group")
             .is_none());
+    }
+
+    #[test]
+    fn gateway_counts_round_trip_and_stay_absent_by_default() {
+        let bare = Health::from_json(BASE).unwrap();
+        assert_eq!(bare.gateway, None);
+        let text = BASE.replace(
+            "\"sessions\": {\"active_sessions\": 1}",
+            "\"sessions\": {\"active_sessions\": 1}, \"gateway\": \
+             {\"requests\": 12, \"tokens\": 345, \"store_errors\": 1}",
+        );
+        let health = Health::from_json(&text).unwrap();
+        assert_eq!(
+            health.gateway,
+            Some(GatewayCounts {
+                requests: 12,
+                tokens: 345,
+                store_errors: 1,
+            })
+        );
+        let value = serde_json::to_value(health).unwrap();
+        assert_eq!(value["gateway"]["requests"], 12);
+        assert_eq!(value["gateway"]["tokens"], 345);
+        assert_eq!(value["gateway"]["store_errors"], 1);
+        let unknown = text.replace("\"requests\": 12,", "\"requests\": 12, \"surprise\": 1,");
+        assert!(Health::from_json(&unknown).is_err());
     }
 
     #[test]

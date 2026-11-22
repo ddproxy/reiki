@@ -7,6 +7,7 @@ use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::{PluginChain, builtin, with_dry_run};
 use reiki::proxy::{App, load_keys, router};
+use reiki_plugin::PluginHost;
 
 #[derive(Parser)]
 #[command(
@@ -109,6 +110,26 @@ enum Command {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Manage opt-in dynamic streams on the admin listener.
+    ///
+    /// The token is read from --token-file or the config-named environment variable, never
+    /// from a CLI argument. Mutating commands require --reason and send an idempotency key.
+    Streams {
+        /// Admin address, such as `http://127.0.0.1:4098`. Default: `[admin] listen` in the config.
+        #[arg(long)]
+        url: Option<String>,
+        /// File holding the stream-admin token. Default: the configured token environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Why the change is made; required for mutations and written to the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Idempotency key for a mutation. Generated when omitted.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[command(subcommand)]
+        command: StreamsCommand,
+    },
     /// Read each `[peers.<name>]` instance's `/v1/health` and print what it reports.
     ///
     /// A peer that cannot be reached, refuses the token or answers with data older than three
@@ -145,6 +166,15 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// Export estimated cost from the running instance's cost plugin.
+    ///
+    /// Calls `GET /v1/cost` on the admin listener and prints the answer unchanged.
+    /// Figures are estimates from the operator price table, not provider invoices.
+    #[cfg(feature = "plugin-cost")]
+    Cost {
+        #[command(subcommand)]
+        command: CostCommand,
+    },
     /// Create a CA limited to the named hosts, for `[tunnel.intercept]`.
     CaInit {
         /// Directory that receives `ca.pem` and `ca.key`.
@@ -165,6 +195,129 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+}
+
+#[cfg(feature = "plugin-cost")]
+#[derive(Subcommand)]
+enum CostCommand {
+    /// Export one UTC period as CSV or JSON.
+    Export {
+        /// UTC period: `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH`.
+        #[arg(long, default_value_t = reiki_cost::current_period())]
+        period: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = CostFormat::Json)]
+        format: CostFormat,
+        /// Admin address, such as `http://127.0.0.1:4098`. Default: `[admin] listen` in the config.
+        #[arg(long)]
+        url: Option<String>,
+        /// File holding the admin token. Default: the `REIKI_ADMIN_TOKEN` environment variable.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+}
+
+#[cfg(feature = "plugin-cost")]
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum CostFormat {
+    Csv,
+    Json,
+}
+
+#[cfg(feature = "plugin-cost")]
+impl CostFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum StreamsCommand {
+    /// List dynamic streams.
+    List,
+    /// Show one dynamic stream.
+    Show {
+        /// Dynamic stream name.
+        name: String,
+    },
+    /// Create a stream and print its first token once.
+    Create {
+        /// Stream name; must not collide with a static `[streams.NAME]`.
+        name: String,
+        /// Configured, assignable key name.
+        key: String,
+        /// Token lifetime in seconds; default and maximum come from `[stream_admin]`.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Change a stream's assignable key or admission limits.
+    Update {
+        /// Dynamic stream name.
+        name: String,
+        /// Replacement assignable key.
+        #[arg(long)]
+        key: Option<String>,
+        /// Replacement RPM ceiling for this stream.
+        #[arg(long)]
+        rpm: Option<u32>,
+        /// Replacement TPM ceiling for this stream.
+        #[arg(long)]
+        tpm: Option<u64>,
+    },
+    /// Revoke every token on a stream without deleting the stream.
+    Revoke {
+        /// Dynamic stream name.
+        name: String,
+    },
+    /// Work with tokens on a dynamic stream.
+    Token {
+        #[command(subcommand)]
+        command: StreamTokenCommand,
+    },
+    /// Verify or inspect a hash-chained audit log without contacting a running instance.
+    Audit {
+        #[command(subcommand)]
+        command: StreamAuditCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StreamTokenCommand {
+    /// Add a token and print it once.
+    Add {
+        /// Dynamic stream name.
+        name: String,
+        /// Token lifetime in seconds.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Revoke one token by id.
+    Revoke {
+        /// Dynamic stream name.
+        name: String,
+        /// Token id from `streams show`.
+        token_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum StreamAuditCommand {
+    /// Verify every record, including the hash chain, and print the record count.
+    Verify {
+        /// Path to the JSONL audit log.
+        file: PathBuf,
+    },
+    /// Print the first records in the log.
+    Head {
+        /// Path to the JSONL audit log.
+        file: PathBuf,
+        /// Number of records to print; default 10.
+        #[arg(long, default_value_t = 10)]
+        n: usize,
     },
 }
 
@@ -399,6 +552,55 @@ async fn run_failures(
     }
 }
 
+/// The `reiki cost export` command: streams the admin plugin's answer to stdout.
+#[cfg(feature = "plugin-cost")]
+async fn run_cost_export(
+    config: &std::path::Path,
+    period: &str,
+    format: CostFormat,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+) -> i32 {
+    if !reiki_cost::validate_period(period) {
+        eprintln!("reiki: period must be YYYY-MM, YYYY-MM-DD or YYYY-MM-DDTHH");
+        return 2;
+    }
+    let target = match admin_target(config, url, token_file) {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!("reiki: {e}");
+            return 2;
+        }
+    };
+    let query = format!(
+        "period={}&format={}",
+        percent_encode_query(period),
+        format.as_str()
+    );
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/cost?{query}", target.base))
+        .bearer_auth(&target.token)
+        .send()
+        .await;
+    match response {
+        Ok(response) => {
+            let ok = response.status().is_success();
+            let status = response.status();
+            match response.text().await {
+                Ok(body) if ok => println!("{body}"),
+                Ok(body) if !body.is_empty() => eprintln!("reiki: {status}: {body}"),
+                Ok(_) => eprintln!("reiki: {status}"),
+                Err(e) => eprintln!("reiki: cannot read the answer: {e}"),
+            }
+            i32::from(!ok)
+        }
+        Err(e) => {
+            eprintln!("reiki: cannot reach {}: {e}", target.base);
+            2
+        }
+    }
+}
+
 /// Terminal width for clipped tables: `COLUMNS` when set, otherwise a plain 120.
 fn terminal_width() -> usize {
     std::env::var("COLUMNS")
@@ -471,6 +673,304 @@ async fn run_enable_key(
     }
     println!("{body}");
     0
+}
+
+struct StreamTarget {
+    base: String,
+    token: String,
+    confirm: Option<String>,
+    settings: reiki::config::StreamAdminConfig,
+}
+
+fn stream_target(
+    config: &std::path::Path,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+) -> Result<StreamTarget, String> {
+    let text = std::fs::read_to_string(config)
+        .map_err(|e| format!("cannot read {}: {e}", config.display()))?;
+    let parsed = Config::parse(&text).map_err(|e| format!("config: {e}"))?;
+    let settings = parsed
+        .stream_admin
+        .clone()
+        .ok_or_else(|| "the config has no [stream_admin] table".to_owned())?;
+    let admin = parsed
+        .admin
+        .as_ref()
+        .ok_or_else(|| "the config has no [admin] listener".to_owned())?;
+    let token = match token_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read the token file: {e}"))?
+            .trim()
+            .to_owned(),
+        None => std::env::var(&settings.token_env).unwrap_or_default(),
+    };
+    if token.is_empty() {
+        return Err(format!(
+            "give the stream-admin token with --token-file or {}",
+            settings.token_env
+        ));
+    }
+    let confirm = std::env::var(&settings.confirm_env)
+        .ok()
+        .filter(|v| !v.is_empty());
+    if !settings.require_two_party.is_empty() && confirm.is_none() {
+        return Err(format!(
+            "two-party confirmation is configured; set {}",
+            settings.confirm_env
+        ));
+    }
+    let base = match url {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => format!("http://{}", admin.listen.replace("0.0.0.0", "127.0.0.1")),
+    };
+    Ok(StreamTarget {
+        base,
+        token,
+        confirm,
+        settings,
+    })
+}
+
+fn mutation_meta(
+    reason: Option<&String>,
+    key: Option<&String>,
+) -> Result<(String, String), String> {
+    let reason = reason
+        .filter(|reason| !reason.is_empty())
+        .ok_or_else(|| "mutations need --reason".to_owned())?
+        .clone();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let key = key
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("cli-{}-{nanos}", std::process::id()));
+    Ok((reason, key))
+}
+
+async fn stream_call(
+    target: &StreamTarget,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    idempotency: Option<&str>,
+) -> i32 {
+    let mut request = reqwest::Client::new()
+        .request(method.clone(), format!("{}{}", target.base, path))
+        .bearer_auth(&target.token);
+    if method != reqwest::Method::GET && method != reqwest::Method::HEAD {
+        if let Some(confirm) = &target.confirm {
+            request = request.header("x-confirm-token", confirm);
+        }
+        if let Some(key) = idempotency {
+            request = request.header("idempotency-key", key);
+        }
+    }
+    if let Some(body) = body {
+        match serde_json::to_vec(&body) {
+            Ok(bytes) => {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes);
+            }
+            Err(e) => {
+                eprintln!("reiki: cannot encode the request: {e}");
+                return 2;
+            }
+        }
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("reiki: cannot reach {}: {e}", target.base);
+            return 2;
+        }
+    };
+    let status = response.status();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("reiki: cannot read the answer: {e}");
+            return 2;
+        }
+    };
+    if !text.is_empty() {
+        println!("{text}");
+    }
+    if status.is_success() {
+        0
+    } else {
+        eprintln!("reiki: the stream admin API answered {status}");
+        1
+    }
+}
+
+fn streams_usage_error(message: &str) -> i32 {
+    eprintln!("reiki: {message}");
+    2
+}
+
+async fn run_streams(
+    config: &std::path::Path,
+    url: Option<&str>,
+    token_file: Option<&std::path::Path>,
+    reason: Option<&String>,
+    idempotency: Option<&String>,
+    command: &StreamsCommand,
+) -> i32 {
+    if let StreamsCommand::Audit { command } = command {
+        return match command {
+            StreamAuditCommand::Verify { file } => match reiki::stream_admin::verify_audit(file) {
+                Ok(count) => {
+                    println!("ok: {count} audit record(s), chain verified");
+                    0
+                }
+                Err(error) => streams_usage_error(&format!("audit verify failed: {error}")),
+            },
+            StreamAuditCommand::Head { file, n } => {
+                match reiki::stream_admin::audit_head(file, *n) {
+                    Ok(records) => {
+                        for record in records {
+                            match serde_json::to_string(&record) {
+                                Ok(line) => println!("{line}"),
+                                Err(_) => {
+                                    return streams_usage_error("cannot render an audit record");
+                                }
+                            }
+                        }
+                        0
+                    }
+                    Err(error) => streams_usage_error(&format!("audit head failed: {error}")),
+                }
+            }
+        };
+    }
+    let target = match stream_target(config, url, token_file) {
+        Ok(target) => target,
+        Err(error) => return streams_usage_error(&error),
+    };
+    let _ = &target.settings;
+    match command {
+        StreamsCommand::List => {
+            stream_call(&target, reqwest::Method::GET, "/v1/streams", None, None).await
+        }
+        StreamsCommand::Show { name } => {
+            stream_call(
+                &target,
+                reqwest::Method::GET,
+                &format!("/v1/streams/{}", percent_encode_query(name)),
+                None,
+                None,
+            )
+            .await
+        }
+        StreamsCommand::Create { name, key, ttl } => {
+            let (reason, idempotency) = match mutation_meta(reason, idempotency) {
+                Ok(meta) => meta,
+                Err(error) => return streams_usage_error(&error),
+            };
+            let mut body = serde_json::json!({"name": name, "key": key, "reason": reason});
+            if let Some(ttl) = ttl {
+                body["ttl"] = serde_json::json!(ttl);
+            }
+            stream_call(
+                &target,
+                reqwest::Method::POST,
+                "/v1/streams/create",
+                Some(body),
+                Some(&idempotency),
+            )
+            .await
+        }
+        StreamsCommand::Update {
+            name,
+            key,
+            rpm,
+            tpm,
+        } => {
+            let (reason, idempotency) = match mutation_meta(reason, idempotency) {
+                Ok(meta) => meta,
+                Err(error) => return streams_usage_error(&error),
+            };
+            let mut body = serde_json::json!({"reason": reason});
+            if let Some(key) = key {
+                body["key"] = serde_json::json!(key);
+            }
+            let mut limits = serde_json::Map::new();
+            if let Some(rpm) = rpm {
+                limits.insert("rpm".to_owned(), serde_json::json!(rpm));
+            }
+            if let Some(tpm) = tpm {
+                limits.insert("tpm".to_owned(), serde_json::json!(tpm));
+            }
+            if !limits.is_empty() {
+                body["limits"] = serde_json::Value::Object(limits);
+            }
+            stream_call(
+                &target,
+                reqwest::Method::PUT,
+                &format!("/v1/streams/{}", percent_encode_query(name)),
+                Some(body),
+                Some(&idempotency),
+            )
+            .await
+        }
+        StreamsCommand::Revoke { name } => {
+            let (reason, idempotency) = match mutation_meta(reason, idempotency) {
+                Ok(meta) => meta,
+                Err(error) => return streams_usage_error(&error),
+            };
+            stream_call(
+                &target,
+                reqwest::Method::POST,
+                &format!("/v1/streams/{}/revoke", percent_encode_query(name)),
+                Some(serde_json::json!({"reason": reason})),
+                Some(&idempotency),
+            )
+            .await
+        }
+        StreamsCommand::Token { command } => match command {
+            StreamTokenCommand::Add { name, ttl } => {
+                let (reason, idempotency) = match mutation_meta(reason, idempotency) {
+                    Ok(meta) => meta,
+                    Err(error) => return streams_usage_error(&error),
+                };
+                let mut body = serde_json::json!({"reason": reason});
+                if let Some(ttl) = ttl {
+                    body["ttl"] = serde_json::json!(ttl);
+                }
+                stream_call(
+                    &target,
+                    reqwest::Method::POST,
+                    &format!("/v1/streams/{}/tokens", percent_encode_query(name)),
+                    Some(body),
+                    Some(&idempotency),
+                )
+                .await
+            }
+            StreamTokenCommand::Revoke { name, token_id } => {
+                let (reason, idempotency) = match mutation_meta(reason, idempotency) {
+                    Ok(meta) => meta,
+                    Err(error) => return streams_usage_error(&error),
+                };
+                stream_call(
+                    &target,
+                    reqwest::Method::POST,
+                    &format!(
+                        "/v1/streams/{}/tokens/{}/revoke",
+                        percent_encode_query(name),
+                        percent_encode_query(token_id)
+                    ),
+                    Some(serde_json::json!({"reason": reason})),
+                    Some(&idempotency),
+                )
+                .await
+            }
+        },
+        StreamsCommand::Audit { .. } => unreachable!("handled above"),
+    }
 }
 
 #[cfg(feature = "plugin-wasm")]
@@ -654,6 +1154,26 @@ async fn main() {
             .await,
         );
     }
+    if let Some(Command::Streams {
+        url,
+        token_file,
+        reason,
+        idempotency_key,
+        command,
+    }) = &cli.command
+    {
+        std::process::exit(
+            run_streams(
+                &cli.config,
+                url.as_deref(),
+                token_file.as_deref(),
+                reason.as_ref(),
+                idempotency_key.as_ref(),
+                command,
+            )
+            .await,
+        );
+    }
     #[cfg(feature = "peers")]
     if let Some(Command::Peers { json, watch }) = &cli.command {
         let config = load_peers_config(&cli.config);
@@ -680,6 +1200,28 @@ async fn main() {
             )
             .await,
         );
+    }
+    #[cfg(feature = "plugin-cost")]
+    if let Some(Command::Cost { command }) = &cli.command {
+        match command {
+            CostCommand::Export {
+                period,
+                format,
+                url,
+                token_file,
+            } => {
+                std::process::exit(
+                    run_cost_export(
+                        &cli.config,
+                        period,
+                        *format,
+                        url.as_deref(),
+                        token_file.as_deref(),
+                    )
+                    .await,
+                );
+            }
+        }
     }
     if let Some(Command::HashToken) = cli.command {
         let mut token = String::new();
@@ -753,7 +1295,17 @@ async fn main() {
     } else {
         config.plugins.clone()
     };
-    let plugins = PluginChain::build(&plugin_tables, &builtin())
+    let mut state_path = cli.config.clone();
+    match state_path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => {
+            state_path.set_extension(format!("{ext}.state"));
+        }
+        _ => {
+            state_path.set_extension("state");
+        }
+    }
+    let host = PluginHost::with_state_path(state_path);
+    let plugins = PluginChain::build_with_host(&plugin_tables, &builtin(), &host)
         .unwrap_or_else(|e| fail(&format!("config: {e}")));
     let env_listen = std::env::var("REIKI_LISTEN").ok();
     let listen = effective_listen(cli.listen.as_deref(), env_listen.as_deref(), &config.listen)
@@ -869,13 +1421,19 @@ async fn main() {
         .as_ref()
         .map(reiki::peers::tls::check_ca_files)
         .unwrap_or_default();
+    let stream_admin_config = config.stream_admin.clone();
     let app = App::new(config, keys, Policy::default(), plugins);
     #[cfg(feature = "peers")]
     app.set_peer_ca(peer_ca);
-    app.set_state_path(state_path);
+    app.set_state_path(state_path.clone());
     app.start_state_writer();
     app.set_config_path(cli.config.clone());
     app.set_logging(Arc::clone(&logging));
+    if let Some(settings) = &stream_admin_config {
+        let manager = reiki::stream_admin::Manager::new(settings, state_dir);
+        app.set_stream_admin(Arc::clone(&manager));
+        manager.reload_from_disk();
+    }
     tokio::spawn(reiki::reload::watch(Arc::clone(&app)));
     app.load_persisted_state();
     #[cfg(unix)]

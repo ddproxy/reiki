@@ -76,8 +76,10 @@ struct StatusStream {
     chain: Vec<String>,
     #[serde(rename = "current_key")]
     _current_key: Value,
-    #[serde(rename = "rate_limit_per_minute")]
-    _rate_limit_per_minute: Value,
+    #[serde(rename = "limits")]
+    _limits: Value,
+    #[serde(rename = "usage")]
+    _usage: Value,
 }
 
 /// Turns a `/v1/status` answer into the rows `reiki keys` shows.
@@ -334,7 +336,7 @@ mod tests {
             {"name":"b","upstream":"zen","consecutive_failures":2,"state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429,"scopes":[]},
             {"name":"a","upstream":"zen","consecutive_failures":0,"state":"out_of_rotation","scopes":[]},
             {"name":"c","upstream":"zen","consecutive_failures":0,"state":"available","scopes":[{"route":"/responses","model":"gpt-big","retry_after_seconds":9,"cooldown_class":"quota_exhausted"}]}],
-          "streams":[{"name":"s2","strategy":"sticky","chain":["a","b"],"current_key":"a","rate_limit_per_minute":null},{"name":"s1","strategy":"round_robin","chain":["b"],"current_key":null,"rate_limit_per_minute":10}],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
+          "streams":[{"name":"s2","strategy":"sticky","chain":["a","b"],"current_key":"a","limits":{"rpm":null},"usage":{"requests":0,"tokens":0,"minute_requests":0,"minute_tokens":0}},{"name":"s1","strategy":"round_robin","chain":["b"],"current_key":null,"limits":{"rpm":10},"usage":{"requests":0,"tokens":0,"minute_requests":0,"minute_tokens":0}}],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
         let keys = parse_status(body).unwrap();
         let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(names, ["b", "a", "c"]);

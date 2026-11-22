@@ -4,7 +4,7 @@ Reiki controls traffic that reaches its listeners. It is not a sandbox for the c
 
 | Threat | Covered by | Not covered |
 | --- | --- | --- |
-| An agent or another host reading a key file | Directory mode `0700`, file mode `0600`, `umask 077`, and `reiki keys --check` warnings on group or other read bits | Any process running as the Reiki user, or as root, can read the file. The daemon reads, trims and length-checks key files at startup and on reload; it does not check their mode. |
+| An agent or another host reading a key file | Directory mode `0700`, file mode `0600`, `umask 077`, and `strict_key_permissions = true` (default), which refuses group or other read/write bits at startup and reload; `reiki keys --check` reports the same | Any process running as the Reiki user, or as root, can read the file. `strict_key_permissions = false` turns the refusal into a warning. |
 | A client getting an upstream key | Reiki removes client credential headers and the `key` query parameter, then sets the upstream credential per attempt | A `passthrough` upstream forwards the client's own credentials and query string. An upstream echo of a key in a form outside the scrubber's list is a limit; see the encoding row below. |
 | A plugin reading or changing a request | Plugins are compiled in and run inside Reiki; they never receive the upstream key | A plugin is trusted code. It sees the client token, request headers, path and body, and can rewrite bodies or reject requests. Panics are caught, not sandboxed. Only compile in plugins you have read. |
 | Traffic to arbitrary destinations | Config-only upstreams and a `[tunnel]` allow-list | An allowed CONNECT destination stays opaque unless `[tunnel.intercept]` lists its host. No token is required on the tunnel socket, so restrict network access. `allow = ["*"]` is legal and leaves every destination it permits (port 443 by default) unread by plugins. |
@@ -19,7 +19,7 @@ Reiki controls traffic that reaches its listeners. It is not a sandbox for the c
 
 Write the file with mode `0600`, keep its directory private, and run `reiki keys --check` in deployment checks. That command checks existence, readability, non-empty content and group/other read bits. It prints no key value. See [keys](keys.md#key-files).
 
-The daemon's `load_keys` reads the file as UTF-8, trims it and requires at least 8 bytes. It does not inspect the file's mode at startup or reload. A process with the Reiki user's privileges can read the same file. Treat the host and that account as part of the trust boundary.
+The daemon reads the file as UTF-8, trims it and requires at least 8 bytes. With the default `strict_key_permissions = true`, startup, reload and `reiki keys --check` refuse a file that group or other users can read or write; set it to `false` for warning-only behaviour. A process with the Reiki user's privileges can still read the file. Treat the host and that account as part of the trust boundary.
 
 ## Plugins are trusted code
 

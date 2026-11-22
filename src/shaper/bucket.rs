@@ -7,8 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::classify::days_from_civil;
-use reiki_plugin::civil_from_days;
+use reiki_plugin::{civil_from_days, days_from_civil};
 
 const MINUTE: Duration = Duration::from_secs(60);
 const DAY: i64 = 86_400;

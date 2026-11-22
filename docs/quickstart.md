@@ -43,7 +43,7 @@ printf '%s' "$ADMIN_TOKEN"  | reiki hash-token
 
 Put each printed hash in the config below. Keep the raw tokens for the client and the admin CLI calls.
 
-> **Key-file limit.** Mode `0600` is the right setting, but the daemon does not check key-file modes at startup. `reiki keys --check` warns on group or other read bits; same-user processes can still read the file. See [limits](limits.md).
+> **Key-file permissions.** Mode `0600` is the right setting. With the default `strict_key_permissions = true`, startup, reload and `reiki keys --check` refuse a key file that group or other users can read or write; set it to `false` for warning-only behaviour. Same-user processes can still read the file. See [limits](limits.md) and [keys](keys.md#key-files).
 
 ## 2. Write the config
 

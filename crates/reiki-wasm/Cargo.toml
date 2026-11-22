@@ -1,0 +1,31 @@
+[package]
+name = "reiki-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Wasm plugin host for the reiki relay"
+license = "MIT"
+publish = false
+
+[dependencies]
+reiki-plugin = { path = "../reiki-plugin" }
+reiki-toolpolicy = { path = "../reiki-toolpolicy" }
+bytes = "1"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+toml = "1.2"
+tracing = "0.1"
+anyhow = "1"
+wasmtime = { version = "=42.0.1", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "=42.0.1", default-features = false, features = ["p2"] }
+
+[dev-dependencies]
+wat = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

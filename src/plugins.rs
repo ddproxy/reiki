@@ -116,6 +116,10 @@ impl Entry {
     }
 }
 
+fn is_wasm_table(table: &toml::Table) -> bool {
+    table.contains_key("wasm")
+}
+
 /// The streams a plugin is limited to, or `None` when it runs on every stream.
 pub(crate) fn streams_of(
     name: &str,
@@ -249,8 +253,26 @@ impl PluginChain {
         configured: &BTreeMap<String, toml::Table>,
         registry: &[Registration],
     ) -> Result<Self, ConfigError> {
+        let mut builtin_entries = Vec::new();
+        #[cfg(feature = "plugin-wasm")]
+        let mut wasm_entries: Vec<String> = Vec::new();
         for name in configured.keys() {
-            if !registry.iter().any(|r| r.name == name) {
+            if registry.iter().any(|r| r.name == name) {
+                continue;
+            }
+            if is_wasm_table(configured.get(name).unwrap()) {
+                #[cfg(feature = "plugin-wasm")]
+                {
+                    wasm_entries.push(name.clone());
+                }
+                #[cfg(not(feature = "plugin-wasm"))]
+                {
+                    return Err(ConfigError::PluginConfig {
+                        name: name.clone(),
+                        message: "runtime Wasm plugins require a binary built with the `plugin-wasm` feature".to_owned(),
+                    });
+                }
+            } else {
                 return Err(ConfigError::UnknownPlugin {
                     name: name.clone(),
                     known: registry.iter().map(|r| r.name.to_string()).collect(),
@@ -258,7 +280,6 @@ impl PluginChain {
             }
         }
 
-        let mut entries = Vec::new();
         for reg in registry {
             let Some(table) = configured.get(reg.name) else {
                 continue;
@@ -274,6 +295,87 @@ impl PluginChain {
             })?;
             let plugin: Arc<dyn Plugin> = Arc::from(plugin);
             let on_error = resolve_on_error(reg.name, explicit, plugin.as_ref());
+            builtin_entries.push(Entry {
+                stamps: stamps_of(plugin.as_ref()),
+                plugin,
+                on_error,
+                table: table.clone(),
+                streams,
+            });
+        }
+
+        #[cfg(feature = "plugin-wasm")]
+        let wasm_built = Self::build_wasm_entries(configured, &wasm_entries)?;
+        #[cfg(not(feature = "plugin-wasm"))]
+        let wasm_built: Vec<Entry> = Vec::new();
+
+        let entries = Self::insert_wasm_at_d5_slot(builtin_entries, wasm_built);
+        Self::check_admin_paths(&entries)?;
+        Ok(Self { entries })
+    }
+
+    fn insert_wasm_at_d5_slot(mut builtin: Vec<Entry>, wasm: Vec<Entry>) -> Vec<Entry> {
+        if wasm.is_empty() {
+            return builtin;
+        }
+        // D5: runtime Wasm plugins run after every compiled-in request plugin and before
+        // every compiled-in response plugin. The fixed inner slot is immediately before the
+        // first response-observer builtin (requestlog/metrics/toolpolicy), which places them
+        // after placeholders on request and before placeholders on response (masked both ways).
+        let pos = builtin
+            .iter()
+            .position(|e| matches!(e.plugin.name(), "requestlog" | "metrics" | "toolpolicy"))
+            .unwrap_or(builtin.len());
+        let tail = builtin.split_off(pos);
+        builtin.extend(wasm);
+        builtin.extend(tail);
+        builtin
+    }
+
+    #[cfg(feature = "plugin-wasm")]
+    fn build_wasm_entries(
+        configured: &BTreeMap<String, toml::Table>,
+        names: &[String],
+    ) -> Result<Vec<Entry>, ConfigError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let engine =
+            reiki_wasm::WasmEngine::new().map_err(|message| ConfigError::PluginConfig {
+                name: "wasm".to_owned(),
+                message,
+            })?;
+        let engine = Arc::new(engine);
+        let mut entries = Vec::new();
+        for name in names {
+            let Some(table) = configured.get(name) else {
+                continue;
+            };
+            if !enabled(name, table)? {
+                continue;
+            }
+            let cfg =
+                reiki_wasm::config::parse_wasm_plugin_config(name, table).map_err(|message| {
+                    ConfigError::PluginConfig {
+                        name: name.clone(),
+                        message,
+                    }
+                })?;
+            let explicit = match cfg.on_error.as_deref() {
+                Some("pass_through") => Some(OnError::PassThrough),
+                Some("reject") => Some(OnError::Reject),
+                _ => None,
+            };
+            let streams = cfg.streams.clone();
+            let plugin =
+                reiki_wasm::WasmPlugin::load(Arc::clone(&engine), cfg).map_err(|message| {
+                    ConfigError::PluginConfig {
+                        name: name.clone(),
+                        message,
+                    }
+                })?;
+            let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+            let on_error = resolve_on_error(name, explicit, plugin.as_ref());
             entries.push(Entry {
                 stamps: stamps_of(plugin.as_ref()),
                 plugin,
@@ -282,8 +384,148 @@ impl PluginChain {
                 streams,
             });
         }
-        Self::check_admin_paths(&entries)?;
-        Ok(Self { entries })
+        Ok(entries)
+    }
+
+    #[cfg(feature = "plugin-wasm")]
+    fn rebuild_wasm_entries(
+        &self,
+        configured: &BTreeMap<String, toml::Table>,
+        names: &[String],
+        build: bool,
+        changed: &mut Vec<String>,
+        restart_needed: &mut Vec<String>,
+    ) -> Result<Vec<Entry>, ConfigError> {
+        let mut entries = Vec::new();
+        // Handle removals: old wasm plugins not in configured
+        for old in &self.entries {
+            let is_wasm_old = is_wasm_table(&old.table);
+            if !is_wasm_old {
+                continue;
+            }
+            if !configured.contains_key(old.plugin.name()) {
+                changed.push(old.plugin.name().to_owned());
+            }
+        }
+
+        if names.is_empty() {
+            return Ok(entries);
+        }
+        let engine =
+            reiki_wasm::WasmEngine::new().map_err(|message| ConfigError::PluginConfig {
+                name: "wasm".to_owned(),
+                message,
+            })?;
+        let engine = Arc::new(engine);
+        for name in names {
+            let Some(table) = configured.get(name) else {
+                continue;
+            };
+            if !enabled(name, table)? {
+                // if it existed before, removal already counted above
+                continue;
+            }
+            let old = self
+                .entries
+                .iter()
+                .find(|e| e.plugin.name() == name.as_str() && is_wasm_table(&e.table));
+            let new_cfg =
+                reiki_wasm::config::parse_wasm_plugin_config(name, table).map_err(|message| {
+                    ConfigError::PluginConfig {
+                        name: name.clone(),
+                        message,
+                    }
+                })?;
+            let streams = new_cfg.streams.clone();
+            let explicit = match new_cfg.on_error.as_deref() {
+                Some("pass_through") => Some(OnError::PassThrough),
+                Some("reject") => Some(OnError::Reject),
+                _ => None,
+            };
+
+            if let Some(old) = old {
+                if same_settings(&old.table, table) && !old.files_changed() {
+                    if old.streams != streams {
+                        changed.push(name.clone());
+                    }
+                    entries.push(old.share(streams));
+                    continue;
+                }
+                // Wasm-specific reload narrowing
+                let old_cfg = reiki_wasm::config::parse_wasm_plugin_config(name, &old.table).ok();
+                let narrowing = if let Some(ref oc) = old_cfg {
+                    let old_has_high_or_med = oc.grants.iter().any(|g| g.risk() != "low");
+                    reiki_wasm::config::reload_narrowing(oc, &new_cfg, old_has_high_or_med)
+                } else {
+                    reiki_wasm::ReloadDecision::RestartNeeded(vec!["config".to_owned()])
+                };
+                match narrowing {
+                    reiki_wasm::ReloadDecision::Live => {
+                        // Can live-reload: rebuild instance if build requested, or reuse?
+                        // live narrowing means safe to rebuild. D6/2.6 says "live reloadable".
+                        changed.push(name.clone());
+                        if build {
+                            let plugin = reiki_wasm::WasmPlugin::load(Arc::clone(&engine), new_cfg)
+                                .map_err(|message| ConfigError::PluginConfig {
+                                    name: name.clone(),
+                                    message,
+                                })?;
+                            let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+                            let on_error = resolve_on_error(name, explicit, plugin.as_ref());
+                            entries.push(Entry {
+                                stamps: stamps_of(plugin.as_ref()),
+                                plugin,
+                                on_error,
+                                table: table.clone(),
+                                streams,
+                            });
+                        } else {
+                            // plan mode: validate by building then drop
+                            let _plugin =
+                                reiki_wasm::WasmPlugin::load(Arc::clone(&engine), new_cfg)
+                                    .map_err(|message| ConfigError::PluginConfig {
+                                        name: name.clone(),
+                                        message,
+                                    })?;
+                        }
+                    }
+                    reiki_wasm::ReloadDecision::RestartNeeded(_reasons) => {
+                        restart_needed.push(name.clone());
+                        if old.streams != streams {
+                            changed.push(name.clone());
+                        }
+                        entries.push(old.share(streams));
+                    }
+                }
+            } else {
+                changed.push(name.clone());
+                if build {
+                    let plugin = reiki_wasm::WasmPlugin::load(Arc::clone(&engine), new_cfg)
+                        .map_err(|message| ConfigError::PluginConfig {
+                            name: name.clone(),
+                            message,
+                        })?;
+                    let plugin: Arc<dyn Plugin> = Arc::from(plugin);
+                    let on_error = resolve_on_error(name, explicit, plugin.as_ref());
+                    entries.push(Entry {
+                        stamps: stamps_of(plugin.as_ref()),
+                        plugin,
+                        on_error,
+                        table: table.clone(),
+                        streams,
+                    });
+                } else {
+                    // plan: validate by building if it looks like a new plugin? plan builds if old.is_some() in registry path;
+                    // for new wasm plugins, build to validate.
+                    let _plugin = reiki_wasm::WasmPlugin::load(Arc::clone(&engine), new_cfg)
+                        .map_err(|message| ConfigError::PluginConfig {
+                            name: name.clone(),
+                            message,
+                        })?;
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// Builds the next chain for a reload. A plugin whose table did not change keeps its running
@@ -314,8 +556,25 @@ impl PluginChain {
         registry: &[Registration],
         build: bool,
     ) -> Result<Rebuilt, ConfigError> {
+        #[cfg(feature = "plugin-wasm")]
+        let mut wasm_names: Vec<String> = Vec::new();
         for name in configured.keys() {
-            if !registry.iter().any(|r| r.name == name) {
+            if registry.iter().any(|r| r.name == name) {
+                continue;
+            }
+            if is_wasm_table(configured.get(name).unwrap()) {
+                #[cfg(feature = "plugin-wasm")]
+                {
+                    wasm_names.push(name.clone());
+                }
+                #[cfg(not(feature = "plugin-wasm"))]
+                {
+                    return Err(ConfigError::PluginConfig {
+                        name: name.clone(),
+                        message: "runtime Wasm plugins require a binary built with the `plugin-wasm` feature".to_owned(),
+                    });
+                }
+            } else {
                 return Err(ConfigError::UnknownPlugin {
                     name: name.clone(),
                     known: registry.iter().map(|r| r.name.to_string()).collect(),
@@ -356,8 +615,6 @@ impl PluginChain {
                 (_, Some(table)) => {
                     let explicit = on_error(reg.name, table)?;
                     changed.push(reg.name.to_owned());
-                    // A preview builds a plugin that is already running (so it is safe to build
-                    // again) and drops it, so a bad file path fails the preview as it would the reload.
                     if build || old.is_some() {
                         let plugin =
                             (reg.build)(table).map_err(|message| ConfigError::PluginConfig {
@@ -380,14 +637,38 @@ impl PluginChain {
                 }
             }
         }
-        if build {
-            Self::check_admin_paths(&entries)?;
+
+        #[cfg(feature = "plugin-wasm")]
+        {
+            let wasm = self.rebuild_wasm_entries(
+                configured,
+                &wasm_names,
+                build,
+                &mut changed,
+                &mut restart_needed,
+            )?;
+            let entries = Self::insert_wasm_at_d5_slot(entries, wasm);
+            if build {
+                Self::check_admin_paths(&entries)?;
+            }
+            Ok(Rebuilt {
+                chain: Self { entries },
+                changed,
+                restart_needed,
+            })
         }
-        Ok(Rebuilt {
-            chain: Self { entries },
-            changed,
-            restart_needed,
-        })
+
+        #[cfg(not(feature = "plugin-wasm"))]
+        {
+            if build {
+                Self::check_admin_paths(&entries)?;
+            }
+            Ok(Rebuilt {
+                chain: Self { entries },
+                changed,
+                restart_needed,
+            })
+        }
     }
 
     /// Starts a request's plugin session: this chain and fresh per-request state for each plugin.

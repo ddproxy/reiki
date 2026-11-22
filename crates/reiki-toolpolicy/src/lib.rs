@@ -5,12 +5,13 @@
 //! responses in `report` mode (default) or replaces flagged calls with a plain-text notice in
 //! `block` mode.
 
-mod checks;
 mod config;
 mod journal;
 mod metrics;
-mod parse;
 mod stream;
+
+pub mod checks;
+pub mod parse;
 
 use std::any::Any;
 use std::path::Path;

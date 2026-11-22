@@ -3,6 +3,9 @@
 ## Unreleased
 
 ## 0.14.0
+### Added
+
+- `plugin-wasm` (off by default): runtime Wasm component plugins in the D5 inner slot. Phase 1 supports `on-request`, default-allowed capabilities, gated `request-body:read|edit` and `finding:detail-vocab`, embedded manifest pinning (`sha256` + `reiki-manifest`), host-applied JSON edit ops, limits/fuel/epoch traps, reload narrowing, `reiki plugin inspect`, and host-enforced request-side tool allowlists that reuse `reiki-toolpolicy` request parsing. See [Wasm plugins](docs/wasm-plugins.md).
 
 ### Changed
 

@@ -1,3 +1,5 @@
+details = ["rule.model-redacted"]
+
 [plugin]
 name = "body-edit"
 version = "0.1.0"
@@ -6,15 +8,18 @@ hooks = ["on-request"]
 
 [requests]
 request-body = "edit"
+request-body-read = true
+finding-detail = "vocab"
 
 [literals]
 redacted-model = "redacted"
 
-details = []
-
 [log-templates]
+edited = "wasm edited {0} bytes"
 
-[reject-templates]
+[reject-templates.bad-model]
+status = 422
+message = "model not allowed by wasm plugin"
 
 [limits]
 memory_mib = 16

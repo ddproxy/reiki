@@ -80,20 +80,34 @@ impl wasmtime_wasi::WasiView for HostState {
 }
 
 fn classify_trap(err: &wasmtime::Error) -> TrapKind {
-    if let Some(trap) = err.downcast_ref::<Trap>() {
-        return match *trap {
-            Trap::OutOfFuel => TrapKind::Fuel,
-            Trap::Interrupt => TrapKind::Epoch,
-            _ => TrapKind::Other(trap.to_string()),
-        };
+    // Wasmtime wraps traps in context, so the top-level error is not always the
+    // Trap itself. Search the whole cause chain before falling back to text.
+    for cause in err.chain() {
+        if let Some(trap) = cause.downcast_ref::<Trap>() {
+            return match *trap {
+                Trap::OutOfFuel => TrapKind::Fuel,
+                Trap::Interrupt => TrapKind::Epoch,
+                _ => TrapKind::Other(trap.to_string()),
+            };
+        }
     }
-    let msg = err.to_string();
+    let msg = err
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
     let lower = msg.to_ascii_lowercase();
     if lower.contains("out of fuel") {
         TrapKind::Fuel
     } else if lower.contains("interrupt") || lower.contains("epoch") {
         TrapKind::Epoch
-    } else if lower.contains("memory") && lower.contains("grow") {
+    } else if lower.contains("forcing trap when growing memory")
+        || (lower.contains("memory")
+            && (lower.contains("grow")
+                || lower.contains("limit")
+                || lower.contains("maximum")
+                || lower.contains("size")))
+    {
         TrapKind::Memory
     } else {
         TrapKind::Other(msg)
@@ -206,6 +220,9 @@ impl WasmPlugin {
     fn make_state(&self) -> HostState {
         let limits = StoreLimitsBuilder::new()
             .memory_size((self.limits.memory_mib * 1024 * 1024) as usize)
+            // Without this, memory.grow returns -1 and the guest allocator aborts with
+            // `unreachable`, which the host cannot tell apart from a guest trap.
+            .trap_on_grow_failure(true)
             .build();
         // Inert WASI p2: no preopens, empty env/args, stdio sink.
         let wasi = wasmtime_wasi::WasiCtxBuilder::new().build();
@@ -256,6 +273,9 @@ impl WasmPlugin {
         let result = plugin
             .call_init(&mut store, &config_bytes)
             .map_err(|e| format!("init {}: {e}", self.name, e = self.format_err(&store, e)))?;
+        if let Some(kind) = store.data().trap.clone() {
+            return Err(format!("init {}: {}", self.name, trap_message(&kind)));
+        }
         match result {
             Ok(()) => Ok(()),
             Err(msg) => Err(format!("init {} failed: {msg}", self.name)),
@@ -307,6 +327,9 @@ impl WasmPlugin {
             Ok(r) => r,
             Err(e) => return Err(self.trap_to_error(&store, e)),
         };
+        if let Some(kind) = store.data().trap.clone() {
+            return Err(self.trap_kind_to_error(&kind));
+        }
         if let Err(msg) = init_res {
             return Err(self.fail_closed_error(&format!("wasm init: {msg}")));
         }
@@ -327,6 +350,11 @@ impl WasmPlugin {
             Ok(r) => r,
             Err(e) => return Err(self.trap_to_error(&store, e)),
         };
+        // A deadline reached inside a host call poisons the store without raising a
+        // Wasmtime trap. Do not let a guest that ignores the deny reason pass.
+        if let Some(kind) = store.data().trap.clone() {
+            return Err(self.trap_kind_to_error(&kind));
+        }
 
         // Collect findings
         let findings = std::mem::take(&mut store.data_mut().findings);
@@ -395,11 +423,15 @@ impl WasmPlugin {
 
     fn trap_to_error(&self, _store: &Store<HostState>, err: wasmtime::Error) -> PluginError {
         let kind = classify_trap(&err);
+        self.trap_kind_to_error(&kind)
+    }
+
+    fn trap_kind_to_error(&self, kind: &TrapKind) -> PluginError {
         tracing::warn!(plugin = %self.name, kind = ?kind, "wasm plugin trapped");
         if self.role_security || self.config.on_error.as_deref() == Some("reject") {
-            PluginError::Reject(trap_status(&kind), trap_message(&kind).to_owned())
+            PluginError::Reject(trap_status(kind), trap_message(kind).to_owned())
         } else {
-            PluginError::Skip(trap_message(&kind).to_owned())
+            PluginError::Skip(trap_message(kind).to_owned())
         }
     }
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
+- Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.
+
+### Tests
+
+- Added config validation edge cases for token hashes, duplicates, rate limits, chains, reserved names, admin credentials, listener collisions and auth bounds.
+
 ## 0.14.0
 ### Added
 

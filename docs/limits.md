@@ -19,7 +19,7 @@ Reiki controls traffic that reaches its listeners. It is not a sandbox for the c
 
 Write the file with mode `0600`, keep its directory private, and run `reiki keys --check` in deployment checks. That command checks existence, readability, non-empty content and group/other read bits. It prints no key value. See [keys](keys.md#key-files).
 
-The daemon reads the file as UTF-8, trims it and requires at least 8 bytes. With the default `strict_key_permissions = true`, startup, reload and `reiki keys --check` refuse a file that group or other users can read or write; set it to `false` for warning-only behaviour. A process with the Reiki user's privileges can still read the file. Treat the host and that account as part of the trust boundary.
+The daemon reads the file as UTF-8, trims it and requires 8 to 4096 bytes. With the default `strict_key_permissions = true`, startup and reload refuse a file that group or other users can read or write; set it to `false` to warn instead. `reiki keys --check` always reports such a file as a warning and exits `1`. A process with the Reiki user's privileges can still read the file. Treat the host and that account as part of the trust boundary.
 
 ## Plugins are trusted code
 

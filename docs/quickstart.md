@@ -43,7 +43,7 @@ printf '%s' "$ADMIN_TOKEN"  | reiki hash-token
 
 Put each printed hash in the config below. Keep the raw tokens for the client and the admin CLI calls.
 
-> **Key-file permissions.** Mode `0600` is the right setting. With the default `strict_key_permissions = true`, startup, reload and `reiki keys --check` refuse a key file that group or other users can read or write; set it to `false` for warning-only behaviour. Same-user processes can still read the file. See [limits](limits.md) and [keys](keys.md#key-files).
+> **Key-file permissions.** Mode `0600` is the right setting. With the default `strict_key_permissions = true`, startup and reload refuse a key file that group or other users can read or write; set it to `false` to warn instead. `reiki keys --check` always reports such a file as a warning and exits `1`. Same-user processes can still read the file. See [limits](limits.md) and [keys](keys.md#key-files).
 
 ## 2. Write the config
 

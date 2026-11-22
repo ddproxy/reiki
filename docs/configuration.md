@@ -36,7 +36,7 @@ There is no top-level `[limits]` table. Outbound limits are set per upstream in 
 
 ## Default listeners and ports
 
-Each listener that is configured needs its own address. Client, admin, tunnel and peers addresses must differ from each other. The hub listener must differ from the client, admin and tunnel addresses and must be on loopback.
+Client, admin and tunnel addresses must differ from each other. A publishing peer listener must also differ from the client, admin and tunnel addresses. The hub listener must differ from the client, admin and tunnel addresses and must be on loopback.
 
 | Listener | Setting | Default | Notes |
 | --- | --- | --- | --- |
@@ -51,11 +51,11 @@ Each listener that is configured needs its own address. Client, admin, tunnel an
 | Key | Type | Default | Meaning | Since |
 | --- | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. | |
-| `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits (anything looser than `0600`). Set to `false` to accept it with a warning instead. | |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits; execute bits do not matter. Set to `false` to accept it with a warning instead. | |
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. |
-| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable by group or others. Set to `false` to accept it with a warning instead. |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable or writable by group or others. Set to `false` to accept it with a warning instead. |
 
 ## `[admin]`
 
@@ -181,7 +181,7 @@ Shared defaults for the multi-user gateway. See [traffic shaping](shaping.md#gat
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a peer TLS file (when the peer listener publishes), or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. |
+| `watch` | bool | `false` | Reload when the config file, a key file, an interception CA file, a `[peers.NAME] ca_file`, a peer TLS certificate or key (when the peer listener publishes), or a file a plugin reads changes. A change applies once the files stay unchanged for one more check. |
 | `interval_secs` | integer | `5` | Seconds between checks. Range 1 to 3600. |
 
 Reload also runs on SIGHUP and on `reiki reload`. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
@@ -286,7 +286,7 @@ One upstream key. The file holds the key; the config holds only its path.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `upstream` | string | required | Upstream this key authenticates to. That upstream must not be `passthrough`. |
-| `file` | string | required | Path to the file that holds the key. Read at startup and on reload. The contents are trimmed and must be at least 8 bytes. |
+| `file` | string | required | Path to the file that holds the key. Read at startup and on reload. The contents are trimmed and must be 8 to 4096 bytes. |
 | `quota_resets` | string | unset | When a quota cooldown ends. `daily HH:MM ZONE` or `monthly D HH:MM ZONE`, where `D` is 1 to 28 and `ZONE` is `UTC` or `+HH:MM` / `-HH:MM`. Without it a quota cooldown lasts 5 hours. |
 
 A quota 429 that carries `Retry-After` cools the key for that long. A `quota_resets` schedule takes precedence over both. A schedule also gives peer consumers the absolute reset as `quota_reset_at`; without a schedule or a non-zero `Retry-After`, no reset time is published. See [providers](providers.md).
@@ -335,7 +335,7 @@ A CONNECT-only forward proxy. It copies bytes without reading them, unless `inte
 | `allow` | array of strings | required | Destinations a client may open. Each entry is `host`, `host:port` (port 443 when omitted), `*.host` for any subdomain, or `*`. Must not be empty. |
 | `connect_timeout_secs` | integer | `10` | Time allowed to open the upstream connection. At least 1. |
 | `allow_loopback` | bool | `false` | Let the tunnel reach loopback addresses. For tests and local development only. |
-| `deny_private` | bool | `false` | Refuse private addresses: RFC 1918, shared `100.64.0.0/10` and IPv6 unique-local. Use it with a broad `allow` list. |
+| `deny_private` | bool | `false` | Refuse private addresses: RFC 1918, shared `100.64.0.0/10`, benchmarking `198.18.0.0/15`, `192.0.0.0/24` and IPv6 unique-local. Local, link-local and metadata addresses are refused regardless of this setting. Use it with a broad `allow` list. |
 | `close_idle_on_stop` | bool | `true` | Close tunnels idle for at least one second as soon as a stop begins; active tunnels get the drain and are then cut. |
 | `intercept` | table | unset | TLS interception. See below. |
 
@@ -522,14 +522,19 @@ Rules, by section:
 - **Logging.** `level` is a valid level or filter. `file` is an absolute path. `stderr = false` needs `file`. `file_keep` is at most 100.
 - **Service, reload, auth.** Each value is in the range shown above.
 - **Server.** Each cap is in range. A per-address cap is at most its total.
-- **Listeners.** `admin.listen`, `tunnel.listen` and `peers.listen` must differ from each other and from `listen`. A non-loopback peer listener needs TLS; a non-loopback admin listener is refused because it has no TLS option.
+- **Listeners.** `admin.listen` and `tunnel.listen` must differ from each other and from `listen`. A publishing peer listener must differ from all three. The hub listener must differ from client, admin and tunnel and be on loopback. A non-loopback peer listener needs TLS; a non-loopback admin listener is refused because it has no TLS option.
 - **Upstream.** `base_url` is `https`, or `http` on loopback. `auth_header` is a valid header name. `auth_format` has `{key}` once and makes a valid header value. Model alias keys and values are not empty. Drop-parameter names are not empty. The timeouts and `max_decoded_bytes` are at least 1. `scope_escalate_after` is 2 to 16. Each response phrase list has at most 16 unique phrases of 3 to 120 non-control characters.
 - **Upstream limits.** The table sets a preset or a limit. `max_wait_secs` is 1 to 120. The preset name is known.
 - **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `max_stream_bytes` and `stream_timeout_secs` are at least 1 when set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
+<<<<<<< ours
 - **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
 - **Gateway.** `usage_rpm` is 1 to 3600 and `on_store_error` is `closed` or `open`.
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `weight` is at least 1. Every limit in `[streams.NAME.limits]` is positive, `period_zone` is `UTC` or a fixed offset, and `on_store_error` is `closed` or `open`. Allowlist patterns use only `*` and `?`. If an upstream falls back, the chain holds a key for the target.
+=======
+- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, and holds 8 to 4096 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
+- **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
+>>>>>>> theirs
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Stream admin.** Needs `[admin]`; `allowed_listen` contains that literal loopback address. Both hashes are 64 hex characters and distinct from each other, the admin and stream tokens, and the two-party hashes. Environment variable names are valid and differ; file names are relative with the required suffix and differ. Ranges: `max_streams` 1 to 10000, `max_tokens_per_stream` 1 to 100, `default_ttl` at least 1 and no greater than `max_ttl` (at most 2592000), `max_body_bytes` 1024 to 1048576, `lockout_secs` 1 to 86400, and `lockout_threshold` and `rpm` at least 1. Every `allowed_keys` entry names a known key and sets `assignable = true`; each present ceiling is positive, and `default_limits` stay within the ceilings.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.

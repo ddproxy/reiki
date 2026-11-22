@@ -49,7 +49,7 @@ chmod 0600 /etc/reiki/keys/zen-a
 
 `NAME` in `[keys.NAME]` is a stable label. Logs, `/v1/status`, chains and the state file use it. Reiki does not enforce a naming pattern for the label or the file. Keep a name until you intend to start fresh health for that key.
 
-At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a non-empty value of at least 8 bytes. A file that is missing, unreadable, empty, too short, or (with the default `strict_key_permissions = true`) having group or other read or write bits stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
+At load and on reload, Reiki reads each file as UTF-8, trims whitespace and requires a value of 8 to 4096 bytes. A file that is missing, unreadable, empty, too short, too long, or (with the default `strict_key_permissions = true`) having group or other read or write bits stops startup and refuses the reload. See [configuration](configuration.md#keysname) and [troubleshooting](troubleshooting.md#key-health).
 
 ```bash
 reiki --config /etc/reiki/reiki.toml keys --check

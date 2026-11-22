@@ -69,6 +69,30 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
     "loaded_at": "2026-11-18T09:00:00Z",
     "last_reload": { "ok": true, "at": "2026-11-18T10:12:00Z" }
   },
+  "observed": [
+    {
+      "upstream": "relay",
+      "account": "primary",
+      "mode": "observed",
+      "status_class": "rate_limited",
+      "observed_at": "2026-11-18T10:12:05Z",
+      "retry_after_seconds": 42,
+      "cooldown_class": "rate_limited",
+      "quota": {
+        "requests_limit": 100,
+        "requests_remaining": 7,
+        "requests_reset_seconds": 60,
+        "tokens_limit": null,
+        "tokens_remaining": null,
+        "tokens_reset_seconds": null
+      }
+    }
+  ],
+  "peers": {
+    "tls_ca": [
+      { "file": "/etc/reiki/peers/peer-a-ca.pem", "ca_not_after": 1790000000, "ca_days_left": 120 }
+    ]
+  },
   "intercept": { "ca_not_after": 1790000000, "ca_days_left": 120 },
   "log": { "write_errors": 0 },
   "requestlog": { "export_dropped_total": 0 }
@@ -86,6 +110,8 @@ Key fields:
 | `retry_after_seconds` | Present while `cooling`, rounded up to at least 1 |
 | `cooldown_class` | Present while cooling with a known class: `rate_limited`, `quota_exhausted` or `transient`; a restored cooldown has no class |
 | `scopes` | Soonest-first route-and-model cooldowns, at most 16 entries; the key can stay `available` for other combinations |
+
+`observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `retry_after_seconds` counts down and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA files with `file`, `ca_not_after` (Unix seconds) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted.
 
 Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`) and `rate_limit_per_minute` (or `null`). `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
 
@@ -249,8 +275,11 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_upstream_requests_1h` | gauge | `upstream` | Attempts in the last hour |
 | `reiki_upstream_limited_1h` | gauge | `upstream` | Attempts in the last hour that were rate-limited or began a cooldown |
 | `reiki_upstream_tokens_1h` | gauge | `upstream` | Input plus output tokens in the last hour |
+| `reiki_upstream_unaccounted_1h` | gauge | `upstream` | Attempts in the last hour with no readable usage figures |
+| `reiki_passthrough_requests_total` | counter | `upstream`, `status_class` | Passthrough answers by fixed observed class; no credential, account or key label is exported |
+| `reiki_observed_cooldown_seconds` | gauge | `upstream`, `class` | Longest remaining informational cooldown across that upstream's observed accounts; `0` when none |
 
-`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The three `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists).
+`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The four `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists). The observed series come from the in-memory observation store; `account` stays out of metrics to keep cardinality bounded by upstream and class.
 
 ## GET /v1/toolpolicy/metrics
 

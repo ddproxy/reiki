@@ -40,6 +40,10 @@ struct Status {
     streams: Vec<StatusStream>,
     #[serde(rename = "config")]
     _config: Value,
+    #[serde(default, rename = "observed")]
+    _observed: Option<Value>,
+    #[serde(default, rename = "peers")]
+    _peers: Option<Value>,
     #[serde(default, rename = "intercept")]
     _intercept: Option<Value>,
     #[serde(rename = "log")]
@@ -348,6 +352,14 @@ mod tests {
             r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"weird","scopes":[]}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_status_accepts_observed_and_peer_fields() {
+        let body = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available","scopes":[]}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"observed":[{"upstream":"u","account":"default"}],"peers":{"tls_ca":[]},"log":{"write_errors":0}}"#;
+        let keys = parse_status(body).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "a");
     }
 
     #[test]

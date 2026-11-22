@@ -1022,6 +1022,7 @@ mod tests {
                 "reiki_version": "0.12.0",
                 "observed_at": "2026-11-13T10:00:00Z",
                 "age_seconds": 0,
+                "observed" : [],
                 "failures": {},
                 "upstreams": [{
                     "name": "zen",
@@ -1140,6 +1141,7 @@ mod tests {
             "reiki_version": "0.13.0",
             "observed_at": "2026-11-13T10:00:00Z",
             "age_seconds": 0,
+            "observed" : [],
             "failures": {},
             "upstreams": [{
                 "name": "zen",

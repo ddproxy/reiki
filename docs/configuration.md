@@ -141,11 +141,14 @@ One provider endpoint. Keys and streams refer to it by `NAME`. Fields marked as 
 | `hold_unauthorized` | bool | `false` | Delay disabling the first key that answers 401 until a later key serves the same request. |
 | `passthrough` | bool | `false` | Plain reverse proxy. The client's own credentials go upstream unchanged. No Reiki token and no key from a chain. A passthrough upstream cannot have `fallback`. |
 | `capacity_group` | string | unset | Opaque operator-set label published on this upstream's peer health entry. Never inferred from the upstream name, a key label or a response. 1 to 64 printable ASCII characters, not blank. |
+| `account` | string | `"default"` | Operator label for observed passthrough answers from this upstream. It groups rate-limit and quota observations without reading a credential, and follows key rotation. 1 to 64 printable ASCII characters, not blank. |
 | `fallback` | table | unset | Where requests go when no key of this upstream can serve them. See below. |
 | `forward` | table | unset | Run a command or talk to a socket instead of Reiki's HTTP client. See below. |
 | `limits` | table | unset | Outbound shaping for keys of this upstream. See below. |
 
 Model and body rewrites run once, before a key is picked. Failover replays the same bytes. See [providers](providers.md).
+
+Client-supplied `X-Reiki-*` request headers are removed before any upstream transport, including `passthrough` and `forward` routes. Reiki reserves that prefix for headers it adds to its own answers; the values are never logged. A `passthrough` answer is classified and its rate-limit headers are read into the `observed` view under `account`, without storing or publishing the client's credential. See [classification](classification.md#observed-passthrough-headers).
 
 ### `[upstream.NAME.fallback]`
 
@@ -269,6 +272,7 @@ Scalar keys go in `[peers]`. Each `[peers.NAME]` sub-table is a peer to read. `[
 | `listen` | string | unset | Address of the peer listener. Required when `publish` is on. Must differ from the client, admin and tunnel listeners. Must be a loopback address unless `tls_cert` and `tls_key` are set. |
 | `peer_token_sha256` | string | unset | Shorthand for one token named `default`. |
 | `tokens` | array of tables | `[]` | `[[peers.tokens]]` entries: `name` and `token_sha256`. Publishing needs at least one token. |
+| `allowed_urls` | array of strings | `[]` | Exact base URLs that `[peers.NAME]` entries may use. A trailing `/` is ignored. Empty keeps the usual rule: https, or http on loopback. A URL that points at this instance's own client, admin, tunnel or peer listener is refused. |
 | `instance` | string | `"reiki"` | Name published for this instance. Letters, digits, `-`, `_` and `.`, at most 64 characters. |
 | `poll_interval_secs` | integer | `30` | Period of the reader's polls. Data older than three periods counts as unknown. Range 1 to 86400. |
 | `expose_key_labels` | bool | `false` | Publish per-key labels and states, not only counts per upstream. |
@@ -420,7 +424,7 @@ Rules, by section:
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
-- **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `[peers.NAME]` has a valid URL and `token_file`. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset.
+- **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `allowed_urls` entry is a plain base URL without credentials, query or fragment. Each `[peers.NAME]` has a valid URL and `token_file`, matches `allowed_urls` when that list is set, and does not point at one of this instance's literal loopback listeners. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset. Invalid URLs are reported without echoing them, so credentials in a malformed URL cannot reach logs.
 - **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`.
 - **Hub.** Only with the `hub` feature. Names, URLs and token hashes are valid, edge tokens are unique and differ from every other credential, accounts and keys exist, and no key is used by two accounts.
 - **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature.

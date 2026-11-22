@@ -83,3 +83,133 @@ fn private_key(pem: &[u8]) -> Option<PrivateKeyDer<'static>> {
 pub fn check(peers: &PeersConfig) -> Result<Option<i64>, String> {
     Ok(load(peers)?.map(|loaded| crate::intercept::days_left(loaded.not_after)))
 }
+
+/// Days left on each configured peer CA, in config order. An unreadable or non-certificate file
+/// is reported as a warning and left out: a status page must not fail because a CA file went
+/// missing. No certificate content or peer token is ever logged.
+pub fn check_ca_files(peers: &PeersConfig) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    for (name, peer) in &peers.peers {
+        let Some(path) = peer.ca_file.as_deref() else {
+            continue;
+        };
+        let pem = match std::fs::read(path) {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::warn!(peer = %name, file = %path, %error, "cannot read peer ca_file");
+                continue;
+            }
+        };
+        let not_after = x509_parser::pem::Pem::iter_from_buffer(&pem)
+            .filter_map(Result::ok)
+            .filter(|pem| pem.label == "CERTIFICATE")
+            .filter_map(|pem| {
+                let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).ok()?;
+                Some(cert.validity().not_after.timestamp())
+            })
+            .min();
+        let Some(not_after) = not_after else {
+            tracing::warn!(peer = %name, file = %path, "peer ca_file holds no PEM certificate");
+            continue;
+        };
+        let days = crate::intercept::days_left(not_after);
+        if days <= 30 {
+            tracing::warn!(peer = %name, file = %path, days, "peer CA certificate expires soon");
+        }
+        out.push((path.to_owned(), days));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn ca_files_are_reported_for_status_and_bad_files_are_warned_about() {
+        let dir = std::env::temp_dir().join(format!(
+            "reiki-peer-ca-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.pem");
+        let bad = dir.join("bad.pem");
+        let missing = dir.join("missing.pem");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["peer.example".to_owned()]).unwrap();
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        let cert = params.self_signed(&key).unwrap();
+        std::fs::write(&good, cert.pem()).unwrap();
+        std::fs::write(&bad, "not a certificate\n").unwrap();
+
+        let text = format!(
+            "[upstream.zen]\nbase_url = \"https://example.invalid/v1\"\n\
+             [peers.good]\nurl = \"https://good.example\"\ntoken_file = \"/t\"\nca_file = \"{}\"\n\
+             [peers.bad]\nurl = \"https://bad.example\"\ntoken_file = \"/t\"\nca_file = \"{}\"\n\
+             [peers.missing]\nurl = \"https://missing.example\"\ntoken_file = \"/t\"\nca_file = \"{}\"\n",
+            good.display(),
+            bad.display(),
+            missing.display()
+        );
+        let peers = crate::config::Config::parse(&text).unwrap().peers.unwrap();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Capture(buffer.clone()))
+            .without_time()
+            .finish();
+        let entries = tracing::subscriber::with_default(subscriber, || check_ca_files(&peers));
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the readable certificate is published"
+        );
+        assert_eq!(entries[0].0, good.to_string_lossy());
+        assert!(
+            entries[0].1 > 300,
+            "a year-long certificate is not near expiry"
+        );
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("peer ca_file holds no PEM certificate"),
+            "{logs}"
+        );
+        assert!(logs.contains("cannot read peer ca_file"), "{logs}");
+        assert!(
+            !logs.contains("not a certificate"),
+            "file content was logged: {logs}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

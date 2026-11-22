@@ -12,6 +12,7 @@ pub mod keys;
 pub mod lifecycle;
 pub mod logging;
 pub mod notify;
+pub mod observed;
 #[cfg(feature = "peers")]
 pub mod peers;
 pub mod plugins;

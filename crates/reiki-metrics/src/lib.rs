@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use reiki_plugin::{
     AdminCtx, AdminReply, ChunkCtx, CooldownScope, Event, FailureKind, HOST_KEYS, KeyCounts,
-    Plugin, RequestCtx, ResponseHeadCtx, UpstreamUsage,
+    ObservedCooldown, Plugin, RequestCtx, ResponseHeadCtx, UpstreamUsage,
 };
 
 /// The `[plugins.metrics]` table this plugin reads.
@@ -59,6 +59,11 @@ impl Plugin for MetricsPlugin {
                 self.metrics.record_cooldown(key, kind, scope);
             }
             Event::RateLimited { stream } => self.metrics.record_rate_limit_rejection(stream),
+            Event::Observed {
+                upstream,
+                status_class,
+                ..
+            } => self.metrics.record_passthrough(upstream, status_class),
             Event::PluginRejected { stream, plugin } => {
                 self.metrics.record_plugin_rejection(stream, plugin);
             }
@@ -121,7 +126,9 @@ impl Plugin for MetricsPlugin {
         if ctx.path == "/metrics" {
             Some(AdminReply {
                 content_type: "text/plain; version=0.0.4; charset=utf-8",
-                body: self.metrics.render(ctx.keys, ctx.usage.as_deref()),
+                body: self
+                    .metrics
+                    .render(ctx.keys, ctx.usage.as_deref(), &ctx.observed),
             })
         } else if ctx.path == "/usage" {
             Some(AdminReply {
@@ -324,6 +331,7 @@ struct Inner {
     findings: BTreeMap<(String, String, String, &'static str), u64>,
     tokens: BTreeMap<(String, String, &'static str), u64>,
     usage_requests: BTreeMap<(String, String), u64>,
+    passthrough: BTreeMap<(String, String), u64>,
 }
 
 /// In-memory counters for the admin `/v1/metrics` endpoint. Bounded by the number
@@ -437,10 +445,26 @@ impl Metrics {
         });
     }
 
+    /// Counts one classified passthrough response. The account is deliberately not a label; the
+    /// fixed status classes and configured upstream names keep the series bounded.
+    pub fn record_passthrough(&self, upstream: &str, status_class: &str) {
+        self.with(|inner| {
+            *inner
+                .passthrough
+                .entry((upstream.to_owned(), status_class.to_owned()))
+                .or_insert(0) += 1;
+        });
+    }
+
     /// Render the Prometheus text exposition. `keys` and `usage` are the current gauges,
     /// sampled by the caller so they reflect the same instant as the scrape. `usage` is `None`
     /// when the operator hides it, and then its families are left out.
-    pub fn render(&self, keys: KeyCounts, usage: Option<&[UpstreamUsage]>) -> String {
+    pub fn render(
+        &self,
+        keys: KeyCounts,
+        usage: Option<&[UpstreamUsage]>,
+        observed: &[ObservedCooldown],
+    ) -> String {
         let inner = self
             .inner
             .lock()
@@ -457,6 +481,39 @@ impl Metrics {
                 escape_label(upstream),
                 class,
                 count
+            );
+        }
+
+        out.push_str("# HELP reiki_passthrough_requests_total Classified passthrough responses by upstream and status class.\n");
+        out.push_str("# TYPE reiki_passthrough_requests_total counter\n");
+        for ((upstream, class), count) in &inner.passthrough {
+            let _ = writeln!(
+                out,
+                "reiki_passthrough_requests_total{{upstream=\"{}\",status_class=\"{}\"}} {}",
+                escape_label(upstream),
+                class,
+                count
+            );
+        }
+
+        out.push_str(
+            "# HELP reiki_observed_cooldown_seconds Remaining cooldown reported by an observed passthrough account.\n",
+        );
+        out.push_str("# TYPE reiki_observed_cooldown_seconds gauge\n");
+        let mut cooldowns: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+        for entry in observed {
+            let slot = cooldowns
+                .entry((&entry.upstream, &entry.class))
+                .or_insert(0);
+            *slot = (*slot).max(entry.seconds_remaining);
+        }
+        for ((upstream, class), seconds) in &cooldowns {
+            let _ = writeln!(
+                out,
+                "reiki_observed_cooldown_seconds{{upstream=\"{}\",class=\"{}\"}} {}",
+                escape_label(upstream),
+                escape_label(class),
+                seconds
             );
         }
 
@@ -556,7 +613,7 @@ impl Metrics {
 
         if let Some(usage) = usage {
             type Field = fn(&UpstreamUsage) -> u64;
-            let families: [(&str, &str, Field); 3] = [
+            let families: [(&str, &str, Field); 4] = [
                 (
                     "reiki_upstream_requests_1h",
                     "Attempts in the last hour, by upstream.",
@@ -571,6 +628,11 @@ impl Metrics {
                     "reiki_upstream_tokens_1h",
                     "Input plus output tokens in the last hour, by upstream.",
                     |u| u.tokens_1h,
+                ),
+                (
+                    "reiki_upstream_unaccounted_1h",
+                    "Responses in the last hour whose usage could not be read because the body passed a parse cap, by upstream.",
+                    |u| u.unaccounted_1h,
                 ),
             ];
             for (family, help, value) in families {
@@ -682,6 +744,7 @@ mod tests {
                 out_of_rotation: 0,
             },
             None,
+            &[],
         );
 
         assert!(text.contains("# TYPE reiki_requests_total counter"));
@@ -707,24 +770,26 @@ mod tests {
             requests_1h: 3,
             limited_1h: 1,
             tokens_1h: 40,
+            unaccounted_1h: 2,
         }];
-        let shown = Metrics::new().render(KeyCounts::default(), Some(&usage));
+        let shown = Metrics::new().render(KeyCounts::default(), Some(&usage), &[]);
         assert!(shown.contains("# TYPE reiki_upstream_requests_1h gauge"));
         assert!(shown.contains("reiki_upstream_requests_1h{upstream=\"zen\"} 3"));
         assert!(shown.contains("reiki_upstream_limited_1h{upstream=\"zen\"} 1"));
         assert!(shown.contains("reiki_upstream_tokens_1h{upstream=\"zen\"} 40"));
+        assert!(shown.contains("reiki_upstream_unaccounted_1h{upstream=\"zen\"} 2"));
 
-        let exposed_but_empty = Metrics::new().render(KeyCounts::default(), Some(&[]));
+        let exposed_but_empty = Metrics::new().render(KeyCounts::default(), Some(&[]), &[]);
         assert!(exposed_but_empty.contains("# TYPE reiki_upstream_tokens_1h gauge"));
         assert!(!exposed_but_empty.contains("reiki_upstream_tokens_1h{"));
 
-        let hidden = Metrics::new().render(KeyCounts::default(), None);
+        let hidden = Metrics::new().render(KeyCounts::default(), None, &[]);
         assert!(!hidden.contains("reiki_upstream_"), "{hidden}");
     }
 
     #[test]
     fn render_always_emits_type_lines_and_the_full_gauge() {
-        let text = Metrics::new().render(KeyCounts::default(), None);
+        let text = Metrics::new().render(KeyCounts::default(), None, &[]);
         for family in [
             "reiki_requests_total",
             "reiki_failovers_total",
@@ -748,7 +813,7 @@ mod tests {
         }
         let usage: serde_json::Value = serde_json::from_str(&metrics.render_usage()).unwrap();
         assert_eq!(usage["s"]["u"]["input"], u64::MAX);
-        let text = metrics.render(KeyCounts::default(), None);
+        let text = metrics.render(KeyCounts::default(), None, &[]);
         assert!(
             text.contains(&format!(
                 "reiki_findings_total{{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"}} {}",
@@ -777,7 +842,7 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_finding("s", "phi", "ssn", 2, false);
         metrics.record_finding("s", "phi", "ssn", 3, true);
-        let text = metrics.render(KeyCounts::default(), None);
+        let text = metrics.render(KeyCounts::default(), None, &[]);
         assert!(text.contains(
             "reiki_findings_total{stream=\"s\",plugin=\"phi\",kind=\"ssn\",action=\"reported\"} 2"
         ));
@@ -808,16 +873,57 @@ mod tests {
         assert!(
             text.contains("reiki_plugin_rejections_total{plugin=\"placeholders\",stream=\"t\"} 1")
         );
-        let empty = Metrics::new().render(KeyCounts::default(), None);
+        let empty = Metrics::new().render(KeyCounts::default(), None, &[]);
         assert!(empty.contains("# TYPE reiki_plugin_rejections_total counter"));
         assert!(!empty.contains("reiki_plugin_rejections_total{"));
+    }
+
+    #[test]
+    fn observed_events_and_cooldowns_are_exposed_without_account_cardinality() {
+        let plugin = build(&toml::Table::new()).unwrap();
+        for _ in 0..2 {
+            plugin.on_event(&Event::Observed {
+                upstream: "zen-pass",
+                account: "one",
+                status_class: "rate_limited",
+            });
+        }
+        plugin.on_event(&Event::Observed {
+            upstream: "zen-pass",
+            account: "two",
+            status_class: "rate_limited",
+        });
+        let observed = [
+            ObservedCooldown {
+                upstream: "zen-pass".to_owned(),
+                account: "one".to_owned(),
+                class: "rate_limited".to_owned(),
+                seconds_remaining: 9,
+            },
+            ObservedCooldown {
+                upstream: "zen-pass".to_owned(),
+                account: "two".to_owned(),
+                class: "rate_limited".to_owned(),
+                seconds_remaining: 4,
+            },
+        ];
+        let ctx =
+            AdminCtx::new("/metrics", KeyCounts::default()).with_observed(Vec::from(observed));
+        let text = plugin.on_admin(&ctx).unwrap().body;
+        assert!(text.contains(
+            "reiki_passthrough_requests_total{upstream=\"zen-pass\",status_class=\"rate_limited\"} 3"
+        ));
+        assert!(!text.contains("account="));
+        assert!(text.contains(
+            "reiki_observed_cooldown_seconds{upstream=\"zen-pass\",class=\"rate_limited\"} 9"
+        ));
     }
 
     #[test]
     fn labels_are_escaped_in_the_exposition() {
         let metrics = Metrics::new();
         metrics.record_request("a\"b", "c\\d", StatusClass::ServerError);
-        let text = metrics.render(KeyCounts::default(), None);
+        let text = metrics.render(KeyCounts::default(), None, &[]);
         assert!(text.contains(
             "reiki_requests_total{stream=\"a\\\"b\",upstream=\"c\\\\d\",status=\"server_error\"} 1"
         ));
@@ -1004,7 +1110,7 @@ mod tests {
         let mut s = state(&metrics, false);
         s.feed(br#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#);
         s.finish();
-        let text = metrics.render(KeyCounts::default(), None);
+        let text = metrics.render(KeyCounts::default(), None, &[]);
         assert!(
             text.contains(
                 "reiki_tokens_total{stream=\"s\",upstream=\"zen\",direction=\"input\"} 2"

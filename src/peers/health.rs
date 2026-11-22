@@ -181,6 +181,17 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         // Every figure is read as the answer is built; a reader adds its own time since receipt.
         "age_seconds": 0,
         "upstreams": upstreams,
+        // Passthrough answers have no keys, so they live in their own list rather than pretending
+        // to be keyed upstreams. Only operator labels and parsed header numbers are published.
+        "observed": app
+            .observed()
+            .snapshot_at(app.wall_now())
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(reiki_health::ObservedUpstream::from(entry))
+                    .expect("an observed entry always serializes to JSON")
+            })
+            .collect::<Vec<_>>(),
         // Counts over the same bounded ring as `/v1/failures`; bodies and key names never leave.
         "failures": app.failures().counts(),
     });

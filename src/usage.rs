@@ -21,6 +21,8 @@ pub(crate) struct Usage {
     /// Dropping the rest of an over-long event line up to its newline.
     discarding: bool,
     exceeded: bool,
+    /// A line or body passed a cap, so any token count from it is incomplete.
+    unaccounted: bool,
     input: Option<u64>,
     output: Option<u64>,
     total: Option<u64>,
@@ -34,6 +36,7 @@ impl Usage {
             buffer: Vec::new(),
             discarding: false,
             exceeded: false,
+            unaccounted: false,
             input: None,
             output: None,
             total: None,
@@ -50,6 +53,7 @@ impl Usage {
         } else if !self.exceeded {
             if self.buffer.len() + chunk.len() > MAX_JSON_BODY {
                 self.exceeded = true;
+                self.unaccounted = true;
                 self.buffer.clear();
             } else {
                 self.buffer.extend_from_slice(chunk);
@@ -64,6 +68,7 @@ impl Usage {
                 if self.buffer.len() + part.len() > MAX_SSE_LINE + usize::from(complete) {
                     self.buffer.clear();
                     self.discarding = true;
+                    self.unaccounted = true;
                 } else {
                     self.buffer.extend_from_slice(part);
                 }
@@ -116,6 +121,12 @@ impl Usage {
         {
             self.take(usage_in(&value));
         }
+    }
+
+    /// True when a body or event line passed a parse cap. Such a response may still yield a
+    /// partial count, but it must not be mistaken for a complete token measurement.
+    pub(crate) fn unaccounted(&self) -> bool {
+        self.unaccounted
     }
 
     /// Prompt + completion when either was reported, otherwise `total_tokens`.
@@ -233,7 +244,10 @@ mod tests {
         let mut text = String::from("{\"usage\":{\"total_tokens\":1},\"pad\":\"");
         text.push_str(&"x".repeat(1024 * 1024));
         text.push_str("\"}");
-        assert_eq!(json(&text), None);
+        let mut usage = Usage::new(false);
+        usage.feed(text.as_bytes());
+        assert_eq!(usage.total(), None);
+        assert!(usage.unaccounted());
     }
 
     #[test]
@@ -241,6 +255,17 @@ mod tests {
         let mut line = String::from("data: {\"usage\":{\"total_tokens\":1},\"pad\":\"");
         line.push_str(&"x".repeat(64 * 1024));
         line.push_str("\"}\n\n");
-        assert_eq!(sse(&[&line]), None);
+        let mut usage = Usage::new(true);
+        usage.feed(line.as_bytes());
+        assert_eq!(usage.total(), None);
+        assert!(usage.unaccounted());
+    }
+
+    #[test]
+    fn ordinary_bodies_are_accounted() {
+        let mut usage = Usage::new(false);
+        usage.feed(br#"{"usage":{"total_tokens":1}}"#);
+        assert_eq!(usage.total(), Some(1));
+        assert!(!usage.unaccounted());
     }
 }

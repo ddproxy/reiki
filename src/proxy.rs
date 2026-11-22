@@ -21,13 +21,14 @@ use crate::chain::{Chain, KeyState, Policy, SavedHealth, Scope, scope_route};
 use crate::classify::{Classification, ExtraPhrases, FailureClass, Outcome, classify_with};
 use crate::config::{Config, DEFAULT_SCOPE_ESCALATE_AFTER, PeersConfig};
 use crate::forward::Forwarder;
+use crate::observed::{self, ObservedStore};
 use crate::plugins::{
     PLUGIN_FAILURE_MESSAGE, PLUGIN_FAILURE_STATUS, PluginChain, PluginSession, RequestMeta,
 };
 use crate::pressure::PressureCounter;
 use crate::rewrite::{request_model, rewrite_body};
 use crate::shaper::bucket::{Bucket, BucketSnapshot, Permit, QuotaSnapshot};
-use crate::shaper::headers::{Observed, observe};
+use crate::shaper::headers::{Observed, observe, observe_at};
 use crate::shaper::{Acquire, KeyLimits, Shaper};
 use crate::upstream::{Call, Faithful, Standard, Transport, UpstreamResponse};
 use crate::usage::Usage;
@@ -416,6 +417,8 @@ pub struct App {
     /// Per-upstream attempts and tokens for the last hour, in memory only. Shared with the
     /// response bodies, which record their tokens when they end.
     pressure: Arc<PressureCounter>,
+    /// The latest classified passthrough answer per `(upstream, account)`, in memory only.
+    observed: ObservedStore,
     /// The latest key failures, across streams, for `/v1/failures` and `reiki top`.
     failures: crate::failures::FailureRing,
     /// Per-key outbound buckets, kept across reloads for an unchanged window.
@@ -437,6 +440,8 @@ pub struct App {
     clock: Arc<dyn Clock>,
     /// When the interception CA expires, as Unix seconds; unset without interception.
     ca_not_after: RwLock<Option<i64>>,
+    /// When each trusted peer CA expires, as Unix seconds. Names and times only.
+    peer_ca: RwLock<Vec<(String, i64)>>,
     logins: LoginThrottle,
     /// Separate counts, so failed admin logins cannot lock out client requests from the same peer.
     admin_logins: LoginThrottle,
@@ -534,6 +539,7 @@ impl App {
             snapshot: RwLock::new(Arc::new(Snapshot::new(config, keys))),
             health: Mutex::new(KeyState::default()),
             pressure: Arc::new(PressureCounter::new()),
+            observed: ObservedStore::new(),
             failures: crate::failures::FailureRing::new(),
             shaper,
             shaper_saved: Mutex::new((BTreeMap::new(), None)),
@@ -547,6 +553,7 @@ impl App {
             persist_tx: OnceLock::new(),
             clock,
             ca_not_after: RwLock::new(None),
+            peer_ca: RwLock::new(Vec::new()),
             logins: LoginThrottle::new(throttle),
             admin_logins: LoginThrottle::new(throttle),
             plugins: RwLock::new(Arc::new(plugins)),
@@ -655,6 +662,22 @@ impl App {
             .ca_not_after
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records the trusted peer CA expiries once at startup.
+    pub fn set_peer_ca(&self, entries: Vec<(String, i64)>) {
+        *self.peer_ca.write().unwrap_or_else(PoisonError::into_inner) = entries;
+    }
+
+    pub(crate) fn peer_ca(&self) -> Vec<(String, i64)> {
+        self.peer_ca
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn observed(&self) -> &ObservedStore {
+        &self.observed
     }
 
     pub(crate) fn wall_now(&self) -> SystemTime {
@@ -857,15 +880,22 @@ impl App {
             paths.push(PathBuf::from(&intercept.ca_cert));
             paths.push(PathBuf::from(&intercept.ca_key));
         }
-        if let Some((cert, key)) = snapshot
-            .config
-            .peers
-            .as_ref()
-            .filter(|peers| peers.publishing())
-            .and_then(PeersConfig::tls_files)
-        {
-            paths.push(PathBuf::from(cert));
-            paths.push(PathBuf::from(key));
+        if let Some(peers) = snapshot.config.peers.as_ref() {
+            paths.extend(
+                peers
+                    .peers
+                    .values()
+                    .filter_map(|peer| peer.ca_file.as_deref())
+                    .map(PathBuf::from),
+            );
+            if let Some((cert, key)) = peers
+                .publishing()
+                .then(|| PeersConfig::tls_files(peers))
+                .flatten()
+            {
+                paths.push(PathBuf::from(cert));
+                paths.push(PathBuf::from(key));
+            }
         }
         paths.extend(self.plugins().watched_paths());
         paths.sort();
@@ -1065,10 +1095,18 @@ impl App {
             });
         }
         let generation = next_generation;
+        #[cfg(feature = "peers")]
+        let peer_ca = config
+            .peers
+            .as_ref()
+            .map(crate::peers::tls::check_ca_files)
+            .unwrap_or_default();
         // Nothing below can fail, so the new state lands whole or not at all.
         let log = config.log.clone();
         let swap_guard = self.swap.write().unwrap_or_else(PoisonError::into_inner);
         self.reload(config, keys);
+        #[cfg(feature = "peers")]
+        self.set_peer_ca(peer_ca);
         *self.plugins.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(rebuilt.chain);
         if let (Some(tunnel), Some(plan)) = (self.tunnel.get(), tunnel_plan) {
             tunnel.apply_reload(plan);
@@ -1201,6 +1239,37 @@ fn rate_limited_response(wait: Duration) -> Response {
     response
 }
 
+/// True for Reiki's own request-header namespace. A client may not set these: only Reiki adds
+/// `x-reiki-*` headers to its own answers. The check is case-insensitive and never looks at a
+/// value, so no credential can reach a log through it.
+pub(crate) fn is_reiki_control_header(name: &HeaderName) -> bool {
+    name.as_str()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-reiki-"))
+}
+
+/// Removes client-supplied Reiki control headers before a request is built for any transport.
+pub(crate) fn strip_reiki_headers(headers: &mut HeaderMap) {
+    let names: Vec<_> = headers
+        .keys()
+        .filter(|name| is_reiki_control_header(name))
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
+/// Marks the client's own credential headers sensitive on a passthrough route. This affects
+/// formatting and debug output only; the values are never read into a log or a status field.
+pub(crate) fn mark_passthrough_credentials(headers: &mut HeaderMap) {
+    for name in ["authorization", "x-api-key", "x-goog-api-key"] {
+        if let Some(value) = headers.get_mut(name) {
+            value.set_sensitive(true);
+        }
+    }
+}
+
 fn skip_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -1238,7 +1307,10 @@ pub(crate) fn upstream_headers(
     }
     for (name, value) in inbound {
         let keep_encoding = forward_accept_encoding && name == header::ACCEPT_ENCODING;
-        if auth_name.as_ref() == Some(name) || !(keep_encoding || !skip_header(name)) {
+        if is_reiki_control_header(name)
+            || auth_name.as_ref() == Some(name)
+            || !(keep_encoding || !skip_header(name))
+        {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -1271,7 +1343,8 @@ pub(crate) fn split_upstream(path: &str) -> Option<(&str, &str)> {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    strip_reiki_headers(&mut parts.headers);
     if parts.uri.path() == HEALTH_PATH && parts.method == Method::GET {
         return Response::new(Body::from("ok"));
     }
@@ -1345,7 +1418,8 @@ pub(crate) async fn handle_intercepted(
     target: &crate::config::InterceptHost,
     req: Request,
 ) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    strip_reiki_headers(&mut parts.headers);
     let named = parts
         .headers
         .get(header::HOST)
@@ -2352,6 +2426,69 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
     }))
 }
 
+/// Watches one passthrough answer without holding or publishing any credential. Error bodies
+/// are read only up to the classification cap and rebuilt so the client still gets the whole
+/// response; successful answers are classified from status and headers alone.
+async fn observe_passthrough(
+    app: &App,
+    upstream_name: &str,
+    upstream: &crate::config::Upstream,
+    response: UpstreamResponse,
+) -> UpstreamResponse {
+    let now = app.wall_now();
+    let local_now = now
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0);
+    let limits = observe_at(&response.headers, local_now);
+    let status = response.status;
+    let (outcome, response) = if status.is_success() || status.is_redirection() {
+        (Outcome::Success, response)
+    } else {
+        let retry_after = response
+            .headers
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let (snippet, _read_error, response) = response.peek_body(MAX_ERROR_BODY).await;
+        let snippet = String::from_utf8_lossy(&snippet);
+        let extra = ExtraPhrases {
+            request_error: &upstream.request_error_phrases,
+            quota: &upstream.quota_phrases,
+            rate_limit: &upstream.rate_limit_phrases,
+        };
+        (
+            classify_with(
+                status.as_u16(),
+                retry_after.as_deref(),
+                &snippet,
+                now,
+                &extra,
+            )
+            .outcome,
+            response,
+        )
+    };
+    let class = observed::status_class(outcome);
+    let cooldown = observed::cooldown_class(outcome);
+    app.observed().record(
+        upstream_name,
+        &upstream.account,
+        class,
+        cooldown,
+        limits,
+        now,
+    );
+    app.plugins().on_event(&Event::Observed {
+        upstream: upstream_name,
+        account: &upstream.account,
+        status_class: class,
+    });
+    tracing::info!(upstream = %upstream_name, status_class = class, status = status.as_u16(), "observed passthrough response");
+    response
+}
+
 /// Sends the request as the client made it, credentials included, and returns any answer.
 async fn forward_passthrough(
     app: &App,
@@ -2386,6 +2523,7 @@ async fn forward_passthrough(
             let status = response.status;
             tracing::info!(method = %parts.method, path = %parts.uri.path(), status = status.as_u16(), version = ?response.version, "passed through");
             plugin_states.on_attempt(PASSTHROUGH_KEY, Some(status.as_u16()), &[]);
+            let response = observe_passthrough(app, upstream_name, upstream, response).await;
             let response = match settle_body(response).await {
                 Ok(response) => response,
                 Err(response) => return Ok(*response),
@@ -2455,6 +2593,9 @@ pub(crate) fn passthrough_headers(
 ) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in inbound {
+        if is_reiki_control_header(name) {
+            continue;
+        }
         let keep = matches!(
             name.as_str(),
             "authorization" | "x-api-key" | "x-goog-api-key"
@@ -2463,6 +2604,7 @@ pub(crate) fn passthrough_headers(
             out.append(name.clone(), value.clone());
         }
     }
+    mark_passthrough_credentials(&mut out);
     if !out.contains_key(header::ACCEPT_ENCODING) {
         out.insert(
             header::ACCEPT_ENCODING,
@@ -2954,7 +3096,12 @@ impl<S> Permitted<S> {
         let Some(mut usage) = self.usage.take() else {
             return;
         };
-        let Some(actual) = usage.total() else {
+        let unaccounted = usage.unaccounted();
+        let actual = usage.total();
+        if unaccounted && let Some((pressure, upstream)) = &self.tokens {
+            pressure.record_unaccounted(upstream, Instant::now());
+        }
+        let Some(actual) = actual else {
             return;
         };
         if let Some(permit) = self.permit.take() {
@@ -3341,6 +3488,58 @@ mod tests {
         assert_eq!(names.first(), Some(&"x-token"));
         assert_eq!(out["x-token"], "upstream-value");
         assert_eq!(out.get_all("x-token").iter().count(), 1);
+    }
+
+    #[test]
+    fn reiki_control_headers_are_stripped_from_every_request_and_credentials_stay_opaque() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("x-reiki-upstream", HeaderValue::from_static("zen"));
+        inbound.insert("X-Reiki-Account", HeaderValue::from_static("primary"));
+        inbound.insert("x-reiki-secret", HeaderValue::from_static("secret-value"));
+        inbound.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer caller-token"),
+        );
+        inbound.insert("x-custom", HeaderValue::from_static("keep"));
+
+        assert!(is_reiki_control_header(&HeaderName::from_static(
+            "x-reiki-upstream"
+        )));
+        assert!(is_reiki_control_header(
+            &HeaderName::from_bytes(b"X-Reiki-Account").unwrap()
+        ));
+        assert!(!is_reiki_control_header(&HeaderName::from_static(
+            "x-reikiish"
+        )));
+        assert!(!is_reiki_control_header(&HeaderName::from_static(
+            "user-agent"
+        )));
+
+        strip_reiki_headers(&mut inbound);
+        assert!(inbound.get("x-reiki-upstream").is_none());
+        assert!(inbound.get("x-reiki-account").is_none());
+        assert!(inbound.get("x-reiki-secret").is_none());
+
+        let shaped = upstream_headers(
+            &inbound,
+            "authorization",
+            "Bearer upstream-key",
+            false,
+            false,
+        );
+        let passthrough = passthrough_headers(&inbound, false, false);
+        for out in [&shaped, &passthrough] {
+            assert_eq!(out["x-custom"], "keep");
+            assert!(!out.keys().any(is_reiki_control_header));
+            assert!(!out.values().any(|value| {
+                value
+                    .to_str()
+                    .is_ok_and(|text| text.contains("secret-value"))
+            }));
+        }
+        assert!(shaped["authorization"].is_sensitive());
+        assert!(passthrough["authorization"].is_sensitive());
+        assert!(!format!("{passthrough:?}").contains("caller-token"));
     }
 
     #[test]
@@ -4319,6 +4518,68 @@ mod tests {
         fn now(&self) -> SystemTime {
             self.0
         }
+    }
+
+    #[tokio::test]
+    async fn a_passthrough_answer_is_observed_without_holding_credentials() {
+        use futures_util::StreamExt;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_311_997);
+        let config = Config::parse(
+            "[upstream.zen]\nbase_url = \"https://example.invalid/v1\"\naccount = \"acct-a\"\n",
+        )
+        .unwrap();
+        let upstream = config.upstream["zen"].clone();
+        let app = App::with_header_timeout_and_clock(
+            config,
+            HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(5),
+            Arc::new(FixedClock(now)),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("12"));
+        headers.insert(
+            "x-ratelimit-limit-requests",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("7"),
+        );
+        headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("1m"));
+        headers.insert("x-ratelimit-limit-tokens", HeaderValue::from_static("5000"));
+        let response = UpstreamResponse::from_stream(
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            axum::http::Version::HTTP_11,
+            futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"rate limited",
+            ))]),
+        );
+
+        let response = observe_passthrough(&app, "zen", &upstream, response).await;
+        let entries = app.observed().snapshot_at(now);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.upstream, "zen");
+        assert_eq!(entry.account, "acct-a");
+        assert_eq!(entry.mode, "observed");
+        assert_eq!(entry.status_class, observed::RATE_LIMITED);
+        assert_eq!(entry.cooldown_class, Some("rate_limited"));
+        assert_eq!(entry.retry_after_seconds, Some(12));
+        assert_eq!(entry.quota.requests_limit, Some(100));
+        assert_eq!(entry.quota.requests_remaining, Some(7));
+        assert_eq!(entry.quota.requests_reset_seconds, Some(60));
+        assert_eq!(entry.quota.tokens_limit, Some(5000));
+
+        let mut body = Vec::new();
+        let mut stream = response.into_stream();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"rate limited");
     }
 
     #[test]

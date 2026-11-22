@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
 use axum::body::Body;
@@ -25,7 +25,11 @@ const V1: &str = "/v1";
 /// The routes this file serves itself, under [`V1`]. The OpenAPI document is built from this
 /// table, so the two cannot drift.
 const ROUTES: &[(&str, &str, &str)] = &[
-    ("/status", "get", "Key, stream and config status"),
+    (
+        "/status",
+        "get",
+        "Key, observed upstream, stream and config status",
+    ),
     (
         "/reload",
         "post",
@@ -201,6 +205,25 @@ async fn status(
         let days_left = (not_after - now).div_euclid(86_400);
         format!("{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}")
     });
+    let observed =
+        serde_json::to_string(&app.observed().snapshot()).unwrap_or_else(|_| "[]".into());
+    let peer_ca = serde_json::to_value(
+        app.peer_ca()
+            .into_iter()
+            .map(|(file, not_after)| {
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                serde_json::json!({
+                    "file": file,
+                    "ca_not_after": not_after,
+                    "ca_days_left": (not_after - now).div_euclid(86_400),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+    .to_string();
     let log = format!(r#"{{"write_errors":{}}}"#, app.file_write_errors());
     let plugin_fields: Vec<(String, String)> = app
         .plugins()
@@ -219,6 +242,9 @@ async fn status(
         fields.push((name.as_str(), value.as_str()));
     }
     fields.push(("config", &config));
+    fields.push(("observed", &observed));
+    let peers_status = format!(r#"{{"tls_ca":{peer_ca}}}"#);
+    fields.push(("peers", &peers_status));
     if let Some(intercept) = &intercept {
         fields.push(("intercept", intercept));
     }
@@ -530,7 +556,8 @@ async fn plugin_route(
         .config
         .exposes_usage()
         .then(|| crate::pressure::upstream_usage(&snapshot.config, app.pressure(), now));
-    match app.plugins().on_admin(path, keys, usage) {
+    let observed = app.observed().cooldowns(SystemTime::now());
+    match app.plugins().on_admin(path, keys, usage, observed) {
         Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
         None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
     }
@@ -631,7 +658,8 @@ fn merge_status_objects(body: &str, fields: &[(&str, &str)]) -> Option<String> {
     out.push_str(base);
     for (name, fragment) in fields {
         let value: Value = serde_json::from_str(fragment).ok()?;
-        if !value.is_object() {
+        // Plugin fragments are objects; the built-in `observed` field is an array.
+        if !value.is_object() && !value.is_array() {
             return None;
         }
         out.push(',');
@@ -864,9 +892,18 @@ mod tests {
                 "log": {"write_errors": 3},
             })
         );
+        let with_array = merge_status_objects(r#"{"keys":[]}"#, &[("observed", "[]")]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&with_array).unwrap(),
+            serde_json::json!({"keys": [], "observed": []})
+        );
         assert!(
             merge_status_objects(r#"{"keys":[]}"#, &[("log", "not json")]).is_none(),
             "an unmergeable field must fail closed"
+        );
+        assert!(
+            merge_status_objects(r#"{"keys":[]}"#, &[("log", "3")]).is_none(),
+            "a scalar field must fail closed"
         );
         assert!(merge_status_objects("[]", &[]).is_none());
     }
@@ -900,6 +937,60 @@ mod tests {
             let response = router.call(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn status_publishes_observed_upstreams_and_peer_ca_expiry() {
+        use axum::extract::Request;
+        use tower_service::Service as _;
+
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{}\"\n",
+            sha256_hex("admin-token-for-tests")
+        );
+        let app = App::new(
+            crate::config::Config::parse(&text).unwrap(),
+            std::collections::HashMap::new(),
+            crate::chain::Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        app.observed().record(
+            "zen",
+            "acct-a",
+            crate::observed::OK,
+            None,
+            Default::default(),
+            now,
+        );
+        app.set_peer_ca(vec![("/etc/reiki/peer/ca.pem".to_owned(), 2_000_086_400)]);
+
+        let mut router = router(app);
+        let response = router
+            .call(
+                Request::builder()
+                    .uri("/v1/status")
+                    .header(header::AUTHORIZATION, "Bearer admin-token-for-tests")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status_code = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status_code, StatusCode::OK);
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["observed"][0]["upstream"], "zen");
+        assert_eq!(status["observed"][0]["account"], "acct-a");
+        assert_eq!(status["observed"][0]["mode"], "observed");
+        assert_eq!(status["observed"][0]["status_class"], "ok");
+        assert_eq!(
+            status["peers"]["tls_ca"][0]["file"],
+            "/etc/reiki/peer/ca.pem"
+        );
+        assert_eq!(status["peers"]["tls_ca"][0]["ca_not_after"], 2_000_086_400);
     }
 
     #[test]

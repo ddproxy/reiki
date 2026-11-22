@@ -200,6 +200,13 @@ pub enum Event<'a> {
     RateLimited { stream: &'a str },
     /// A plugin stopped a request: it returned `Reject`, or it skipped under `on_error = "reject"`.
     PluginRejected { stream: &'a str, plugin: &'a str },
+    /// A passthrough response was classified for observation. The account is an operator label;
+    /// neither it nor the class carries a credential or any response text.
+    Observed {
+        upstream: &'a str,
+        account: &'a str,
+        status_class: &'a str,
+    },
     /// A detection plugin found identifiers in a request body: how many of one kind, and whether
     /// the request was blocked for it. The event never carries the matched text.
     Finding {
@@ -231,6 +238,20 @@ pub struct UpstreamUsage {
     pub requests_1h: u64,
     pub limited_1h: u64,
     pub tokens_1h: u64,
+    /// Responses in the last hour whose token usage could not be read because the body passed
+    /// the extraction caps. A count only; no body text is kept.
+    pub unaccounted_1h: u64,
+}
+
+/// A passthrough account's remaining observed cooldown, sampled for an admin request. The
+/// account is an operator label and is never included in a metric, where it would multiply
+/// cardinality; it is still carried here for plugins that need to group a local report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedCooldown {
+    pub upstream: String,
+    pub account: String,
+    pub class: String,
+    pub seconds_remaining: u64,
 }
 
 /// An admin request for one of a plugin's paths.
@@ -241,6 +262,8 @@ pub struct AdminCtx<'a> {
     pub keys: KeyCounts,
     /// Per-upstream usage, sampled for this request; `None` when the operator hides usage.
     pub usage: Option<Vec<UpstreamUsage>>,
+    /// Remaining cooldowns of observed passthrough accounts, sampled for this request.
+    pub observed: Vec<ObservedCooldown>,
 }
 
 impl<'a> AdminCtx<'a> {
@@ -249,11 +272,17 @@ impl<'a> AdminCtx<'a> {
             path,
             keys,
             usage: None,
+            observed: Vec::new(),
         }
     }
 
     pub fn with_usage(mut self, usage: Option<Vec<UpstreamUsage>>) -> Self {
         self.usage = usage;
+        self
+    }
+
+    pub fn with_observed(mut self, observed: Vec<ObservedCooldown>) -> Self {
+        self.observed = observed;
         self
     }
 }

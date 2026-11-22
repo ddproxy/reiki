@@ -283,6 +283,8 @@ pub struct PeersConfig {
     pub peer_token_sha256: Option<String>,
     /// Every peer token, the shorthand first; publishing needs at least one.
     pub tokens: Vec<PeerToken>,
+    /// Exact base URLs peers may use. Empty means the usual rule: https, or http on loopback.
+    pub allowed_urls: Vec<String>,
     /// Name published as `instance`; `reiki` when unset.
     pub instance: Option<String>,
     /// Reader poll period; data older than three of them counts as unknown.
@@ -341,6 +343,8 @@ struct PeersSettings {
     listen: Option<String>,
     #[serde(default)]
     peer_token_sha256: Option<String>,
+    #[serde(default)]
+    allowed_urls: Vec<String>,
     #[serde(default)]
     instance: Option<String>,
     #[serde(default = "default_poll_interval_secs")]
@@ -467,6 +471,7 @@ impl TryFrom<toml::Table> for PeersConfig {
             listen: settings.listen,
             peer_token_sha256: settings.peer_token_sha256,
             tokens,
+            allowed_urls: settings.allowed_urls,
             instance: settings.instance,
             poll_interval_secs: settings.poll_interval_secs,
             expose_key_labels: settings.expose_key_labels,
@@ -497,6 +502,16 @@ impl PeersConfig {
     /// The certificate and key files when the peer listener serves HTTPS.
     pub fn tls_files(&self) -> Option<(&str, &str)> {
         Some((self.tls_cert.as_deref()?, self.tls_key.as_deref()?))
+    }
+
+    /// Whether a peer URL is permitted. An empty allowlist keeps the existing rule: https, or
+    /// http on loopback; both are already checked when the config is parsed.
+    pub fn allows_url(&self, url: &str) -> bool {
+        self.allowed_urls.is_empty()
+            || self
+                .allowed_urls
+                .iter()
+                .any(|allowed| allowed.trim_end_matches('/') == url.trim_end_matches('/'))
     }
 
     /// The `peers:` line `reiki check` prints.
@@ -777,6 +792,10 @@ pub struct Upstream {
     /// derived from the upstream name, a key label or a response body.
     #[serde(default)]
     pub capacity_group: Option<String>,
+    /// Operator-set label used to group observed passthrough responses. It is never derived
+    /// from a credential or a response, and is `default` when unset.
+    #[serde(default = "default_account")]
+    pub account: String,
     /// Run this command for each request instead of Reiki's HTTP clients.
     /// The API token and outbound headers are written to the process stdin, never argv.
     #[serde(default)]
@@ -957,6 +976,10 @@ fn phrase_list_problem(field: &str, phrases: &[String]) -> Option<String> {
 
 fn default_auth_header() -> String {
     "authorization".to_owned()
+}
+
+fn default_account() -> String {
+    crate::observed::DEFAULT_ACCOUNT.to_owned()
 }
 
 fn default_auth_format() -> String {
@@ -1425,6 +1448,12 @@ impl Config {
                 return Err(ConfigError::BadUpstream {
                     upstream: name.clone(),
                     reason: format!("capacity_group {reason}"),
+                });
+            }
+            if let Some(reason) = safe_label_problem(&upstream.account) {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: format!("account {reason}"),
                 });
             }
             for (field, phrases) in [
@@ -1903,9 +1932,22 @@ impl Config {
             }
             _ => {}
         }
+        for (index, url) in peers.allowed_urls.iter().enumerate() {
+            if let Some(reason) = base_url_problem(url) {
+                return Some(format!("allowed_urls[{index}] {reason}"));
+            }
+        }
         for (name, peer) in &peers.peers {
             if let Some(reason) = peer_entry_problem(name, peer) {
                 return Some(reason);
+            }
+            if !peers.allows_url(&peer.url) {
+                return Some(format!("[peers.{name}] url is not in allowed_urls"));
+            }
+            if let Some((listener, addr)) = self.peer_loop_target(peers, &peer.url) {
+                return Some(format!(
+                    "[peers.{name}] url points at this instance's {listener} listener at {addr}"
+                ));
             }
         }
         if !peers.publishing() {
@@ -2229,6 +2271,39 @@ impl Config {
         }
         None
     }
+
+    /// A peer URL that reaches one of this instance's own listeners would just ask itself, or
+    /// talk to a stronger listener than the read-only peer one. Names are not resolved here:
+    /// only literal loopback URLs can be compared to literal bind addresses without DNS.
+    fn peer_loop_target(
+        &self,
+        peers: &PeersConfig,
+        url: &str,
+    ) -> Option<(&'static str, std::net::SocketAddr)> {
+        let (ip, port) = loopback_target(url)?;
+        let target = std::net::SocketAddr::new(ip, port);
+        let listeners = [
+            ("client", Some(self.listen.as_str())),
+            ("admin", self.admin.as_ref().map(|a| a.listen.as_str())),
+            ("tunnel", self.tunnel.as_ref().map(|t| t.listen.as_str())),
+            ("peer", peers.listen.as_deref()),
+        ];
+        for (name, listen) in listeners {
+            let Some(listen) = listen else {
+                continue;
+            };
+            let Ok(addr) = listen.parse::<std::net::SocketAddr>() else {
+                continue;
+            };
+            let same_ip = addr.ip() == target.ip()
+                || addr.ip().is_unspecified()
+                || (addr.ip().is_loopback() && target.ip().is_loopback());
+            if addr.port() != 0 && addr.port() == target.port() && same_ip {
+                return Some((name, addr));
+            }
+        }
+        None
+    }
 }
 
 /// The loopback address and port a hub URL reaches, if it names one.
@@ -2283,6 +2358,27 @@ fn valid_label(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// What is wrong with a base URL used by a peer or an allowlist entry. The URL is never quoted
+/// in the answer: it may contain credentials even though such a URL is refused.
+fn base_url_problem(url: &str) -> Option<String> {
+    let https = url.starts_with("https://");
+    if !https && !is_loopback_http(url) {
+        return Some("must use https, or http on a loopback address".to_owned());
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Some("is not a URL".to_owned());
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.host_str().is_none_or(str::is_empty)
+    {
+        return Some("must be a plain base URL without credentials, query or fragment".to_owned());
+    }
+    None
+}
+
 /// What is wrong with one `[peers.<name>]`, if anything.
 fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
     if !valid_peer_name(name) {
@@ -2291,29 +2387,13 @@ fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
         ));
     }
     let url = peer.url.as_str();
-    let https = url.starts_with("https://");
-    if !https && !is_loopback_http(url) {
-        return Some(format!(
-            "[peers.{name}] url must use https, or http on a loopback address"
-        ));
-    }
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return Some(format!("[peers.{name}] url `{url}` is not a URL"));
-    };
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.host_str().is_none_or(str::is_empty)
-    {
-        return Some(format!(
-            "[peers.{name}] url must be a plain base URL without credentials, query or fragment"
-        ));
+    if let Some(reason) = base_url_problem(url) {
+        return Some(format!("[peers.{name}] url {reason}"));
     }
     if peer.token_file.trim().is_empty() {
         return Some(format!("[peers.{name}] token_file must not be empty"));
     }
-    if https && peer.ca_file.as_deref().is_none_or(|f| f.trim().is_empty()) {
+    if url.starts_with("https://") && peer.ca_file.as_deref().is_none_or(|f| f.trim().is_empty()) {
         return Some(format!(
             "[peers.{name}] needs ca_file: an https peer is trusted only through its own CA"
         ));
@@ -3927,6 +4007,41 @@ socket = "/run/forwarder.sock"
         }
     }
 
+    #[cfg(feature = "peers")]
+    #[test]
+    fn peer_allowlist_entries_are_exact_and_safely_validated() {
+        let config = Config::parse(&with_peers(
+            "[peers]\nallowed_urls = [\"https://peer.example.test/\", \"http://127.0.0.1:9100\"]\n",
+        ))
+        .unwrap();
+        let peers = config.peers.unwrap();
+        assert!(peers.allows_url("https://peer.example.test"));
+        assert!(peers.allows_url("https://peer.example.test/"));
+        assert!(peers.allows_url("http://127.0.0.1:9100/"));
+        assert!(!peers.allows_url("https://other.example.test"));
+        assert!(!peers.allows_url("https://peer.example.test:443"));
+
+        let bad = peers_error("[peers]\nallowed_urls = [\"not a url\"]\n");
+        assert!(bad.contains("allowed_urls[0]"), "{bad}");
+        assert!(!bad.contains("not a url"), "{bad}");
+        let secret = peers_error("[peers]\nallowed_urls = [\"https://u:p@peer.example\"]\n");
+        assert!(!secret.contains("u:p"), "secret leaked: {secret}");
+    }
+
+    #[cfg(feature = "peers")]
+    #[test]
+    fn a_peer_url_cannot_point_back_at_this_instance() {
+        for (url, needle) in [
+            ("http://127.0.0.1:4097", "client listener"),
+            ("http://127.0.0.1:4098", "admin listener"),
+        ] {
+            let peers =
+                format!("[peers]\n[peers.selfpeer]\nurl = \"{url}\"\ntoken_file = \"/t\"\n");
+            let reason = peers_error(&peers);
+            assert!(reason.contains(needle), "{peers}: {reason}");
+        }
+    }
+
     #[cfg(not(feature = "peers"))]
     #[test]
     fn a_build_without_the_feature_refuses_a_peers_table() {
@@ -4089,6 +4204,34 @@ socket = "/run/forwarder.sock"
         assert!(config.upstream["zen"].limits.is_none());
         assert_eq!(config.upstream["zen"].max_decoded_bytes, 64 * 1024 * 1024);
         assert_eq!(config.upstream["zen"].response_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn an_upstream_account_has_a_safe_label_and_defaults_to_default() {
+        assert_eq!(
+            Config::parse(&base("")).unwrap().upstream["zen"].account,
+            "default"
+        );
+        let with = |extra: &str| {
+            base("").replace(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+                &format!("[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{extra}"),
+            )
+        };
+        assert_eq!(
+            Config::parse(&with("account = \"acct-2\"\n"))
+                .unwrap()
+                .upstream["zen"]
+                .account,
+            "acct-2"
+        );
+        for bad in ["account = \"\"", "account = \"a\\nb\"", "account = \"   \""] {
+            let error = Config::parse(&with(bad)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::BadUpstream { ref upstream, .. } if upstream == "zen"),
+                "{bad}: {error}"
+            );
+        }
     }
 
     #[test]

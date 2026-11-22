@@ -55,6 +55,7 @@ With `tls_cert` and `tls_key` the listener serves HTTPS (rustls, TLS 1.2 and 1.3
 - `tls_cert` holds the PEM chain, leaf first. `tls_key` holds its PEM key (PKCS#8, PKCS#1 or SEC1) and stays readable and writable only by its owner: refused by default, loaded with a warning under `tls_key_permissions = "warn"`.
 - The certificate must be unexpired and the key must match it; otherwise startup, `reiki check` and a reload fail. `reiki check` prints `peers TLS certificate valid for N more day(s)`.
 - A reload reads both files again. New contents or new paths swap in without a restart and show in `changed` as `peers.tls`; open connections keep the old certificate. Both files are watched like key files, so a renewal on disk triggers the reload. Turning TLS on or off needs a restart. Reiki tracks the running listener's scheme on every start, so a later reload still reports the switch as needing a restart even after the listener has been restarted.
+- Each reader's `ca_file` is watched on start and reload. Its expiry appears in `GET /v1/status` as `peers.tls_ca`, one entry per configured peer with `file`, `ca_not_after` (Unix seconds) and `ca_days_left`. An unreadable file or one with no PEM certificate is warned about and left out of status; a certificate within 30 days of expiry gets a warning. Certificate contents and peer tokens are never logged.
 
 A private CA and a listener certificate for a peer reached as `192.0.2.10`:
 
@@ -94,7 +95,7 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192
 ```
 
 ```json
-{"instance":"peer-a","reiki_version":"0.10.6","observed_at":"2026-11-13T09:30:00Z","age_seconds":0,"upstreams":[
+{"instance":"peer-a","reiki_version":"0.10.6","observed_at":"2026-11-13T09:30:00Z","age_seconds":0,"observed":[],"upstreams":[
   {"name":"zen","healthy_keys":1,"cooling_keys":1,"disabled_keys":0,
    "cooling_combinations":2,
    "soonest_cooldown_seconds":300,"last_status_class":"4xx",
@@ -106,6 +107,7 @@ curl -s --cacert peers-ca.pem -H "Authorization: Bearer $PEER_TOKEN" https://192
 ```
 
 - One `upstreams` entry per upstream that uses Reiki's keys, in config order; a `passthrough` upstream is left out.
+- `observed` is always present, even when empty, and is required on the wire. Each entry holds one `(upstream, account)` pair seen on a passthrough route: its fixed status class, the remaining `Retry-After` hint counted down from this host's clock, and the request/token quota numbers read from response headers. `account` comes from `[upstream.NAME] account`; no credential value is read, stored or published. Older documents without `observed` are refused.
 - `soonest_cooldown_seconds` rounds up to whole seconds and then to a multiple of `cooldown_bucket_secs` (default 300, at most 86400): a 42 s wait reads as 300, 301 s as 600, and `0` stays exact. It is relative, so readers need no agreement with this host's clock.
 - `last_status_class` is `2xx`, `4xx` or `5xx` for the latest attempt on any of the upstream's keys, or `null` before one or when it got no response.
 - `cooling_combinations` counts `(route, model)` combinations currently cooling on that upstream's keys. Whole-key cooldowns clear their combinations.

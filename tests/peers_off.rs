@@ -326,7 +326,7 @@ fn a_disabled_peers_table_opens_nothing_either() {
             format!(
                 "[peers]\nenabled = false\npublish = true\nlisten = \"127.0.0.1:{peer}\"\n\
                  peer_token_sha256 = \"{}\"\n\
-                 [peers.other]\nurl = \"http://127.0.0.1:{peer}\"\ntoken_file = \"/nonexistent\"\n",
+                 [peers.other]\nurl = \"http://127.0.0.1:1\"\ntoken_file = \"/nonexistent\"\n",
                 sha("peer-token-for-tests"),
                 peer = ports.peer,
             )

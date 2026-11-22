@@ -264,6 +264,7 @@ mod tests {
     /// A full document, with host stats and sessions, as a publisher with everything on sends.
     const FULL_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "host" : {
       "cores" : 8,
@@ -314,6 +315,7 @@ mod tests {
     /// The same document from a publisher with host stats and labels off.
     const BARE_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "2026-11-13T09:30:00Z",
@@ -335,6 +337,7 @@ mod tests {
     /// A document carrying the last hour of attempts.
     const USAGE_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "2026-11-13T09:30:00Z",
@@ -411,6 +414,7 @@ mod tests {
     /// A labelled view whose cooling key carries the quota class.
     const LABELLED_DOC: &str = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "2026-11-13T09:30:00Z",
@@ -456,6 +460,7 @@ mod tests {
     fn failure_counts_parse_and_default_to_empty() {
         let with = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {
       "rate_limited" : 2,
       "transient" : 1
@@ -547,6 +552,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -636,6 +642,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -722,6 +729,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -794,6 +802,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -880,6 +889,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -964,6 +974,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1038,6 +1049,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1129,6 +1141,7 @@ mod tests {
         let health = Health::from_json(
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1307,7 +1320,7 @@ mod tests {
     fn nullable_fields_accept_explicit_null() {
         let health = Health::from_json(
             r#"{"instance":"peer-a","reiki_version":"0.10.3","observed_at":"t",
-                "age_seconds":0,"failures":{},"upstreams":[
+                "age_seconds":0,"observed":[],"failures":{},"upstreams":[
                 {"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
                  "cooling_combinations":0,"soonest_cooldown_seconds":null,
                  "last_status_class":null}]}"#,
@@ -1341,8 +1354,10 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let docs = [
             r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
+                 "observed" : [],
                  "failures":{},"upstreams":[],"future_field":42}"#,
             r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
+                 "observed" : [],
                  "failures":{},"upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,
                  "disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":null,
                  "last_status_class":null,"extra":true}]}"#,
@@ -1356,21 +1371,21 @@ mod tests {
     fn required_fields_are_enforced() {
         let docs = [
             // Missing top-level figures.
-            r#"{"instance":"p","observed_at":"t","age_seconds":0,"failures":{},"upstreams":[]}"#,
+            r#"{"instance":"p","observed_at":"t","age_seconds":0,"observed":[],"failures":{},"upstreams":[]}"#,
             r#"{"instance":"p","reiki_version":"0","observed_at":"t","failures":{},"upstreams":[]}"#,
-            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"upstreams":[]}"#,
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"observed":[],"upstreams":[]}"#,
             // Missing upstream figures, including the required nullable pair.
-            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"observed":[],"failures":{},
                  "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
                  "soonest_cooldown_seconds":null,"last_status_class":null}]}"#,
-            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"observed":[],"failures":{},
                  "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
                  "cooling_combinations":0,"last_status_class":null}]}"#,
-            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"observed":[],"failures":{},
                  "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,"disabled_keys":0,
                  "cooling_combinations":0,"soonest_cooldown_seconds":null}]}"#,
             // A labelled key must carry its nullable cooldown too.
-            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"failures":{},
+            r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,"observed":[],"failures":{},
                  "upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,
                  "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":null,
                  "keys":[{"name":"k","state":"cooling"}]}]}"#,
@@ -1388,6 +1403,7 @@ mod tests {
             "not json",
             r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : 1,
    "reiki_version" : "0.10.3",
@@ -1505,6 +1521,7 @@ mod tests {
                 "snapshot",
                 r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "2026-11-13T09:31:00Z",
@@ -1568,6 +1585,7 @@ mod tests {
             Health::from_json(
                 r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1603,6 +1621,7 @@ mod tests {
             Health::from_json(
                 r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-b",
    "observed_at" : "t",
@@ -1716,6 +1735,7 @@ mod tests {
         let mut fleet = Fleet::new(Duration::from_secs(30));
         let doc = r#"{
    "age_seconds" : 0,
+   "observed" : [],
    "failures" : {},
    "instance" : "peer-a",
    "observed_at" : "t",
@@ -1765,6 +1785,7 @@ mod tests {
         let doc = |value: &str| {
             format!(
                 r#"{{"instance":"p","reiki_version":{value},"observed_at":"t","age_seconds":0,
+                    "observed" : [],
                     "failures":{{}},"upstreams":[]}}"#
             )
         };

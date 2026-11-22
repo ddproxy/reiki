@@ -23,6 +23,9 @@ pub struct Health {
     /// How old the figures were when the peer sent them.
     pub age_seconds: u64,
     pub upstreams: Vec<Upstream>,
+    /// Passthrough upstreams Reiki has observed. These carry no key state; a reader synthesises
+    /// display-only upstream entries so they can be seen beside keyed upstreams.
+    pub observed: Vec<ObservedUpstream>,
     /// Counts of recent key failures by class over the peer's bounded ring. Counts only: the
     /// bodies behind them never leave the peer.
     pub failures: BTreeMap<String, u64>,
@@ -60,6 +63,86 @@ pub struct Failure {
     pub cooled: bool,
     pub cooling_seconds: Option<u64>,
     pub note: String,
+}
+
+/// Quota numbers a passthrough upstream reported in its response headers. Every field is present
+/// on the wire and may be `null`; other JSON types are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedQuota {
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub requests_limit: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub requests_remaining: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub requests_reset_seconds: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub tokens_limit: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub tokens_remaining: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub tokens_reset_seconds: Option<u64>,
+}
+
+/// One observed passthrough account. `retry_after_seconds` is the remaining wait on the host's
+/// clock, not a value copied from the upstream; `null` means it has elapsed or was never reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedUpstream {
+    #[serde(deserialize_with = "safe_label_field")]
+    pub upstream: String,
+    #[serde(deserialize_with = "safe_label_field")]
+    pub account: String,
+    #[serde(deserialize_with = "safe_label_field")]
+    pub mode: String,
+    #[serde(deserialize_with = "safe_label_field")]
+    pub status_class: String,
+    #[serde(deserialize_with = "safe_label_field")]
+    pub observed_at: String,
+    #[serde(deserialize_with = "required_nullable_u64")]
+    pub retry_after_seconds: Option<u64>,
+    #[serde(deserialize_with = "required_nullable_label")]
+    pub cooldown_class: Option<String>,
+    pub quota: ObservedQuota,
+}
+
+fn required_nullable_u64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| D::Error::custom("expected an unsigned integer or null"))
+}
+
+fn required_nullable_label<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Value::String(text) = value else {
+        return Err(D::Error::custom("expected a string or null"));
+    };
+    if let Some(reason) = safe_label_problem(&text) {
+        return Err(D::Error::custom(format!("cooldown_class {reason}")));
+    }
+    Ok(Some(text))
+}
+
+fn safe_label_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let Value::String(text) = Value::deserialize(deserializer)? else {
+        return Err(D::Error::custom("expected a string"));
+    };
+    if let Some(reason) = safe_label_problem(&text) {
+        return Err(D::Error::custom(reason));
+    }
+    Ok(text)
 }
 
 /// Printable ASCII, at most 32 characters, so a peer's version cannot spoof a terminal line.
@@ -392,6 +475,7 @@ mod tests {
             "last_status_class": null,
             "keys": [{"name": "k", "state": "available", "cooldown_seconds": null}]
         }],
+        "observed": [],
         "failures": {"rate_limited": 2},
         "requestlog_export_dropped_total": 3,
         "host": {"cores": 4},
@@ -441,6 +525,54 @@ mod tests {
                 "{group:?} must not be accepted"
             );
         }
+    }
+
+    #[test]
+    fn observed_entries_round_trip_with_required_nullable_fields() {
+        let text = BASE.replace(
+            "\"observed\": [],",
+            r#""observed": [{
+                "upstream": "oauth",
+                "account": "alpha",
+                "mode": "observed",
+                "status_class": "rate_limited",
+                "observed_at": "2026-11-22T00:00:00Z",
+                "retry_after_seconds": 30,
+                "cooldown_class": "rate_limited",
+                "quota": {
+                    "requests_limit": 60,
+                    "requests_remaining": 0,
+                    "requests_reset_seconds": null,
+                    "tokens_limit": null,
+                    "tokens_remaining": null,
+                    "tokens_reset_seconds": null
+                }
+            }],"#,
+        );
+        let health = Health::from_json(&text).unwrap();
+        assert_eq!(health.observed.len(), 1);
+        assert_eq!(health.observed[0].retry_after_seconds, Some(30));
+        assert_eq!(health.observed[0].quota.requests_remaining, Some(0));
+        assert_eq!(
+            serde_json::to_value(health).unwrap()["observed"][0]["mode"],
+            "observed"
+        );
+
+        let missing = text.replace("\"retry_after_seconds\": 30,", "");
+        assert!(
+            Health::from_json(&missing).is_err(),
+            "a missing key is an error"
+        );
+        let wrong_type = text.replace(
+            "\"retry_after_seconds\": 30,",
+            "\"retry_after_seconds\": \"30\",",
+        );
+        assert!(Health::from_json(&wrong_type).is_err());
+        let unknown = text.replace(
+            "\"mode\": \"observed\",",
+            "\"mode\": \"observed\", \"surprise\": 1,",
+        );
+        assert!(Health::from_json(&unknown).is_err());
     }
 
     #[test]

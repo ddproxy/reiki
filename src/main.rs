@@ -863,7 +863,15 @@ async fn main() {
     reiki::lifecycle::spawn_signal_handler();
     reiki::lifecycle::warn_if_open_files_low();
     reiki::notify::spawn_watchdog();
+    #[cfg(feature = "peers")]
+    let peer_ca = config
+        .peers
+        .as_ref()
+        .map(reiki::peers::tls::check_ca_files)
+        .unwrap_or_default();
     let app = App::new(config, keys, Policy::default(), plugins);
+    #[cfg(feature = "peers")]
+    app.set_peer_ca(peer_ca);
     app.set_state_path(state_path);
     app.start_state_writer();
     app.set_config_path(cli.config.clone());

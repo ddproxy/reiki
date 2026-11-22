@@ -177,7 +177,7 @@ fn now_rfc3339(offset_secs: i64) -> String {
 fn health_json(observed_at: &str, age_seconds: u64) -> String {
     format!(
         "{{\"instance\":\"mock\",\"reiki_version\":\"0.12.0\",\"observed_at\":\"{observed_at}\",\
-         \"age_seconds\":{age_seconds},\"failures\":{{}},\"upstreams\":[\
+         \"observed\":[],\"age_seconds\":{age_seconds},\"failures\":{{}},\"upstreams\":[\
          {{\"name\":\"zen\",\"healthy_keys\":2,\"cooling_keys\":0,\"disabled_keys\":0,\
          \"cooling_combinations\":0,\"soonest_cooldown_seconds\":null,\"last_status_class\":\"2xx\"}}]}}"
     )

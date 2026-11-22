@@ -215,26 +215,37 @@ impl Tunnel {
     /// Keeps an allowed name from being pointed back at this machine's own services.
     fn reachable(&self, addr: &SocketAddr) -> bool {
         let policy = self.policy();
-        if policy.deny_private && private_ip(addr.ip()) {
-            return false;
-        }
-        if policy.allow_loopback && addr.ip().is_loopback() {
-            return true;
-        }
-        let local = match addr.ip() {
-            IpAddr::V4(v4) => local_v4(v4),
-            IpAddr::V6(v6) => {
-                let seg = v6.segments();
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (seg[0] & 0xffc0) == 0xfe80
-                    || seg == [0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254]
-                    || embedded_v4s(&seg).into_iter().flatten().any(local_v4)
-            }
-        };
-        !local
+        outbound_address_allowed(addr, policy.allow_loopback, policy.deny_private)
     }
+}
+
+/// Reusable check for every outbound socket Reiki opens, tunnel or direct: private ranges are
+/// optional, but local, link-local, metadata and transition addresses are never destinations
+/// unless loopback was explicitly allowed.
+pub fn outbound_address_allowed(
+    addr: &SocketAddr,
+    allow_loopback: bool,
+    deny_private: bool,
+) -> bool {
+    if deny_private && private_ip(addr.ip()) {
+        return false;
+    }
+    if allow_loopback && addr.ip().is_loopback() {
+        return true;
+    }
+    let local = match addr.ip() {
+        IpAddr::V4(v4) => local_v4(v4),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || seg == [0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254]
+                || embedded_v4s(&seg).into_iter().flatten().any(local_v4)
+        }
+    };
+    !local
 }
 
 fn private_v4(v4: std::net::Ipv4Addr) -> bool {
@@ -1157,5 +1168,22 @@ mod tests {
         ] {
             assert!(closed.reachable(&addr.parse().unwrap()), "{addr}");
         }
+    }
+
+    #[test]
+    fn the_reusable_validator_is_the_one_the_tunnel_uses() {
+        let tunnel = tunnel(&["*"]);
+        for addr in ["93.184.216.34:443", "127.0.0.1:443", "169.254.169.254:443"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            assert_eq!(
+                tunnel.reachable(&addr),
+                super::outbound_address_allowed(&addr, false, false)
+            );
+        }
+        assert!(super::outbound_address_allowed(
+            &"127.0.0.1:443".parse().unwrap(),
+            true,
+            false
+        ));
     }
 }

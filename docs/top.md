@@ -81,6 +81,7 @@ Inside the Peers panel:
 - The cooling panel lists each (peer, provider) with cooling keys: its drain bar, time left and last status class, soonest first, six lines then `+N more`. `--once` prints it too.
 - A `+N` after a cell is the number of cooling (route, model) combinations on that provider, when the peer publishes it; the request total is never in the matrix.
 - The detail pane adds `last hour: N requests, M limited` and a twelve-cell five-minute trend for each upstream.
+- Observed passthrough entries appear as display-only columns named `observed/{account}` when a peer publishes them. They show the last observed status class and retry hint, carry no key state, and are left out of key counts and fleet tallies. Duplicate observed entries for one account are collapsed by worst state; the detail pane says `observed` and lists the account, status class, remaining retry and quota figures.
 - `Ver` is the version each peer publishes (`reiki_version`), after the provider columns and before the host figures, clipped to twelve characters. `?` means the peer does not publish one. The detail card shows it after the instance name, as `v0.10.3`.
 - `load` is the one-minute load with a sparkline of recent samples. `disk` is the fullest disk: green under 75%, yellow to 89%, red from 90%. `sess` is active sessions. A `-` means the peer does not publish that figure.
 - A stale row shows `stale <age>` in place of host figures. Its error goes to the detail pane.

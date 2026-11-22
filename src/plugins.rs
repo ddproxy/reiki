@@ -829,11 +829,18 @@ impl PluginSession {
         }
 
         let chain = Arc::clone(&self.chain);
+        // The blocking task runs on another thread, where neither the request's tracing span nor
+        // this session's ownership survives. Carry the span in explicitly, and poison the session
+        // before handing its state away: if this future is cancelled at the await, the moved
+        // states never come back and the session must fail closed on any reuse.
+        let span = tracing::Span::current();
+        self.failed = true;
         let mut states = std::mem::take(&mut self.states);
         let owned_meta = OwnedRequestMeta::from(meta);
         let mut owned_headers = headers.clone();
         let mut owned_body = body.clone();
         let joined = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let meta = owned_meta.borrowed();
             let result = chain.on_request(&mut states, &meta, &mut owned_headers, &mut owned_body);
             (states, owned_headers, owned_body, result)
@@ -844,6 +851,7 @@ impl PluginSession {
                 self.states = states;
                 *headers = returned_headers;
                 *body = returned_body;
+                self.failed = false;
                 result
             }
             Err(_) => {
@@ -1748,6 +1756,179 @@ mod tests {
         let mut chunk = Bytes::from_static(b"secret");
         assert!(session.on_response_chunk(&mut chunk, true));
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A process-wide log capture for the blocking-pool span test. Global because blocking
+    /// threads do not inherit the thread-local subscriber the rest of this test binary uses.
+    #[derive(Clone)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn request_logs() -> &'static LogBuffer {
+        static LOGS: std::sync::OnceLock<LogBuffer> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = LogBuffer(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("install the request log capture once");
+            logs
+        })
+    }
+
+    #[tokio::test]
+    async fn blocking_hooks_keep_the_request_span_in_their_logs() {
+        use tracing::Instrument;
+
+        struct Logger;
+        impl Plugin for Logger {
+            fn name(&self) -> &str {
+                "logger"
+            }
+            fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+                tracing::info!("blocking hook ran");
+                Ok(())
+            }
+        }
+
+        let logs = request_logs();
+        logs.clear();
+        let registry = vec![Registration {
+            name: "logger",
+            build: |_| Ok(Box::new(Logger) as Box<dyn Plugin>),
+        }];
+        let chain = Arc::new(PluginChain::build(&configured("[logger]\n"), &registry).unwrap());
+        let mut session = chain.session();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "span-42",
+            stream: "default",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/chat",
+        };
+        let span = tracing::info_span!("req", id = %meta.id);
+        async {
+            session
+                .on_request_blocking(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+                .await
+                .unwrap();
+        }
+        .instrument(span)
+        .await;
+
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("blocking hook ran"))
+            .unwrap_or_else(|| panic!("the blocking hook log is missing: {text}"));
+        assert!(
+            line.contains("req{id=span-42}"),
+            "the hook lost its request span: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_blocking_session_fails_closed_when_reused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::{Receiver, channel};
+        use std::time::Duration;
+
+        struct Blocker {
+            release: Arc<std::sync::Mutex<Receiver<()>>>,
+            calls: &'static AtomicUsize,
+        }
+        impl Plugin for Blocker {
+            fn name(&self) -> &str {
+                "blocker"
+            }
+            fn fails_closed(&self) -> bool {
+                true
+            }
+            fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Result<(), PluginError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _ = self.release.lock().unwrap().recv();
+                Ok(())
+            }
+        }
+
+        static RELEASE: std::sync::OnceLock<Arc<std::sync::Mutex<Receiver<()>>>> =
+            std::sync::OnceLock::new();
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let (tx, rx) = channel();
+        let _release = RELEASE.get_or_init(|| Arc::new(std::sync::Mutex::new(rx)));
+        CALLS.store(0, Ordering::SeqCst);
+        let registry = vec![Registration {
+            name: "blocker",
+            build: |_| {
+                Ok(Box::new(Blocker {
+                    release: Arc::clone(RELEASE.get().unwrap()),
+                    calls: &CALLS,
+                }) as Box<dyn Plugin>)
+            },
+        }];
+        let chain = Arc::new(PluginChain::build(&configured("[blocker]\n"), &registry).unwrap());
+        let mut session = chain.session();
+        let method = Method::POST;
+        let meta = RequestMeta {
+            id: "cancelled",
+            stream: "default",
+            upstream: "zen",
+            method: &method,
+            path: "/zen/chat",
+        };
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            session.on_request_blocking(&meta, &mut HeaderMap::new(), &mut Bytes::new()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the hook was supposed to still be running"
+        );
+        let _ = tx.send(());
+        tokio::task::yield_now().await;
+
+        let blocked = session
+            .on_request(&meta, &mut HeaderMap::new(), &mut Bytes::new())
+            .unwrap_err();
+        assert_eq!(blocked.status, PLUGIN_FAILURE_STATUS);
+        assert_eq!(blocked.message, PLUGIN_FAILURE_MESSAGE);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1, "the hook ran again");
     }
 
     #[cfg(feature = "plugin-placeholders")]

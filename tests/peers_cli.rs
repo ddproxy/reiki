@@ -391,12 +391,15 @@ async fn a_token_file_others_can_read_is_refused_before_any_request() {
     assert_eq!(peer.hits.load(Ordering::SeqCst), 0);
 }
 
-/// A real publisher, served on loopback.
-async fn real_publisher() -> SocketAddr {
+/// A real publisher, served on loopback, with an optional operator-set capacity group.
+async fn real_publisher_with_group(group: Option<&str>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let group = group
+        .map(|value| format!("capacity_group = \"{value}\"\n"))
+        .unwrap_or_default();
     let text = format!(
-        "[upstream.zen]\nbase_url = \"https://example.com/v1\"\n\
+        "[upstream.zen]\nbase_url = \"https://example.com/v1\"\n{group}\
          [keys.zen-a]\nupstream = \"zen\"\nfile = \"/unused\"\n\
          [peers]\nenabled = true\npublish = true\nlisten = \"{addr}\"\n\
          peer_token_sha256 = \"{}\"\ninstance = \"real\"\n",
@@ -417,6 +420,50 @@ async fn real_publisher() -> SocketAddr {
         std::future::pending(),
     ));
     addr
+}
+
+/// The publisher without a configured group, as the other tests expect.
+async fn real_publisher() -> SocketAddr {
+    real_publisher_with_group(None).await
+}
+
+#[tokio::test]
+async fn a_real_publishers_configured_group_is_read_by_a_polling_peer() {
+    let dir = Dir::new("group");
+    let addr = real_publisher_with_group(Some("team-a")).await;
+    let token = dir.write("token", PEER_TOKEN, 0o600);
+    let report = poll_one(("client-a", format!("http://{addr}"), None), &token).await;
+    assert!(report.is_fresh(), "{report:?}");
+    assert_eq!(
+        report.upstreams[0].capacity_group.as_deref(),
+        Some("team-a"),
+        "the reader accepts the group the publisher sends"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_cannot_send_an_unsafe_group_to_a_polling_reader() {
+    let dir = Dir::new("bad-group");
+    let token = dir.write("token", PEER_TOKEN, 0o600);
+    let body = health_json(&now_rfc3339(0), 0).replace(
+        "\"last_status_class\":\"2xx\"",
+        "\"last_status_class\":\"2xx\",\"capacity_group\":\"a\\u001bb\"",
+    );
+    let peer = mock_peer(None, ok_reply(&body)).await;
+    let report = poll_one(
+        (
+            "client-a",
+            format!("http://127.0.0.1:{}", peer.addr.port()),
+            None,
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(report.state, "unknown");
+    assert!(
+        report.error.unwrap().contains("capacity_group"),
+        "an invalid group is a parse error, not a missing value"
+    );
 }
 
 #[tokio::test]

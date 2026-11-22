@@ -8,6 +8,10 @@
 
 ### Fixed
 
+- Peers that read another instance's health document now accept `capacity_group` in polling snapshots and key events, so a configured group no longer breaks the peer view. Unsafe group values are still refused on the wire.
+- A CONNECT connection still waiting for its request head is closed at the shutdown drain cut instead of holding a socket until the head timeout.
+- Tunnel idle detection uses one monotonic clock, so a wall-clock step cannot keep an idle tunnel open or close an active one. Tunnels cut by shutdown now log the `bytes_up` and `bytes_down` that actually moved.
+- Plugin request hooks offloaded to the blocking pool keep the `req{id=...}` span in their log lines. A session whose blocking hook is cancelled now fails closed with 503 if it is reused, instead of running without its plugin state.
 - Documentation: deduplicated `docs/README.md` navigation, removed the broken `service.md` link, listed every docs page, and corrected stale key-permission text in quickstart, limits and security docs. Monitoring admin-route wording now matches the `/v1`-only route mounting.
 
 ## 0.13.0

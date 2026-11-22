@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
@@ -314,21 +314,114 @@ enum Phase {
     Cut,
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+/// Elapsed milliseconds from one fixed monotonic start. Activity timestamps and the idle
+/// comparison share this clock, so a wall-clock step cannot close an active tunnel or keep an
+/// idle one alive.
+#[derive(Clone, Copy)]
+struct Clock {
+    start: Instant,
 }
 
-/// Records the last byte in either direction so a stop can tell an idle tunnel from a busy one.
+impl Clock {
+    fn now() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    fn at(start: Instant) -> Self {
+        Self { start }
+    }
+
+    fn millis(self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    fn idle_since(self, last: u64) -> bool {
+        idle_after(last, self.millis())
+    }
+}
+
+fn idle_after(last: u64, now: u64) -> bool {
+    now.saturating_sub(last) >= IDLE_AFTER.as_millis() as u64
+}
+
+/// Activity and directional byte counts for one tunnel. They live outside the copy future, so a
+/// shutdown cut still reports the bytes that actually moved before cancellation.
+#[derive(Default)]
+struct Traffic {
+    last: AtomicU64,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+    target: std::sync::OnceLock<(String, u16)>,
+}
+
+impl Traffic {
+    fn new(clock: Clock) -> Self {
+        Self {
+            last: AtomicU64::new(clock.millis()),
+            ..Self::default()
+        }
+    }
+
+    fn set_target(&self, host: String, port: u16) {
+        let _ = self.target.set((host, port));
+    }
+
+    fn touch(&self, clock: Clock) {
+        self.last.store(clock.millis(), Ordering::Relaxed);
+    }
+
+    fn add_up(&self, count: usize) {
+        self.bytes_up.fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    fn add_down(&self, count: usize) {
+        self.bytes_down.fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.bytes_up.load(Ordering::Relaxed),
+            self.bytes_down.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Which side of a tunnel a read or write belongs to. Only the client side counts bytes: the
+/// upstream side sees the same traffic and would double it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Counting {
+    Client,
+    ActivityOnly,
+}
+
+/// Updates activity, and byte counts on the client side, as data actually moves through a tunnel.
 struct Tracked<S> {
     inner: S,
-    last: Arc<AtomicU64>,
+    traffic: Arc<Traffic>,
+    clock: Clock,
+    counting: Counting,
 }
 
 impl<S> Tracked<S> {
-    fn new(inner: S, last: Arc<AtomicU64>) -> Self {
-        Self { inner, last }
+    fn client(inner: S, traffic: Arc<Traffic>, clock: Clock) -> Self {
+        Self {
+            inner,
+            traffic,
+            clock,
+            counting: Counting::Client,
+        }
+    }
+
+    fn activity_only(inner: S, traffic: Arc<Traffic>, clock: Clock) -> Self {
+        Self {
+            inner,
+            traffic,
+            clock,
+            counting: Counting::ActivityOnly,
+        }
     }
 }
 
@@ -341,8 +434,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Tracked<S> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if buf.filled().len() > before {
-            this.last.store(now_millis(), Ordering::Relaxed);
+        let moved = buf.filled().len().saturating_sub(before);
+        if moved > 0 {
+            this.traffic.touch(this.clock);
+            if this.counting == Counting::Client {
+                this.traffic.add_up(moved);
+            }
         }
         polled
     }
@@ -359,7 +456,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
         if let Poll::Ready(Ok(written)) = polled
             && written > 0
         {
-            this.last.store(now_millis(), Ordering::Relaxed);
+            this.traffic.touch(this.clock);
+            if this.counting == Counting::Client {
+                this.traffic.add_down(written);
+            }
         }
         polled
     }
@@ -374,20 +474,57 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
 }
 
 /// Ends a tunnel's copy when it is idle at the start of a stop, or when the drain is over.
-async fn stop_watcher(mut phase: watch::Receiver<Phase>, last: Arc<AtomicU64>, close_idle: bool) {
+async fn stop_watcher(
+    mut phase: watch::Receiver<Phase>,
+    traffic: Arc<Traffic>,
+    close_idle: bool,
+    clock: Clock,
+) {
     while phase.changed().await.is_ok() {
         match *phase.borrow() {
             Phase::Running => {}
             Phase::Stopping if close_idle => {
-                let idle = now_millis().saturating_sub(last.load(Ordering::Relaxed))
-                    >= IDLE_AFTER.as_millis() as u64;
-                if idle {
+                if clock.idle_since(traffic.last.load(Ordering::Relaxed)) {
                     return;
                 }
             }
             Phase::Stopping => {}
             Phase::Cut => return,
         }
+    }
+}
+
+/// The end of the drain. Watched around the whole handler, including its setup phases, so a
+/// socket is never left open by a handler that has not finished its CONNECT head.
+async fn cut_watcher(mut phase: watch::Receiver<Phase>) {
+    while phase.changed().await.is_ok() && *phase.borrow() != Phase::Cut {}
+}
+
+fn log_closed(host: &str, port: u16, started: Instant, traffic: &Traffic) {
+    let (up, down) = traffic.totals();
+    tracing::info!(
+        %host,
+        port,
+        bytes_up = up,
+        bytes_down = down,
+        millis = started.elapsed().as_millis() as u64,
+        "tunnel closed"
+    );
+}
+
+/// A cut can land before the CONNECT head names a destination; the byte totals are still known.
+fn log_cut(peer: SocketAddr, started: Instant, traffic: &Traffic) {
+    let (up, down) = traffic.totals();
+    let millis = started.elapsed().as_millis() as u64;
+    match traffic.target.get() {
+        Some((host, port)) => log_closed(host, *port, started, traffic),
+        None => tracing::info!(
+            %peer,
+            bytes_up = up,
+            bytes_down = down,
+            millis,
+            "tunnel closed before the destination was chosen"
+        ),
     }
 }
 
@@ -448,11 +585,29 @@ pub async fn serve_until(
         };
         let tunnel = Arc::clone(&tunnel);
         let phase = phase_rx.clone();
+        let clock = Clock::now();
         tokio::spawn(async move {
             let _slot = slot;
             let _guard = guard;
             let close_idle = tunnel.policy().close_idle_on_stop;
-            if let Err(error) = handle(stream, &tunnel, phase, close_idle).await {
+            let started = Instant::now();
+            let traffic = Arc::new(Traffic::new(clock));
+            let outcome = tokio::select! {
+                () = cut_watcher(phase.clone()) => {
+                    log_cut(peer, started, &traffic);
+                    return;
+                }
+                result = handle(
+                    stream,
+                    &tunnel,
+                    phase,
+                    close_idle,
+                    Arc::clone(&traffic),
+                    clock,
+                    started,
+                ) => result,
+            };
+            if let Err(error) = outcome {
                 tracing::debug!(%peer, %error, "tunnel connection ended with an error");
             }
         });
@@ -523,6 +678,9 @@ async fn handle(
     tunnel: &Tunnel,
     phase: watch::Receiver<Phase>,
     close_idle: bool,
+    traffic: Arc<Traffic>,
+    clock: Clock,
+    started: Instant,
 ) -> io::Result<()> {
     let Some((target, rest, proxy_authorization)) = read_connect(&mut client).await? else {
         return respond(&mut client, "400 Bad Request", "expected a CONNECT request").await;
@@ -534,6 +692,7 @@ async fn handle(
         tracing::warn!(%host, port, "tunnel refused a destination that is not allowed");
         return respond(&mut client, "403 Forbidden", "destination not allowed").await;
     }
+    traffic.set_target(host.clone(), port);
 
     if let Some(interceptor) = tunnel
         .interceptor
@@ -571,21 +730,24 @@ async fn handle(
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
+        traffic.touch(clock);
         tracing::info!(%host, "tunnel intercepting");
-        let last = Arc::new(AtomicU64::new(now_millis()));
-        let stream = Tracked::new(Prefixed::new(rest, client), Arc::clone(&last));
-        let watcher = stop_watcher(phase, last, close_idle);
-        let _ = tokio::time::timeout(MAX_TUNNEL_LIFETIME, async {
+        let stream = Tracked::client(Prefixed::new(rest, client), Arc::clone(&traffic), clock);
+        let watcher = stop_watcher(phase, Arc::clone(&traffic), close_idle, clock);
+        let served = tokio::time::timeout(MAX_TUNNEL_LIFETIME, async {
             tokio::select! {
-                () = interceptor.serve(&host, target, stream) => {}
-                () = watcher => {}
+                () = interceptor.serve(&host, target, stream) => (),
+                () = watcher => (),
             }
         })
         .await;
+        if served.is_err() {
+            tracing::debug!(%host, port, "tunnel lifetime reached");
+        }
+        log_closed(&host, port, started, &traffic);
         return Ok(());
     }
 
-    let started = Instant::now();
     let upstream = tokio::time::timeout(
         tunnel.policy().connect_timeout,
         connect(tunnel, &host, port),
@@ -606,35 +768,29 @@ async fn handle(
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
+    traffic.touch(clock);
     if !rest.is_empty() {
-        upstream.write_all(&rest).await?;
+        if let Err(error) = upstream.write_all(&rest).await {
+            tracing::debug!(%host, port, %error, "tunnel early payload failed");
+            log_closed(&host, port, started, &traffic);
+            return Ok(());
+        }
+        traffic.add_up(rest.len());
     }
-    let last = Arc::new(AtomicU64::new(now_millis()));
-    let mut client = Tracked::new(client, Arc::clone(&last));
-    let mut upstream = Tracked::new(upstream, Arc::clone(&last));
+    let mut client = Tracked::client(client, Arc::clone(&traffic), clock);
+    let mut upstream = Tracked::activity_only(upstream, Arc::clone(&traffic), clock);
     let copied = tokio::time::timeout(MAX_TUNNEL_LIFETIME, async {
         tokio::select! {
             copied = copy_bidirectional(&mut client, &mut upstream) => copied,
-            () = stop_watcher(phase, last, close_idle) => Ok((0, 0)),
+            () = stop_watcher(phase, Arc::clone(&traffic), close_idle, clock) => Ok((0, 0)),
         }
     })
     .await
     .unwrap_or_else(|_| Err(io::Error::other("tunnel lifetime reached")));
-    let (up, down) = match copied {
-        Ok(counts) => counts,
-        Err(error) => {
-            tracing::debug!(%host, port, %error, "tunnel copy ended with an error; byte counts are unknown");
-            (0, 0)
-        }
-    };
-    tracing::info!(
-        %host,
-        port,
-        bytes_up = up + rest.len() as u64,
-        bytes_down = down,
-        millis = started.elapsed().as_millis() as u64,
-        "tunnel closed"
-    );
+    if let Err(error) = &copied {
+        tracing::debug!(%host, port, %error, "tunnel copy ended with an error; byte counts are still known");
+    }
+    log_closed(&host, port, started, &traffic);
     Ok(())
 }
 
@@ -786,7 +942,9 @@ mod tests {
     #[tokio::test]
     async fn an_idle_tunnel_is_not_closed_at_stop_when_close_idle_is_off() {
         let (tx, rx) = watch::channel(Phase::Running);
-        let mut watcher = Box::pin(stop_watcher(rx, Arc::new(AtomicU64::new(0)), false));
+        let clock = Clock::now();
+        let traffic = Arc::new(Traffic::new(clock));
+        let mut watcher = Box::pin(stop_watcher(rx, Arc::clone(&traffic), false, clock));
         tx.send_replace(Phase::Stopping);
         tokio::select! {
             () = &mut watcher => panic!("an idle tunnel was closed before the cut"),
@@ -796,6 +954,29 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), watcher)
             .await
             .expect("the watcher ends at the cut");
+    }
+
+    #[test]
+    fn idle_comparisons_use_monotonic_elapsed_time() {
+        let window = IDLE_AFTER.as_millis() as u64;
+        assert!(!idle_after(window - 1, window - 1));
+        assert!(!idle_after(window - 1, window));
+        assert!(idle_after(0, window));
+        assert!(idle_after(10, window + 10));
+        // A stored timestamp ahead of the current reading cannot be idle; a real clock step
+        // backwards must never close an active tunnel.
+        assert!(!idle_after(u64::MAX, window));
+
+        let start = Instant::now()
+            .checked_sub(Duration::from_millis(window + 500))
+            .expect("the test clock can look back");
+        let clock = Clock::at(start);
+        assert!(
+            clock.idle_since(0),
+            "the fixed start makes the reading monotonic"
+        );
+        let recent = clock.millis().saturating_sub(window - 1);
+        assert!(!clock.idle_since(recent));
     }
 
     #[test]

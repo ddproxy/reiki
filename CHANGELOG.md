@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- `days_from_civil` moved into `reiki-plugin::timefmt` alongside `civil_from_days`; host modules now import the shared helper.
+
+### Fixed
+
+- Documentation: deduplicated `docs/README.md` navigation, removed the broken `service.md` link, listed every docs page, and corrected stale key-permission text in quickstart, limits and security docs. Monitoring admin-route wording now matches the `/v1`-only route mounting.
+
 ## 0.13.0
 
 ### Changed

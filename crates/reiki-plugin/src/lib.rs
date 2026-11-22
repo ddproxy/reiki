@@ -8,7 +8,7 @@
 
 mod timefmt;
 
-pub use timefmt::{civil_from_days, format_utc};
+pub use timefmt::{civil_from_days, days_from_civil, format_utc};
 
 use std::any::Any;
 use std::collections::hash_map::RandomState;

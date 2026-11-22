@@ -166,17 +166,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-// Days since 1970-01-01, Proleptic Gregorian (Howard Hinnant's days_from_civil).
-pub(crate) fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
-    if month <= 2 {
-        year -= 1;
-    }
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
+pub(crate) use reiki_plugin::days_from_civil;
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))

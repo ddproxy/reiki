@@ -2,7 +2,7 @@
 
 /// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`.
 ///
-/// Howard Hinnant's `civil_from_days`; the inverse of the host's `days_from_civil`.
+/// Howard Hinnant's `civil_from_days`; the inverse of [`days_from_civil`].
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -14,6 +14,20 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Days since 1970-01-01 from a proleptic Gregorian date.
+///
+/// Howard Hinnant's `days_from_civil`; the inverse of [`civil_from_days`].
+pub fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Unix `secs` as `YYYY-MM-DD<separator>HH:MM:SS[.mmm]<suffix>` in UTC, without a date library.
@@ -60,5 +74,14 @@ mod tests {
             "2026-10-03 04:00:00"
         );
         assert_eq!(format_utc(-1, 'T', None, "Z"), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn days_from_civil_round_trips_civil_from_days() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2024, 2, 29), (2026, 3, 1)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
     }
 }

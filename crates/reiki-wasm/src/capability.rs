@@ -159,6 +159,18 @@ pub fn capability_for_import(import: &str) -> Option<Capability> {
     }
 }
 
+/// Returns true for host imports that carry no capability gate. The generated guest
+/// bindings import `reiki:plugin/types` for the shared variant/record definitions;
+/// it is part of the WIT world but is not a grantable capability.
+pub fn is_allowed_non_capability_import(import: &str) -> bool {
+    // Wasmtime exposes the `request` resource imported from request-meta as a
+    // bare name in ComponentType::imports. It is part of the request-meta
+    // capability already derived from the interface import.
+    import.starts_with("reiki:plugin/types@")
+        || import == "reiki:plugin/types"
+        || import == "request"
+}
+
 /// Returns true if an import is a known WASI/host inert stub allowed in Phase 1.
 pub fn is_allowed_inert_import(import: &str) -> bool {
     // WASI p2 cli/stdio/clocks/random/filesystem/sockets/env may be imported by toolchains.
@@ -180,4 +192,19 @@ fn s_is_wasi_socket(import: &str) -> bool {
 
 fn s_is_wasi_http(import: &str) -> bool {
     import.contains("wasi:http")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_types_import_is_allowed_but_not_a_capability() {
+        let import = "reiki:plugin/types@1.0.0";
+        assert!(is_allowed_non_capability_import(import));
+        assert!(capability_for_import(import).is_none());
+        assert!(!is_allowed_inert_import(import));
+        assert!(is_allowed_non_capability_import("request"));
+        assert!(!is_allowed_non_capability_import("wasi:sockets"));
+    }
 }

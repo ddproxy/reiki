@@ -141,3 +141,75 @@ Reference examples:
 - `examples/wasm-body-edit` - `request-body:edit` with a manifest literal edit.
 
 Both include source, manifest, README, and `rebuild.sh`.
+
+### Building without `cargo-component`
+
+The reference examples do not use `cargo-component`. They are plain Rust crates
+that call `wit-bindgen` at compile time, then use `wasm-tools` to wrap the core
+module as a component. You need:
+
+- the `wasm32-wasip1` Rust target (`rustup target add wasm32-wasip1`);
+- `wasm-tools` on `PATH` (the scripts use the 1.263 command set);
+- `perl`, used only to inject the manifest as a top-level custom section.
+
+From an example directory, run `./rebuild.sh [OUTPUT]`. With no argument the
+script writes `no-grant.wasm` or `body-edit.wasm` in that directory. The steps
+are:
+
+```sh
+cargo build --release --target wasm32-wasip1
+wasm-tools strip -a "$core" -o "$stripped"
+wasm-tools component embed ../../crates/reiki-wasm/wit "$stripped" \
+  -w plugin -o "$embedded"
+wasm-tools parse "$adapter_wat" -o "$adapter"
+wasm-tools component new "$embedded" \
+  --adapt "wasi_snapshot_preview1=$adapter" -o "$component"
+wasm-tools print "$component" -o "$component_wat"
+# inject (@custom "reiki-manifest" "...") at the component top level
+wasm-tools parse "$component_wat" -o "$out"
+wasm-tools validate "$out"
+wasm-tools component wit "$out"
+```
+
+The tiny inline WASI preview1 adapter supplies `environ_get`,
+`environ_sizes_get`, `fd_write`, and `proc_exit`; it does not give the plugin
+filesystem or socket access. Current `wasm-tools` has no
+`wasm-tools component add-metadata` subcommand, so the manifest is injected
+through the text format. The section must be at component top level: the host
+inspector reads top-level custom sections only. `rebuild.sh` accepts
+`REIKI_WASM_OUT`, `REIKI_WASM_WORK`, and `CARGO_TARGET_DIR` for reproducible
+builds in a temporary directory.
+
+### Phase 1 conformance coverage
+
+The Phase 1 design's section 5 cases are exercised against the committed
+components by `crates/reiki-wasm/tests/conformance.rs`:
+
+| Case | Test or check |
+| --- | --- |
+| Small, hashed fixtures and rebuild comparison | `committed_fixtures_are_small_and_hashed`; `rebuilt_fixtures_match_committed_bytes` |
+| Load with and without grants; import-derived capabilities | `no_grant_component_loads_and_runs_default_hooks`; `body_read_edit_and_vocab_findings_work_end_to_end`; `inspect_reports_import_derived_capabilities` |
+| Pin mismatch and manifest mismatch | `pin_and_manifest_mismatches_fail_to_load` |
+| Template skip/reject and sanitised reasons | `skip_and_reject_use_manifest_templates_and_sanitised_text` |
+| Fuel exhaustion, memory limit, epoch deadline | `fuel_exhaustion_fails_closed`; `memory_limit_traps_and_fails_closed`; `deadline_reached_inside_host_call_is_enforced` |
+| Trap handling per available hook | `trap_matrix_covers_init_and_request_by_role` (init load failure, and on-request trap with pass-through and fail-closed policies) |
+| Body read/edit, vocab findings, invalid edit ops | `body_read_edit_and_vocab_findings_work_end_to_end`; `non_vocab_detail_is_dropped`; `invalid_edit_ops_are_rejected` |
+| Request-side tool allowlist | `tool_allowlist_is_enforced_before_the_wasm_hook` |
+| Reload that can only narrow | `reload_narrowing_uses_real_component_configs` |
+| Inspect output | `inspect_reports_import_derived_capabilities`; `tests/wasm_plugin_inspect.rs` checks `reiki plugin inspect` text and `--json` output for both fixtures |
+
+Run the suite with:
+
+```sh
+cargo test -p reiki-wasm --test conformance
+```
+
+The rebuild comparison skips with a clear message when `wasm32-wasip1`,
+`wasm-tools`, or `perl` is unavailable; when the toolchain is present it
+rebuilds both examples into a temporary directory and compares SHA-256 against
+`tests/fixtures/SHA256SUMS`.
+
+Not covered by this Phase 1 pass: response-side hooks and the full design 3.3
+hook matrix (Phase 1 exposes only `init` and `on-request`), the `wall-budget-ms`
+and `max-body-kib` limits (not exercised by the committed fixtures), and the
+reserved `signature`/`files` fields (unsupported).

@@ -8,3 +8,7 @@ reiki.toml
 .idea
 *.state
 bom.json
+/examples/*/target/
+/examples/*/*.component.wasm
+/examples/wasm-no-grant/no-grant.wasm
+/examples/wasm-body-edit/body-edit.wasm

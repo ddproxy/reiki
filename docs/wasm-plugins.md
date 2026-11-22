@@ -86,6 +86,13 @@ Fuel is charged per call with a body-size component (`fuel-per-call +
 ceil(body_kib) * fuel-per-kib`). Exceeding fuel, memory, or deadline traps the
 plugin; `role = "security"` or `on_error = "reject"` fails closed with 503.
 
+`deadline-ms` bounds a request, including time spent inside host calls.
+Load-time instantiation and `init` are a separate phase and use `wall-budget-ms`
+instead; the per-request `init` call is part of the request and uses the
+request deadline. Both budgets are checked by host calls and by the epoch
+ticker, so neither init nor a request can run unbounded; both are also capped
+by their host ceilings.
+
 ### Restart rules and reload narrowing
 
 Reload can only narrow. Widening requires restart.
@@ -202,7 +209,7 @@ components by `crates/reiki-wasm/tests/conformance.rs`:
 | Load with and without grants; import-derived capabilities | `no_grant_component_loads_and_runs_default_hooks`; `body_read_edit_and_vocab_findings_work_end_to_end`; `inspect_reports_import_derived_capabilities` |
 | Pin mismatch and manifest mismatch | `pin_and_manifest_mismatches_fail_to_load` |
 | Template skip/reject and sanitised reasons | `skip_and_reject_use_manifest_templates_and_sanitised_text` |
-| Fuel exhaustion, memory limit, epoch deadline | `fuel_exhaustion_fails_closed`; `memory_limit_traps_and_fails_closed`; `deadline_reached_inside_host_call_is_enforced` |
+| Fuel exhaustion, memory limit, epoch deadline | `fuel_exhaustion_fails_closed`; `memory_limit_traps_and_fails_closed`; `deadline_reached_inside_host_call_is_enforced`; `init_is_bounded_by_the_wall_budget` |
 | Trap handling per available hook | `trap_matrix_covers_init_and_request_by_role` (init load failure, and on-request trap with pass-through and fail-closed policies) |
 | Body read/edit, vocab findings, invalid edit ops | `body_read_edit_and_vocab_findings_work_end_to_end`; `non_vocab_detail_is_dropped`; `invalid_edit_ops_are_rejected` |
 | Request-side tool allowlist | `tool_allowlist_is_enforced_before_the_wasm_hook` |
@@ -222,6 +229,6 @@ rebuilds all four reference components into a temporary directory and compares
 SHA-256 against `tests/fixtures/SHA256SUMS`.
 
 Not covered by this Phase 1 pass: response-side hooks and the full design 3.3
-hook matrix (Phase 1 exposes only `init` and `on-request`), the `wall-budget-ms`
-and `max-body-kib` limits (not exercised by the committed fixtures), and the
-reserved `signature`/`files` fields (unsupported).
+hook matrix (Phase 1 exposes only `init` and `on-request`), the `max-body-kib`
+limit (not exercised by the committed fixtures), and the reserved
+`signature`/`files` fields (unsupported).

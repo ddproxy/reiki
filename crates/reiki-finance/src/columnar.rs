@@ -59,7 +59,7 @@ pub fn scan_tables(text: &str, kinds: &[Kind]) -> Vec<Hit> {
 
 #[cfg(test)]
 mod tests {
-    use crate::detect::{scan, Kind};
+    use crate::detect::{Kind, scan};
 
     fn found(text: &str) -> Vec<Kind> {
         let mut kinds: Vec<Kind> = scan(text, &Kind::DEFAULT)
@@ -102,8 +102,7 @@ mod tests {
 
     #[test]
     fn sql_and_copy_blocks_map_values_to_columns() {
-        let sql =
-            "INSERT INTO t (id, iban, swift) VALUES (1, 'GB82WEST12345698765432', 'DEUTDEFF'), (2, 'N/A', NULL);";
+        let sql = "INSERT INTO t (id, iban, swift) VALUES (1, 'GB82WEST12345698765432', 'DEUTDEFF'), (2, 'N/A', NULL);";
         assert_eq!(found(sql), [Kind::Iban, Kind::Swift]);
         let copy = "COPY t (id, isin) FROM stdin;\n1\tUS0378331005\n\\.\n";
         assert_eq!(found(copy), [Kind::Isin]);

@@ -208,7 +208,7 @@ impl Config {
                 return Err(format!(
                     "`capture_bodies` must be a boolean, got {}",
                     other.type_str()
-                ))
+                ));
             }
         };
         let body = match string(table, "body")?.as_deref() {
@@ -218,7 +218,7 @@ impl Config {
             Some(other) => {
                 return Err(format!(
                     "`body` must be \"full\", \"summary\" or \"none\", got \"{other}\""
-                ))
+                ));
             }
         };
         let response = match string(table, "response")?.as_deref() {
@@ -228,7 +228,7 @@ impl Config {
             Some(other) => {
                 return Err(format!(
                     "`response` must be \"status\", \"body\" or \"none\", got \"{other}\""
-                ))
+                ));
             }
         };
 
@@ -276,7 +276,7 @@ impl Config {
             Some(other) => {
                 return Err(format!(
                     "`sse` must be \"events\", \"assembled\" or \"raw\", got \"{other}\""
-                ))
+                ));
             }
         };
         let format = match string(table, "format")?.as_deref() {
@@ -285,7 +285,7 @@ impl Config {
             Some(other) => {
                 return Err(format!(
                     "`format` must be \"json\" or \"ocsf\", got \"{other}\""
-                ))
+                ));
             }
         };
         let dry_run = match table.get("dry_run") {
@@ -295,7 +295,7 @@ impl Config {
                 return Err(format!(
                     "`dry_run` must be a boolean, got {}",
                     other.type_str()
-                ))
+                ));
             }
         };
         let redact = match table.get("redact") {
@@ -305,7 +305,7 @@ impl Config {
                 return Err(format!(
                     "`redact` must be a boolean, got {}",
                     other.type_str()
-                ))
+                ));
             }
         };
 
@@ -406,7 +406,7 @@ fn export_config(table: &Table) -> Result<Option<ExportConfig>, String> {
         Some(other) => {
             return Err(format!(
                 "`export.format` must be \"jsonl\" or \"syslog\", got \"{other}\""
-            ))
+            ));
         }
     };
     let file = path(export, "file")?;
@@ -603,12 +603,16 @@ mod tests {
 
     #[test]
     fn full_bodies_require_an_explicit_opt_in() {
-        assert!(parse("file = \"/x\"\nbody = \"full\"")
-            .unwrap_err()
-            .contains("capture_bodies"));
-        assert!(parse("file = \"/x\"\nresponse = \"body\"")
-            .unwrap_err()
-            .contains("capture_bodies"));
+        assert!(
+            parse("file = \"/x\"\nbody = \"full\"")
+                .unwrap_err()
+                .contains("capture_bodies")
+        );
+        assert!(
+            parse("file = \"/x\"\nresponse = \"body\"")
+                .unwrap_err()
+                .contains("capture_bodies")
+        );
         let config =
             parse("file = \"/x\"\ncapture_bodies = true\nbody = \"full\"\nresponse = \"body\"")
                 .unwrap();
@@ -648,29 +652,37 @@ mod tests {
     fn host_keys_are_accepted_and_unknown_keys_are_not() {
         assert!(parse("socket = \"/run/r.sock\"\nenabled = true\non_error = \"reject\"").is_ok());
         assert!(parse("socket = \"/run/r.sock\"\nstreams = [\"a\"]").is_ok());
-        assert!(parse("socket = \"/run/r.sock\"\nfiel = 1")
-            .unwrap_err()
-            .contains("fiel"));
+        assert!(
+            parse("socket = \"/run/r.sock\"\nfiel = 1")
+                .unwrap_err()
+                .contains("fiel")
+        );
     }
 
     #[test]
     fn a_socket_path_too_long_for_unix_is_refused_up_front() {
         let long = format!("/run/{}/r.sock", "d".repeat(100));
-        assert!(parse(&format!("socket = \"{long}\""))
-            .unwrap_err()
-            .contains("longer"));
+        assert!(
+            parse(&format!("socket = \"{long}\""))
+                .unwrap_err()
+                .contains("longer")
+        );
         let ok = format!("/run/{}/r.sock", "d".repeat(40));
         assert!(parse(&format!("socket = \"{ok}\"")).is_ok());
     }
 
     #[test]
     fn relative_paths_are_refused() {
-        assert!(parse("file = \"req.jsonl\"")
-            .unwrap_err()
-            .contains("absolute"));
-        assert!(parse("socket = \"run/r.sock\"")
-            .unwrap_err()
-            .contains("absolute"));
+        assert!(
+            parse("file = \"req.jsonl\"")
+                .unwrap_err()
+                .contains("absolute")
+        );
+        assert!(
+            parse("socket = \"run/r.sock\"")
+                .unwrap_err()
+                .contains("absolute")
+        );
     }
 
     #[test]
@@ -764,17 +776,21 @@ mod tests {
         assert!(parse("syslog = \"tcp://c:514\"\nsyslog_app_name = \"has space\"").is_err());
         assert!(parse("syslog = \"tcp://c:514\"\nsyslog_app_name = \"-\"").is_err());
         let too_long = "a".repeat(49);
-        assert!(parse(&format!(
-            "syslog = \"tcp://c:514\"\nsyslog_app_name = \"{too_long}\""
-        ))
-        .is_err());
+        assert!(
+            parse(&format!(
+                "syslog = \"tcp://c:514\"\nsyslog_app_name = \"{too_long}\""
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn syslog_options_need_a_syslog_target() {
-        assert!(parse("file = \"/x\"\nsyslog_facility = \"local0\"")
-            .unwrap_err()
-            .contains("need `syslog`"));
+        assert!(
+            parse("file = \"/x\"\nsyslog_facility = \"local0\"")
+                .unwrap_err()
+                .contains("need `syslog`")
+        );
         assert!(parse("file = \"/x\"\nsyslog_app_name = \"reiki\"").is_err());
     }
 
@@ -878,9 +894,11 @@ mod tests {
 
     #[test]
     fn export_rejects_unknown_keys_and_wrong_sink_shapes() {
-        assert!(parse("[export]\nfile = \"/x\"\nformt = \"jsonl\"")
-            .unwrap_err()
-            .contains("export.formt"));
+        assert!(
+            parse("[export]\nfile = \"/x\"\nformt = \"jsonl\"")
+                .unwrap_err()
+                .contains("export.formt")
+        );
         assert!(parse("[export]\nfile = \"/x\"\nextra = 1").is_err());
         assert!(parse("[export]\nformat = \"jsonl\"").is_err());
         assert!(

@@ -5,17 +5,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::intercept::{init_ca, Interceptor};
+use reiki::intercept::{Interceptor, init_ca};
 use reiki::plugins::{PluginChain, Registration};
-use reiki::proxy::{load_keys, App};
+use reiki::proxy::{App, load_keys};
 use reiki::reiki_plugin::{Plugin, RequestCtx};
-use reiki::tunnel::{serve, Tunnel};
+use reiki::tunnel::{Tunnel, serve};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -285,17 +285,23 @@ async fn connect_status(setup: &Setup, credential: Option<&str>) -> String {
 async fn an_intercepted_host_needs_the_streams_token_on_connect() {
     let s = setup("auth", "", "").await;
     assert!(connect_status(&s, None).await.contains("407"));
-    assert!(connect_status(&s, Some("Bearer wrong"))
-        .await
-        .contains("407"));
+    assert!(
+        connect_status(&s, Some("Bearer wrong"))
+            .await
+            .contains("407")
+    );
     assert!(connect_status(&s, Some("Digest x")).await.contains("407"));
-    assert!(connect_status(&s, Some("Bearer unused"))
-        .await
-        .contains("200"));
+    assert!(
+        connect_status(&s, Some("Bearer unused"))
+            .await
+            .contains("200")
+    );
     // HTTPS_PROXY=http://user:unused@host sends this basic credential ("user:unused").
-    assert!(connect_status(&s, Some("Basic dXNlcjp1bnVzZWQ="))
-        .await
-        .contains("200"));
+    assert!(
+        connect_status(&s, Some("Basic dXNlcjp1bnVzZWQ="))
+            .await
+            .contains("200")
+    );
 }
 
 #[tokio::test]

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
-use reiki::proxy::{router, App};
+use reiki::proxy::{App, router};
 
 mod common;
 use common::serve;

@@ -350,10 +350,10 @@ fn base64_forms(raw: &[u8], forms: &mut Vec<Vec<u8>>, budget: usize) {
     }
     for alphabet in [B64_STD, B64_URL] {
         for offset in [1, 2] {
-            if let Some(form) = base64_at_offset(raw, offset, alphabet) {
-                if !push_form(forms, budget, form) {
-                    return;
-                }
+            if let Some(form) = base64_at_offset(raw, offset, alphabet)
+                && !push_form(forms, budget, form)
+            {
+                return;
             }
         }
     }

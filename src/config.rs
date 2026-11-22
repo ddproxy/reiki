@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use reiki_health::safe_label_problem;
+
 use crate::chain::Strategy;
 use crate::proxy::PASSTHROUGH_STREAM;
 use crate::quota::Reset;
 use crate::shaper::bucket;
-use crate::shaper::headers::Preset;
+use crate::shaper::headers::{preset_limits, preset_names};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
@@ -166,7 +168,10 @@ impl fmt::Display for ConfigError {
                 "admin token_sha256 is the same as the token of stream `{stream}`, which would give that stream admin access"
             ),
             Self::ReservedStreamName(name) => {
-                write!(f, "stream name `{name}` is reserved for unauthenticated passthrough traffic")
+                write!(
+                    f,
+                    "stream name `{name}` is reserved for unauthenticated passthrough traffic"
+                )
             }
             Self::BadTunnel(reason) => write!(f, "invalid [tunnel]: {reason}"),
             Self::BadLog(reason) => write!(f, "invalid [log]: {reason}"),
@@ -768,6 +773,10 @@ pub struct Upstream {
     /// no Reiki token is needed and no key from the chain is used.
     #[serde(default)]
     pub passthrough: bool,
+    /// Opaque operator-set group published on this upstream's peer health entry. It is never
+    /// derived from the upstream name, a key label or a response body.
+    #[serde(default)]
+    pub capacity_group: Option<String>,
     /// Run this command for each request instead of Reiki's HTTP clients.
     /// The API token and outbound headers are written to the process stdin, never argv.
     #[serde(default)]
@@ -829,7 +838,7 @@ impl LimitsConfig {
     pub fn to_window(&self) -> Result<(bucket::Window, Duration), String> {
         let mut window = bucket::Window::default();
         if let Some(name) = &self.preset {
-            let preset = Preset::parse(name)?.limits();
+            let preset = preset_limits(name)?;
             window.rpm = preset.rpm.unwrap_or(0);
             window.tpm = u64::from(preset.tpm.unwrap_or(0));
             window.concurrent = preset.concurrent.unwrap_or(0);
@@ -1083,6 +1092,10 @@ pub struct TunnelConfig {
     /// so a broad allowlist reaches the internet and not the local network.
     #[serde(default)]
     pub deny_private: bool,
+    /// On stop, close tunnels with no recent traffic at once. Busy tunnels get the
+    /// `[service].shutdown_timeout_secs` drain before they are cut.
+    #[serde(default = "default_close_idle_on_stop")]
+    pub close_idle_on_stop: bool,
     /// Terminates TLS for listed hosts so plugins and key handling apply to tunnelled traffic.
     #[serde(default)]
     pub intercept: Option<InterceptConfig>,
@@ -1090,6 +1103,10 @@ pub struct TunnelConfig {
 
 fn default_connect_timeout() -> u64 {
     10
+}
+
+fn default_close_idle_on_stop() -> bool {
+    true
 }
 
 /// TLS interception for the tunnel: Reiki answers as the listed hosts using certificates
@@ -1285,10 +1302,10 @@ impl Config {
             if let Some(reason) = reason {
                 return Err(ConfigError::BadTunnel(reason));
             }
-            if let Some(intercept) = &tunnel.intercept {
-                if let Some(reason) = self.intercept_problem(tunnel, intercept) {
-                    return Err(ConfigError::BadTunnel(format!("intercept: {reason}")));
-                }
+            if let Some(intercept) = &tunnel.intercept
+                && let Some(reason) = self.intercept_problem(tunnel, intercept)
+            {
+                return Err(ConfigError::BadTunnel(format!("intercept: {reason}")));
             }
         }
         Ok(())
@@ -1402,6 +1419,14 @@ impl Config {
             if upstream.drop_params.iter().any(String::is_empty) {
                 return Err(ConfigError::EmptyDropParam(name.clone()));
             }
+            if let Some(group) = &upstream.capacity_group
+                && let Some(reason) = safe_label_problem(group)
+            {
+                return Err(ConfigError::BadUpstream {
+                    upstream: name.clone(),
+                    reason: format!("capacity_group {reason}"),
+                });
+            }
             for (field, phrases) in [
                 ("request_error_phrases", &upstream.request_error_phrases),
                 ("quota_phrases", &upstream.quota_phrases),
@@ -1500,13 +1525,13 @@ impl Config {
                         reason: "set exactly one of `command` or `socket`".to_owned(),
                     });
                 }
-                if let Some(command) = &forward.command {
-                    if command.trim().is_empty() {
-                        return Err(ConfigError::BadForward {
-                            upstream: name.clone(),
-                            reason: "command must not be empty".to_owned(),
-                        });
-                    }
+                if let Some(command) = &forward.command
+                    && command.trim().is_empty()
+                {
+                    return Err(ConfigError::BadForward {
+                        upstream: name.clone(),
+                        reason: "command must not be empty".to_owned(),
+                    });
                 }
                 if !has_command && (!forward.args.is_empty() || !forward.pass_env.is_empty()) {
                     return Err(ConfigError::BadForward {
@@ -1738,15 +1763,15 @@ impl Config {
         if let Some(reason) = self.server_problem() {
             return Err(ConfigError::BadServer(reason));
         }
-        if let Some(peers) = &self.peers {
-            if let Some(reason) = self.peers_problem(peers) {
-                return Err(ConfigError::BadPeers(reason));
-            }
+        if let Some(peers) = &self.peers
+            && let Some(reason) = self.peers_problem(peers)
+        {
+            return Err(ConfigError::BadPeers(reason));
         }
-        if self.hubs.is_some() || self.hub.is_some() || self.accounts.is_some() {
-            if let Some(err) = self.hub_problem() {
-                return Err(err);
-            }
+        if (self.hubs.is_some() || self.hub.is_some() || self.accounts.is_some())
+            && let Some(err) = self.hub_problem()
+        {
+            return Err(err);
         }
         Ok(())
     }
@@ -1859,12 +1884,12 @@ impl Config {
                 "session_header `{header}` carries credentials and cannot count sessions"
             ));
         }
-        if let Some(instance) = &peers.instance {
-            if !valid_peer_name(instance) {
-                return Some(format!(
-                    "instance `{instance}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
-                ));
-            }
+        if let Some(instance) = &peers.instance
+            && !valid_peer_name(instance)
+        {
+            return Some(format!(
+                "instance `{instance}` may only hold letters, digits, `-`, `_` and `.` (at most 64)"
+            ));
         }
         if let Some(reason) = self.peer_tokens_problem(peers) {
             return Some(reason);
@@ -2139,12 +2164,13 @@ impl Config {
             .limits
             .as_ref()
             .and_then(|limits| limits.preset.as_deref());
-        if let Some(preset) = preset {
-            if !HUB_PRESETS.contains(&preset) {
-                return Some(format!(
-                    "limits preset `{preset}` is not one of zen-free, openrouter-free"
-                ));
-            }
+        if let Some(preset) = preset
+            && preset_limits(preset).is_err()
+        {
+            return Some(format!(
+                "limits preset `{preset}` is not one of {}",
+                preset_names().collect::<Vec<_>>().join(", ")
+            ));
         }
         None
     }
@@ -2173,12 +2199,12 @@ impl Config {
                     ));
                 }
             }
-            if let Some(admin) = &self.admin {
-                if admin.token_sha256.eq_ignore_ascii_case(hash) {
-                    return Some(format!(
-                        "[hub.edges.{name}] token_sha256 is the same as the admin token"
-                    ));
-                }
+            if let Some(admin) = &self.admin
+                && admin.token_sha256.eq_ignore_ascii_case(hash)
+            {
+                return Some(format!(
+                    "[hub.edges.{name}] token_sha256 is the same as the admin token"
+                ));
             }
             let stream = self
                 .streams
@@ -2380,9 +2406,6 @@ pub struct HubEdge {
     pub max_tokens_per_day: u64,
 }
 
-/// Names a `limits.preset` may take.
-const HUB_PRESETS: [&str; 2] = ["zen-free", "openrouter-free"];
-
 /// One `[accounts.LABEL]`: one account's key(s) on one upstream.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2469,10 +2492,12 @@ mod tests {
     #[test]
     fn the_reload_interval_is_checked() {
         let base = "[upstream.zen]\nbase_url = \"https://example.com\"\n";
-        assert!(Config::parse(&format!(
-            "{base}[reload]\nwatch = true\ninterval_secs = 5\n"
-        ))
-        .is_ok());
+        assert!(
+            Config::parse(&format!(
+                "{base}[reload]\nwatch = true\ninterval_secs = 5\n"
+            ))
+            .is_ok()
+        );
         let zero = Config::parse(&format!("{base}[reload]\ninterval_secs = 0\n")).unwrap_err();
         assert!(matches!(zero, ConfigError::BadReload(_)), "{zero}");
         assert!(Config::parse(&format!("{base}[reload]\ninterval_secs = 99999\n")).is_err());
@@ -2591,6 +2616,39 @@ file = "/etc/reiki/keys/zen-b"
             Config::parse(&text).unwrap().upstream["zen"].max_decoded_bytes,
             1
         );
+    }
+
+    #[test]
+    fn capacity_group_is_operator_set_and_terminal_safe() {
+        let with = |line: &str| {
+            base("").replace(
+                "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"",
+                &format!("[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n{line}"),
+            )
+        };
+        let config = Config::parse(&with("capacity_group = \"team-a\"")).unwrap();
+        assert_eq!(
+            config.upstream["zen"].capacity_group.as_deref(),
+            Some("team-a")
+        );
+        assert_eq!(
+            Config::parse(&base("")).unwrap().upstream["zen"].capacity_group,
+            None
+        );
+        for bad in [
+            "capacity_group = \"\"",
+            "capacity_group = \"   \"",
+            "capacity_group = \"a\\nb\"",
+            "capacity_group = \"a\\u001bb\"",
+            &format!("capacity_group = \"{}\"", "x".repeat(65)),
+        ] {
+            let error = Config::parse(&with(bad)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::BadUpstream { ref upstream, .. } if upstream == "zen"),
+                "{bad}: {error}"
+            );
+        }
+        // The key label `zen-a` in `base` must not become a capacity group by inference.
     }
 
     #[test]
@@ -3803,11 +3861,13 @@ socket = "/run/forwarder.sock"
             let reason = peers_error(&peers);
             assert!(reason.contains(needle), "{peers}: {reason}");
         }
-        assert!(Config::parse(&with_peers(&format!(
-            "[peers]\n{}",
-            token(&"a".repeat(32), HASH_C)
-        )))
-        .is_ok());
+        assert!(
+            Config::parse(&with_peers(&format!(
+                "[peers]\n{}",
+                token(&"a".repeat(32), HASH_C)
+            )))
+            .is_ok()
+        );
         assert!(matches!(
             Config::parse(&with_peers(&format!(
                 "[peers]\n[[peers.tokens]]\nname = \"a\"\ntoken_sha256 = \"{HASH_C}\"\ntoken = \"x\"\n"
@@ -3820,11 +3880,13 @@ socket = "/run/forwarder.sock"
     #[test]
     fn peer_tables_need_a_safe_url_a_token_file_and_a_ca_for_https() {
         let peer = |name: &str, body: &str| format!("[peers.{name}]\n{body}\n");
-        assert!(Config::parse(&with_peers(&peer(
-            "a",
-            "url = \"https://peer.example:4099\"\ntoken_file = \"/t\"\nca_file = \"/ca.pem\""
-        )))
-        .is_ok());
+        assert!(
+            Config::parse(&with_peers(&peer(
+                "a",
+                "url = \"https://peer.example:4099\"\ntoken_file = \"/t\"\nca_file = \"/ca.pem\""
+            )))
+            .is_ok()
+        );
         for (peers, needle) in [
             (
                 peer("a", "url = \"http://10.0.0.5:4099\"\ntoken_file = \"/t\""),

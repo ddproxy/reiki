@@ -1,11 +1,11 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::config::{BodyMode, Config, LogFormat, SseMode};
 use crate::redact;
@@ -13,7 +13,7 @@ use crate::shape;
 #[cfg(unix)]
 use crate::sink::SocketHub;
 use crate::sink::{FileSink, Notice};
-use crate::syslog::{Meta, Syslog, SEVERITY_INFO, SEVERITY_WARNING};
+use crate::syslog::{Meta, SEVERITY_INFO, SEVERITY_WARNING, Syslog};
 use crate::timefmt::rfc3339_millis;
 
 const MAX_HEADER_VALUE: usize = 256;
@@ -172,24 +172,24 @@ pub fn spawn(
                 let meta = meta(&event);
                 let line = render(&config, event);
                 if emit(&mut sinks, &line, &meta, &mut file_failing) {
-                    if syslog_lost > 0 {
-                        if let Some(syslog) = sinks.syslog.as_mut() {
-                            let now = SystemTime::now();
-                            let note = json!({
-                                "v": 1,
-                                "event": "dropped",
-                                "ts": rfc3339_millis(now),
-                                "count": syslog_lost,
-                            })
-                            .to_string();
-                            let meta = Meta {
-                                msgid: "dropped",
-                                severity: SEVERITY_WARNING,
-                                at: now,
-                            };
-                            if syslog.send(&meta, &note) {
-                                syslog_lost = 0;
-                            }
+                    if syslog_lost > 0
+                        && let Some(syslog) = sinks.syslog.as_mut()
+                    {
+                        let now = SystemTime::now();
+                        let note = json!({
+                            "v": 1,
+                            "event": "dropped",
+                            "ts": rfc3339_millis(now),
+                            "count": syslog_lost,
+                        })
+                        .to_string();
+                        let meta = Meta {
+                            msgid: "dropped",
+                            severity: SEVERITY_WARNING,
+                            at: now,
+                        };
+                        if syslog.send(&meta, &note) {
+                            syslog_lost = 0;
                         }
                     }
                 } else {
@@ -478,10 +478,10 @@ fn summarize(body: &[u8]) -> Option<Value> {
     let object = value.as_object()?;
     let mut summary = Map::new();
     for key in ["model", "stream", "max_tokens", "temperature"] {
-        if let Some(found) = object.get(key) {
-            if found.is_string() || found.is_number() || found.is_boolean() {
-                summary.insert(key.to_owned(), found.clone());
-            }
+        if let Some(found) = object.get(key)
+            && (found.is_string() || found.is_number() || found.is_boolean())
+        {
+            summary.insert(key.to_owned(), found.clone());
         }
     }
     for (key, name) in [
@@ -730,9 +730,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(record["body"]["answer"], "ok");
-        assert!(!record
-            .to_string()
-            .contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(
+            !record
+                .to_string()
+                .contains("abcdefghijklmnopqrstuvwxyz0123456789")
+        );
         assert!(record.get("body_truncated").is_none());
 
         let sse = b"data: {\"a\":1}\n\ndata: [DONE]\n\n";
@@ -770,10 +772,12 @@ mod tests {
         let config = body_config("max_body_bytes = 2000\nmax_string_bytes = 100");
         let record = parsed(&config, request(&body));
         assert!(record["body"].is_object(), "{record}");
-        assert!(record["body"]["a"]
-            .as_str()
-            .unwrap()
-            .contains("…[+4900 bytes]"));
+        assert!(
+            record["body"]["a"]
+                .as_str()
+                .unwrap()
+                .contains("…[+4900 bytes]")
+        );
         assert!(record.get("body_truncated").is_none());
     }
 

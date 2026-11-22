@@ -6,15 +6,22 @@
 
 ### Changed
 
+- Quota classification no longer treats vendor-specific body phrases as built-ins. `subscribe to go` and `free-models-per-day` must now be supplied in `[upstream.NAME] quota_phrases`; the generic 402, credit balance, quota and insufficient rules are unchanged.
+- `limits.preset` names are documented as optional named examples rather than authoritative provider caps. Preset lookup is an opaque data-table lookup: no provider name, response body or header chooses a preset.
 - `requestlog` now records summaries only by default. `body` defaults to `summary`, and a new `capture_bodies` option defaults to `false`; no prompt, response or tool-argument text is written to the file, socket or syslog unless body capture is explicitly enabled. The summary still records method, route, status, durations, byte counts, token-setting counts, key names, attempts and failure findings.
 - Body capture requires `capture_bodies = true`: `body = "full"` and `response = "body"` are config errors without it, and enabling it logs a startup warning. Every captured request, response and failed-attempt body is masked and capped by `max_capture_bytes` and `max_body_bytes`, and the live socket feed follows the same rules as the file and syslog sinks.
 - Security docs now spell out the agent-framework supply-chain scenario: bearer stream tokens have no source binding or built-in expiry, what they buy on the client and intercepted-tunnel listeners, why the global tunnel allow-list is not a per-stream control, and why body masking is not a general cloud-token detector. A regression test confirms that a valid token for another stream cannot authorise an intercepted host.
+- The workspace, fuzz and helper crates now build with Rust edition 2024. The edition migration adds no unsafe code; a test that needed `std::env::set_var` now runs in a child process.
+- Request plugin hooks, including placeholder masking of large bodies, run on Tokio's blocking pool. A CPU-heavy hook no longer stalls health checks, watchdogs, admin requests or other connections; a panic that escapes the chain fails the request closed with 503.
 ### Added
 
+- `[upstream.NAME] capacity_group` is an optional, opaque operator-set label. It appears on that upstream's `/v1/health` entry and in `reiki top`; it is never inferred from key labels, upstream names or responses, and unsafe values are refused at config load and on the wire.
+- Health document wire types now live in the small `reiki-health` crate shared by the publisher and `reiki top`. The JSON shape is unchanged, with strict parsing and round-trip tests in the new crate.
 - `requestlog` gains a summary-only export for log collectors at `[plugins.requestlog.export]`: rotating JSON Lines or RFC 5424 syslog over UDP/Unix datagram, with a bounded non-blocking queue and an allow-listed `request_summary` field set. Drops are counted as `reiki_requestlog_export_dropped_total`, exposed at `GET /v1/requestlog/metrics`, in `GET /v1/status` and in `reiki top`. See [summary export](docs/requestlog.md#summary-export).
 - New `toolpolicy` plugin inspects tool calls in OpenAI Chat and Anthropic Messages responses, in whole bodies and streams. It checks declared tools, user/system host provenance and command tripwires; `report` is the default and `block` replaces flagged calls with a plain-text notice. See [tool policy](docs/toolpolicy.md).
 - `toolpolicy` writes a rotating owner-only JSONL journal and serves counters at `GET /v1/toolpolicy/metrics` on the admin listener.
 - A quota cooldown with a known reset now carries that absolute instant to peer consumers as `quota_reset_at` on the labelled key view in `/v1/health`, with the peer OpenAPI schema and `reiki top` wire reader updated. Daily free tiers need a `quota_resets` schedule for the reset to be known; the fixed window publishes none.
+- `[tunnel] close_idle_on_stop` (default `true`) closes tunnels with no bytes in either direction for at least one second as soon as a stop begins. Active tunnels get the configured drain and are then cut; `false` keeps every tunnel until the drain ends. The change is live on reload for new tunnels.
 ### Added
 
 - Cargo-fuzz targets for the SSE/stream parser, scrubbing and redaction, JSON key-invalid detection, config and key-file parsing, percent-decoding and path normalisation, tunnel allow-lists and header parsers. Each target checks for panics, leaked secrets and unbounded output, with hand-written seed corpora and a weekly/manual CI workflow that uploads crash artifacts.

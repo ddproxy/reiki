@@ -67,10 +67,10 @@ impl Sessions {
         let ids = seen.entry(stream.to_owned()).or_default();
         if !ids.contains_key(&hash) && ids.len() >= MAX_PER_STREAM {
             ids.retain(|_, at| now.saturating_duration_since(*at) < window);
-            if ids.len() >= MAX_PER_STREAM {
-                if let Some(oldest) = ids.iter().min_by_key(|(_, at)| **at).map(|(h, _)| *h) {
-                    ids.remove(&oldest);
-                }
+            if ids.len() >= MAX_PER_STREAM
+                && let Some(oldest) = ids.iter().min_by_key(|(_, at)| **at).map(|(h, _)| *h)
+            {
+                ids.remove(&oldest);
             }
         }
         ids.insert(hash, now);

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// How long the filesystem queries of one answer may take before their roles read as unavailable.
 const DISK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -260,9 +260,11 @@ mod tests {
             json!({"roles": ["log"], "total_bytes": null, "available_bytes": null, "used_percent": null}),
             "a directory that cannot be queried is unavailable"
         );
-        assert!(!Value::Array(out)
-            .to_string()
-            .contains(&*dir.to_string_lossy()));
+        assert!(
+            !Value::Array(out)
+                .to_string()
+                .contains(&*dir.to_string_lossy())
+        );
     }
 
     fn slow(dir: &Path) -> Option<Usage> {

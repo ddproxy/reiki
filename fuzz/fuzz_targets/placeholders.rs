@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use libfuzzer_sys::fuzz_target;
 use reiki_placeholders::fuzzing::{
-    incomplete_start, restore_text, validate_terms, Masker, HEAD, TAIL,
+    HEAD, Masker, TAIL, incomplete_start, restore_text, validate_terms,
 };
 
 fn split(text: &str) -> (&str, &str) {

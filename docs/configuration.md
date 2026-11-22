@@ -140,6 +140,7 @@ One provider endpoint. Keys and streams refer to it by `NAME`. Fields marked as 
 | `scope_escalate_after` | integer | `3` | Cool the whole key when this many models cool on it and another failure arrives. Range 2 to 16. |
 | `hold_unauthorized` | bool | `false` | Delay disabling the first key that answers 401 until a later key serves the same request. |
 | `passthrough` | bool | `false` | Plain reverse proxy. The client's own credentials go upstream unchanged. No Reiki token and no key from a chain. A passthrough upstream cannot have `fallback`. |
+| `capacity_group` | string | unset | Opaque operator-set label published on this upstream's peer health entry. Never inferred from the upstream name, a key label or a response. 1 to 64 printable ASCII characters, not blank. |
 | `fallback` | table | unset | Where requests go when no key of this upstream can serve them. See below. |
 | `forward` | table | unset | Run a command or talk to a socket instead of Reiki's HTTP client. See below. |
 | `limits` | table | unset | Outbound shaping for keys of this upstream. See below. |
@@ -175,11 +176,11 @@ See [providers](providers.md#forwarding).
 
 ### `[upstream.NAME.limits]`
 
-Outbound shaping. Each key of the upstream gets a budget. A key out of budget is skipped. Fields that are not set do not limit anything. An explicit `0` means unlimited, even over a preset value. The table must set a `preset` or at least one limit.
+Outbound shaping. Each key of the upstream gets a budget. A key out of budget is skipped. Fields that are not set do not limit anything. An explicit `0` means unlimited, even over a preset value. The table must set a `preset` or at least one limit. Presets are optional named examples, not provider detection: Reiki never chooses one from an upstream name or a response header.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `preset` | string | unset | Starting values. One of `zen-free`, `openrouter-free`; see [limit presets](#limit-presets). |
+| `preset` | string | unset | Starting values from an optional named example: `zen-free` or `openrouter-free`; see [limit presets](#limit-presets). |
 | `rpm` | integer | from preset | Requests per minute. |
 | `tpm` | integer | from preset | Estimated tokens per minute. |
 | `concurrent` | integer | from preset | Requests in flight at once. |
@@ -226,6 +227,7 @@ A CONNECT-only forward proxy. It copies bytes without reading them, unless `inte
 | `connect_timeout_secs` | integer | `10` | Time allowed to open the upstream connection. At least 1. |
 | `allow_loopback` | bool | `false` | Let the tunnel reach loopback addresses. For tests and local development only. |
 | `deny_private` | bool | `false` | Refuse private addresses: RFC 1918, shared `100.64.0.0/10` and IPv6 unique-local. Use it with a broad `allow` list. |
+| `close_idle_on_stop` | bool | `true` | Close tunnels idle for at least one second as soon as a stop begins; active tunnels get the drain and are then cut. |
 | `intercept` | table | unset | TLS interception. See below. |
 
 See [tunnel](tunnel.md).
@@ -331,14 +333,14 @@ The `requestlog` plugin records summaries only by default: `body = "summary"` an
 
 ## Limit presets
 
-`limits.preset` and `accounts.LABEL.limits.preset` take one of these names. Explicit fields override the preset's value.
+`limits.preset` and `accounts.LABEL.limits.preset` take one of these optional example names. Explicit fields override the preset's value.
 
 | Name | `rpm` | `tpm` | `concurrent` | `daily_requests` | `min_rpm` |
 | --- | --- | --- | --- | --- | --- |
 | `zen-free` | 10 | none | 2 | none | 1 |
 | `openrouter-free` | 20 | none | none | 50 | 1 |
 
-These values are the ones in the build; the source notes that the `openrouter-free` figures should be re-checked on each release.
+These are illustrative starting values shipped in the build, not authoritative limits for any service; check the service's current terms and override any field that matters. The names are opaque configuration keys: no provider name, response body or header selects a preset.
 
 ## Hubs, hub and accounts
 

@@ -10,15 +10,15 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use reiki_top::matrix::{
-    fleet_series, is_fleet_row, is_problem, key_counts, order_peers, resolve, usage_by_provider,
-    History, HostSummary, Matrix, Metric, Sample,
+    History, HostSummary, Matrix, Metric, Sample, fleet_series, is_fleet_row, is_problem,
+    key_counts, order_peers, resolve, usage_by_provider,
 };
-use reiki_top::ui::{self, crossterm, ratatui, ChartMetric, ChartSeries};
-use reiki_top::{view, Fleet, Health};
+use reiki_top::ui::{self, ChartMetric, ChartSeries, crossterm, ratatui};
+use reiki_top::{Fleet, Health, view};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, PeerEntry, PeersConfig};
-use crate::peers::client::{self, Chunk, SseItem, SseParser, MAX_BODY};
+use crate::peers::client::{self, Chunk, MAX_BODY, SseItem, SseParser};
 
 /// One message from a peer's feed task.
 #[derive(Debug, Clone, PartialEq, Eq)]

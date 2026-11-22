@@ -7,11 +7,11 @@ use serde_json::Value;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::matrix::{
-    is_fleet_row, order_peers, resolve, Cell, History, Matrix, Metric, Pressure, Row, FLEET_PEER,
-    MINUTE_SLOTS,
-};
 use crate::Fleet;
+use crate::matrix::{
+    Cell, FLEET_PEER, History, MINUTE_SLOTS, Matrix, Metric, Pressure, Row, is_fleet_row,
+    order_peers, resolve,
+};
 
 /// How a span should read on the terminal. `Plain` is the caller's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,12 +519,15 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
     }
 
     for u in &peer.health.upstreams {
-        let mut spans = vec![
-            span(format!("  {}: ", u.name), Style::Plain),
+        let mut spans = vec![span(format!("  {}: ", u.name), Style::Plain)];
+        if let Some(group) = u.capacity_group.as_deref() {
+            spans.push(span(format!("[{group}] "), Style::Dim));
+        }
+        spans.extend([
             span(format!("{} healthy", u.healthy_keys), Style::Good),
             span(format!("  {} cooling", u.cooling_keys), Style::Warn),
             span(format!("  {} disabled", u.disabled_keys), Style::Bad),
-        ];
+        ]);
         if let Some(class) = crate::matrix::cooldown_class(u) {
             spans.push(span(format!("  class {class}"), Style::Warn));
         }
@@ -675,14 +678,14 @@ fn key_line(k: &crate::KeyView, width: usize) -> Line {
         span(format!("    {}  ", k.name), Style::Plain),
         span(k.state.clone(), state),
     ];
-    if k.state == "cooling" {
-        if let Some(secs) = k.cooldown_seconds {
-            let remaining = Duration::from_secs(secs);
-            let scale = cooldown_scale(k.cooldown_class.as_deref(), remaining);
-            let filled = bar_cells(remaining, scale, 12);
-            spans.push(span(format!("  [{}]", bar(filled, 12)), Style::Warn));
-            spans.push(span(format!("  {}", fmt_duration(remaining)), Style::Plain));
-        }
+    if k.state == "cooling"
+        && let Some(secs) = k.cooldown_seconds
+    {
+        let remaining = Duration::from_secs(secs);
+        let scale = cooldown_scale(k.cooldown_class.as_deref(), remaining);
+        let filled = bar_cells(remaining, scale, 12);
+        spans.push(span(format!("  [{}]", bar(filled, 12)), Style::Warn));
+        spans.push(span(format!("  {}", fmt_duration(remaining)), Style::Plain));
     }
     line(spans, width)
 }
@@ -1414,11 +1417,7 @@ fn marker(selected: bool) -> Span {
 }
 
 fn name_style(selected: bool) -> Style {
-    if selected {
-        Style::Title
-    } else {
-        Style::Plain
-    }
+    if selected { Style::Title } else { Style::Plain }
 }
 
 /// The first `n` characters, never splitting one.
@@ -1453,8 +1452,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::matrix::{Cell, Column, History, HostSummary, Matrix, Row, Sample};
     use crate::Health;
+    use crate::matrix::{Cell, Column, History, HostSummary, Matrix, Row, Sample};
 
     fn fleet() -> Fleet {
         Fleet::new(Duration::from_secs(90))
@@ -1797,6 +1796,21 @@ mod tests {
             "peer-b  instance peer-b  v0.9.9",
             "{other:?}"
         );
+    }
+
+    #[test]
+    fn a_capacity_group_shows_on_the_upstream_line() {
+        let t0 = Instant::now();
+        let mut f = fleet();
+        let doc = MIX_DOC.replace(
+            "\"name\" : \"zen\",",
+            "\"name\" : \"zen\", \"capacity_group\" : \"team-a\",",
+        );
+        add(&mut f, "peer-a", &doc, t0);
+        let card = peer_detail(&f, "peer-a", t0, 100);
+        let line = find(&card, "zen:").plain_text();
+        assert!(line.contains("zen: [team-a] 1 healthy"), "{line:?}");
+        assert!(!find(&card, "open:").plain_text().contains('['));
     }
 
     #[test]
@@ -2285,9 +2299,11 @@ mod tests {
         let at_30 = matrix_lines(&f, &peers, t0, 30);
         assert_eq!(at_30.len(), 4, "fleet line plus one chip line per peer");
         assert!(at_30[1].plain_text().starts_with("  peer-b  gemini ■"));
-        assert!(at_30[3]
-            .plain_text()
-            .starts_with("  peer-a  zen ■  load 0.4"));
+        assert!(
+            at_30[3]
+                .plain_text()
+                .starts_with("  peer-a  zen ■  load 0.4")
+        );
         for line in &at_30 {
             assert!(line.plain_text().chars().count() <= 30);
         }
@@ -2306,9 +2322,11 @@ mod tests {
         let lines = matrix_lines(&f, &peers, t0, 19);
         assert_eq!(lines.len(), 4, "fleet line and names only");
         assert_eq!(lines[1].plain_text(), "  peer-b");
-        assert!(matrix_lines(&f, &peers, t0, 0)
-            .iter()
-            .all(|l| l.plain_text().is_empty()));
+        assert!(
+            matrix_lines(&f, &peers, t0, 0)
+                .iter()
+                .all(|l| l.plain_text().is_empty())
+        );
     }
 
     #[test]

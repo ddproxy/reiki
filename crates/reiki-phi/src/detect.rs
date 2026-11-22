@@ -6,7 +6,7 @@
 //! and addresses are not detected. A hit never carries the matched text, only its position.
 
 use reiki_detect::{
-    account_value, digit_run, keyed, keyword_before, word_at, word_before, KeyedStyle,
+    KeyedStyle, account_value, digit_run, keyed, keyword_before, word_at, word_before,
 };
 
 pub(crate) use reiki_detect::luhn;

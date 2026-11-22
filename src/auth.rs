@@ -183,10 +183,11 @@ impl LoginThrottle {
             return;
         }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = seen.get_mut(&attempt.key) {
-            if entry.1 == attempt.since && entry.0 > 0 {
-                entry.0 -= 1;
-            }
+        if let Some(entry) = seen.get_mut(&attempt.key)
+            && entry.1 == attempt.since
+            && entry.0 > 0
+        {
+            entry.0 -= 1;
         }
     }
 

@@ -84,25 +84,24 @@ fn check_order(chosen: &[&Plugin]) -> Result<Vec<String>, String> {
     let position = |name: &str| chosen.iter().position(|p| p.name == name);
     let placeholders = position("placeholders");
     let requestlog = position("requestlog");
-    if let (Some(placeholders), Some(requestlog)) = (placeholders, requestlog) {
-        if placeholders > requestlog {
-            return Err(
+    if let (Some(placeholders), Some(requestlog)) = (placeholders, requestlog)
+        && placeholders > requestlog
+    {
+        return Err(
                 "REIKI_PLUGINS puts `requestlog` before `placeholders`; placeholders must come first so logged bodies are masked"
                     .to_owned(),
             );
-        }
     }
     let mut warnings = Vec::new();
-    if let Some(requestlog) = requestlog {
-        if !chosen[..requestlog]
+    if let Some(requestlog) = requestlog
+        && !chosen[..requestlog]
             .iter()
             .any(|p| p.name == "placeholders")
-        {
-            warnings.push(
+    {
+        warnings.push(
                 "REIKI_PLUGINS puts `requestlog` without a preceding `placeholders`; requestlog masks the credential patterns it knows, but anything else can reach the log"
                     .to_owned(),
             );
-        }
     }
     if let Some(placeholders) = placeholders {
         let after: Vec<&str> = chosen[placeholders + 1..]
@@ -149,7 +148,9 @@ fn main() {
             let mut picked: Vec<&Plugin> = Vec::new();
             for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
                 let Some(plugin) = all.iter().find(|p| p.name == name) else {
-                    fail(&format!("REIKI_PLUGINS names `{name}`, which is not a known plugin (known: {known})"));
+                    fail(&format!(
+                        "REIKI_PLUGINS names `{name}`, which is not a known plugin (known: {known})"
+                    ));
                 };
                 if picked.iter().any(|p| p.name == name) {
                     fail(&format!("REIKI_PLUGINS lists `{name}` twice"));
@@ -232,9 +233,11 @@ mod tests {
     { name = "phi", feature = "plugin-finance", crate = "reiki_finance" },
 "#,
         );
-        assert!(parse_catalog(&duplicate)
-            .unwrap_err()
-            .contains("names `phi` twice"));
+        assert!(
+            parse_catalog(&duplicate)
+                .unwrap_err()
+                .contains("names `phi` twice")
+        );
     }
 
     #[test]
@@ -244,9 +247,11 @@ mod tests {
         let phi = plugin("phi");
 
         assert!(check_order(&[&placeholders]).unwrap().is_empty());
-        assert!(check_order(&[&placeholders, &requestlog])
-            .unwrap()
-            .is_empty());
+        assert!(
+            check_order(&[&placeholders, &requestlog])
+                .unwrap()
+                .is_empty()
+        );
         assert!(check_order(&[&phi, &placeholders]).unwrap().is_empty());
 
         let reversed = check_order(&[&requestlog, &placeholders]).unwrap_err();

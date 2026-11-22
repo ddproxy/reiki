@@ -9,7 +9,7 @@ mod detect;
 use reiki_detect::guard::{self, Spec};
 use reiki_plugin::Plugin;
 
-pub use detect::{scan, Hit, Kind};
+pub use detect::{Hit, Kind, scan};
 
 /// The `[plugins.controlled]` table this plugin reads.
 pub const NAME: &str = "controlled";
@@ -103,13 +103,15 @@ mod tests {
     #[test]
     fn clean_bodies_and_other_upstreams_pass() {
         let p = plugin("mode = \"block\"\nupstreams = [\"zen\"]").unwrap();
-        assert!(send(
-            p.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "{\"q\":\"hello\"}"
-        )
-        .is_ok());
+        assert!(
+            send(
+                p.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "{\"q\":\"hello\"}"
+            )
+            .is_ok()
+        );
         assert!(send(p.as_ref(), "git-host", &mut HeaderMap::new(), "CUI//SP-CTI").is_ok());
         assert!(send(p.as_ref(), "zen", &mut HeaderMap::new(), "CUI//SP-CTI").is_err());
     }
@@ -132,13 +134,15 @@ mod tests {
         let cui_only = plugin("mode = \"block\"\nkinds = [\"cui\"]").unwrap();
         assert!(send(cui_only.as_ref(), "zen", &mut HeaderMap::new(), "NOFORN").is_ok());
         let with_ein = plugin("mode = \"block\"\nkinds = [\"ein\"]").unwrap();
-        assert!(send(
-            with_ein.as_ref(),
-            "zen",
-            &mut HeaderMap::new(),
-            "EIN 12-3456789"
-        )
-        .is_err());
+        assert!(
+            send(
+                with_ein.as_ref(),
+                "zen",
+                &mut HeaderMap::new(),
+                "EIN 12-3456789"
+            )
+            .is_err()
+        );
     }
 
     #[test]

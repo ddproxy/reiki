@@ -15,9 +15,9 @@ mod timefmt;
 mod writer;
 
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
@@ -27,7 +27,7 @@ use reiki_plugin::{
 };
 
 pub use config::{
-    BodyMode, Config, LogFormat, ResponseMode, SseMode, SyslogTarget, DENIED_HEADERS,
+    BodyMode, Config, DENIED_HEADERS, LogFormat, ResponseMode, SseMode, SyslogTarget,
 };
 /// Internal redaction and stream-shaping parsers exposed only to the cargo-fuzz targets when the
 /// `fuzzing` feature is on.
@@ -847,12 +847,14 @@ mod tests {
             !path.exists() && !sock.exists(),
             "a dry run must not create anything"
         );
-        assert!(build(
-            &"dry_run = true\nbody = \"all\"\nfile = \"/x\""
-                .parse()
-                .unwrap()
-        )
-        .is_err());
+        assert!(
+            build(
+                &"dry_run = true\nbody = \"all\"\nfile = \"/x\""
+                    .parse()
+                    .unwrap()
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

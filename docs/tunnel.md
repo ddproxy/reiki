@@ -20,6 +20,7 @@ HTTPS_PROXY=http://127.0.0.1:4098 NO_PROXY=127.0.0.1,localhost some-client
 | `connect_timeout_secs` | 10 | How long to wait for the destination to accept the connection. |
 | `allow_loopback` | false | Lets the tunnel reach loopback addresses. For tests and local development only. |
 | `deny_private` | false | Refuses private-range addresses: RFC 1918, `100.64.0.0/10` and IPv6 unique-local. Turn it on with a broad allowlist such as `*` so the tunnel reaches the internet and not the local network. |
+| `close_idle_on_stop` | true | On a stop, close tunnels with no bytes in either direction for at least one second at once. Active tunnels get the configured drain and are then cut. Set `false` to keep every tunnel until the drain ends. |
 | `intercept` | none | Reads the traffic of chosen hosts; see below. |
 
 ## What it does and does not do
@@ -29,7 +30,8 @@ HTTPS_PROXY=http://127.0.0.1:4098 NO_PROXY=127.0.0.1,localhost some-client
 - The filter also refuses `100.100.100.200`, `168.63.129.16` and `fd00:ec2::254`. The host's other interface addresses are not filtered, so avoid a broad allowlist such as `*`.
 - Each closed tunnel is logged at `info` with the destination host and port, bytes in each direction and the duration. Nothing inside an opaque tunnel is visible, so there is no request log, no placeholders, no key injection and no failover for it.
 - At most 512 tunnels run at once and 64 from one peer address; more get 503. The CONNECT request head must arrive within 10 seconds, and an opaque tunnel is closed after one hour.
-- A reload changes `allow`, `deny_private`, `allow_loopback` and `connect_timeout_secs` without a restart; open tunnels keep running. A new `listen` address needs a restart. See [upgrades](upgrades.md#reload-vs-restart) and [reload](troubleshooting.md#reload).
+- On a clean stop, tunnels idle for at least one second close immediately with `close_idle_on_stop = true`. Tunnels moving bytes get the full drain, then their sockets are cut; the whole tunnel drain is bounded by `[service] shutdown_timeout_secs`.
+- A reload changes `allow`, `deny_private`, `allow_loopback`, `connect_timeout_secs` and `close_idle_on_stop` without a restart; open tunnels keep running with the policy they started under. A new `listen` address needs a restart. See [upgrades](upgrades.md#reload-vs-restart) and [reload](troubleshooting.md#reload).
 
 ## Interception
 

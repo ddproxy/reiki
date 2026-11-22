@@ -131,14 +131,14 @@ pub fn tuples<K: Copy>(
                 }
                 (i, end, j)
             };
-            if let Some(Some(kind)) = map.get(column) {
-                if cell_ok(*kind, &text[s..e]) {
-                    hits.push(Hit {
-                        kind: *kind,
-                        start: s,
-                        end: e,
-                    });
-                }
+            if let Some(Some(kind)) = map.get(column)
+                && cell_ok(*kind, &text[s..e])
+            {
+                hits.push(Hit {
+                    kind: *kind,
+                    start: s,
+                    end: e,
+                });
             }
             column += 1;
             i = next;
@@ -187,14 +187,14 @@ pub fn copy_blocks<K: Copy>(
             let cells = split_cells(all[j].text, b'\t', all[j].start);
             if cells.len() == map.len() {
                 for (idx, (s, e)) in cells.iter().enumerate() {
-                    if let Some(kind) = map[idx] {
-                        if cell_ok(kind, &text[*s..*e]) {
-                            hits.push(Hit {
-                                kind,
-                                start: *s,
-                                end: *e,
-                            });
-                        }
+                    if let Some(kind) = map[idx]
+                        && cell_ok(kind, &text[*s..*e])
+                    {
+                        hits.push(Hit {
+                            kind,
+                            start: *s,
+                            end: *e,
+                        });
                     }
                 }
             }
@@ -245,14 +245,14 @@ pub fn scan_tables<K: Copy>(
             let cells = split_cells(all[j].text, delim, all[j].start);
             if cells.len() == width {
                 for (idx, (s, e)) in cells.iter().enumerate() {
-                    if let Some(kind) = map[idx] {
-                        if (rules.cell_ok)(kind, &text[*s..*e]) {
-                            hits.push(Hit {
-                                kind,
-                                start: *s,
-                                end: *e,
-                            });
-                        }
+                    if let Some(kind) = map[idx]
+                        && (rules.cell_ok)(kind, &text[*s..*e])
+                    {
+                        hits.push(Hit {
+                            kind,
+                            start: *s,
+                            end: *e,
+                        });
                     }
                 }
             }
@@ -384,7 +384,7 @@ fn sql<K: Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_blocks, lines, scan_tables, split_cells, tuples, TableRules};
+    use super::{TableRules, copy_blocks, lines, scan_tables, split_cells, tuples};
 
     #[test]
     fn split_cells_splits_and_trims() {

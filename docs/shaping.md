@@ -32,7 +32,7 @@ rate_limit_per_minute = 60
 
 ```toml
 [upstream.zen.limits]
-preset = "zen-free"        # or "openrouter-free"
+preset = "zen-free"        # or "openrouter-free": named examples, not provider detection
 rpm = 20
 tpm = 100000
 concurrent = 2
@@ -47,7 +47,7 @@ Every field is optional. An explicit `0` means unlimited, and it overrides the p
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `[upstream.NAME.limits]` | absent: no shaping | Turns shaping on for every key of the upstream. |
-| `preset` | none | Starting values: `zen-free` or `openrouter-free`. An unknown name is refused. |
+| `preset` | none | Starting values from an optional named example: `zen-free` or `openrouter-free`. An unknown name is refused; no provider name selects a preset. |
 | `rpm` | `0`, unlimited | Requests per minute, per key. |
 | `tpm` | `0`, unlimited | Tokens per minute, per key. Measured tokens replace the estimate; see below. |
 | `concurrent` | `0`, unlimited | Requests in flight at once, per key. |
@@ -57,14 +57,14 @@ Every field is optional. An explicit `0` means unlimited, and it overrides the p
 | `max_wait_secs` | `20` | Longest a request may sleep for a slot on one key. Must be 1 to 120. |
 | `[keys.NAME] quota_resets` | unset | Reset schedule for a quota failure. Also closes the key's budget after a quota 429. See [cooldown values](classification.md#cooldowns). |
 
-Presets seed the table. Explicit fields override them.
+Optional named examples seed the table. Explicit fields override them.
 
-| Preset | `rpm` | `tpm` | `concurrent` | `daily_requests` | `min_rpm` |
+| Example | `rpm` | `tpm` | `concurrent` | `daily_requests` | `min_rpm` |
 | --- | --- | --- | --- | --- | --- |
 | `zen-free` | 10 | unlimited | 2 | unlimited | 1 |
 | `openrouter-free` | 20 | unlimited | unlimited | 50 | 1 |
 
-The `zen-free` values are a conservative start, since no limits are published for it. The `openrouter-free` values come from the provider's documented free tier.
+These values are illustrative starting points, not published or guaranteed limits. Reiki does not infer a preset from a provider name, request or response; the operator chooses one by name and can override every field.
 
 Each key on the upstream gets its own bucket with these settings. Keys of other upstreams are not shaped.
 

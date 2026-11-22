@@ -140,16 +140,16 @@ pub fn scan(text: &str) -> Vec<Span> {
             continue;
         }
 
-        if bytes[i..].starts_with(b"-----BEGIN ") {
-            if let Some(end) = private_key_end(text, i) {
-                spans.push(Span {
-                    start: i,
-                    end,
-                    private_key: true,
-                });
-                i = end;
-                continue;
-            }
+        if bytes[i..].starts_with(b"-----BEGIN ")
+            && let Some(end) = private_key_end(text, i)
+        {
+            spans.push(Span {
+                start: i,
+                end,
+                private_key: true,
+            });
+            i = end;
+            continue;
         }
 
         if bytes.len() - i >= BEARER.len()

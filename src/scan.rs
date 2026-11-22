@@ -111,66 +111,66 @@ pub fn scan(text: &str, only: &[String], selection: &Kinds) -> Result<Vec<Findin
     let wanted = |name: &str| only.is_empty() || only.iter().any(|p| p == name);
     let mut findings: Vec<Finding> = Vec::new();
     #[cfg(feature = "plugin-phi")]
-    if wanted("phi") {
-        if let Some(kinds) = pick(
+    if wanted("phi")
+        && let Some(kinds) = pick(
             selection,
             &reiki_phi::Kind::DEFAULT,
             &reiki_phi::Kind::ALL,
             reiki_phi::Kind::parse,
             "phi",
             required,
-        )? {
-            findings.extend(reiki_phi::scan(text, &kinds).into_iter().map(|h| Finding {
-                plugin: "phi",
-                kind: h.kind.label(),
-                start: h.start,
-                end: h.end,
-            }));
-        }
+        )?
+    {
+        findings.extend(reiki_phi::scan(text, &kinds).into_iter().map(|h| Finding {
+            plugin: "phi",
+            kind: h.kind.label(),
+            start: h.start,
+            end: h.end,
+        }));
     }
     #[cfg(feature = "plugin-finance")]
-    if wanted("finance") {
-        if let Some(kinds) = pick(
+    if wanted("finance")
+        && let Some(kinds) = pick(
             selection,
             &reiki_finance::Kind::DEFAULT,
             &reiki_finance::Kind::ALL,
             reiki_finance::Kind::parse,
             "finance",
             required,
-        )? {
-            findings.extend(
-                reiki_finance::scan(text, &kinds)
-                    .into_iter()
-                    .map(|h| Finding {
-                        plugin: "finance",
-                        kind: h.kind.label(),
-                        start: h.start,
-                        end: h.end,
-                    }),
-            );
-        }
+        )?
+    {
+        findings.extend(
+            reiki_finance::scan(text, &kinds)
+                .into_iter()
+                .map(|h| Finding {
+                    plugin: "finance",
+                    kind: h.kind.label(),
+                    start: h.start,
+                    end: h.end,
+                }),
+        );
     }
     #[cfg(feature = "plugin-controlled")]
-    if wanted("controlled") {
-        if let Some(kinds) = pick(
+    if wanted("controlled")
+        && let Some(kinds) = pick(
             selection,
             &reiki_controlled::Kind::DEFAULT,
             &reiki_controlled::Kind::ALL,
             reiki_controlled::Kind::parse,
             "controlled",
             required,
-        )? {
-            findings.extend(
-                reiki_controlled::scan(text, &kinds)
-                    .into_iter()
-                    .map(|h| Finding {
-                        plugin: "controlled",
-                        kind: h.kind.label(),
-                        start: h.start,
-                        end: h.end,
-                    }),
-            );
-        }
+        )?
+    {
+        findings.extend(
+            reiki_controlled::scan(text, &kinds)
+                .into_iter()
+                .map(|h| Finding {
+                    plugin: "controlled",
+                    kind: h.kind.label(),
+                    start: h.start,
+                    end: h.end,
+                }),
+        );
     }
     #[cfg(not(any(
         feature = "plugin-phi",
@@ -372,12 +372,16 @@ mod tests {
 
     #[test]
     fn unknown_plugins_and_kinds_are_errors() {
-        assert!(scan("x", &["nope".into()], &Kinds::Default)
-            .unwrap_err()
-            .contains("unknown plugin"));
-        assert!(scan("x", &[], &Kinds::Named(vec!["bogus".into()]))
-            .unwrap_err()
-            .contains("unknown kind"));
+        assert!(
+            scan("x", &["nope".into()], &Kinds::Default)
+                .unwrap_err()
+                .contains("unknown plugin")
+        );
+        assert!(
+            scan("x", &[], &Kinds::Named(vec!["bogus".into()]))
+                .unwrap_err()
+                .contains("unknown kind")
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use axum::routing::get;
 use axum::Router;
-use reiki::serve::{serve_with, serve_with_limits, ConnectionLimits};
+use axum::routing::get;
+use reiki::serve::{ConnectionLimits, serve_with, serve_with_limits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 

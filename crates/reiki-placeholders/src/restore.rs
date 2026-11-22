@@ -234,11 +234,7 @@ pub(crate) fn protected_keys(map: &serde_json::Map<String, Value>) -> &'static [
                 .and_then(|source| source.get("type"))
                 .and_then(Value::as_str)
                 == Some("base64");
-            if base64 {
-                &["source"]
-            } else {
-                &[]
-            }
+            if base64 { &["source"] } else { &[] }
         }
         _ => &[],
     }

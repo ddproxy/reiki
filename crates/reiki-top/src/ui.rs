@@ -11,14 +11,14 @@ use fw_tui::sanitize::printable;
 use fw_tui::text::{display_width, pad_width, truncate_width};
 use fw_tui::theme::Theme;
 use fw_tui::widgets::{
-    render_footer_bar, render_frequency_chart, render_header_bar, render_line_chart,
-    render_overlay, render_tabs, FrequencyBar, LineChartConfig, Panel, Series, ToggleChip,
+    FrequencyBar, LineChartConfig, Panel, Series, ToggleChip, render_footer_bar,
+    render_frequency_chart, render_header_bar, render_line_chart, render_overlay, render_tabs,
 };
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style as RatStyle};
 use ratatui::text::{Line as RatLine, Span as RatSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::matrix::UsageMetric;
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
@@ -26,8 +26,7 @@ use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 /// The key hints on the footer's right side, full view.
 const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix  ? keys";
 /// The key hints under the matrix header. Kept within 100 columns so the header's status fits.
-const HINTS_MATRIX: &str =
-    "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys";
+const HINTS_MATRIX: &str = "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys";
 
 /// Rows of the matrix header panel: a border, the status line, the hints and a border.
 const HEADER_ROWS: u16 = 4;
@@ -396,11 +395,7 @@ fn draw_help(frame: &mut Frame, area: Rect, keys: &[&str]) {
 /// above the footer, or none when that would be too short to hold a border and a line.
 pub fn detail_height(screen_height: u16) -> u16 {
     let third = screen_height.saturating_sub(1) / 3;
-    if third >= 3 {
-        third
-    } else {
-        0
-    }
+    if third >= 3 { third } else { 0 }
 }
 
 /// Rows of each band of the matrix frame, top to bottom. Zero means the band is not drawn.
@@ -1045,9 +1040,9 @@ fn footer_text(state: &UiState, status: &str, hints: &str) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::Terminal;
 
     fn line(text: &str) -> view::Line {
         view::Line {

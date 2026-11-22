@@ -13,7 +13,7 @@ use hyper_util::rt::TokioIo;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::time::Instant;
@@ -112,10 +112,10 @@ async fn start_simple_socket_server(
                         let mut resp = Response::new(Full::new(rbody));
                         *resp.status_mut() = status;
                         for (n, v) in rheaders {
-                            if let Ok(name) = hyper::header::HeaderName::from_bytes(n.as_bytes()) {
-                                if let Ok(val) = hyper::header::HeaderValue::from_str(&v) {
-                                    resp.headers_mut().insert(name, val);
-                                }
+                            if let Ok(name) = hyper::header::HeaderName::from_bytes(n.as_bytes())
+                                && let Ok(val) = hyper::header::HeaderValue::from_str(&v)
+                            {
+                                resp.headers_mut().insert(name, val);
                             }
                         }
                         Ok::<_, std::convert::Infallible>(resp)
@@ -182,23 +182,26 @@ async fn forward_socket_round_trip_binary_and_headers() {
     assert!(s.headers.iter().any(
         |(n, v)| n.eq_ignore_ascii_case("host") && String::from_utf8_lossy(v) == "example.test"
     ));
-    assert!(s
-        .headers
-        .iter()
-        .any(|(n, v)| n.eq_ignore_ascii_case("x-forwarded-proto")
-            && String::from_utf8_lossy(v) == "https"));
+    assert!(
+        s.headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("x-forwarded-proto")
+                && String::from_utf8_lossy(v) == "https")
+    );
     assert!(s.headers.iter().any(
         |(n, v)| n.eq_ignore_ascii_case("connection") && String::from_utf8_lossy(v) == "close"
     ));
-    assert!(s
-        .headers
-        .iter()
-        .any(|(n, v)| n.eq_ignore_ascii_case("authorization")
-            && String::from_utf8_lossy(v) == "Bearer key123"));
-    assert!(!s
-        .headers
-        .iter()
-        .any(|(n, _)| n.to_ascii_lowercase().starts_with("x-reiki")));
+    assert!(
+        s.headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("authorization")
+                && String::from_utf8_lossy(v) == "Bearer key123")
+    );
+    assert!(
+        !s.headers
+            .iter()
+            .any(|(n, _)| n.to_ascii_lowercase().starts_with("x-reiki"))
+    );
     assert_eq!(s.body, vec![9u8, 10, 11]);
     let _ = std::fs::remove_file(&sock);
 }
@@ -232,16 +235,17 @@ async fn forward_socket_passthrough() {
     let seen_list = seen.lock().unwrap();
     assert_eq!(seen_list.len(), 1);
     let s = &seen_list[0];
-    assert!(s
-        .headers
-        .iter()
-        .any(|(n, v)| n.eq_ignore_ascii_case("authorization")
-            && String::from_utf8_lossy(v) == "Bearer client-own"));
+    assert!(
+        s.headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("authorization")
+                && String::from_utf8_lossy(v) == "Bearer client-own")
+    );
     let _ = std::fs::remove_file(&sock);
 }
 
 #[tokio::test]
-async fn forward_socket_large_bodies_timeout_10s() {
+async fn forward_socket_large_bodies() {
     let (sock, _seen) = start_simple_socket_server(|_| {
         (
             hyper::StatusCode::OK,
@@ -266,8 +270,10 @@ async fn forward_socket_large_bodies_timeout_10s() {
         PluginChain::default(),
     );
     let base = serve_app(app).await;
+    // Debug builds move this 1 MiB body slowly when the other tests in this binary
+    // are running; keep the allowance well above the transfer time.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
     let resp = client
@@ -589,7 +595,10 @@ async fn forward_socket_various_bad_responses() {
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let bigv = "a".repeat(65537);
-                let hdr = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-big: {}\r\nConnection: close\r\n\r\n", bigv);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-big: {}\r\nConnection: close\r\n\r\n",
+                    bigv
+                );
                 let _ = AsyncWriteExt::write_all(&mut stream, hdr.as_bytes()).await;
                 let _ = AsyncWriteExt::write_all(&mut stream, b"ok").await;
                 let _ = AsyncWriteExt::shutdown(&mut stream).await;
@@ -1276,13 +1285,12 @@ async fn forward_command_linger() {
     assert!(start.elapsed() < Duration::from_secs(5));
     let mut pid = None;
     for _ in 0..50 {
-        if pid_path.exists() {
-            if let Ok(s) = std::fs::read_to_string(&pid_path) {
-                if let Ok(p) = s.trim().parse::<u32>() {
-                    pid = Some(p);
-                    break;
-                }
-            }
+        if pid_path.exists()
+            && let Ok(s) = std::fs::read_to_string(&pid_path)
+            && let Ok(p) = s.trim().parse::<u32>()
+        {
+            pid = Some(p);
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1296,8 +1304,20 @@ async fn forward_command_env_report() {
     if !python_available() {
         return;
     }
-    std::env::set_var("REIKI_TEST_SECRET", "x");
-    std::env::set_var("REIKI_TEST_PASSED", "y");
+    // Edition 2024 makes `set_var` unsafe because other threads may read the environment.
+    // Run the body in a child test process instead, where the variables can be set before
+    // any threads start. The marker stops the child from respawning itself.
+    if std::env::var_os("REIKI_ENV_REPORT_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["forward_command_env_report", "--exact", "--nocapture"])
+            .env("REIKI_ENV_REPORT_CHILD", "1")
+            .env("REIKI_TEST_SECRET", "x")
+            .env("REIKI_TEST_PASSED", "y")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the env-report test process failed");
+        return;
+    }
     let text = format!(
         "[upstream.zen]\nbase_url = \"https://example.test/v1\"\n\
          [upstream.zen.forward]\ncommand = \"{}\"\nargs = [\"{}\", \"env-report\", \"REIKI_TEST_SECRET\", \"REIKI_TEST_PASSED\", \"PATH\"]\npass_env = [\"REIKI_TEST_PASSED\"]\n\
@@ -1406,10 +1426,12 @@ async fn expect_continue_is_not_passed_to_the_forwarder() {
     .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let seen = seen.lock().unwrap();
-    assert!(!seen[0]
-        .headers
-        .iter()
-        .any(|(n, _)| n.eq_ignore_ascii_case("expect")));
+    assert!(
+        !seen[0]
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("expect"))
+    );
     let _ = std::fs::remove_file(&sock);
 }
 

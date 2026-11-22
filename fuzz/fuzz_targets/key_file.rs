@@ -6,7 +6,7 @@
 use libfuzzer_sys::fuzz_target;
 use reiki::fuzzing::key_file_verdict;
 use reiki::keys::parse_status;
-use reiki::scrub::{forms, MAX_SECRET};
+use reiki::scrub::{MAX_SECRET, forms};
 
 fn split(text: &str) -> (&str, &str) {
     let mut at = text.find('\n').unwrap_or(text.len() / 2);

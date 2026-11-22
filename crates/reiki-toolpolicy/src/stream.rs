@@ -10,7 +10,7 @@ use crate::checks::check_call;
 use crate::config::{Config, Mode, Severity};
 use crate::journal::{Entry, Journal};
 use crate::metrics::Metrics;
-use crate::parse::{notice, Call, Format, RequestParse, MAX_CALLS};
+use crate::parse::{Call, Format, MAX_CALLS, RequestParse, notice};
 
 const MAX_ARGS: usize = 64 * 1024;
 const MAX_BUFFERED_BODY: usize = 8 * 1024 * 1024;

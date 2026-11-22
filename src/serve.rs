@@ -9,8 +9,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
 use axum::Router;
+use axum::body::Body;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;

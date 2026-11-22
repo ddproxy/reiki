@@ -407,9 +407,11 @@ mod tests {
         assert!(syslog.send(&meta("request", SEVERITY_INFO), "{\"u\":1}"));
         let mut buf = [0u8; 2048];
         let n = peer.recv(&mut buf).unwrap();
-        assert!(std::str::from_utf8(&buf[..n])
-            .unwrap()
-            .ends_with(" request - {\"u\":1}"));
+        assert!(
+            std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .ends_with(" request - {\"u\":1}")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

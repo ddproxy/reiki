@@ -1,8 +1,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::classify::{parse_http_date, parse_retry_after};
 
@@ -155,41 +155,44 @@ pub struct PresetLimits {
     pub min_rpm: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Preset {
-    ZenFree,
-    OpenrouterFree,
+/// Optional named starting points, held as data: the name is an opaque key, not a provider check.
+/// These numbers are illustrative examples. They are neither discovered from a response nor a
+/// promise about any service; operators should override them with the limits they want.
+pub const EXAMPLE_PRESETS: [(&str, PresetLimits); 2] = [
+    (
+        "zen-free",
+        PresetLimits {
+            rpm: Some(10),
+            tpm: None,
+            concurrent: Some(2),
+            daily_requests: None,
+            min_rpm: Some(1),
+        },
+    ),
+    (
+        "openrouter-free",
+        PresetLimits {
+            rpm: Some(20),
+            tpm: None,
+            concurrent: None,
+            daily_requests: Some(50),
+            min_rpm: Some(1),
+        },
+    ),
+];
+
+/// Looks up one example preset by name. No provider name or response header takes part in this.
+pub fn preset_limits(name: &str) -> Result<PresetLimits, String> {
+    EXAMPLE_PRESETS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, limits)| *limits)
+        .ok_or_else(|| format!("unknown shaper preset `{name}`"))
 }
 
-impl Preset {
-    pub fn parse(name: &str) -> Result<Self, String> {
-        match name {
-            "zen-free" => Ok(Self::ZenFree),
-            "openrouter-free" => Ok(Self::OpenrouterFree),
-            other => Err(format!("unknown shaper preset `{other}`")),
-        }
-    }
-
-    pub const fn limits(self) -> PresetLimits {
-        match self {
-            // Documented free-tier caps; re-check on each release.
-            Self::OpenrouterFree => PresetLimits {
-                rpm: Some(20),
-                tpm: None,
-                concurrent: None,
-                daily_requests: Some(50),
-                min_rpm: Some(1),
-            },
-            // No published limits for Zen free; start conservative and let learning raise it.
-            Self::ZenFree => PresetLimits {
-                rpm: Some(10),
-                tpm: None,
-                concurrent: Some(2),
-                daily_requests: None,
-                min_rpm: Some(1),
-            },
-        }
-    }
+/// Names accepted by [`preset_limits`], for validation messages and documentation.
+pub fn preset_names() -> impl Iterator<Item = &'static str> {
+    EXAMPLE_PRESETS.iter().map(|(name, _)| *name)
 }
 
 #[cfg(test)]
@@ -395,25 +398,30 @@ mod tests {
     }
 
     #[test]
-    fn preset_names_parse() {
-        assert_eq!(Preset::parse("zen-free"), Ok(Preset::ZenFree));
-        assert_eq!(Preset::parse("openrouter-free"), Ok(Preset::OpenrouterFree));
+    fn preset_names_are_opaque_data_keys() {
+        assert_eq!(preset_limits("zen-free").unwrap().rpm, Some(10));
+        assert_eq!(preset_limits("openrouter-free").unwrap().rpm, Some(20));
+        assert_eq!(
+            preset_names().collect::<Vec<_>>(),
+            ["zen-free", "openrouter-free"]
+        );
     }
 
     #[test]
     fn unknown_preset_is_an_error() {
-        assert!(Preset::parse("zen").is_err());
-        assert!(Preset::parse("").is_err());
+        for name in ["zen", "", "some-new-provider-free"] {
+            assert!(preset_limits(name).is_err(), "{name:?} is not an example");
+        }
     }
 
     #[test]
-    fn preset_limits_match_the_documented_values() {
-        let openrouter = Preset::OpenrouterFree.limits();
+    fn preset_limits_match_the_documented_examples() {
+        let openrouter = preset_limits("openrouter-free").unwrap();
         assert_eq!(openrouter.rpm, Some(20));
         assert_eq!(openrouter.daily_requests, Some(50));
         assert_eq!(openrouter.tpm, None);
 
-        let zen = Preset::ZenFree.limits();
+        let zen = preset_limits("zen-free").unwrap();
         assert_eq!(zen.rpm, Some(10));
         assert_eq!(zen.concurrent, Some(2));
         assert_eq!(zen.daily_requests, None);

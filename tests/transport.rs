@@ -3,15 +3,15 @@
 use std::sync::{Arc, Mutex};
 
 use async_compression::tokio::write::GzipEncoder;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
-use reiki::proxy::{router, App, Secret};
+use reiki::proxy::{App, Secret, router};
 use tokio::io::AsyncWriteExt;
 
 mod common;

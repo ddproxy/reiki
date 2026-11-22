@@ -21,7 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use x509_parser::extensions::{GeneralName, GeneralSubtree as ParsedSubtree};
 
 use crate::config::{CaKeyPermissions, InterceptConfig, InterceptHost};
-use crate::proxy::{handle_intercepted, App};
+use crate::proxy::{App, handle_intercepted};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,11 +98,7 @@ fn dns_names(subtrees: Option<&[ParsedSubtree<'_>]>) -> Vec<String> {
 fn at(offset: Duration, future: bool) -> time::OffsetDateTime {
     let now = time::OffsetDateTime::now_utc();
     let offset = time::Duration::seconds(i64::try_from(offset.as_secs()).unwrap_or(i64::MAX / 4));
-    if future {
-        now + offset
-    } else {
-        now - offset
-    }
+    if future { now + offset } else { now - offset }
 }
 
 /// Name-constrained to `hosts`, so a stolen key cannot impersonate anything else.
@@ -204,7 +200,9 @@ pub(crate) fn check_private_key_mode(
     if mode & 0o077 == 0 {
         return Ok(());
     }
-    let message = format!("{what} {path} has mode {mode:03o}; it must not be accessible to group or others (chmod 600)");
+    let message = format!(
+        "{what} {path} has mode {mode:03o}; it must not be accessible to group or others (chmod 600)"
+    );
     match policy {
         CaKeyPermissions::Error => Err(message),
         CaKeyPermissions::Warn => {

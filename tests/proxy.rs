@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::{to_bytes, Body};
+use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::proxy::{router, App, Clock, Secret};
+use reiki::proxy::{App, Clock, Secret, router};
 
 mod common;
 use common::serve;

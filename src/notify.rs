@@ -80,10 +80,10 @@ pub fn watchdog_interval() -> Option<Duration> {
 
 pub(crate) fn parse_watchdog(usec: Option<&str>, pid: Option<&str>, own: u32) -> Option<Duration> {
     let usec: u64 = usec?.trim().parse().ok()?;
-    if let Some(pid) = pid {
-        if pid.trim().parse::<u32>().ok()? != own {
-            return None;
-        }
+    if let Some(pid) = pid
+        && pid.trim().parse::<u32>().ok()? != own
+    {
+        return None;
     }
     (usec > 0).then(|| Duration::from_micros(usec))
 }
@@ -108,15 +108,17 @@ pub fn spawn_watchdog() {
     });
     let spawned = std::thread::Builder::new()
         .name("reiki-watchdog".to_owned())
-        .spawn(move || loop {
-            std::thread::sleep(interval / 2);
-            let last = beat.load(std::sync::atomic::Ordering::Relaxed);
-            let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let fresh = last != 0
-                && now.saturating_sub(last)
-                    < u64::try_from(interval.as_millis() / 2).unwrap_or(u64::MAX);
-            if fresh {
-                notify("WATCHDOG=1");
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval / 2);
+                let last = beat.load(std::sync::atomic::Ordering::Relaxed);
+                let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let fresh = last != 0
+                    && now.saturating_sub(last)
+                        < u64::try_from(interval.as_millis() / 2).unwrap_or(u64::MAX);
+                if fresh {
+                    notify("WATCHDOG=1");
+                }
             }
         });
     if let Err(error) = spawned {

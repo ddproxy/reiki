@@ -1590,6 +1590,7 @@ dependencies = [
  "reiki-controlled",
  "reiki-detect",
  "reiki-finance",
+ "reiki-health",
  "reiki-metrics",
  "reiki-phi",
  "reiki-placeholders",
@@ -1649,6 +1650,14 @@ dependencies = [
  "sha3",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "reiki-health"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1738,6 +1747,7 @@ dependencies = [
  "crossterm",
  "fw-tui",
  "ratatui",
+ "reiki-health",
  "serde",
  "serde_json",
  "unicode-width",

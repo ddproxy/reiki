@@ -1,11 +1,11 @@
 //! Replaces sensitive values in request text with stable placeholders.
 
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -327,11 +327,7 @@ impl RawOffsets {
                 b'u' => {
                     // A four-byte decoded character can only come from a surrogate pair.
                     let ch = decoded.get(decoded_start..)?.chars().next()?;
-                    if ch.len_utf8() == 4 {
-                        12
-                    } else {
-                        6
-                    }
+                    if ch.len_utf8() == 4 { 12 } else { 6 }
                 }
                 _ => return None,
             };
@@ -580,9 +576,10 @@ mod tests {
     #[test]
     fn text_with_nothing_sensitive_is_left_alone() {
         let m = masker(&["Falcon"], true);
-        assert!(m
-            .mask("an ordinary sentence", &mut HashMap::new())
-            .is_none());
+        assert!(
+            m.mask("an ordinary sentence", &mut HashMap::new())
+                .is_none()
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ Each fetch has a 5 s deadline, including connect. Redirects are refused so the t
 | `upstreams[].cooling_combinations` | integer | Active scoped (route, model) cooldowns across this upstream's keys. A whole-key cooldown adds none, since it clears its scopes. |
 | `upstreams[].soonest_cooldown_seconds` | integer or null | Shortest remaining key wait, rounded up to whole seconds and then to a multiple of `cooldown_bucket_secs` (default 300, cap 86400; `0` is exact). `null` when no key is cooling. |
 | `upstreams[].last_status_class` | `2xx`, `4xx`, `5xx` or null | Class of the latest attempt on any of this upstream's keys. `null` before an attempt, after a 3xx, or when the attempt got no response. |
+| `upstreams[].capacity_group` | string | Opaque group set by the operator at `[upstream.NAME] capacity_group`; absent until configured. Never inferred from the upstream name, a key label or a response. |
 | `upstreams[].requests_1h` | integer | Attempts in the last hour. Present with `expose_usage = true` (the default). |
 | `upstreams[].limited_1h` | integer | Attempts that were rate-limited or began a cooldown. |
 | `upstreams[].request_buckets` | array of 12 integers | Five-minute attempt counts, oldest first. |

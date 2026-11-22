@@ -237,23 +237,22 @@ fn add_host(out: &mut BTreeSet<String>, raw: &str) {
         host = bracketed.split(']').next().unwrap_or("");
     }
     // Bare values such as `host: 2001:db8::1` become `host:2001:db8::1` after tokenising.
-    if let Some((key, rest)) = host.split_once(':') {
-        if !key.is_empty()
-            && key
-                .bytes()
-                .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
-        {
-            host = rest;
-        }
+    if let Some((key, rest)) = host.split_once(':')
+        && !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
+    {
+        host = rest;
     }
     if host.parse::<Ipv6Addr>().is_ok() {
         out.insert(host.to_owned());
         return;
     }
-    if let Some((address, port)) = host.rsplit_once(':') {
-        if port.bytes().all(|b| b.is_ascii_digit()) {
-            host = address;
-        }
+    if let Some((address, port)) = host.rsplit_once(':')
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        host = address;
     }
     if let Some(bracketed) = host.strip_prefix('[') {
         host = bracketed.split(']').next().unwrap_or("");

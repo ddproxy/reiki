@@ -6,19 +6,19 @@
 //! record that cannot be queued or sent is counted in
 //! `reiki_requestlog_export_dropped_total`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ExportConfig;
 use crate::redact;
 use crate::sink::{FileSink, Notice};
-use crate::syslog::{Meta, Syslog, SEVERITY_INFO, SEVERITY_WARNING};
+use crate::syslog::{Meta, SEVERITY_INFO, SEVERITY_WARNING, Syslog};
 use crate::timefmt::rfc3339_millis;
 
 /// Longest scalar field in an export record, in bytes.
@@ -416,10 +416,10 @@ impl Usage {
             if !self.discarding {
                 self.read_event_line(&rest);
             }
-        } else if !self.exceeded {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.buffer) {
-                self.take(usage_in(&value));
-            }
+        } else if !self.exceeded
+            && let Ok(value) = serde_json::from_slice::<Value>(&self.buffer)
+        {
+            self.take(usage_in(&value));
         }
         (self.input.unwrap_or(0), self.output.unwrap_or(0))
     }
@@ -595,9 +595,10 @@ mod tests {
         // The cap deletes the oldest file, so only the newest records survive.
         let kept = all.lines().count();
         assert!((1..=7).contains(&kept), "{kept} lines kept");
-        assert!(all
-            .lines()
-            .all(|line| serde_json::from_str::<Value>(line).is_ok()));
+        assert!(
+            all.lines()
+                .all(|line| serde_json::from_str::<Value>(line).is_ok())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

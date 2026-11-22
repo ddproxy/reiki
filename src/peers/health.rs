@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::chain::{KeyState, KeyStatus};
 use crate::classify::FailureClass;
@@ -22,12 +22,12 @@ fn ceil_secs(wait: Duration, bucket: u64) -> u64 {
     }
 }
 
-fn status_class(status: Option<u16>) -> Value {
+fn status_class(status: Option<u16>) -> Option<String> {
     match status {
-        Some(200..=299) => json!("2xx"),
-        Some(400..=499) => json!("4xx"),
-        Some(500..=599) => json!("5xx"),
-        _ => Value::Null,
+        Some(200..=299) => Some("2xx".to_owned()),
+        Some(400..=499) => Some("4xx".to_owned()),
+        Some(500..=599) => Some("5xx".to_owned()),
+        _ => None,
     }
 }
 
@@ -76,45 +76,72 @@ pub(crate) fn upstreams(
                 }
             };
             if labels {
-                let mut item = json!({"name": key, "state": state, "cooldown_seconds": wait});
-                if wait.is_some() {
-                    if let Some(class) = health.cooling_class(key, now) {
-                        item["cooldown_class"] = json!(class.name());
-                        if class == FailureClass::QuotaExhausted {
-                            if let Some(reset_at) = health.cooling_reset_at(key, now) {
-                                item["quota_reset_at"] = json!(crate::reload::rfc3339(reset_at));
-                            }
-                        }
+                let mut cooldown_class = None;
+                let mut quota_reset_at = None;
+                if wait.is_some()
+                    && let Some(class) = health.cooling_class(key, now)
+                {
+                    cooldown_class = Some(class.name().to_owned());
+                    if class == FailureClass::QuotaExhausted {
+                        quota_reset_at = health
+                            .cooling_reset_at(key, now)
+                            .map(crate::reload::rfc3339);
                     }
                 }
-                listed.push(item);
+                listed.push(reiki_health::KeyView {
+                    name: (*key).to_owned(),
+                    state: state.to_owned(),
+                    cooldown_seconds: wait,
+                    cooldown_class,
+                    quota_reset_at,
+                });
             }
         }
-        let mut entry = json!({
-            "name": name,
-            "healthy_keys": healthy,
-            "cooling_keys": cooling,
-            "disabled_keys": disabled,
-            "cooling_combinations": combinations,
-            "soonest_cooldown_seconds": soonest.map(|wait| ceil_secs(wait, bucket)),
-            "last_status_class": health
-                .latest_status(keys.iter().copied())
-                .map_or(Value::Null, status_class),
-        });
-        if let Some(pressure) = pressure {
+        let (
+            requests_1h,
+            limited_1h,
+            request_buckets,
+            tokens_1h,
+            token_buckets,
+            request_minutes,
+            token_minutes,
+        ) = if let Some(pressure) = pressure {
             let snapshot = pressure.snapshot(name, now);
-            entry["requests_1h"] = json!(snapshot.requests_1h);
-            entry["limited_1h"] = json!(snapshot.limited_1h);
-            entry["request_buckets"] = json!(snapshot.buckets);
-            entry["tokens_1h"] = json!(snapshot.tokens_1h);
-            entry["token_buckets"] = json!(snapshot.token_buckets);
-            entry["request_minutes"] = json!(snapshot.minutes);
-            entry["token_minutes"] = json!(snapshot.token_minutes);
-        }
-        if labels {
-            entry["keys"] = Value::Array(listed);
-        }
-        out.push(entry);
+            (
+                Some(snapshot.requests_1h),
+                Some(snapshot.limited_1h),
+                Some(snapshot.buckets),
+                Some(snapshot.tokens_1h),
+                Some(snapshot.token_buckets),
+                Some(snapshot.minutes),
+                Some(snapshot.token_minutes),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
+        let entry = reiki_health::Upstream {
+            name: name.clone(),
+            healthy_keys: healthy,
+            cooling_keys: cooling,
+            disabled_keys: disabled,
+            cooling_combinations: combinations,
+            soonest_cooldown_seconds: soonest.map(|wait| ceil_secs(wait, bucket)),
+            last_status_class: health
+                .latest_status(keys.iter().copied())
+                .and_then(status_class),
+            capacity_group: upstream.capacity_group.clone(),
+            keys: labels.then_some(listed),
+            requests_1h,
+            limited_1h,
+            request_buckets,
+            tokens_1h,
+            token_buckets,
+            request_minutes,
+            token_minutes,
+        };
+        out.push(
+            serde_json::to_value(entry).expect("a health upstream entry always serializes to JSON"),
+        );
     }
     out
 }
@@ -236,6 +263,25 @@ mod tests {
              [keys.c]\nupstream = \"zen\"\nfile = \"/c\"\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_capacity_group_is_published_unsourced_and_key_labels_stay_labels() {
+        let configured = Config::parse(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             capacity_group = \"team-a\"\n\
+             [keys.zen-a]\nupstream = \"zen\"\nfile = \"/a\"\n",
+        )
+        .unwrap();
+        let mut health = KeyState::default();
+        let zen = &upstreams(&configured, &mut health, Instant::now(), true, 0, None)[0];
+        assert_eq!(zen["capacity_group"], "team-a");
+        assert_eq!(zen["keys"][0]["name"], "zen-a");
+        assert!(zen["keys"][0].get("capacity_group").is_none());
+
+        let inferred = config();
+        let zen = &upstreams(&inferred, &mut health, Instant::now(), true, 0, None)[1];
+        assert!(zen.get("capacity_group").is_none(), "never inferred");
     }
 
     #[test]
@@ -582,10 +628,10 @@ mod tests {
 
     #[test]
     fn status_classes_are_coarse() {
-        assert_eq!(status_class(Some(201)), "2xx");
-        assert_eq!(status_class(Some(404)), "4xx");
-        assert_eq!(status_class(Some(503)), "5xx");
-        assert!(status_class(Some(302)).is_null());
-        assert!(status_class(None).is_null());
+        assert_eq!(status_class(Some(201)).as_deref(), Some("2xx"));
+        assert_eq!(status_class(Some(404)).as_deref(), Some("4xx"));
+        assert_eq!(status_class(Some(503)).as_deref(), Some("5xx"));
+        assert_eq!(status_class(Some(302)), None);
+        assert_eq!(status_class(None), None);
     }
 }

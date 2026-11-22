@@ -4,7 +4,7 @@
 //! such as SWIFT codes and account numbers, are only reported next to a label, an adjacent IBAN
 //! or a table header. A hit never carries the matched text, only its position.
 
-use reiki_detect::{account_value, digit_run, keyed, luhn, word_at, word_before, KeyedStyle};
+use reiki_detect::{KeyedStyle, account_value, digit_run, keyed, luhn, word_at, word_before};
 
 /// Account numbers need a label; this style keeps the finance separator grammar.
 const KEYED: KeyedStyle = KeyedStyle {

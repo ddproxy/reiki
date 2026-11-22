@@ -4,7 +4,7 @@ use common::write_key;
 use reiki::chain::Policy;
 use reiki::config::Config;
 use reiki::plugins::PluginChain;
-use reiki::proxy::{load_keys, router, App};
+use reiki::proxy::{App, load_keys, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

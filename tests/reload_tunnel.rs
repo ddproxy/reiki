@@ -4,8 +4,8 @@ mod common;
 use common::write_key;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose,
@@ -13,9 +13,9 @@ use rcgen::{
 };
 use reiki::chain::Policy;
 use reiki::config::{Config, TunnelConfig};
-use reiki::intercept::{init_ca, InterceptAuth, Interceptor};
+use reiki::intercept::{InterceptAuth, Interceptor, init_ca};
 use reiki::plugins::PluginChain;
-use reiki::proxy::{load_keys, App};
+use reiki::proxy::{App, load_keys};
 use reiki::tunnel::Tunnel;
 use time::OffsetDateTime;
 

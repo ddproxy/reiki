@@ -1,12 +1,18 @@
 //! A CONNECT-only forward proxy. Bytes are copied in both directions without being read,
 //! so the client's own TLS session reaches the destination untouched.
 
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::watch;
 
 use crate::config::TunnelConfig;
 use crate::intercept::{InterceptAuth, InterceptPlan, Interceptor, Prefixed};
@@ -17,6 +23,8 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TUNNEL_LIFETIME: Duration = Duration::from_secs(3600);
 /// Most tunnels one peer address may hold open at once.
 const MAX_TUNNELS_PER_PEER: usize = 64;
+/// No bytes in either direction for this long makes a tunnel idle at stop.
+const IDLE_AFTER: Duration = Duration::from_secs(1);
 
 /// One entry of the destination allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,7 @@ struct Policy {
     connect_timeout: Duration,
     allow_loopback: bool,
     deny_private: bool,
+    close_idle_on_stop: bool,
 }
 
 impl Policy {
@@ -93,6 +102,7 @@ impl Policy {
             connect_timeout: Duration::from_secs(config.connect_timeout_secs),
             allow_loopback: config.allow_loopback,
             deny_private: config.deny_private,
+            close_idle_on_stop: config.close_idle_on_stop,
         }
     }
 }
@@ -158,6 +168,12 @@ impl Tunnel {
         }
         if current.connect_timeout != next.connect_timeout {
             changed.push("tunnel connect_timeout_secs".to_owned());
+        }
+        if current.close_idle_on_stop != next.close_idle_on_stop {
+            changed.push(format!(
+                "tunnel close_idle_on_stop {}",
+                next.close_idle_on_stop
+            ));
         }
         let mut restart_needed = Vec::new();
         let intercept = match (&self.interceptor, &config.intercept) {
@@ -289,13 +305,131 @@ fn embedded_v4s(seg: &[u16; 8]) -> [Option<std::net::Ipv4Addr>; 2] {
 /// Most tunnels open at once; further connections are dropped until one closes.
 const MAX_TUNNELS: usize = 512;
 
+/// Stop phases broadcast to every open tunnel. Idle ones close on `Stopping`; active ones get
+/// until `Cut` to finish, then their copy future is dropped and the socket closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Running,
+    Stopping,
+    Cut,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Records the last byte in either direction so a stop can tell an idle tunnel from a busy one.
+struct Tracked<S> {
+    inner: S,
+    last: Arc<AtomicU64>,
+}
+
+impl<S> Tracked<S> {
+    fn new(inner: S, last: Arc<AtomicU64>) -> Self {
+        Self { inner, last }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Tracked<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            this.last.store(now_millis(), Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = polled
+            && written > 0
+        {
+            this.last.store(now_millis(), Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Ends a tunnel's copy when it is idle at the start of a stop, or when the drain is over.
+async fn stop_watcher(mut phase: watch::Receiver<Phase>, last: Arc<AtomicU64>, close_idle: bool) {
+    while phase.changed().await.is_ok() {
+        match *phase.borrow() {
+            Phase::Running => {}
+            Phase::Stopping if close_idle => {
+                let idle = now_millis().saturating_sub(last.load(Ordering::Relaxed))
+                    >= IDLE_AFTER.as_millis() as u64;
+                if idle {
+                    return;
+                }
+            }
+            Phase::Stopping => {}
+            Phase::Cut => return,
+        }
+    }
+}
+
 /// Serves CONNECT requests until the listener fails.
 pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
+    serve_until(
+        listener,
+        tunnel,
+        crate::lifecycle::stopped(),
+        crate::serve::drain_timeout(),
+    )
+    .await;
+}
+
+/// Same as [`serve`], with the stop signal and drain time supplied so tests can drive a stop
+/// without touching process-global state.
+pub async fn serve_until(
+    listener: TcpListener,
+    tunnel: Arc<Tunnel>,
+    stop: impl Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) {
+    let (phase_tx, phase_rx) = watch::channel(Phase::Running);
+    let sender = phase_tx.clone();
+    let phases = tokio::spawn(async move {
+        stop.await;
+        sender.send_replace(Phase::Stopping);
+        tokio::time::sleep(drain).await;
+        sender.send_replace(Phase::Cut);
+    });
+
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS));
     let peers: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>> = Arc::default();
     loop {
+        let mut stopping = phase_rx.clone();
         let accepted = tokio::select! {
-            () = crate::lifecycle::stopped() => break,
+            _ = stopping.changed() => {
+                if *stopping.borrow() != Phase::Running {
+                    break;
+                }
+                continue;
+            }
             accepted = listener.accept() => accepted,
         };
         let Ok((stream, peer)) = accepted else {
@@ -313,18 +447,23 @@ pub async fn serve(listener: TcpListener, tunnel: Arc<Tunnel>) {
             continue;
         };
         let tunnel = Arc::clone(&tunnel);
+        let phase = phase_rx.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let _guard = guard;
-            if let Err(error) = handle(stream, &tunnel).await {
+            let close_idle = tunnel.policy().close_idle_on_stop;
+            if let Err(error) = handle(stream, &tunnel, phase, close_idle).await {
                 tracing::debug!(%peer, %error, "tunnel connection ended with an error");
             }
         });
     }
-    // Open tunnels get the drain time, then they are cut with the process.
+    // Idle tunnels have already closed; active ones keep copying until the phase task cuts them
+    // at the end of the drain. Waiting on the slots bounds the whole stop to the drain time.
     drop(listener);
     let all = u32::try_from(MAX_TUNNELS).unwrap_or(u32::MAX);
-    let _ = tokio::time::timeout(crate::serve::drain_timeout(), slots.acquire_many(all)).await;
+    let _ = tokio::time::timeout(drain, slots.acquire_many(all)).await;
+    phase_tx.send_replace(Phase::Cut);
+    phases.abort();
 }
 
 /// Counts one open tunnel for a peer address and releases it on drop.
@@ -379,7 +518,12 @@ fn refuse(mut stream: TcpStream) {
     });
 }
 
-async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
+async fn handle(
+    mut client: TcpStream,
+    tunnel: &Tunnel,
+    phase: watch::Receiver<Phase>,
+    close_idle: bool,
+) -> io::Result<()> {
     let Some((target, rest, proxy_authorization)) = read_connect(&mut client).await? else {
         return respond(&mut client, "400 Bad Request", "expected a CONNECT request").await;
     };
@@ -416,9 +560,9 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
             InterceptAuth::Refused => {
                 let message = "a stream token is required";
                 let response = format!(
-                        "HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"reiki\"\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
-                        message.len()
-                    );
+                    "HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"reiki\"\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
+                    message.len()
+                );
                 client.write_all(response.as_bytes()).await?;
                 return client.shutdown().await;
             }
@@ -428,10 +572,15 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         tracing::info!(%host, "tunnel intercepting");
-        let _ = tokio::time::timeout(
-            MAX_TUNNEL_LIFETIME,
-            interceptor.serve(&host, target, Prefixed::new(rest, client)),
-        )
+        let last = Arc::new(AtomicU64::new(now_millis()));
+        let stream = Tracked::new(Prefixed::new(rest, client), Arc::clone(&last));
+        let watcher = stop_watcher(phase, last, close_idle);
+        let _ = tokio::time::timeout(MAX_TUNNEL_LIFETIME, async {
+            tokio::select! {
+                () = interceptor.serve(&host, target, stream) => {}
+                () = watcher => {}
+            }
+        })
         .await;
         return Ok(());
     }
@@ -460,12 +609,17 @@ async fn handle(mut client: TcpStream, tunnel: &Tunnel) -> std::io::Result<()> {
     if !rest.is_empty() {
         upstream.write_all(&rest).await?;
     }
-    let copied = tokio::time::timeout(
-        MAX_TUNNEL_LIFETIME,
-        copy_bidirectional(&mut client, &mut upstream),
-    )
+    let last = Arc::new(AtomicU64::new(now_millis()));
+    let mut client = Tracked::new(client, Arc::clone(&last));
+    let mut upstream = Tracked::new(upstream, Arc::clone(&last));
+    let copied = tokio::time::timeout(MAX_TUNNEL_LIFETIME, async {
+        tokio::select! {
+            copied = copy_bidirectional(&mut client, &mut upstream) => copied,
+            () = stop_watcher(phase, last, close_idle) => Ok((0, 0)),
+        }
+    })
     .await
-    .unwrap_or_else(|_| Err(std::io::Error::other("tunnel lifetime reached")));
+    .unwrap_or_else(|_| Err(io::Error::other("tunnel lifetime reached")));
     let (up, down) = match copied {
         Ok(counts) => counts,
         Err(error) => {
@@ -590,17 +744,18 @@ pub(crate) fn split_host_port(text: &str, default_port: Option<u16>) -> Option<(
         };
         return Some((host, port));
     }
-    if let Some((host, port)) = text.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            if !host.is_empty() && !host.contains(':') {
-                return Some((host.to_owned(), port));
-            }
-        }
+    if let Some((host, port)) = text.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        return Some((host.to_owned(), port));
     }
-    if let Some(port) = default_port {
-        if !text.is_empty() && !text.contains(':') {
-            return Some((text, port));
-        }
+    if let Some(port) = default_port
+        && !text.is_empty()
+        && !text.contains(':')
+    {
+        return Some((text, port));
     }
     let host = text.parse::<Ipv6Addr>().ok()?.to_string();
     Some((host, default_port?))
@@ -622,9 +777,25 @@ mod tests {
                 connect_timeout: Duration::from_secs(5),
                 allow_loopback: false,
                 deny_private,
+                close_idle_on_stop: true,
             })),
             interceptor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_idle_tunnel_is_not_closed_at_stop_when_close_idle_is_off() {
+        let (tx, rx) = watch::channel(Phase::Running);
+        let mut watcher = Box::pin(stop_watcher(rx, Arc::new(AtomicU64::new(0)), false));
+        tx.send_replace(Phase::Stopping);
+        tokio::select! {
+            () = &mut watcher => panic!("an idle tunnel was closed before the cut"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        tx.send_replace(Phase::Cut);
+        tokio::time::timeout(Duration::from_millis(50), watcher)
+            .await
+            .expect("the watcher ends at the cut");
     }
 
     #[test]
@@ -701,6 +872,7 @@ mod tests {
                 connect_timeout: Duration::from_secs(5),
                 allow_loopback: true,
                 deny_private: false,
+                close_idle_on_stop: true,
             })),
             interceptor: None,
         };

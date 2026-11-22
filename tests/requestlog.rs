@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::Router;
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::plugins::{builtin, PluginChain};
-use reiki::proxy::{router, App, Secret};
+use reiki::plugins::{PluginChain, builtin};
+use reiki::proxy::{App, Secret, router};
 use serde_json::Value;
 
 mod common;

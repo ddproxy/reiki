@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use reiki::chain::Policy;
 use reiki::config::Config;
-use reiki::intercept::{init_ca, Interceptor};
+use reiki::intercept::{Interceptor, init_ca};
 use reiki::plugins::PluginChain;
-use reiki::proxy::{load_keys, router, App};
-use reiki::tunnel::{serve, Tunnel};
+use reiki::proxy::{App, load_keys, router};
+use reiki::tunnel::{Tunnel, serve};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

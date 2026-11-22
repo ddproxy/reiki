@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 
@@ -571,9 +571,10 @@ mod tests {
         );
         drop(first);
         settle(&hub, 1).await;
-        assert!(hub
-            .subscribe(ip(1), "default", limits(2, 1), HEARTBEAT, snapshot)
-            .is_ok());
+        assert!(
+            hub.subscribe(ip(1), "default", limits(2, 1), HEARTBEAT, snapshot)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -637,9 +638,10 @@ mod tests {
             .expect("another token has its own count");
         drop(first);
         settle(&hub, 2).await;
-        assert!(hub
-            .subscribe(ip(3), "peer-b", caps, HEARTBEAT, snapshot)
-            .is_ok());
+        assert!(
+            hub.subscribe(ip(3), "peer-b", caps, HEARTBEAT, snapshot)
+                .is_ok()
+        );
     }
 
     #[tokio::test]

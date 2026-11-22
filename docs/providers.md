@@ -18,10 +18,10 @@ No test calls a live provider. Integration tests point an upstream at a local mo
 | Provider or profile | Config mapping | Covered by tests | Not verified here |
 | --- | --- | --- | --- |
 | OpenAI | `base_url = "https://api.openai.com/v1"`; default `authorization: Bearer {key}` | Bearer and `x-api-key` token extraction (`src/auth.rs`), path and credential swap (`tests/proxy.rs`), 401 disable and 429 quota/rate rules (`src/classify.rs`, `tests/exhausted.rs`), 402 request-size pass-through (`tests/proxy.rs`) | Real OpenAI endpoint, SDK and exhausted key |
-| OpenCode Zen | `base_url = "https://opencode.ai/zen/v1"`; default Bearer mapping | `model_aliases` and `drop_params` (`src/rewrite.rs`, `tests/proxy.rs`), `FreeUsageLimitError` and free-model 429 classification (`src/classify.rs`), `confirm_quota` retry and scoped 402/429 (`tests/proxy.rs`) | Real Zen account, free-tier headers, paid-model 402, `/responses` probe, `scope_escalate_after` behaviour |
+| OpenCode Zen | `base_url = "https://opencode.ai/zen/v1"`; default Bearer mapping, with `quota_phrases = ["free-models-per-day"]` when that body must count as quota | `model_aliases` and `drop_params` (`src/rewrite.rs`, `tests/proxy.rs`), generic free-usage 429 and configured free-model phrase classification (`src/classify.rs`), `confirm_quota` retry and scoped 402/429 (`tests/proxy.rs`) | Real Zen account, free-tier headers, paid-model 402, `/responses` probe, `scope_escalate_after` behaviour |
 | Anthropic | `x-api-key`, `{key}` | `/anthropic/v1/messages` path with `anthropic-version` and placeholder/SSE handling in `tests/anthropic_path.rs` (needs `plugin-placeholders` and Unix); 400 credit-balance classification in `src/classify.rs` | Real Anthropic endpoint; `tests/anthropic_path.rs` does not send the documented quota body |
 | Gemini | `x-goog-api-key`, `{key}` | `x-goog-api-key` extraction, `?key=` accepted then stripped (`src/auth.rs`, `tests/proxy.rs`); 400 `API_KEY_INVALID` classification (`src/classify.rs`) | No end-to-end Gemini profile test and no real response |
-| Other OpenAI-compatible (OpenRouter, Groq, Together) | OpenAI mapping with the service's base URL | OpenRouter 402 request-size and free-model 429 classifier units (`src/classify.rs`); generic failover and limits tests | No base-URL integration tests; no Groq- or Together-specific tests |
+| Other OpenAI-compatible (OpenRouter, Groq, Together) | OpenAI mapping with the service's base URL; vendor quota bodies go in `quota_phrases` | 402 request-size and configured free-model 429 classifier units (`src/classify.rs`); generic failover and limits tests | No base-URL integration tests; no Groq- or Together-specific tests |
 | Passthrough | `passthrough = true`; no Reiki token or key | Client credentials and `key=` query forwarded, no key used, no failover (`tests/passthrough.rs`) | Real provider TLS handshake and HTTP version |
 | Forwarders | `[upstream.X.forward]` socket or command | Socket and command round trips, failover, uid check, streaming, timeouts and concurrency (`tests/forward.rs`) | A real listener or program outside the tests |
 | Fallback and transport | `[upstream.X.fallback]`, limits and transport flags | Exhaustion fallback, budgets, compression and header settings (`tests/fallback.rs`, `tests/proxy.rs`, `tests/transport.rs`, `tests/headers.rs`); one hop is enforced in `src/proxy.rs` | The one-hop rule has no behavioural test; HTTP/2 negotiation over TLS is not exercised |
@@ -80,7 +80,7 @@ daily_tokens = 250000
 max_wait_secs = 20           # longest Reiki waits for a slot, 1-120
 ```
 
-Every field is optional; an explicit `0` means unlimited, even over a preset. A preset seeds the values and explicit fields override them; `min_rpm` sets a floor for learning.
+Every field is optional; an explicit `0` means unlimited, even over a preset. A preset is an optional named example in the build, not a provider detected from the name or response; it seeds the values and explicit fields override them. `min_rpm` sets a floor for learning. Check the service's current terms and override any value that matters.
 
 Reiki takes a slot for the chosen key before sending. A wait within `max_wait_secs` is slept off, at most twice per key; a longer wait or a closed daily quota skips that key for this request and tries the next. If no key is usable, the client gets `429` with JSON error code `reiki_shaped`, `Retry-After` and `x-reiki-origin: local`. A `concurrent` slot is held until the response body ends or the client disconnects.
 
@@ -249,7 +249,7 @@ Any HTTP API that takes its key in a header can be an upstream. For OpenAI-compa
 base_url = "https://openrouter.ai/api/v1"
 ```
 
-Reiki decides a key failure from the status code, the `Retry-After` header, and a few error-body phrases. The generic 401, 400 and quota rules have unit and mock-upstream tests for all three mappings; `tests/anthropic_path.rs` covers path, header and masking behaviour, not the documented quota body. No test calls a live provider. See [provider status](#provider-status-and-test-coverage). OpenAI-compatible services can use the same mapping, while a provider that signals quota or key problems differently may need a new rule in `src/classify.rs`.
+Reiki decides a key failure from the status code, the `Retry-After` header, and a few generic error-body phrases. The generic 401, 400 and quota rules have unit and mock-upstream tests for all three mappings; `tests/anthropic_path.rs` covers path, header and masking behaviour, not the documented quota body. No test calls a live provider. See [provider status](#provider-status-and-test-coverage). OpenAI-compatible services can use the same mapping; a service that signals quota or key problems differently should name those phrases in `quota_phrases`, `request_error_phrases` or `rate_limit_phrases` on its upstream, as described in [custom response phrases](classification.md#custom-response-phrases).
 
 ## Unauthorized keys
 

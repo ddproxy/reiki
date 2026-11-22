@@ -49,6 +49,9 @@ impl From<&crate::config::AuthConfig> for ThrottleSettings {
 /// characters); keep tokens at least this long.
 pub const MIN_TOKEN_LEN: usize = 16;
 
+/// Fixed text for a token under [`MIN_TOKEN_LEN`]: the public minimum, never the supplied length.
+const TOKEN_TOO_SHORT: &str = "token must be at least 16 characters";
+
 /// The key a failure is counted under: an IPv4 address as is, an IPv6 address by its /64 so a
 /// host that rotates through its prefix shares one count. A mapped IPv4 address (a dual-stack
 /// listener's IPv4 peer) is counted as the IPv4 address it carries.
@@ -240,7 +243,7 @@ pub fn sha256_hex(input: &str) -> String {
 pub fn hash_token(token: &str) -> Result<String, &'static str> {
     let token = token.trim();
     if token.chars().count() < MIN_TOKEN_LEN {
-        return Err("token must be at least the minimum number of characters");
+        return Err(TOKEN_TOO_SHORT);
     }
     Ok(sha256_hex(token))
 }
@@ -354,6 +357,14 @@ pub fn strip_query_key(query: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_short_token_message_states_the_minimum_without_the_supplied_length() {
+        let err = hash_token("short").unwrap_err();
+        assert!(err.contains(&MIN_TOKEN_LEN.to_string()), "{err}");
+        assert!(!err.contains('5'), "the supplied length must not appear");
+        assert!(hash_token(&"x".repeat(MIN_TOKEN_LEN)).is_ok());
+    }
+
     use super::*;
     use axum::http::HeaderValue;
 

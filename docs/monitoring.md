@@ -37,7 +37,8 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
       "upstream": "zen",
       "consecutive_failures": 0,
       "last_status_code": 200,
-      "state": "available"
+      "state": "available",
+      "scopes": []
     },
     {
       "name": "zen-b",
@@ -246,7 +247,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 ```
 
 ```text
-{"title":"Reiki admin API","version":"0.11.0"}
+{"title":"Reiki admin API","version":"0.14.0"}
 /v1/failures
 /v1/keys/enable
 /v1/metrics

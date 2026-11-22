@@ -235,10 +235,10 @@ zen-a  zen       ok     -         -     client
 ### JSON
 
 ```
-{"keys":[{"name":"zen-a","upstream":"zen","state":"ok","cooldown_seconds":null,"last_status_code":null,"streams":["client"]}]}
+{"keys":[{"name":"zen-a","upstream":"zen","state":"ok","cooldown_seconds":null,"last_status_code":null,"streams":["client"],"scopes":[]}]}
 ```
 
-`cooldown_class` and `scopes` appear when the instance reports them. `scopes` lists cooling route and model pairs, soonest first.
+`cooldown_class` appears when the instance reports it; `scopes` always appears, empty when there are no cooling combinations. `scopes` lists cooling route and model pairs, soonest first.
 
 ### `--enable`
 
@@ -315,7 +315,7 @@ TIME               STREAM  KEY    STATUS  CLASS         COOLED  NOTE
 | `STREAM` | Stream that made the attempt. |
 | `KEY` | Key name from `[keys.NAME]`. |
 | `STATUS` | Upstream status code, or `-` for a transport failure. |
-| `CLASS` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized` or `transient`. |
+| `CLASS` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error`. |
 | `COOLED` | Seconds left on the cooldown this failure started, or `-`. |
 | `NOTE` | Scrubbed, printable body snippet, cut to the terminal width (`COLUMNS`, default 120). |
 
@@ -438,7 +438,7 @@ Some keys act only in matrix mode, which is the default view. Ctrl-C quits from 
 | `?` | Show the key list. The next key press closes it and does nothing else. |
 | `x` | No action. |
 
-The footer hint line reads `j/k peer`, which is the matrix behaviour above.
+The matrix footer hint line reads `q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys`; the full view uses `j/k scroll`.
 
 Source: `crates/reiki-top/src/ui.rs` and `src/top.rs`.
 
@@ -480,3 +480,18 @@ ca_key = "/etc/reiki/intercept/ca.key"
 ```
 
 See [tunnel](tunnel.md#interception).
+
+## plugin inspect
+
+Only builds with the `plugin-wasm` feature have this subcommand. It reads a Wasm component without starting a proxy and prints its manifest, requested and derived capabilities, and configured limits.
+
+```
+reiki plugin inspect FILE [--json]
+```
+
+| Argument or flag | Default | Meaning |
+| --- | --- | --- |
+| `FILE` | required | Path to the `.wasm` component. |
+| `--json` | off | Print the pretty-printed JSON report instead of text lines such as `name: ...` and `pin: ...`. |
+
+It does not read the config or contact an admin listener. Exit codes: `0` for a readable component; `1` when the file cannot be read, is not a valid component, or the report cannot be printed. See [Wasm plugins](wasm-plugins.md).

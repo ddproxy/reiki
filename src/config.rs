@@ -1797,11 +1797,11 @@ impl Config {
                 Some(format!("`{bad}` is not a valid allow entry"))
             } else if tunnel.connect_timeout_secs == 0 {
                 Some("connect_timeout_secs must be at least 1".to_owned())
-            } else if tunnel.listen == self.listen
+            } else if listeners_collide(&tunnel.listen, &self.listen)
                 || self
                     .admin
                     .as_ref()
-                    .is_some_and(|a| a.listen == tunnel.listen)
+                    .is_some_and(|a| listeners_collide(&a.listen, &tunnel.listen))
             {
                 Some("listen must differ from the client and admin listen addresses".to_owned())
             } else {
@@ -2287,7 +2287,7 @@ impl Config {
             {
                 return Err(ConfigError::AdminTokenReused(name.clone()));
             }
-            if admin.listen == self.listen {
+            if listeners_collide(&admin.listen, &self.listen) {
                 return Err(ConfigError::AdminListenConflict);
             }
             check_admin_listen(&admin.listen).map_err(ConfigError::BadAdminListen)?;
@@ -2870,6 +2870,15 @@ fn same_listener(other: &str, addr: std::net::SocketAddr) -> bool {
     })
 }
 
+/// Whether two configured listen strings would bind the same socket. Either side may be the
+/// wildcard address, so the comparison must work in both directions; port 0 never collides.
+fn listeners_collide(a: &str, b: &str) -> bool {
+    a.parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| same_listener(b, addr))
+        || b.parse::<std::net::SocketAddr>()
+            .is_ok_and(|addr| same_listener(a, addr))
+}
+
 fn valid_peer_token_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name
@@ -3115,6 +3124,29 @@ mod tests {
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn auth_bounds_apply_even_with_backoff_off() {
+        for (text, reason) in [
+            (
+                "[auth]\nbackoff = false\nmax_failures = 0\n",
+                "max_failures must be between 1 and 10000, got 0",
+            ),
+            (
+                "[auth]\nbackoff = false\nwindow_secs = 86401\n",
+                "window_secs must be between 1 and 86400, got 86401",
+            ),
+        ] {
+            assert_eq!(
+                Config::parse(text).unwrap_err(),
+                ConfigError::BadAuth(reason.into())
+            );
+        }
+        assert!(
+            Config::parse("[auth]\nbackoff = false\nmax_failures = 10000\nwindow_secs = 86400\n")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3383,6 +3415,93 @@ file = "/etc/reiki/keys/zen-b"
     }
 
     #[test]
+    fn token_hashes_need_exactly_64_hex_characters() {
+        for hash in [
+            String::new(),
+            "a".repeat(63),
+            format!("{HASH_A}g"),
+            "g".repeat(64),
+            format!("{HASH_A}a"),
+        ] {
+            let text = base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{hash}\"\nchain = [\"zen-a\"]\n"
+            ));
+            assert_eq!(
+                Config::parse(&text).unwrap_err(),
+                ConfigError::BadTokenHash("s".into()),
+                "{hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uppercase_stream_token_hash_is_accepted() {
+        let hash = HASH_A.to_uppercase();
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{hash}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap().streams["s"].token_sha256,
+            hash
+        );
+    }
+
+    #[test]
+    fn duplicate_token_names_follow_sorted_stream_order() {
+        let text = base(&format!(
+            "[streams.zeta]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[streams.alpha]\ntoken_sha256 = \"{}\"\nchain = [\"zen-b\"]\n",
+            HASH_A.to_uppercase()
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::DuplicateToken("alpha".into(), "zeta".into())
+        );
+    }
+
+    #[test]
+    fn rate_limit_bounds_are_exact_and_negative_is_a_parse_error() {
+        for value in ["1", "4294967295"] {
+            let text = base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[streams.s.limits]\nrpm = {value}\n"
+            ));
+            assert_eq!(
+                Config::parse(&text).unwrap().streams["s"]
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.rpm),
+                Some(value.parse().unwrap())
+            );
+        }
+        let text = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[streams.s.limits]\nrpm = -1\n"
+        ));
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn a_chain_may_repeat_a_key_and_only_lowercase_passthrough_is_reserved() {
+        let repeated = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\", \"zen-a\"]\n"
+        ));
+        assert_eq!(
+            Config::parse(&repeated).unwrap().streams["s"].chain,
+            ["zen-a", "zen-a"]
+        );
+        let mixed = base(&format!(
+            "[streams.Passthrough]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n"
+        ));
+        assert!(
+            Config::parse(&mixed)
+                .unwrap()
+                .streams
+                .contains_key("Passthrough")
+        );
+    }
+
+    #[test]
     fn rejects_plain_http_upstreams_except_loopback() {
         let remote = "[upstream.x]\nbase_url = \"http://example.com/v1\"\n";
         assert_eq!(
@@ -3486,6 +3605,63 @@ file = "/etc/reiki/keys/zen-b"
         assert_eq!(
             Config::parse(&text).unwrap_err(),
             ConfigError::AdminListenConflict
+        );
+    }
+
+    #[test]
+    fn admin_hash_shape_and_reuse_are_checked() {
+        for hash in [
+            String::new(),
+            "b".repeat(63),
+            "g".repeat(64),
+            format!("{HASH_B}b"),
+        ] {
+            let text = base(&format!(
+                "[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{hash}\"\n"
+            ));
+            assert_eq!(
+                Config::parse(&text).unwrap_err(),
+                ConfigError::BadAdminTokenHash,
+                "{hash}"
+            );
+        }
+        let text = base(&format!(
+            "[streams.a]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[streams.z]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"zen-b\"]\n[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{}\"\n",
+            HASH_B.to_uppercase()
+        ));
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::AdminTokenReused("z".into())
+        );
+    }
+
+    #[test]
+    fn admin_listen_collision_with_wildcard_client_listen_is_rejected() {
+        let text = format!(
+            "listen = \"0.0.0.0:4097\"\n{}",
+            base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[admin]\nlisten = \"127.0.0.1:4097\"\ntoken_sha256 = \"{HASH_B}\"\n"
+            ))
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::AdminListenConflict
+        );
+    }
+
+    #[test]
+    fn tunnel_listen_collision_with_wildcard_client_is_rejected() {
+        let text = format!(
+            "listen = \"0.0.0.0:4097\"\n{}",
+            base(&format!(
+                "[streams.s]\ntoken_sha256 = \"{HASH_A}\"\nchain = [\"zen-a\"]\n[tunnel]\nlisten = \"127.0.0.1:4097\"\nallow = [\"example.com\"]\n"
+            ))
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadTunnel(
+                "listen must differ from the client and admin listen addresses".into()
+            )
         );
     }
 

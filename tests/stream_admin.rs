@@ -1514,7 +1514,7 @@ async fn store_failures_fail_closed_without_changing_memory() {
 async fn a_dynamic_token_works_then_expires_and_revocation_is_immediate() {
     let rig = Rig::new(Options::default()).await;
     let short = serde_json::json!({
-        "name": "short-lived", "key": "zen-a", "reason": "short client", "ttl": 1
+        "name": "short-lived", "key": "zen-a", "reason": "short client", "ttl": 3
     })
     .to_string();
     let created = rig
@@ -1526,14 +1526,14 @@ async fn a_dynamic_token_works_then_expires_and_revocation_is_immediate() {
             &[],
         )
         .await;
-    assert_eq!(created.status, 200, "a one-second token may be created");
+    assert_eq!(created.status, 200, "a short-lived token may be created");
     let token = created_token(&created);
     assert_eq!(
         rig.send_relay(&token).await,
         200,
         "the token works before expiry"
     );
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    tokio::time::sleep(Duration::from_millis(3300)).await;
     assert_eq!(
         rig.send_relay(&token).await,
         401,

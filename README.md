@@ -53,7 +53,7 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). [Se
 Archives ship with `.sha256` files, a CycloneDX SBOM and build provenance attestations. Check the one you use:
 
 ```bash
-tag=v0.13.0
+tag=v0.14.0
 gh release download "$tag" --repo ddproxy/reiki \
   --pattern '*.tar.gz' --pattern '*.sha256' --pattern '*-sbom.json' --dir dist
 gh attestation verify "dist/reiki-$tag-x86_64-unknown-linux-musl.tar.gz" --repo ddproxy/reiki

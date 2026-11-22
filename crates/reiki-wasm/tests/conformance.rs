@@ -576,6 +576,38 @@ fn tool_allowlist_is_enforced_before_the_wasm_hook() {
 }
 
 #[test]
+fn unparseable_tool_route_rejects_even_in_pass_through_mode() {
+    let engine = engine();
+    let mut table = base_table("no-grant", NO_GRANT, "");
+    set_tool_allowlist(&mut table, &["search"]);
+    let plugin = load(&engine, NO_GRANT, &table).unwrap();
+    match invoke(&plugin, "/v1/chat/completions", b"not json").result {
+        Err(PluginError::Reject(status, _)) => assert_eq!(status.as_u16(), 403),
+        other => panic!("expected reject on unparseable tool route, got {other:?}"),
+    }
+}
+
+#[test]
+fn pure_wasm_loop_is_bounded_by_the_deadline() {
+    let bytes = edit_manifest(NO_GRANT, |toml| {
+        toml.replace("fuel_per_call = 10000000", "fuel_per_call = 2000000000")
+    });
+    let engine = engine();
+    let mut table = base_table("no-grant", &bytes, "fuel");
+    set_string(&mut table, "role", "security");
+    set_string(&mut table, "on_error", "reject");
+    set_limits(&mut table, &[("deadline-ms", 20)]);
+    let plugin = load(&engine, &bytes, &table).unwrap();
+    match invoke(&plugin, "/x", b"{}").result {
+        Err(PluginError::Reject(status, message)) => {
+            assert_eq!(status.as_u16(), 503);
+            assert_eq!(message, "wasm plugin exceeded deadline");
+        }
+        other => panic!("expected deadline reject for a compute loop, got {other:?}"),
+    }
+}
+
+#[test]
 fn reload_narrowing_uses_real_component_configs() {
     let plain = base_table("no-grant", NO_GRANT, "");
     let mut granted = base_table("no-grant", NO_GRANT, "");

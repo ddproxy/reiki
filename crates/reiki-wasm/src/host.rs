@@ -1,4 +1,7 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use wasmtime::component::Component;
@@ -11,9 +14,14 @@ use crate::capability::{
 use crate::config::{EffectiveLimits, WasmPluginConfig};
 use crate::manifest::{EmbeddedManifest, HostCeilings, extract_embedded_manifest};
 
+/// Interval between global epoch ticks. Stores set their own deadline in ticks,
+/// so each call is bounded by its configured budget rather than by this constant.
+pub(crate) const EPOCH_TICK_MS: u64 = 10;
+const EPOCH_TICK: Duration = Duration::from_millis(EPOCH_TICK_MS);
+
 /// Compiled Wasm engine shared across plugins.
 pub struct WasmEngine {
-    engine: Engine,
+    engine: Arc<Engine>,
     ceilings: HostCeilings,
 }
 
@@ -30,7 +38,21 @@ impl WasmEngine {
         // No on-disk cache in v1 (P25); cache feature not enabled.
         // No debug info needed in production; keep deterministic.
         cfg.debug_info(false);
-        let engine = Engine::new(&cfg).map_err(|e| format!("wasmtime engine: {e}"))?;
+        let engine = Arc::new(Engine::new(&cfg).map_err(|e| format!("wasmtime engine: {e}"))?);
+        let weak = Arc::downgrade(&engine);
+        thread::Builder::new()
+            .name("wasm-epoch".to_owned())
+            .spawn(move || {
+                loop {
+                    thread::sleep(EPOCH_TICK);
+                    let Some(engine) = weak.upgrade() else {
+                        break;
+                    };
+                    engine.increment_epoch();
+                    drop(engine);
+                }
+            })
+            .map_err(|e| format!("wasmtime epoch ticker: {e}"))?;
         Ok(Self { engine, ceilings })
     }
 
@@ -241,16 +263,19 @@ fn validate_read_xor_egress(
     grants: &BTreeSet<Capability>,
     derived: &DerivedCapabilities,
 ) -> Result<(), String> {
-    let has_read =
-        derived.iter().any(|c| c.is_data_read()) || grants.iter().any(|c| c.is_data_read());
-    // Phase 1 has no log:text or finding:detail-free or helper; but enforce rule structurally.
-    let has_egress = false;
-    if has_read && has_egress {
+    if read_xor_egress_violation(grants, derived) {
         return Err(
             "read-xor-egress: plugin cannot hold data-read and egress capabilities".to_owned(),
         );
     }
     Ok(())
+}
+
+fn read_xor_egress_violation(grants: &BTreeSet<Capability>, derived: &DerivedCapabilities) -> bool {
+    let has_read =
+        derived.iter().any(|c| c.is_data_read()) || grants.iter().any(|c| c.is_data_read());
+    let has_egress = derived.iter().any(|c| c.is_egress()) || grants.iter().any(|c| c.is_egress());
+    has_read && has_egress
 }
 
 fn validate_role(

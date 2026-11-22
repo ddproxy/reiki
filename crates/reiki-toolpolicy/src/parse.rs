@@ -37,7 +37,8 @@ pub struct Extracted {
 
 /// The route decides which response shape we are reading. Unknown routes are left alone.
 pub fn detect_format(path: &str) -> Option<Format> {
-    let path = path.to_ascii_lowercase();
+    // A trailing slash is the same route for an upstream; do not let it skip a check.
+    let path = path.trim_end_matches('/').to_ascii_lowercase();
     if path.ends_with("/chat/completions") {
         Some(Format::OpenAiChat)
     } else if path.ends_with("/messages") {
@@ -477,6 +478,15 @@ mod tests {
             Some(Format::AnthropicMessages)
         );
         assert_eq!(detect_format("/zen/v1/responses"), None);
+        assert_eq!(
+            detect_format("/zen/v1/chat/completions/"),
+            Some(Format::OpenAiChat)
+        );
+        assert_eq!(
+            detect_format("/anthropic/v1/messages/"),
+            Some(Format::AnthropicMessages)
+        );
+        assert_eq!(detect_format("/"), None);
     }
 
     #[test]

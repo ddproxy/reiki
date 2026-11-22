@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use wasmtime::{Store, StoreLimits, StoreLimitsBuilder, Trap};
 
 use crate::capability::Capability;
 use crate::config::{EffectiveLimits, WasmPluginConfig};
-use crate::host::{LoadedComponent, WasmEngine};
+use crate::host::{EPOCH_TICK_MS, LoadedComponent, WasmEngine};
 use crate::manifest::Manifest;
 
 wasmtime::component::bindgen!({
@@ -254,9 +254,20 @@ impl WasmPlugin {
         store.limiter(|s| &mut s.limits);
         let fuel = self.limits.fuel_for_body(body_len);
         let _ = store.set_fuel(fuel);
-        store.set_epoch_deadline(1);
+        store.set_epoch_deadline(Self::budget_ticks(&self.limits));
         store.epoch_deadline_trap();
         store
+    }
+
+    /// Ticks until a store traps, derived from the tightest configured time budget.
+    /// The engine ticks every 10 ms, so this also bounds a pure-Wasm loop that
+    /// never calls a checked host function.
+    fn budget_ticks(limits: &EffectiveLimits) -> u64 {
+        limits
+            .deadline_ms
+            .min(limits.wall_budget_ms)
+            .div_ceil(EPOCH_TICK_MS)
+            .max(1)
     }
 
     fn run_init(&self) -> Result<(), String> {
@@ -278,7 +289,11 @@ impl WasmPlugin {
         }
         match result {
             Ok(()) => Ok(()),
-            Err(msg) => Err(format!("init {} failed: {msg}", self.name)),
+            Err(msg) => Err(format!(
+                "init {} failed: {}",
+                self.name,
+                sanitize_reason(&msg)
+            )),
         }
     }
 
@@ -307,11 +322,6 @@ impl WasmPlugin {
             path: ctx.path.to_owned(),
             body: ctx.body.clone(),
         });
-
-        // Epoch ticker: set deadline via wall clock check in host calls; also use epoch interruption.
-        // We approximate epoch by setting a short epoch deadline and updating periodically is not
-        // possible without a background ticker; rely on fuel and host-call deadline checks.
-        store.set_epoch_deadline(u64::MAX / 2);
 
         let instance = match self.linker.instantiate(&mut store, &self.component) {
             Ok(i) => i,
@@ -373,7 +383,7 @@ impl WasmPlugin {
                     "wasm plugin returned edits without request-body:edit grant",
                 ));
             }
-            self.apply_edits(ctx, &edit)?;
+            self.apply_edits(ctx, &edit, &mut store)?;
         }
 
         match verdict {
@@ -395,9 +405,14 @@ impl WasmPlugin {
         };
         match reiki_toolpolicy::parse::parse_request(ctx.path, ctx.body.as_ref()) {
             reiki_toolpolicy::parse::RequestParse::Unrelated => Ok(()),
-            reiki_toolpolicy::parse::RequestParse::Unparsed(_) => Err(self.fail_closed_error(
-                "request-side tool allowlist could not parse recognized request",
-            )),
+            reiki_toolpolicy::parse::RequestParse::Unparsed(_) => {
+                // An unparseable request on a tool route cannot be checked; the
+                // allowlist must reject it regardless of the plugin's error mode.
+                Err(PluginError::Reject(
+                    StatusCode::FORBIDDEN,
+                    "request-side tool allowlist could not parse recognized request".to_owned(),
+                ))
+            }
             reiki_toolpolicy::parse::RequestParse::Recognized { declared, .. } => {
                 for tool in &declared {
                     let allowed = allowlist.iter().any(|a| a.eq_ignore_ascii_case(tool));
@@ -436,18 +451,12 @@ impl WasmPlugin {
     }
 
     fn fail_closed_error(&self, msg: &str) -> PluginError {
+        let msg = sanitize_reason(msg);
         tracing::warn!(plugin = %self.name, "{msg}");
-        if self.role_security
+        let reject = self.role_security
             || self.config.on_error.as_deref() == Some("reject")
-            || self.fails_closed()
-        {
-            PluginError::Reject(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "wasm plugin failed".to_owned(),
-            )
-        } else {
-            PluginError::Skip(msg.to_owned())
-        }
+            || self.fails_closed();
+        fail_closed_result(&msg, reject)
     }
 
     fn resolve_reject(
@@ -473,21 +482,68 @@ impl WasmPlugin {
         &self,
         ctx: &mut RequestCtx<'_>,
         edit: &types::RequestEdit,
+        store: &mut Store<HostState>,
     ) -> Result<(), PluginError> {
-        if edit.ops.is_empty() {
-            return Ok(());
-        }
-        let mut value: JsonValue = serde_json::from_slice(ctx.body.as_ref())
-            .map_err(|_| self.fail_closed_error("request body is not valid JSON for wasm edit"))?;
-        for op in &edit.ops {
-            apply_edit_op(&mut value, op, &self.manifest)
-                .map_err(|e| self.fail_closed_error(&e))?;
-        }
-        let new_body = serde_json::to_vec(&value).map_err(|e| {
-            self.fail_closed_error(&format!("edited body is not serializable: {e}"))
-        })?;
-        *ctx.body = Bytes::from(new_body);
-        Ok(())
+        apply_edits_inner(
+            ctx,
+            edit,
+            &self.manifest,
+            || {
+                let state = store.data_mut();
+                if state.poisoned {
+                    return Err(self.fail_closed_error("wasm plugin poisoned during edit"));
+                }
+                if state.check_deadline().is_err() {
+                    return Err(self.trap_kind_to_error(&TrapKind::Epoch));
+                }
+                Ok(())
+            },
+            |msg| self.fail_closed_error(msg),
+        )
+    }
+}
+
+const MAX_EDIT_OPS: usize = 256;
+
+fn apply_edits_inner<C, F>(
+    ctx: &mut RequestCtx<'_>,
+    edit: &types::RequestEdit,
+    manifest: &Manifest,
+    mut check: C,
+    fail: F,
+) -> Result<(), PluginError>
+where
+    C: FnMut() -> Result<(), PluginError>,
+    F: Fn(&str) -> PluginError,
+{
+    if edit.ops.is_empty() {
+        return Ok(());
+    }
+    if edit.ops.len() > MAX_EDIT_OPS {
+        return Err(fail("wasm edit has too many operations"));
+    }
+    check()?;
+    let mut value: JsonValue = serde_json::from_slice(ctx.body.as_ref())
+        .map_err(|_| fail("request body is not valid JSON for wasm edit"))?;
+    for op in &edit.ops {
+        check()?;
+        apply_edit_op(&mut value, op, manifest).map_err(|e| fail(&e))?;
+    }
+    let new_body = serde_json::to_vec(&value)
+        .map_err(|e| fail(&format!("edited body is not serializable: {e}")))?;
+    *ctx.body = Bytes::from(new_body);
+    Ok(())
+}
+
+fn fail_closed_result(msg: &str, reject: bool) -> PluginError {
+    let msg = sanitize_reason(msg);
+    if reject {
+        PluginError::Reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wasm plugin failed".to_owned(),
+        )
+    } else {
+        PluginError::Skip(msg.to_owned())
     }
 }
 
@@ -744,7 +800,7 @@ impl reiki::plugin::finding::Host for HostState {
             }
         });
         self.findings.push(reiki_plugin::Reported {
-            kind: leak_kind(kind),
+            kind: intern_kind(kind),
             detail,
             count: f.count as usize,
             blocked: f.blocked,
@@ -753,10 +809,26 @@ impl reiki::plugin::finding::Host for HostState {
     }
 }
 
-fn leak_kind(kind: String) -> &'static str {
-    // Plugin::report expects &'static str for kind. We use a small set of known strings
-    // or leak; leaking is bounded by 256 findings per request max.
-    Box::leak(kind.into_boxed_str())
+const MAX_INTERNED_KINDS: usize = 1024;
+const UNKNOWN_KIND: &str = "wasm.unknown";
+
+fn intern_kind(kind: String) -> &'static str {
+    static KINDS: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    let kinds = KINDS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut kinds = kinds.lock().unwrap_or_else(|e| e.into_inner());
+    intern_kind_in(&mut kinds, kind, MAX_INTERNED_KINDS)
+}
+
+fn intern_kind_in(kinds: &mut BTreeSet<&'static str>, kind: String, limit: usize) -> &'static str {
+    if let Some(interned) = kinds.get(kind.as_str()) {
+        return interned;
+    }
+    if kinds.len() >= limit {
+        return UNKNOWN_KIND;
+    }
+    let interned: &'static str = Box::leak(kind.into_boxed_str());
+    kinds.insert(interned);
+    interned
 }
 
 fn sanitize_label(s: &str, max: usize) -> String {
@@ -863,31 +935,22 @@ impl reiki::plugin::random::Host for HostState {
     fn fill(&mut self, len: u32) -> Result<Vec<u8>, wasmtime::Error> {
         let len = len.min(1024) as usize;
         let mut buf = vec![0u8; len];
-        // Use getrandom-like source; std doesn't expose directly. Use a simple approach.
-        fill_random(&mut buf);
+        random_fill(&mut buf).map_err(csprng_error)?;
         Ok(buf)
     }
     fn next_u64(&mut self) -> Result<u64, wasmtime::Error> {
         let mut buf = [0u8; 8];
-        fill_random(&mut buf);
+        random_fill(&mut buf).map_err(csprng_error)?;
         Ok(u64::from_le_bytes(buf))
     }
 }
 
-fn fill_random(buf: &mut [u8]) {
-    // Best-effort randomness without adding getrandom dep; use /dev/urandom on linux.
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(buf);
-            return;
-        }
-    }
-    // Fallback: not cryptographically great, but better than zero; Phase 1 default-allowed.
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i as u8).wrapping_mul(131).wrapping_add(7);
-    }
+fn random_fill(buf: &mut [u8]) -> Result<(), String> {
+    getrandom::fill(buf).map_err(|e| format!("host CSPRNG unavailable: {e}"))
+}
+
+fn csprng_error(msg: String) -> wasmtime::Error {
+    wasmtime::Error::new(std::io::Error::other(msg))
 }
 
 impl reiki::plugin::request_state::Host for HostState {
@@ -953,5 +1016,114 @@ mod tests {
     #[test]
     fn render_template_replaces_args() {
         assert_eq!(render_template("hit {0} of {1}", &[2, 5]), "hit 2 of 5");
+    }
+
+    #[test]
+    fn epoch_deadline_uses_the_tightest_budget() {
+        let limits = EffectiveLimits {
+            memory_mib: 16,
+            fuel_per_call: 10_000_000,
+            fuel_per_kib: 200_000,
+            deadline_ms: 250,
+            wall_budget_ms: 1_000,
+            max_body_kib: 1024,
+        };
+        assert_eq!(WasmPlugin::budget_ticks(&limits), 25);
+        let limits = EffectiveLimits {
+            wall_budget_ms: 100,
+            ..limits
+        };
+        assert_eq!(WasmPlugin::budget_ticks(&limits), 10);
+    }
+
+    #[test]
+    fn finding_kinds_are_interned_with_a_bounded_table() {
+        let mut kinds = BTreeSet::new();
+        let first = intern_kind_in(&mut kinds, "wasm.rule".to_owned(), 2);
+        assert_eq!(first, intern_kind_in(&mut kinds, "wasm.rule".to_owned(), 2));
+        intern_kind_in(&mut kinds, "wasm.edit".to_owned(), 2);
+        assert_eq!(
+            intern_kind_in(&mut kinds, "wasm.other".to_owned(), 2),
+            UNKNOWN_KIND
+        );
+    }
+
+    #[test]
+    fn guest_messages_are_sanitized_before_a_skip() {
+        let err = fail_closed_result("line\n\x1b[31mreason", false);
+        match err {
+            PluginError::Skip(msg) => assert_eq!(msg, "line[31mreason"),
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_ops_are_capped_and_checked_before_each_op() {
+        let manifest = Manifest::parse(
+            r#"
+[plugin]
+name = "t"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+"#,
+        )
+        .unwrap();
+        let method = http::Method::POST;
+        let mut headers = http::HeaderMap::new();
+        let mut body = Bytes::from_static(br#"{"a":1}"#);
+        let mut state = ();
+        let mut ctx = RequestCtx::new("s", "u", &method, "/x", &mut headers, &mut body, &mut state);
+
+        let too_many = types::RequestEdit {
+            ops: (0..=MAX_EDIT_OPS)
+                .map(|_| types::EditOp::Remove("/a".to_owned()))
+                .collect(),
+        };
+        let mut checks = 0;
+        let result = apply_edits_inner(
+            &mut ctx,
+            &too_many,
+            &manifest,
+            || {
+                checks += 1;
+                Ok(())
+            },
+            |msg| PluginError::Skip(msg.to_owned()),
+        );
+        assert!(matches!(result, Err(PluginError::Skip(msg)) if msg.contains("too many")));
+        assert_eq!(checks, 0);
+
+        let three = types::RequestEdit {
+            ops: (0..3)
+                .map(|_| types::EditOp::Remove("/a".to_owned()))
+                .collect(),
+        };
+        let mut checks = 0;
+        let result = apply_edits_inner(
+            &mut ctx,
+            &three,
+            &manifest,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    Err(PluginError::Skip("poisoned".to_owned()))
+                } else {
+                    Ok(())
+                }
+            },
+            |msg| PluginError::Skip(msg.to_owned()),
+        );
+        assert!(result.is_err());
+        assert_eq!(checks, 3);
+        assert_eq!(&body[..], br#"{"a":1}"#);
+    }
+
+    #[test]
+    fn random_fill_uses_the_host_csprng() {
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        random_fill(&mut first).unwrap();
+        random_fill(&mut second).unwrap();
+        assert_ne!(first, second);
     }
 }

@@ -1,0 +1,25 @@
+details = []
+
+[plugin]
+name = "wasi-imports"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+hooks = ["on-request"]
+
+[requests]
+
+[literals]
+
+[log-templates]
+
+[reject-templates.blocked]
+status = 403
+message = "blocked by wasm plugin"
+
+[limits]
+memory_mib = 16
+fuel_per_call = 10000000
+fuel_per_kib = 200000
+deadline_ms = 250
+wall_budget_ms = 1000
+max_body_kib = 1024

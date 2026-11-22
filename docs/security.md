@@ -111,6 +111,12 @@ constrained host interface.
   `finding:detail-vocab`) require explicit config grants; requesting more than
   granted fails to load. Default-allowed capabilities are low-risk and linked
   for every plugin.
+- **No filesystem or network capability.** Components importing
+  `wasi:filesystem`, `wasi:sockets`, or `wasi:http` are refused at load, and no
+  grant can enable them. The runtime pins `wasmtime`/`wasmtime-wasi` 51.0.0.
+  End-to-end tests check that a reference plugin cannot open, truncate, rename,
+  or hard-link files through WASI, and that a component importing filesystem
+  or socket interfaces is refused.
 - **Resource limits/traps.** Fuel, memory, and deadlines are enforced per call.
   Traps fail closed for `role = "security"` or `on_error = "reject"`, and are
   logged otherwise.

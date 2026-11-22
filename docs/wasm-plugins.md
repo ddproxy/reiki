@@ -48,6 +48,13 @@ Capabilities are derived from component imports (D1). Default-allowed Phase 1
 capabilities are linked for every plugin: `request-meta`, `finding`, `log`,
 `reject`, `clock:monotonic`, `random`, `request-state`.
 
+Filesystem, network, and HTTP access are not Phase 1 capabilities. The host
+pins `wasmtime` and `wasmtime-wasi` to 51.0.0. It refuses to load a component
+that imports any `wasi:filesystem`, `wasi:sockets`, or `wasi:http` interface.
+No `grants` entry can enable those interfaces. The tiny preview1 adapter used
+by the reference fixtures does not implement filesystem or socket calls, so
+those calls fail at runtime.
+
 Gated Phase 1 capabilities must be granted in config and declared in the
 manifest:
 
@@ -139,8 +146,12 @@ Reference examples:
 
 - `examples/wasm-no-grant` - no gated capabilities.
 - `examples/wasm-body-edit` - `request-body:edit` with a manifest literal edit.
+- `examples/wasm-fs-probe` - a reference plugin that tries `open`, `truncate`,
+  `rename`, and `hard_link` through WASI; the calls are refused.
+- `examples/wasm-wasi-imports` - a negative component importing WASI
+  filesystem and sockets; the host refuses it at load.
 
-Both include source, manifest, README, and `rebuild.sh`.
+Each includes source, manifest, README, and `rebuild.sh`.
 
 ### Building without `cargo-component`
 
@@ -196,6 +207,7 @@ components by `crates/reiki-wasm/tests/conformance.rs`:
 | Body read/edit, vocab findings, invalid edit ops | `body_read_edit_and_vocab_findings_work_end_to_end`; `non_vocab_detail_is_dropped`; `invalid_edit_ops_are_rejected` |
 | Request-side tool allowlist | `tool_allowlist_is_enforced_before_the_wasm_hook` |
 | Reload that can only narrow | `reload_narrowing_uses_real_component_configs` |
+| No WASI filesystem or network capability | `reference_plugin_cannot_open_truncate_rename_or_hard_link`; `wasi_filesystem_and_sockets_imports_are_refused_at_load`; `filesystem_and_network_cannot_be_granted` |
 | Inspect output | `inspect_reports_import_derived_capabilities`; `tests/wasm_plugin_inspect.rs` checks `reiki plugin inspect` text and `--json` output for both fixtures |
 
 Run the suite with:
@@ -206,8 +218,8 @@ cargo test -p reiki-wasm --test conformance
 
 The rebuild comparison skips with a clear message when `wasm32-wasip1`,
 `wasm-tools`, or `perl` is unavailable; when the toolchain is present it
-rebuilds both examples into a temporary directory and compares SHA-256 against
-`tests/fixtures/SHA256SUMS`.
+rebuilds all four reference components into a temporary directory and compares
+SHA-256 against `tests/fixtures/SHA256SUMS`.
 
 Not covered by this Phase 1 pass: response-side hooks and the full design 3.3
 hook matrix (Phase 1 exposes only `init` and `on-request`), the `wall-budget-ms`

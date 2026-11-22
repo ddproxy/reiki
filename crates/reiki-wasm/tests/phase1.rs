@@ -58,6 +58,19 @@ fn grants_support_phase1_gated_caps() {
 }
 
 #[test]
+fn filesystem_and_network_cannot_be_granted() {
+    for capability in ["wasi:filesystem", "wasi:sockets", "wasi:http"] {
+        let mut t = base_table();
+        t.insert(
+            "grants".into(),
+            toml::Value::Array(vec![toml::Value::String(capability.into())]),
+        );
+        let err = parse_wasm_plugin_config("p", &t).unwrap_err();
+        assert!(err.contains("unknown grant"), "{capability}: {err}");
+    }
+}
+
+#[test]
 fn tool_allowlist_parses_and_rejects_bad_values() {
     let mut t = base_table();
     t.insert(

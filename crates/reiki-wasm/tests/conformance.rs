@@ -11,7 +11,14 @@ use sha2::{Digest, Sha256};
 
 const NO_GRANT: &[u8] = include_bytes!("fixtures/no-grant.wasm");
 const BODY_EDIT: &[u8] = include_bytes!("fixtures/body-edit.wasm");
-const FIXTURES: &[(&str, &[u8])] = &[("no-grant", NO_GRANT), ("body-edit", BODY_EDIT)];
+const FS_PROBE: &[u8] = include_bytes!("fixtures/fs-probe.wasm");
+const WASI_IMPORTS: &[u8] = include_bytes!("fixtures/wasi-imports.wasm");
+const FIXTURES: &[(&str, &[u8])] = &[
+    ("no-grant", NO_GRANT),
+    ("body-edit", BODY_EDIT),
+    ("fs-probe", FS_PROBE),
+    ("wasi-imports", WASI_IMPORTS),
+];
 
 fn sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -623,4 +630,30 @@ fn inspect_reports_import_derived_capabilities() {
         ]
     );
     assert!(edit.derived_capabilities.iter().all(|c| c != "types"));
+}
+
+#[test]
+fn reference_plugin_cannot_open_truncate_rename_or_hard_link() {
+    let engine = engine();
+    let table = base_table("fs-probe", FS_PROBE, "");
+    let plugin = load(&engine, FS_PROBE, &table).unwrap();
+    let out = invoke(&plugin, "/x", br#"{"model":"x"}"#);
+    // The guest returns Pass only when all four probes failed; any successful
+    // filesystem operation turns into a template reject instead.
+    assert!(out.result.is_ok(), "{:?}", out.result);
+    assert_eq!(out.body, br#"{"model":"x"}"#.as_slice());
+}
+
+#[test]
+fn wasi_filesystem_and_sockets_imports_are_refused_at_load() {
+    let engine = engine();
+    let table = base_table("wasi-imports", WASI_IMPORTS, "");
+    let config = parse_wasm_plugin_config("wasi-imports", &table).unwrap();
+    let err = match engine.load_component_bytes(&config, WASI_IMPORTS) {
+        Ok(_) => panic!("a plugin importing WASI filesystem or sockets must not load"),
+        Err(err) => err,
+    };
+    assert!(err.contains("disallowed interface"), "{err}");
+    assert!(err.contains("wasi:filesystem"), "{err}");
+    assert!(err.contains("wasi:sockets"), "{err}");
 }

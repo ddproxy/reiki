@@ -4025,7 +4025,7 @@ socket = "/run/forwarder.sock"
         assert!(bad.contains("allowed_urls[0]"), "{bad}");
         assert!(!bad.contains("not a url"), "{bad}");
         let secret = peers_error("[peers]\nallowed_urls = [\"https://u:p@peer.example\"]\n");
-        assert!(!secret.contains("u:p"), "secret leaked: {secret}");
+        assert!(!secret.contains("u:p"), "credentials leaked into the error");
     }
 
     #[cfg(feature = "peers")]

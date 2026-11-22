@@ -69,8 +69,8 @@ fn header_lines(head: &str) -> Vec<&str> {
 async fn by_default_names_are_lowercase_with_the_credential_first_and_no_connection_header() {
     let head = head_sent_with("default", "").await;
     let lines = header_lines(&head);
-    assert_eq!(
-        lines[0], "authorization: Bearer upstream-key",
+    assert!(
+        lines[0] == "authorization: Bearer upstream-key",
         "the credential must be first"
     );
     assert!(
@@ -91,8 +91,8 @@ async fn title_case_and_keep_alive_are_sent_when_asked_for() {
     )
     .await;
     let lines = header_lines(&head);
-    assert_eq!(
-        lines[0], "Authorization: Bearer upstream-key",
+    assert!(
+        lines[0] == "Authorization: Bearer upstream-key",
         "the credential must be first"
     );
     assert!(

@@ -106,6 +106,9 @@ impl KeyHealth {
             _ => {
                 self.cooling_until = Some(until);
                 self.cooling_class = Some(class);
+                // A reset time belongs to the cooldown it came with; a caller that knows one for
+                // this deadline sets it after this call.
+                self.cooling_reset_at = None;
                 true
             }
         }
@@ -825,6 +828,31 @@ mod tests {
             state.cooling_reset_at("a", now),
             None,
             "state file has no reset"
+        );
+    }
+
+    #[test]
+    fn a_new_quota_cooldown_does_not_publish_the_previous_reset() {
+        let mut state = KeyState::default();
+        let policy = Policy::default();
+        let now = Instant::now();
+        let reset = SystemTime::UNIX_EPOCH + secs(1_000);
+        state.record_failure_with(
+            "a",
+            FailureClass::QuotaExhausted,
+            &policy,
+            now,
+            Some(secs(5)),
+        );
+        state.note_quota_reset("a", reset, now);
+        assert_eq!(state.cooling_reset_at("a", now), Some(reset));
+
+        let later = now + secs(10);
+        state.record_failure("a", FailureClass::QuotaExhausted, &policy, later);
+        assert_eq!(
+            state.cooling_reset_at("a", later),
+            None,
+            "the new cooldown carries no reset of its own"
         );
     }
 

@@ -157,6 +157,69 @@ fn reload_narrowing_tool_allowlist_widening_needs_restart() {
 }
 
 #[test]
+fn reload_narrowing_checks_all_fields_when_the_pin_changes() {
+    let mut t1 = base_table();
+    t1.insert(
+        "tool_allowlist".into(),
+        toml::Value::Array(vec![toml::Value::String("search".into())]),
+    );
+    t1.insert(
+        "streams".into(),
+        toml::Value::Array(vec![toml::Value::String("s".into())]),
+    );
+    let old = parse_wasm_plugin_config("p", &t1).unwrap();
+
+    let mut t2 = base_table();
+    t2.insert("sha256".into(), toml::Value::String("1".repeat(64)));
+    t2.insert(
+        "grants".into(),
+        toml::Value::Array(vec![toml::Value::String("request-body:read".into())]),
+    );
+    let new = parse_wasm_plugin_config("p", &t2).unwrap();
+
+    match reload_narrowing(&old, &new, false) {
+        ReloadDecision::RestartNeeded(reasons) => {
+            assert!(reasons.iter().any(|r| r == "wasm"), "{reasons:?}");
+            assert!(
+                reasons.iter().any(|r| r.contains("tool_allowlist")),
+                "{reasons:?}"
+            );
+            assert!(reasons.iter().any(|r| r == "streams:add"), "{reasons:?}");
+        }
+        other => panic!("expected restart needed, got {other:?}"),
+    }
+}
+
+#[test]
+fn security_config_and_confirm_changes_need_restart() {
+    fn config_table(mode: &str, confirm: Option<&str>) -> toml::Table {
+        let mut t = base_table();
+        let mut config = toml::Table::new();
+        config.insert("mode".into(), toml::Value::String(mode.into()));
+        t.insert("config".into(), toml::Value::Table(config));
+        t.insert("role".into(), toml::Value::String("security".into()));
+        t.insert("on_error".into(), toml::Value::String("reject".into()));
+        if let Some(value) = confirm {
+            t.insert("confirm".into(), toml::Value::String(value.into()));
+        }
+        t
+    }
+
+    let old = parse_wasm_plugin_config("p", &config_table("a", Some("x"))).unwrap();
+    let changed = parse_wasm_plugin_config("p", &config_table("b", Some("x"))).unwrap();
+    match reload_narrowing(&old, &changed, false) {
+        ReloadDecision::RestartNeeded(reasons) => assert!(reasons.iter().any(|r| r == "config")),
+        other => panic!("expected restart needed, got {other:?}"),
+    }
+
+    let cleared = parse_wasm_plugin_config("p", &config_table("a", None)).unwrap();
+    match reload_narrowing(&old, &cleared, false) {
+        ReloadDecision::RestartNeeded(reasons) => assert!(reasons.iter().any(|r| r == "confirm")),
+        other => panic!("expected restart needed, got {other:?}"),
+    }
+}
+
+#[test]
 fn manifest_parses_and_rejects_free_detail() {
     let err = Manifest::parse(
         r#"

@@ -367,18 +367,15 @@ pub fn reload_narrowing(
     new: &WasmPluginConfig,
     old_has_high_or_med_grants: bool,
 ) -> ReloadDecision {
-    if old.wasm != new.wasm || old.sha256 != new.sha256 {
-        // new wasm hash: same grants/no high-risk grant => live (2.6). high-risk needs confirm mismatch handling at load.
-        // We report as restart_needed only when high-risk grant present.
-        if new.grants.iter().any(|g| g.risk() != "low") {
-            return ReloadDecision::RestartNeeded(vec!["wasm".to_owned()]);
-        }
-        return ReloadDecision::Live;
+    let mut restart = Vec::new();
+    if (old.wasm != new.wasm || old.sha256 != new.sha256)
+        && new.grants.iter().any(|g| g.risk() != "low")
+    {
+        restart.push("wasm".to_owned());
     }
     if old.name != new.name {
-        return ReloadDecision::RestartNeeded(vec!["name".to_owned()]);
+        restart.push("name".to_owned());
     }
-    let mut restart = Vec::new();
     // grants: remove is live narrowing, add is restart
     for g in &new.grants {
         if !old.grants.contains(g) {
@@ -451,7 +448,18 @@ pub fn reload_narrowing(
     if !restart.is_empty() {
         return ReloadDecision::RestartNeeded(restart);
     }
-    // config/confirm changes: confirm mismatch for high-risk is checked at load; config changes are live if no widening.
+    // A security plugin's operator config or confirmation cannot be swapped under a
+    // running instance; neither can a confirmation be removed from any plugin.
+    let security = old.role == Some(Role::Security) || new.role == Some(Role::Security);
+    if old.config != new.config && security {
+        restart.push("config".to_owned());
+    }
+    if old.confirm != new.confirm && (security || old.confirm.is_some()) {
+        restart.push("confirm".to_owned());
+    }
+    if !restart.is_empty() {
+        return ReloadDecision::RestartNeeded(restart);
+    }
     ReloadDecision::Live
 }
 

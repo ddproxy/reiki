@@ -304,6 +304,7 @@ fn extract_custom_section(bytes: &[u8], name: &str) -> Result<Option<Vec<u8>>, S
     // version: module = 0x01 00 00 00, component = 0x0d 00 01 00 (wasm component model)
     let mut pos = 8;
     // For component model, there may be a component layer; custom sections are id 0.
+    let mut found = None;
     while pos < bytes.len() {
         let section_id = bytes[pos];
         pos += 1;
@@ -330,12 +331,15 @@ fn extract_custom_section(bytes: &[u8], name: &str) -> Result<Option<Vec<u8>>, S
             let sec_name = std::str::from_utf8(&bytes[name_start..name_end])
                 .map_err(|e| format!("custom section name is not UTF-8: {e}"))?;
             if sec_name == name {
-                return Ok(Some(bytes[name_end..end].to_vec()));
+                if found.is_some() {
+                    return Err(format!("more than one `{name}` custom section"));
+                }
+                found = Some(bytes[name_end..end].to_vec());
             }
         }
         pos = end;
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn read_leb128_u32(bytes: &[u8]) -> Result<(u32, usize), String> {
@@ -408,6 +412,23 @@ request-body-read = true
         let caps = m.declared_capabilities();
         assert!(caps.contains(&Capability::RequestBodyRead));
         assert!(caps.contains(&Capability::RequestBodyEdit));
+    }
+
+    #[test]
+    fn duplicate_manifest_sections_are_refused() {
+        fn section(name: &str, payload: &[u8]) -> Vec<u8> {
+            let mut body = vec![name.len() as u8];
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(payload);
+            let mut out = vec![0, body.len() as u8];
+            out.extend(body);
+            out
+        }
+        let mut bytes = b"\0asm\r\0\x01\0".to_vec();
+        bytes.extend(section(SECTION_NAME, b"first"));
+        bytes.extend(section(SECTION_NAME, b"second"));
+        let err = extract_embedded_manifest(&bytes).unwrap_err();
+        assert!(err.contains("more than one"), "{err}");
     }
 
     #[test]

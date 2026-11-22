@@ -83,6 +83,24 @@ impl Capability {
         matches!(self, Self::RequestBodyRead | Self::RequestBodyEdit)
     }
 
+    /// No phase-1 capability can send data off the host. Keeping this an explicit
+    /// classifier means the read-xor-egress check starts enforcing as soon as an
+    /// egress capability is introduced.
+    pub fn is_egress(self) -> bool {
+        match self {
+            Self::RequestMeta
+            | Self::RequestBodyRead
+            | Self::RequestBodyEdit
+            | Self::Finding
+            | Self::FindingDetailVocab
+            | Self::Log
+            | Self::Reject
+            | Self::ClockMonotonic
+            | Self::Random
+            | Self::RequestState => false,
+        }
+    }
+
     pub fn all_default_allowed() -> &'static [Capability] {
         &[
             Self::RequestMeta,
@@ -202,6 +220,24 @@ pub fn is_allowed_inert_import(import: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_phase1_capability_is_egress() {
+        for cap in [
+            Capability::RequestMeta,
+            Capability::RequestBodyRead,
+            Capability::RequestBodyEdit,
+            Capability::Finding,
+            Capability::FindingDetailVocab,
+            Capability::Log,
+            Capability::Reject,
+            Capability::ClockMonotonic,
+            Capability::Random,
+            Capability::RequestState,
+        ] {
+            assert!(!cap.is_egress(), "{cap:?}");
+        }
+    }
 
     #[test]
     fn generated_types_import_is_allowed_but_not_a_capability() {

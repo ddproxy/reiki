@@ -14,6 +14,7 @@
 
 ### Changed
 
+- `plugin-wasm` now pins `wasmtime` and `wasmtime-wasi` to 51.0.0. The previous 42.0.2 pins are affected by published RUSTSEC advisories. The host API used by Phase 1 is unchanged in 51.0.0. The component loader now refuses any import of `wasi:filesystem`, `wasi:sockets`, or `wasi:http` at load time; those interfaces cannot be granted in Phase 1. Two new reference fixtures and end-to-end tests prove that a reference plugin cannot open, truncate, rename, or hard-link a file through WASI, and that a component importing WASI filesystem or sockets is refused before execution.
 - `days_from_civil` moved into `reiki-plugin::timefmt` alongside `civil_from_days`; host modules now import the shared helper.
 - `reiki_health::Health` now requires `observed`; older peer documents without it are refused. Client-supplied `X-Reiki-*` request headers are stripped before every upstream transport.
 

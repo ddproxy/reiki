@@ -1,0 +1,25 @@
+details = []
+
+[plugin]
+name = "fs-probe"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+hooks = ["on-request"]
+
+[requests]
+
+[literals]
+
+[log-templates]
+
+[reject-templates.fs-capability-leak]
+status = 403
+message = "WASI filesystem access is not available"
+
+[limits]
+memory_mib = 16
+fuel_per_call = 10000000
+fuel_per_kib = 200000
+deadline_ms = 250
+wall_budget_ms = 1000
+max_body_kib = 1024

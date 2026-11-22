@@ -171,12 +171,25 @@ pub fn is_allowed_non_capability_import(import: &str) -> bool {
         || import == "request"
 }
 
+/// Returns true if an import would give the guest a filesystem or network
+/// interface. These interfaces are not in any grant table: a Phase 1 plugin
+/// must not be able to open a path or open a socket, regardless of the WASI
+/// context configuration.
+pub fn is_forbidden_wasi_interface(import: &str) -> bool {
+    import.starts_with("wasi:filesystem/")
+        || import.starts_with("wasi:sockets/")
+        || import.starts_with("wasi:http/")
+        || import == "wasi:filesystem"
+        || import == "wasi:sockets"
+        || import == "wasi:http"
+}
+
 /// Returns true if an import is a known WASI/host inert stub allowed in Phase 1.
 pub fn is_allowed_inert_import(import: &str) -> bool {
-    // WASI p2 cli/stdio/clocks/random/filesystem/sockets/env may be imported by toolchains.
-    // Phase 1: filesystem linked with zero preopens (inert), env/args/stdin empty, stdout/stderr sink.
-    // sockets/http not grantable - refused at load.
-    if s_is_wasi_socket(import) || s_is_wasi_http(import) {
+    // WASI p2 cli/stdio/clocks/random/env may be imported by toolchains. The
+    // host context has no preopens, no env, no args and no inherited stdio.
+    // Filesystem and network interfaces are refused before this check.
+    if is_forbidden_wasi_interface(import) {
         return false;
     }
     import.starts_with("wasi:")
@@ -184,14 +197,6 @@ pub fn is_allowed_inert_import(import: &str) -> bool {
         || import.starts_with("[resource-drop]")
         || import.starts_with("[constructor]")
         || import.starts_with("[static]")
-}
-
-fn s_is_wasi_socket(import: &str) -> bool {
-    import.contains("wasi:sockets") || import.contains("wasi:http/outgoing-handler")
-}
-
-fn s_is_wasi_http(import: &str) -> bool {
-    import.contains("wasi:http")
 }
 
 #[cfg(test)]
@@ -206,5 +211,25 @@ mod tests {
         assert!(!is_allowed_inert_import(import));
         assert!(is_allowed_non_capability_import("request"));
         assert!(!is_allowed_non_capability_import("wasi:sockets"));
+    }
+
+    #[test]
+    fn filesystem_and_network_interfaces_are_forbidden() {
+        for import in [
+            "wasi:filesystem/types@0.2.12",
+            "wasi:filesystem/preopens@0.2.12",
+            "wasi:sockets/tcp@0.2.12",
+            "wasi:sockets/ip-name-lookup@0.2.12",
+            "wasi:http/outgoing-handler@0.2.12",
+        ] {
+            assert!(is_forbidden_wasi_interface(import), "{import}");
+            assert!(!is_allowed_inert_import(import), "{import}");
+        }
+        assert!(!is_forbidden_wasi_interface(
+            "wasi:clocks/monotonic-clock@0.2.12"
+        ));
+        assert!(is_allowed_inert_import(
+            "wasi:clocks/monotonic-clock@0.2.12"
+        ));
     }
 }

@@ -6,7 +6,7 @@ use wasmtime::{Config as WasmConfig, Engine};
 
 use crate::capability::{
     Capability, DerivedCapabilities, capability_for_import, is_allowed_inert_import,
-    is_allowed_non_capability_import,
+    is_allowed_non_capability_import, is_forbidden_wasi_interface,
 };
 use crate::config::{EffectiveLimits, WasmPluginConfig};
 use crate::manifest::{EmbeddedManifest, HostCeilings, extract_embedded_manifest};
@@ -143,18 +143,26 @@ pub fn derive_capabilities_public(
 
 fn validate_imports(engine: &Engine, component: &Component) -> Result<(), String> {
     let ty = component.component_type();
+    let mut forbidden = BTreeSet::new();
     for (name, _item) in ty.imports(engine) {
-        if capability_for_import(name).is_some() || is_allowed_non_capability_import(name) {
+        if is_forbidden_wasi_interface(name) {
+            forbidden.insert(name.to_owned());
             continue;
         }
-        if is_allowed_inert_import(name) {
-            if name.contains("wasi:sockets") || name.contains("wasi:http") {
-                return Err(format!("component imports disallowed interface `{name}`"));
-            }
+        if capability_for_import(name).is_some()
+            || is_allowed_non_capability_import(name)
+            || is_allowed_inert_import(name)
+        {
             continue;
         }
         return Err(format!(
             "component imports unknown or unsupported interface `{name}`"
+        ));
+    }
+    if !forbidden.is_empty() {
+        return Err(format!(
+            "component imports disallowed interface(s): {}",
+            forbidden.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
     Ok(())

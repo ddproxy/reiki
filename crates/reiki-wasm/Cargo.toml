@@ -18,8 +18,8 @@ sha2 = "0.11"
 toml = "1.2"
 tracing = "0.1"
 anyhow = "1"
-wasmtime = { version = "=42.0.2", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "=42.0.2", default-features = false, features = ["p2"] }
+wasmtime = { version = "=51.0.0", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "=51.0.0", default-features = false, features = ["p2"] }
 
 [dev-dependencies]
 wat = "1"

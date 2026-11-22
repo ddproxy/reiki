@@ -1,3 +1,5 @@
+details = []
+
 [plugin]
 name = "no-grant"
 version = "0.1.0"
@@ -8,11 +10,12 @@ hooks = ["on-request"]
 
 [literals]
 
-details = []
-
 [log-templates]
+hit = "wasm hit {0}"
 
-[reject-templates]
+[reject-templates.blocked]
+status = 403
+message = "blocked by wasm plugin"
 
 [limits]
 memory_mib = 16

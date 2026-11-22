@@ -46,6 +46,11 @@ pub struct Requests {
     /// "read" or "edit"
     #[serde(default, rename = "request-body")]
     pub request_body: Option<String>,
+    /// Declares the read half of an editing plugin. `request-body = "edit"` alone
+    /// declares only `request-body:edit`; a component that also calls `body()` needs
+    /// this explicit flag. Kept optional so existing manifests parse unchanged.
+    #[serde(default, rename = "request-body-read")]
+    pub request_body_read: bool,
     #[serde(default, rename = "finding-detail")]
     pub finding_detail: Option<String>,
 }
@@ -257,6 +262,9 @@ impl Manifest {
             }
             _ => {}
         }
+        if self.requests.request_body_read {
+            caps.insert(Capability::RequestBodyRead);
+        }
         if self.requests.finding_detail.as_deref() == Some("vocab") {
             caps.insert(Capability::FindingDetailVocab);
         }
@@ -383,6 +391,23 @@ message = "blocked"
             m.declared_capabilities()
                 .contains(&Capability::FindingDetailVocab)
         );
+    }
+
+    #[test]
+    fn edit_manifest_can_declare_body_read_and_edit() {
+        let toml = r#"
+[plugin]
+name = "edit"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+[requests]
+request-body = "edit"
+request-body-read = true
+"#;
+        let m = Manifest::parse(toml).unwrap();
+        let caps = m.declared_capabilities();
+        assert!(caps.contains(&Capability::RequestBodyRead));
+        assert!(caps.contains(&Capability::RequestBodyEdit));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use wasmtime::{Config as WasmConfig, Engine};
 
 use crate::capability::{
     Capability, DerivedCapabilities, capability_for_import, is_allowed_inert_import,
+    is_allowed_non_capability_import,
 };
 use crate::config::{EffectiveLimits, WasmPluginConfig};
 use crate::manifest::{EmbeddedManifest, HostCeilings, extract_embedded_manifest};
@@ -143,7 +144,7 @@ pub fn derive_capabilities_public(
 fn validate_imports(engine: &Engine, component: &Component) -> Result<(), String> {
     let ty = component.component_type();
     for (name, _item) in ty.imports(engine) {
-        if capability_for_import(name).is_some() {
+        if capability_for_import(name).is_some() || is_allowed_non_capability_import(name) {
             continue;
         }
         if is_allowed_inert_import(name) {

@@ -1,0 +1,25 @@
+[plugin]
+name = "body-edit"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+hooks = ["on-request"]
+
+[requests]
+request-body = "edit"
+
+[literals]
+redacted-model = "redacted"
+
+details = []
+
+[log-templates]
+
+[reject-templates]
+
+[limits]
+memory_mib = 16
+fuel_per_call = 10000000
+fuel_per_kib = 200000
+deadline_ms = 250
+wall_budget_ms = 1000
+max_body_kib = 1024

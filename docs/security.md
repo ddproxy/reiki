@@ -95,3 +95,33 @@ A compromised dependency in an agent framework runs with that framework's privil
 - **Cloud-token detection in bodies is not a barrier.** The PHI, finance and controlled-information plugins detect their own kinds in request bodies when compiled and configured; there is no separate core detector that recognises infrastructure or cloud credentials in arbitrary bodies. `placeholders` masks credential-shaped strings in requests, and `requestlog` masks them in bodies only when `capture_bodies = true`; both are bounded heuristics, not a guarantee that an unknown token format is caught. Scrubbing of response bodies and failure-ring snippets only removes Reiki's *known upstream key*, not other secrets an upstream or framework may echo. Do not assume a leaked infrastructure token in a body is blocked or reported.
 
 Adding source binding, token expiry and a general credential-detection kind would change the config surface and detection model; those are owner decisions, not current behaviour.
+
+## Wasm plugins (Phase 1)
+
+Runtime Wasm plugins (`plugin-wasm`) run inside the Reiki process but are
+sandboxed by Wasmtime component isolation, fuel, memory limits, and
+epoch/deadline budgets. Phase 1 exposes only request-side hooks and a
+constrained host interface.
+
+- **Pinning.** Config requires `sha256`; load fails on mismatch. The embedded
+  `reiki-manifest` custom section must match the configured name and the
+  component import-derived capability request.
+- **Capability derivation.** Capabilities are derived from imports (D1). Gated
+  capabilities (`request-body:read`, `request-body:edit`,
+  `finding:detail-vocab`) require explicit config grants; requesting more than
+  granted fails to load. Default-allowed capabilities are low-risk and linked
+  for every plugin.
+- **Resource limits/traps.** Fuel, memory, and deadlines are enforced per call.
+  Traps fail closed for `role = "security"` or `on_error = "reject"`, and are
+  logged otherwise.
+- **Host-applied edits.** Plugins return structured edit ops with manifest
+  literals/JSON pointers; the host applies and revalidates JSON. Free-form
+  rewrite is not supported in Phase 1.
+- **Request-side tool allowlist.** Host config can enforce a declared-tool
+  allowlist on recognized request formats, reusing `reiki-toolpolicy` request
+  parsing. Unparseable recognized requests fail closed.
+- **Reload narrowing.** Reload cannot widen grants, limits, tool allowlists, or
+  high-risk stream scope; widening requires restart.
+
+Wasm plugins are not a substitute for process isolation. Treat plugin
+configuration, manifests, and granted capabilities as security-sensitive.

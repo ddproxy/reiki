@@ -160,6 +160,25 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Work with Wasm plugins.
+    #[cfg(feature = "plugin-wasm")]
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+
+#[cfg(feature = "plugin-wasm")]
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Inspect a Wasm plugin component and print its manifest, capabilities, and limits.
+    Inspect {
+        /// Path to the .wasm component file.
+        file: PathBuf,
+        /// Print JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where the admin listener is and the bearer token to use.
@@ -454,6 +473,57 @@ async fn run_enable_key(
     0
 }
 
+#[cfg(feature = "plugin-wasm")]
+fn print_inspect_report(report: &reiki_wasm::InspectReport) {
+    println!("file: {}", report.path);
+    println!("sha256: {}", report.sha256);
+    println!("name: {}", report.name);
+    println!("version: {}", report.version);
+    println!("wit-world: {}", report.wit_world);
+    println!(
+        "hooks: {}",
+        if report.hooks.is_empty() {
+            "(none)".to_owned()
+        } else {
+            report.hooks.join(", ")
+        }
+    );
+    println!(
+        "derived-capabilities: {}",
+        if report.derived_capabilities.is_empty() {
+            "(none)".to_owned()
+        } else {
+            report.derived_capabilities.join(", ")
+        }
+    );
+    println!(
+        "requested-gated-capabilities: {}",
+        if report.requested_gated_capabilities.is_empty() {
+            "(none)".to_owned()
+        } else {
+            report.requested_gated_capabilities.join(", ")
+        }
+    );
+    println!(
+        "default-allowed-capabilities: {}",
+        report.default_allowed_capabilities.join(", ")
+    );
+    println!("limits:");
+    println!("  memory-mib: {}", report.manifest_limits.memory_mib);
+    println!("  fuel-per-call: {}", report.manifest_limits.fuel_per_call);
+    println!("  fuel-per-kib: {}", report.manifest_limits.fuel_per_kib);
+    println!("  deadline-ms: {}", report.manifest_limits.deadline_ms);
+    println!(
+        "  wall-budget-ms: {}",
+        report.manifest_limits.wall_budget_ms
+    );
+    println!("  max-body-kib: {}", report.manifest_limits.max_body_kib);
+    println!(
+        "pin: manifest-present={} section={}",
+        report.pin.manifest_present, report.pin.embedded_section
+    );
+}
+
 fn fail(message: &str) -> ! {
     eprintln!("reiki: {message}");
     std::process::exit(1);
@@ -637,6 +707,32 @@ async fn main() {
                 dir.join("ca.key").display()
             ),
             Err(e) => fail(&e),
+        }
+        return;
+    }
+
+    #[cfg(feature = "plugin-wasm")]
+    if let Some(Command::Plugin { command }) = &cli.command {
+        match command {
+            PluginCommand::Inspect { file, json } => match reiki_wasm::inspect_component(file) {
+                Ok(report) => {
+                    if *json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
+                                eprintln!("reiki: {e}");
+                                std::process::exit(1);
+                            })
+                        );
+                    } else {
+                        print_inspect_report(&report);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("reiki: {e}");
+                    std::process::exit(1);
+                }
+            },
         }
         return;
     }

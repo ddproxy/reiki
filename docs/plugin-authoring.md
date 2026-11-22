@@ -73,6 +73,10 @@ The context types are `#[non_exhaustive]`. Use their constructors in tests; do n
 
 Admin paths must start with `/`, must not be `/`, have no trailing slash, `%`, or empty, `.` or `..` segment. A duplicate path, or one Reiki reserves (`/v1/status`, `/v1/failures`, `/v1/reload`, `/v1/keys/enable`, `/v1/openapi.json`), fails plugin chain construction at startup; a bad reload is refused. Reiki authenticates the caller before calling the hook.
 
+## Runtime Wasm plugins
+
+Phase 1 Wasm plugins run behind `plugin-wasm` and are configured as `[plugins.<name>]` tables with `wasm = ...` and `sha256 = ...`. They use a Wasmtime sandbox, import-derived capabilities, embedded manifest pinning, host-applied request edits, and reload narrowing. See [Wasm plugins](wasm-plugins.md).
+
 ## Errors and `on_error`
 
 | Return from `on_request` | Result |

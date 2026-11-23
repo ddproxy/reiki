@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reiki_top::matrix::{
     History, HostSummary, Matrix, Metric, Sample, fleet_series, is_fleet_row, is_problem,
-    key_counts, order_peers, resolve, usage_by_provider,
+    key_counts, order_peers, peer_columns, resolve, usage_by_provider,
 };
 use reiki_top::streams::StreamsView;
 use reiki_top::ui::{self, ChartMetric, ChartSeries, crossterm, ratatui};
@@ -672,9 +672,23 @@ async fn live_loop(
                             return 1;
                         }
                     };
+                let sorting = matches!(
+                    action,
+                    ui::Action::SortNext | ui::Action::SortPrev | ui::Action::SortReverse
+                );
+                if state.mode == ui::Mode::Matrix {
+                    let matrix = shown_matrix(shown, &all, shown_at, &state);
+                    follow_cursor(&mut state, &matrix);
+                }
                 let keep = if state.mode == ui::Mode::Streams {
                     let rows = shown.local_streams().map_or(0, |view| view.rows.len());
                     apply_streams_action(&mut state, action, rows, total, viewport)
+                } else if sorting {
+                    if state.mode == ui::Mode::Matrix {
+                        let matrix = shown_matrix(shown, &all, shown_at, &state);
+                        apply_sort(&mut state, action, &matrix);
+                    }
+                    true
                 } else {
                     let problem = selected_peer(shown, &all, shown_at, &state)
                         .is_some_and(|(_, problem)| problem);
@@ -690,6 +704,12 @@ async fn live_loop(
                         apply_action(&mut state, action, &all, total, viewport, problem)
                     }
                 };
+                // A sort keeps the cursor on its peer through the draw; any other key records
+                // which peer the cursor landed on.
+                if state.mode == ui::Mode::Matrix && !sorting {
+                    let matrix = shown_matrix(shown, &all, shown_at, &state);
+                    record_cursor(&mut state, &matrix);
+                }
                 if !keep {
                     return 0;
                 }
@@ -706,6 +726,10 @@ async fn live_loop(
                 Some(f) => (&f.fleet, &f.history, f.at, Some(f.at.elapsed())),
                 None => (&fleet, &history, Instant::now(), None),
             };
+            if state.mode == ui::Mode::Matrix {
+                let matrix = shown_matrix(shown, &all, shown_at, &state);
+                follow_cursor(&mut state, &matrix);
+            }
             let shown = Shown {
                 fleet: shown,
                 history: shown_history,
@@ -781,6 +805,53 @@ fn apply_streams_action(
         .scroll
         .min(detail_lines.saturating_sub(viewport.max(1)));
     true
+}
+
+/// The matrix the screen shows: every configured peer, narrowed to the provider filter.
+fn shown_matrix(fleet: &Fleet, all: &[String], now: Instant, state: &ui::UiState) -> Matrix {
+    let full = Matrix::build_fleet(fleet, all, now);
+    match state.filter.provider.as_deref() {
+        Some(p) => full.filter_provider(p).unwrap_or(full),
+        None => full,
+    }
+}
+
+/// Applies one sort key to the matrix. The columns are the ones on screen, so `o` never lands on
+/// a provider the filter hides.
+fn apply_sort(state: &mut ui::UiState, action: ui::Action, matrix: &Matrix) {
+    match action {
+        ui::Action::SortReverse => {
+            state.reverse_sort();
+        }
+        _ => state.cycle_sort(&peer_columns(matrix), action == ui::Action::SortNext),
+    }
+}
+
+/// Moves the cursor back onto the peer it was on. A refresh or a sort can move that peer to
+/// another row; the position is only re-taken when the peer has left the list.
+fn follow_cursor(state: &mut ui::UiState, matrix: &Matrix) {
+    if state.selected.is_none() {
+        state.selected_peer = None;
+        return;
+    }
+    let order = order_peers(matrix, state.peer_sort.as_ref());
+    let found = state
+        .selected_peer
+        .as_ref()
+        .and_then(|name| order.iter().position(|&i| matrix.rows[i].peer == *name));
+    match found {
+        Some(pos) => state.selected = Some(pos),
+        None => record_cursor(state, matrix),
+    }
+}
+
+/// Remembers the peer under the cursor, so `follow_cursor` can find it again.
+fn record_cursor(state: &mut ui::UiState, matrix: &Matrix) {
+    let order = order_peers(matrix, state.peer_sort.as_ref());
+    state.selected_peer = state
+        .selected
+        .and_then(|pos| resolve(Some(pos), order.len()))
+        .map(|pos| matrix.rows[order[pos]].peer.clone());
 }
 
 /// Applies one key action. In matrix view the arrows and j/k move the selection and Enter opens
@@ -867,16 +938,8 @@ fn selected_peer(
     now: Instant,
     state: &ui::UiState,
 ) -> Option<(String, bool)> {
-    let matrix = Matrix::build_fleet(fleet, all, now);
-    let matrix = if state.mode == ui::Mode::Matrix {
-        match state.filter.provider.as_deref() {
-            Some(p) => matrix.filter_provider(p).unwrap_or(matrix),
-            None => matrix,
-        }
-    } else {
-        matrix
-    };
-    let order = order_peers(&matrix);
+    let matrix = shown_matrix(fleet, all, now, state);
+    let order = order_peers(&matrix, state.peer_sort.as_ref());
     let row = &matrix.rows[order[resolve(state.selected, order.len())?]];
     Some((row.peer.clone(), is_problem(row)))
 }
@@ -954,7 +1017,7 @@ fn build_parts(
                     },
                     None => (full, None),
                 };
-            let order = order_peers(&matrix);
+            let order = order_peers(&matrix, state.peer_sort.as_ref());
             let pos = resolve(state.selected, order.len());
             let row = pos.map(|pos| &matrix.rows[order[pos]]);
             let detail = row.and_then(|row| {
@@ -996,6 +1059,7 @@ fn build_parts(
                     inner,
                     filter_name,
                     state.gauge,
+                    state.peer_sort.as_ref(),
                 ),
                 rows: matrix.rows.len(),
                 selected: pos,
@@ -2459,6 +2523,7 @@ mod tests {
             98,
             None,
             state.gauge,
+            None,
         ));
         let parts = build_parts(&f, &history, &all, now, &state, 100, SAMPLE_INTERVAL);
         assert_eq!(
@@ -2653,5 +2718,108 @@ mod tests {
             "{:?}",
             plain(&parts.lines)
         );
+    }
+
+    fn three_peers(now: Instant) -> Fleet {
+        let mut f = fleet();
+        for name in ["peer-a", "peer-b", "peer-c"] {
+            apply_feed(&mut f, name, FeedEvent::Snapshot(DOC.to_owned()), now);
+        }
+        f
+    }
+
+    fn peer_names() -> Vec<String> {
+        ["peer-a", "peer-b", "peer-c"].map(str::to_owned).to_vec()
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_peer_through_a_resort() {
+        let now = Instant::now();
+        let f = three_peers(now);
+        let all = peer_names();
+        let mut state = ui::UiState {
+            selected: Some(1),
+            ..ui::UiState::default()
+        };
+        record_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(state.selected_peer.as_deref(), Some("peer-a"));
+
+        apply_sort(
+            &mut state,
+            ui::Action::SortNext,
+            &Matrix::build_fleet(&f, &all, now),
+        );
+        follow_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(
+            state.selected,
+            Some(1),
+            "name ascending keeps peer-a second"
+        );
+
+        apply_sort(
+            &mut state,
+            ui::Action::SortReverse,
+            &Matrix::build_fleet(&f, &all, now),
+        );
+        follow_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(state.selected, Some(3), "descending puts peer-a last");
+        assert_eq!(state.selected_peer.as_deref(), Some("peer-a"));
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_peer_through_a_refresh_that_reorders_problems() {
+        let now = Instant::now();
+        let mut f = three_peers(now);
+        let all = peer_names();
+        let mut state = ui::UiState {
+            selected: Some(1),
+            ..ui::UiState::default()
+        };
+        record_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(state.selected_peer.as_deref(), Some("peer-a"));
+
+        apply_feed(
+            &mut f,
+            "peer-c",
+            FeedEvent::Snapshot(COOLING_DOC.to_owned()),
+            now,
+        );
+        follow_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(
+            state.selected,
+            Some(2),
+            "peer-c is a problem, so it moved up"
+        );
+        assert_eq!(state.selected_peer.as_deref(), Some("peer-a"));
+    }
+
+    #[test]
+    fn a_peer_that_left_the_list_keeps_the_cursor_position() {
+        let now = Instant::now();
+        let f = three_peers(now);
+        let all = peer_names();
+        let mut state = ui::UiState {
+            selected: Some(2),
+            selected_peer: Some("peer-gone".to_owned()),
+            ..ui::UiState::default()
+        };
+        follow_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(state.selected, Some(2));
+        assert_eq!(state.selected_peer.as_deref(), Some("peer-b"));
+    }
+
+    #[test]
+    fn clearing_the_cursor_clears_the_peer_it_was_on() {
+        let now = Instant::now();
+        let f = three_peers(now);
+        let all = peer_names();
+        let mut state = ui::UiState {
+            selected: None,
+            selected_peer: Some("peer-a".to_owned()),
+            ..ui::UiState::default()
+        };
+        follow_cursor(&mut state, &Matrix::build_fleet(&f, &all, now));
+        assert_eq!(state.selected, None, "the cursor does not come back");
+        assert_eq!(state.selected_peer, None);
     }
 }

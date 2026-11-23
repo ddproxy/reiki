@@ -9,8 +9,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::Fleet;
 use crate::matrix::{
-    Cell, FLEET_PEER, History, MINUTE_SLOTS, Matrix, Metric, Pressure, Row, is_fleet_row,
-    order_peers, resolve,
+    Cell, FLEET_PEER, History, MINUTE_SLOTS, Matrix, Metric, PeerColumn, PeerSort, Pressure, Row,
+    is_fleet_row, order_peers, resolve,
 };
 
 /// How a span should read on the terminal. `Plain` is the caller's default.
@@ -1118,11 +1118,12 @@ pub fn render_matrix(
         width,
         filter,
         GaugeMode::default(),
+        None,
     )
 }
 
-/// [`render_matrix`] with the gauge's metric and window chosen by the caller. The fleet line ends
-/// with the mode's tag.
+/// [`render_matrix`] with the gauge's metric and window and the row sort chosen by the caller.
+/// The fleet line ends with the mode's tag. A sorted column's header shows its direction.
 pub fn render_matrix_mode(
     matrix: &Matrix,
     history: &History,
@@ -1130,8 +1131,9 @@ pub fn render_matrix_mode(
     width: usize,
     filter: Option<&str>,
     mode: GaugeMode,
+    sort: Option<&PeerSort>,
 ) -> Vec<Line> {
-    let order = order_peers(matrix);
+    let order = order_peers(matrix, sort);
     let selected = selected.and_then(|s| resolve(Some(s), order.len()));
     let (fresh, total) = matrix.fresh_counts();
     let mut title = vec![span(format!("Fleet {fresh}/{total} fresh"), Style::Title)];
@@ -1234,15 +1236,13 @@ pub fn render_matrix_mode(
     }
 
     for (ver, label_max, spark, gauge) in FITS {
-        let grid = Grid::new(
-            matrix,
-            &order,
-            history,
+        let fit = Fit {
+            ver,
             label_max,
             spark,
-            gauge.then_some(mode),
-            ver,
-        );
+            gauge: gauge.then_some(mode),
+        };
+        let grid = Grid::new(matrix, &order, history, fit, sort);
         if grid.width() <= width {
             return grid.lines(title, selected, width);
         }
@@ -1444,15 +1444,41 @@ fn chip_lines(
     out
 }
 
+/// One layout to try: the version column, the provider header width, the sparkline and the gauge.
+#[derive(Clone, Copy)]
+struct Fit {
+    ver: bool,
+    label_max: usize,
+    spark: bool,
+    gauge: Option<GaugeMode>,
+}
+
+/// A header label with the sort direction marked when `column` is the sorted one.
+fn sorted_header(text: &str, column: &PeerColumn, sort: Option<&PeerSort>) -> String {
+    match sort {
+        Some(sort) if sort.column == *column => {
+            let arrow = if sort.descending { "▼" } else { "▲" };
+            format!("{text} {arrow}")
+        }
+        _ => text.to_owned(),
+    }
+}
+
 /// The column layout for one header width and sparkline setting.
 struct Grid<'a> {
     matrix: &'a Matrix,
     order: &'a [usize],
-    /// Header per column, clipped to the layout's label width.
+    /// Header per provider column, clipped to the layout's label width.
     labels: Vec<String>,
+    /// Header of the peer-name column; blank unless the rows are sorted by name.
+    name_head: String,
+    /// Header of the version column, when the layout has one.
+    ver_head: String,
+    /// Headers of the load, disk and sessions columns, in that order.
+    host_heads: [String; 3],
     /// Width of each column, the wider of its header and cells.
     widths: Vec<usize>,
-    /// Peer names clipped to `NAME_MAX`, padded to the widest.
+    /// Peer names clipped to `NAME_MAX`, padded to the widest or to the name header.
     name_w: usize,
     /// Spans of each row's cells, padded per column later.
     cells: Vec<Vec<Vec<(String, Style)>>>,
@@ -1469,16 +1495,23 @@ impl<'a> Grid<'a> {
         matrix: &'a Matrix,
         order: &'a [usize],
         history: &History,
-        label_max: usize,
-        spark: bool,
-        gauge: Option<GaugeMode>,
-        ver: bool,
+        fit: Fit,
+        sort: Option<&PeerSort>,
     ) -> Self {
+        let gauge = fit.gauge;
         let labels: Vec<String> = matrix
             .columns
             .iter()
-            .map(|c| clip(&c.upstream, label_max))
+            .map(|c| {
+                let column = PeerColumn::Provider(c.upstream.clone());
+                sorted_header(&clip(&c.upstream, fit.label_max), &column, sort)
+            })
             .collect();
+        let name_head = if sort.is_some_and(|s| s.column == PeerColumn::Name) {
+            sorted_header("name", &PeerColumn::Name, sort)
+        } else {
+            String::new()
+        };
         let mode = gauge.unwrap_or_default();
         let peaks: Vec<u64> = (0..labels.len())
             .map(|c| column_peak(matrix, c, mode))
@@ -1522,22 +1555,27 @@ impl<'a> Grid<'a> {
             .iter()
             .map(|&i| text_width(&clip(&matrix.rows[i].peer, NAME_MAX)))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(text_width(&name_head));
         let versions: Vec<(String, Style)> = order
             .iter()
             .map(|&i| version_text(&matrix.rows[i]))
             .collect();
-        let ver_w = ver.then(|| {
+        let ver_head = sorted_header(VER_HEADER, &PeerColumn::Version, sort);
+        let ver_w = fit.ver.then(|| {
             versions
                 .iter()
                 .map(|(text, _)| text_width(text))
-                .fold(text_width(VER_HEADER), usize::max)
+                .fold(text_width(&ver_head), usize::max)
         });
         let host: Vec<HostArea> = order
             .iter()
-            .map(|&i| host_area(&matrix.rows[i], history, spark))
+            .map(|&i| host_area(&matrix.rows[i], history, fit.spark))
             .collect();
-        let mut host_w = HOST_LABELS.map(str::len);
+        let host_columns = [PeerColumn::Load, PeerColumn::Disk, PeerColumn::Sessions];
+        let host_heads: [String; 3] =
+            std::array::from_fn(|i| sorted_header(HOST_LABELS[i], &host_columns[i], sort));
+        let mut host_w = host_heads.each_ref().map(|head| text_width(head));
         for area in &host {
             if let HostArea::Figures(figures) = area {
                 for (w, (text, _)) in host_w.iter_mut().zip(figures) {
@@ -1549,6 +1587,9 @@ impl<'a> Grid<'a> {
             matrix,
             order,
             labels,
+            name_head,
+            ver_head,
+            host_heads,
             widths,
             name_w,
             cells,
@@ -1569,16 +1610,16 @@ impl<'a> Grid<'a> {
     fn lines(&self, title: Vec<Span>, selected: Option<usize>, width: usize) -> Vec<Line> {
         let mut out = vec![line(title, width)];
 
-        let mut head = vec![span(" ".repeat(2 + self.name_w), Style::Plain)];
+        let mut head = vec![span(pad(&self.name_head, 2 + self.name_w), Style::Title)];
         for (label, w) in self.labels.iter().zip(&self.widths) {
             head.push(span(GAP_TEXT, Style::Plain));
             head.push(span(pad(label, *w), Style::Title));
         }
         if let Some(w) = self.ver_w {
             head.push(span(GAP_TEXT, Style::Plain));
-            head.push(span(pad(VER_HEADER, w), Style::Title));
+            head.push(span(pad(&self.ver_head, w), Style::Title));
         }
-        for (label, w) in HOST_LABELS.iter().zip(self.host_w) {
+        for (label, w) in self.host_heads.iter().zip(self.host_w) {
             head.push(span(GAP_TEXT, Style::Plain));
             head.push(span(pad(label, w), Style::Title));
         }
@@ -1820,7 +1861,9 @@ mod tests {
 
     use super::*;
     use crate::Health;
-    use crate::matrix::{Cell, Column, History, HostSummary, Matrix, Row, Sample};
+    use crate::matrix::{
+        Cell, Column, History, HostSummary, Matrix, PeerColumn, PeerSort, Row, Sample,
+    };
 
     fn fleet() -> Fleet {
         Fleet::new(Duration::from_secs(90))
@@ -3815,7 +3858,7 @@ mod tests {
         let mut f = fleet();
         add(&mut f, "peer-a", &gauge_doc(), t0);
         let m = Matrix::build(&f, &names(&["peer-a"]), t0);
-        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode);
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode, None);
         (lines[0].plain_text(), row_text(&lines, "peer-a"))
     }
 
@@ -3866,7 +3909,7 @@ mod tests {
         );
         let m = Matrix::build(&f, &names(&["peer-a", "peer-b"]), t0);
         let layout = |mode: GaugeMode| {
-            let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode);
+            let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, mode, None);
             let header = lines[1].plain_text();
             let row = row_text(&lines, "peer-a");
             (first(&header, "load"), row.chars().count())
@@ -3905,7 +3948,7 @@ mod tests {
             window: GaugeWindow::Minutes,
         };
         let m = Matrix::build(&f, &names(&["peer-q", "peer-b"]), t0);
-        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, minutes);
+        let lines = render_matrix_mode(&m, &History::new(0), None, 100, None, minutes, None);
         assert!(row_text(&lines, "peer-q").contains("■ ▄▄▄▄▄"), "{lines:?}");
         assert!(row_text(&lines, "peer-b").contains("■ █████"), "{lines:?}");
     }
@@ -4131,7 +4174,7 @@ mod tests {
                 let mode = GaugeMode { metric, window };
                 for width in 0..=24 {
                     let lines =
-                        render_matrix_mode(&m, &History::new(0), Some(0), width, None, mode);
+                        render_matrix_mode(&m, &History::new(0), Some(0), width, None, mode, None);
                     for line in lines {
                         assert!(
                             line.plain_text().chars().count() <= width,
@@ -4190,6 +4233,7 @@ mod tests {
             100,
             None,
             GaugeMode::default(),
+            None,
         ));
         assert!(lines[0].contains("Fleet 2/3 fresh"), "{lines:?}");
         assert!(lines[0].contains("zen 1/3"), "ALL is not a peer: {lines:?}");
@@ -4341,5 +4385,92 @@ mod tests {
         assert!(lines.contains("stream_admin is disabled"));
         assert!(lines.contains("admin unreachable"));
         assert!(!lines.contains(&secret));
+    }
+
+    fn sort_view_row(peer: &str, load: Option<f64>) -> Row {
+        Row {
+            peer: peer.to_owned(),
+            cells: vec![Cell::Healthy],
+            combos: vec![0],
+            pressure: vec![None],
+            host: HostSummary {
+                load1: load,
+                disk_percent: None,
+                sessions: None,
+            },
+            version: Some("0.10.3".to_owned()),
+            error: None,
+            stale: false,
+            age: None,
+        }
+    }
+
+    fn sort_view_matrix() -> Matrix {
+        Matrix {
+            columns: vec![Column {
+                upstream: "zen".to_owned(),
+                peers_with: 2,
+                healthy_peers: 2,
+            }],
+            rows: vec![
+                sort_view_row("ALL", None),
+                sort_view_row("peer-a", Some(0.5)),
+                sort_view_row("peer-b", Some(2.5)),
+            ],
+            hidden_columns: 0,
+        }
+    }
+
+    fn sorted_lines(sort: Option<&PeerSort>) -> Vec<String> {
+        texts(&render_matrix_mode(
+            &sort_view_matrix(),
+            &History::new(0),
+            None,
+            100,
+            None,
+            GaugeMode::default(),
+            sort,
+        ))
+    }
+
+    #[test]
+    fn a_sorted_header_shows_its_direction_and_the_rows_follow_it() {
+        let by_load_desc = PeerSort {
+            column: PeerColumn::Load,
+            descending: true,
+        };
+        let lines = sorted_lines(Some(&by_load_desc));
+        assert!(lines[1].contains("load ▼"), "{lines:?}");
+        assert!(!lines[1].contains("disk ▼"), "{lines:?}");
+        let (b, a) = (
+            lines.iter().position(|l| l.contains("peer-b")),
+            lines.iter().position(|l| l.contains("peer-a")),
+        );
+        assert!(b < a, "2.5 before 0.5 when descending: {lines:?}");
+
+        let by_name_asc = PeerSort {
+            column: PeerColumn::Name,
+            descending: false,
+        };
+        let lines = sorted_lines(Some(&by_name_asc));
+        assert!(lines[1].trim_start().starts_with("name ▲"), "{lines:?}");
+        assert!(lines[2].contains("ALL"), "ALL stays first: {lines:?}");
+    }
+
+    #[test]
+    fn an_unsorted_matrix_has_no_sort_marks_and_keeps_its_default_order() {
+        let lines = sorted_lines(None);
+        assert!(!lines.iter().any(|l| l.contains('▲') || l.contains('▼')));
+        assert_eq!(sorted_lines(None), lines);
+    }
+
+    #[test]
+    fn a_provider_header_marks_the_sorted_provider() {
+        let by_zen = PeerSort {
+            column: PeerColumn::Provider("zen".to_owned()),
+            descending: true,
+        };
+        let lines = sorted_lines(Some(&by_zen));
+        assert!(lines[1].contains("zen ▼"), "{lines:?}");
     }
 }

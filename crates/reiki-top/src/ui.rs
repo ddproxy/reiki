@@ -20,7 +20,7 @@ use ratatui::style::{Color, Modifier, Style as RatStyle};
 use ratatui::text::{Line as RatLine, Span as RatSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::matrix::UsageMetric;
+use crate::matrix::{PeerColumn, PeerSort, UsageMetric};
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
@@ -51,6 +51,8 @@ const MATRIX_KEYS: &[&str] = &[
     "m   chart: load, disk, sessions, requests",
     "s   requests chart: overlaid series or stacked total",
     "a   jump back to ALL (the fleet row)",
+    "o or O   sort the peers by the next or previous column; past the last, unsorted",
+    "r   reverse the sort",
     "p   freeze the screen; again to resume",
     "v or E   full text view",
     "t   read-only Streams view",
@@ -121,6 +123,13 @@ pub enum Action {
     SelectFleet,
     /// Opens or closes the key list.
     ToggleHelp,
+    /// Sorts the matrix by the next column, or unsorted after the last. Needs the matrix's
+    /// columns, so the caller applies it with [`UiState::cycle_sort`].
+    SortNext,
+    /// Sorts the matrix by the previous column, or unsorted before the first.
+    SortPrev,
+    /// Flips the matrix sort's direction. A no-op while the rows are unsorted.
+    SortReverse,
 }
 
 /// What the matrix chart plots. Load is the default.
@@ -200,6 +209,11 @@ pub struct UiState {
     pub stream_row: Option<usize>,
     /// Whether the key list is open over the frame.
     pub help: bool,
+    /// The matrix sort. `None` keeps the default order.
+    pub peer_sort: Option<PeerSort>,
+    /// The peer under the cursor, by name. `selected` is its position in the last order the
+    /// caller resolved, so a refresh or re-sort moves the cursor with the peer.
+    pub selected_peer: Option<String>,
 }
 
 /// The last top line that still fills the viewport, or the last line when the viewport is
@@ -260,6 +274,43 @@ impl UiState {
         self.scroll = 0;
     }
 
+    /// Steps the matrix sort through `columns` and then back to unsorted, ascending on each
+    /// column. `forward` is `o`; the reverse step is `O`. A sort on a column that is no longer
+    /// listed counts as unsorted, so the next step lands on the first column.
+    pub fn cycle_sort(&mut self, columns: &[PeerColumn], forward: bool) {
+        if columns.is_empty() {
+            return;
+        }
+        // Slot 0 is unsorted; slot n is `columns[n - 1]`.
+        let slots = columns.len() + 1;
+        let current = self.peer_sort.as_ref().map_or(0, |sort| {
+            columns
+                .iter()
+                .position(|c| *c == sort.column)
+                .map_or(0, |i| i + 1)
+        });
+        let next = if forward {
+            (current + 1) % slots
+        } else {
+            (current + slots - 1) % slots
+        };
+        self.peer_sort = (next > 0).then(|| PeerSort {
+            column: columns[next - 1].clone(),
+            descending: false,
+        });
+    }
+
+    /// Flips the sort's direction. Returns false while the rows are unsorted.
+    pub fn reverse_sort(&mut self) -> bool {
+        match self.peer_sort.as_mut() {
+            Some(sort) => {
+                sort.descending = !sort.descending;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Applies one key action. Returns false only for [`Action::Quit`]; a false return leaves
     /// the state untouched. Scroll is clamped to the last line, so any view size is safe.
     pub fn apply(&mut self, action: Action, total_lines: usize, viewport: usize) -> bool {
@@ -309,6 +360,8 @@ impl UiState {
                 self.scroll = 0;
             }
             Action::ToggleHelp => self.help = !self.help,
+            // The matrix columns live in the caller; it calls `cycle_sort` and `reverse_sort`.
+            Action::SortNext | Action::SortPrev | Action::SortReverse => {}
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
         true
@@ -344,6 +397,9 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Char('m') => Action::CycleChart,
         KeyCode::Char('s') => Action::ToggleStack,
         KeyCode::Char('a') => Action::SelectFleet,
+        KeyCode::Char('o') => Action::SortNext,
+        KeyCode::Char('O') => Action::SortPrev,
+        KeyCode::Char('r') => Action::SortReverse,
         KeyCode::Char('?') => Action::ToggleHelp,
         _ => return None,
     };
@@ -1345,6 +1401,11 @@ mod tests {
             chart_usage: UsageMetric::Tokens,
             stream_row: Some(1),
             help: true,
+            peer_sort: Some(PeerSort {
+                column: PeerColumn::Load,
+                descending: true,
+            }),
+            selected_peer: Some("peer-b".to_owned()),
         };
         let before = state.clone();
         assert!(!state.apply(Action::Quit, 10, 3));
@@ -1524,6 +1585,21 @@ mod tests {
                 KeyModifiers::NONE,
                 Some(Action::SelectFleet),
             ),
+            (
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+                Some(Action::SortNext),
+            ),
+            (
+                KeyCode::Char('O'),
+                KeyModifiers::NONE,
+                Some(Action::SortPrev),
+            ),
+            (
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                Some(Action::SortReverse),
+            ),
         ];
         for (code, modifiers, expected) in cases {
             let event = KeyEvent::new(code, modifiers);
@@ -1562,6 +1638,95 @@ mod tests {
         assert!(
             fw_tui::text::display_width(HINTS_MATRIX) <= 98,
             "fits the panel"
+        );
+    }
+
+    fn sort_columns() -> Vec<PeerColumn> {
+        vec![PeerColumn::Name, PeerColumn::Version, PeerColumn::Load]
+    }
+
+    #[test]
+    fn o_steps_through_the_columns_and_back_to_unsorted() {
+        let columns = sort_columns();
+        let mut state = UiState::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            state.cycle_sort(&columns, true);
+            seen.push(state.peer_sort.clone());
+        }
+        let sort = |column: PeerColumn| {
+            Some(PeerSort {
+                column,
+                descending: false,
+            })
+        };
+        assert_eq!(
+            seen,
+            [
+                sort(PeerColumn::Name),
+                sort(PeerColumn::Version),
+                sort(PeerColumn::Load),
+                None,
+            ],
+        );
+    }
+
+    #[test]
+    fn capital_o_steps_backwards_and_starts_from_the_last_column() {
+        let columns = sort_columns();
+        let mut state = UiState::default();
+        state.cycle_sort(&columns, false);
+        assert_eq!(
+            state.peer_sort.as_ref().map(|s| &s.column),
+            Some(&PeerColumn::Load)
+        );
+        state.cycle_sort(&columns, false);
+        assert_eq!(
+            state.peer_sort.as_ref().map(|s| &s.column),
+            Some(&PeerColumn::Version)
+        );
+        state.cycle_sort(&columns, false);
+        assert_eq!(
+            state.peer_sort.as_ref().map(|s| &s.column),
+            Some(&PeerColumn::Name)
+        );
+        state.cycle_sort(&columns, false);
+        assert_eq!(state.peer_sort, None);
+    }
+
+    #[test]
+    fn a_sort_on_a_vanished_column_steps_from_unsorted() {
+        let mut state = UiState {
+            peer_sort: Some(PeerSort {
+                column: PeerColumn::Provider("gone".to_owned()),
+                descending: true,
+            }),
+            ..UiState::default()
+        };
+        state.cycle_sort(&sort_columns(), true);
+        assert_eq!(
+            state.peer_sort,
+            Some(PeerSort {
+                column: PeerColumn::Name,
+                descending: false,
+            }),
+        );
+    }
+
+    #[test]
+    fn r_reverses_the_sort_and_does_nothing_while_unsorted() {
+        let mut state = UiState::default();
+        assert!(!state.reverse_sort(), "nothing to reverse");
+        assert_eq!(state.peer_sort, None);
+        state.cycle_sort(&sort_columns(), true);
+        assert!(state.reverse_sort());
+        assert!(state.peer_sort.as_ref().is_some_and(|s| s.descending));
+        assert!(state.reverse_sort());
+        assert!(state.peer_sort.as_ref().is_some_and(|s| !s.descending));
+        state.cycle_sort(&sort_columns(), true);
+        assert!(
+            state.peer_sort.as_ref().is_some_and(|s| !s.descending),
+            "moving to a column sorts it ascending"
         );
     }
 

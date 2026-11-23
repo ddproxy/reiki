@@ -1,15 +1,38 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 (unreleased)
+
+The opt-in features introduced in 0.14.0 — the multi-stream gateway with admission limits, dynamic streams with a hash-chained audit log, the `plugin-wasm` runtime host and `plugin-cost` estimates — now have operator documentation that is checked against the binary. Their behavior is unchanged here; see the 0.14.0 entries below for the original feature and behavior changes. `Cargo.toml` is intentionally still at 0.14.0.
+
+### Added
+
+- Dynamic stream runbook: create, show, rotate and revoke tokens, expiry and TTL ceilings, assignable keys and limits, offline audit verification, and backup/restore of the state file, JSONL audit log and its `audit.head` sidecar. Every command is checked against the CLI definitions. See [dynamic streams](docs/dynamic-streams.md).
+- Install and operations pages covering the tuishou one-liner's status, the manual install path that works today, release verification, upgrade and rollback, exact failure messages, logs, health checks, and the mode and location of key, state and audit files.
+- A checked quickstart in the README with expected `check`, key-table and proof output, plus a documentation test that replays the wrong-token proof and the `keys` and `failures` commands against a throwaway instance.
+- `make docs-check`, `tests/docs_examples.rs` and a CI job that validate documented TOML with `reiki check`, CLI flags with help output, config keys with the docs, local links and anchors, and the README proof.
+- `AGENTS.md` with commands, repo map, conventions and stable exit codes, and `llms.txt` as a short docs index.
+
+### Changed
+
+- The README and docs follow one template: proof-first quickstart, how it works, configuration, operating, security model, compatibility matrix, limits and non-goals, development and links. The docs index lists every page, including the new install, operations and dynamic stream pages.
+- Upgrade notes spell out the new keys and defaults, fail-closed behavior, the state directory beside `<config>.state`, mode `0600` files, and the audit log and sidecar names.
+- Stream administration is cross-linked from configuration, CLI, keys and monitoring docs; static and dynamic stream controls are described with the same vocabulary.
 
 ### Fixed
 
 - Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
 - Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.
+- Corrected stale documentation links and version strings, and clarified that a failed audit append refuses the management mutation instead of silently continuing.
+
+### Security
+
+- Documentation only: spell out that stream management uses a dedicated token with optional two-party confirmation, that state and audit files are mode `0600` and hold hashes rather than raw tokens, and that a failed audit write fails closed.
+- Clarify the trust boundary: gateway counter failures refuse with `503` under the default `[gateway] on_store_error = "closed"`, native plugins are trusted in-process code, and runtime Wasm plugins are sandboxed behind `plugin-wasm`. No behavior changed in this release.
 
 ### Tests
 
 - Added config validation edge cases for token hashes, duplicates, rate limits, chains, reserved names, admin credentials, listener collisions and auth bounds.
+- Added documentation checks for config snippets, new keys and flags, local links and anchors, and the README proof against a live throwaway instance.
 
 ## 0.14.0
 ### Added

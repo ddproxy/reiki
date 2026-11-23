@@ -106,8 +106,10 @@ Reload can only narrow. Widening requires restart.
   requires restart.
 - `tool_allowlist` tightening is live; removing it or adding allowed tools
   requires restart.
-- New Wasm bytes/hash: live when no high-risk grant is present; high-risk grants
-  require restart/confirm flow as configured.
+- New Wasm bytes/hash: live when every grant has `risk() == "low"`; any new
+  medium- or high-risk grant requires restart. `confirm` does not change that
+  rule; it only forces restart when a previously present confirm value changes
+  or is removed.
 
 ### Request-side tool allowlist
 

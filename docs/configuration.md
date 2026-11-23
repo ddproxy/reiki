@@ -28,7 +28,7 @@ Conventions in this page:
 | `[tunnel.intercept]` | TLS interception for tunnelled hosts | no |
 | `[peers]` | Health sharing between instances | no |
 | `[peers.NAME]` | A peer whose health `reiki peers` reads | no |
-| `[plugins.NAME]` | A compiled-in plugin | no |
+| `[plugins.NAME]` | A compiled-in plugin, or a runtime Wasm component with `plugin-wasm` | no |
 | `[plugins.cost]` | Opt-in estimated spend from operator prices; needs `plugin-cost` | no |
 | `[hubs.NAME]`, `[hub]`, `[accounts.LABEL]` | Hub configuration; see [hub](hub.md) | no |
 
@@ -48,14 +48,10 @@ Client, admin and tunnel addresses must differ from each other. A publishing pee
 
 ## Top level
 
-| Key | Type | Default | Meaning | Since |
-| --- | --- | --- | --- | --- |
-| `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. | |
-| `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits; execute bits do not matter. Set to `false` to accept it with a warning instead. | |
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. |
-| `strict_key_permissions` | bool | `true` | Refuse to load a key file that is readable or writable by group or others. Set to `false` to accept it with a warning instead. |
+| `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits; execute bits do not matter. Set to `false` to accept it with a warning instead. |
 
 ## `[admin]`
 
@@ -76,7 +72,6 @@ Required keys:
 | --- | --- | --- | --- |
 | `audit_log` | string | required | Append-only JSONL audit file, a relative name ending in `.jsonl` in the state directory (the directory holding `<config>.state`). Reiki also keeps a small `audit.head` sidecar beside it with the last sequence number and hash. Must differ from `state_file`. Management fails closed when a record cannot be written. |
 | `max_streams` | integer | required | Hard cap on dynamic streams. Range 1 to 10000. |
-| `allowed_keys` | table of tables | required | Key labels from `[keys.*]` the API may assign. Each `[stream_admin.allowed_keys.NAME]` entry must set `assignable = true`; an unknown key or `false` is a config error. The API never creates keys. |
 | `ceilings` | table | required | Upper bounds for every dynamic stream; see below. Each present field must be at least 1. |
 | `allowed_listen` | array of strings | required | Literal loopback `IP:port` values where these routes may be served. Must contain the configured `[admin].listen` exactly; hostnames such as `localhost:4098` are refused. |
 | `token_sha256` | string | required | SHA-256 hex of the dedicated stream-management token, 64 characters. Must differ from `[admin].token_sha256`, every stream token and every two-party confirmation hash. Make it with `reiki hash-token`. |
@@ -97,11 +92,12 @@ Optional keys:
 | --- | --- | --- | --- |
 | `token_env` | string | `"REIKI_STREAM_ADMIN_TOKEN"` | Environment variable the CLI reads the raw token from. The token is never a CLI argument. |
 | `confirm_env` | string | `"REIKI_STREAM_ADMIN_CONFIRM_TOKEN"` | Environment variable holding the second token when `require_two_party` is set. Must differ from `token_env`. |
+| `allowed_keys` | table of tables | `{}` | Key labels from `[keys.*]` the API may assign. Each `[stream_admin.allowed_keys.NAME]` entry must set `assignable = true`; an unknown key or `false` is a config error. An empty table means no key can be assigned, so stream creation is refused. The API never creates keys. |
 | `state_file` | string | `"stream-admin.json"` | Relative name ending in `.json` in the state directory. Written atomically with mode `0600`. |
 | `max_tokens_per_stream` | integer | `3` | Maximum tokens per dynamic stream, including the first one. Range 1 to 100. |
 | `default_ttl` | integer | `3600` | Token lifetime in seconds when a request omits `ttl`. At least 1 and no greater than `max_ttl`. |
 | `max_ttl` | integer | `86400` | Hard cap on token lifetime in seconds. At most 2592000 (30 days). |
-| `default_limits` | table | unset | Limits for new streams unless the request provides its own. Uses the same fields as `[streams.NAME.limits]`; each present numeric limit must stay within the matching `ceilings`. |
+| `default_limits` | table | unset | Limits checked against `ceilings` at config load, but not applied to new streams by the current code. CLI-created streams start without per-stream limits; the HTTP create route can send its own `limits`, and `reiki streams update` can set `rpm` and `tpm`. Uses the same fields as `[streams.NAME.limits]`. |
 | `require_two_party` | array of strings | `[]` | Extra SHA-256 token hashes whose bearer must send `X-Confirm-Token` on every mutation. Hashes must be unique and differ from the admin, stream-management and actor hashes. |
 | `max_body_bytes` | integer | `16384` | Largest management request body. Range 1024 to 1048576. |
 | `lockout_threshold` | integer | `5` | Failed attempts from one source before a lockout. At least 1. |
@@ -417,7 +413,7 @@ Peer names use letters, digits, `-`, `_` and `.`, at most 64 characters. See [pe
 
 ## `[plugins.NAME]`
 
-Each `[plugins.NAME]` table turns on a plugin that is compiled into the binary. A name that is not compiled in is an error at startup. Plugin order is set at build time. See [plugins](plugins.md).
+Each `[plugins.NAME]` table turns on a compiled-in plugin; without `plugin-wasm`, a name that is not compiled in is an error at startup. With `plugin-wasm`, a table that sets `wasm` and `sha256` loads a runtime component at the fixed D5 slot. Compiled-in plugin order is set at build time. See [plugins](plugins.md) and [Wasm plugins](wasm-plugins.md).
 
 Keys that every plugin accepts:
 
@@ -527,22 +523,17 @@ Rules, by section:
 - **Upstream limits.** The table sets a preset or a limit. `max_wait_secs` is 1 to 120. The preset name is known.
 - **Upstream forward.** Exactly one of `command` or `socket`. `args`, `pass_env` and `max_concurrent` apply only to `command`. `expect_uid` applies only to `socket`. `socket` is an absolute path of at most 103 bytes, in a directory that group and others cannot write unless it has the sticky bit, or with `expect_uid` set. `max_stream_bytes` and `stream_timeout_secs` are at least 1 when set. `send_keep_alive`, `http2` and `title_case_headers` are refused.
 - **Upstream fallback.** Not on a passthrough upstream. The target exists, is not this upstream, and has valid aliases.
-<<<<<<< ours
-- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, is not empty and holds at least 8 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
+- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, and holds 8 to 4096 bytes after trimming. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
 - **Gateway.** `usage_rpm` is 1 to 3600 and `on_store_error` is `closed` or `open`.
 - **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `weight` is at least 1. Every limit in `[streams.NAME.limits]` is positive, `period_zone` is `UTC` or a fixed offset, and `on_store_error` is `closed` or `open`. Allowlist patterns use only `*` and `?`. If an upstream falls back, the chain holds a key for the target.
-=======
-- **Keys.** The upstream exists and is not passthrough. `quota_resets` parses. Each key file exists, is readable, and holds 8 to 4096 bytes. Unless `strict_key_permissions = false`, it must have no group or other read or write bits.
-- **Streams.** Every chain entry is a known key. The chain is not empty. `token_sha256` is 64 hex characters and unique. The name `passthrough` is not used. `rate_limit_per_minute` is at least 1. If an upstream falls back, the chain holds a key for the target.
->>>>>>> theirs
 - **Admin.** `token_sha256` is 64 hex characters and not the same as a stream token. `listen` is a literal loopback IP and port; hostnames are refused.
 - **Stream admin.** Needs `[admin]`; `allowed_listen` contains that literal loopback address. Both hashes are 64 hex characters and distinct from each other, the admin and stream tokens, and the two-party hashes. Environment variable names are valid and differ; file names are relative with the required suffix and differ. Ranges: `max_streams` 1 to 10000, `max_tokens_per_stream` 1 to 100, `default_ttl` at least 1 and no greater than `max_ttl` (at most 2592000), `max_body_bytes` 1024 to 1048576, `lockout_secs` 1 to 86400, and `lockout_threshold` and `rpm` at least 1. Every `allowed_keys` entry names a known key and sets `assignable = true`; each present ceiling is positive, and `default_limits` stay within the ceilings.
 - **Tunnel.** `allow` is not empty and every entry is valid. `connect_timeout_secs` is at least 1. Each intercepted host is unique, valid, covered by `allow`, and served by an upstream and stream that match.
 - **Peers.** Each numeric setting is in range. `session_header` is a lowercase header that is not a credential header. `instance` is a valid name. Each token name and hash is valid and unique. Each `allowed_urls` entry is a plain base URL without credentials, query or fragment. Each `[peers.NAME]` has a valid URL and `token_file`, matches `allowed_urls` when that list is set, and does not point at one of this instance's literal loopback listeners. An `https` peer has `ca_file`. Publishing needs `listen` and at least one token. `tls_cert` and `tls_key` are both set or both unset. Invalid URLs are reported without echoing them, so credentials in a malformed URL cannot reach logs.
-- **Plugins.** The plugin is compiled in. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`. `cost` needs at least one price table, a shared uppercase currency label, decimal string prices and budgets, and a `report` or `block` value for `on_exceed`.
+- **Plugins.** The plugin is compiled in, or is a runtime Wasm component when `plugin-wasm` is enabled and the table sets `wasm`. `enabled` is a boolean. `on_error` is `pass_through` or `reject`. Each `streams` entry names a configured stream or `passthrough`. The plugin's own settings are valid. `requestlog` refuses `body = "full"` or `response = "body"` unless `capture_bodies = true`. `cost` needs at least one price table, a shared uppercase currency label, decimal string prices and budgets, and a `report` or `block` value for `on_exceed`.
 - **Hub.** Only with the `hub` feature. Names, URLs and token hashes are valid, edge tokens are unique and differ from every other credential, accounts and keys exist, and no key is used by two accounts.
-- **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature. A `[plugins.cost]` table needs the `plugin-cost` feature; cost is not in the default build.
+- **Build features.** A `[peers]` table needs the `peers` feature. Any hub table needs the `hub` feature. A `[plugins.cost]` table needs the `plugin-cost` feature; cost is not in the default build. A `[plugins.NAME]` table with `wasm` needs `plugin-wasm`; the component is pinned by `sha256` and loaded at the fixed D5 plugin slot.
 
-Startup also fails when a key file cannot be read or is too short. `reiki check` reports the same failures.
+Startup also fails when a key file cannot be read, or is shorter than 8 or longer than 4096 bytes after trimming. `reiki check` reports the same failures.
 
 See also: [cli](cli.md) for the commands that read this file, and [security](security.md) for the trust boundaries these settings draw.

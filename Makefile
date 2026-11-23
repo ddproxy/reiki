@@ -1,4 +1,4 @@
-.PHONY: help build install uninstall du clean clean-debug clean-release clean-stale
+.PHONY: help build install uninstall test lint check docs-check ci du clean clean-debug clean-release clean-stale
 
 # root installs to /usr/local, anyone else to ~/.local; override with PREFIX=
 PREFIX ?= $(if $(filter 0,$(shell id -u)),/usr/local,$(HOME)/.local)
@@ -19,6 +19,26 @@ install: build  ## build and install reiki into PREFIX/bin (~/.local, or /usr/lo
 
 uninstall:  ## remove the installed binary
 	rm -f '$(DESTDIR)$(BINDIR)/reiki'
+
+fmt:  ## check Rust formatting
+	cargo fmt --all --check
+
+lint:  ## fmt check plus clippy with warnings denied, default and top features
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --locked --features top -- -D warnings
+
+test:  ## workspace tests, default and top features
+	cargo test --locked --workspace
+	cargo test --locked --workspace --features top
+
+check:  ## compile every target without running tests
+	cargo check --workspace --all-targets --locked
+
+docs-check:  ## validate documented config examples, CLI flags and links
+	cargo test --locked --test docs_examples
+
+ci: check lint test docs-check  ## everything CI runs
 
 du:  ## show target/ size breakdown (debug/release/musl), biggest first
 	@du -sh target/* 2>/dev/null | sort -rh || echo "no target/ yet"

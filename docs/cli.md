@@ -12,7 +12,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by `check`, server mode, `keys`, `failures`, `reload`, `peers` and `top`. `hash-token`, `ca-init` and `scan` do not read it. |
+| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by `check`, server mode, `keys`, `failures`, `reload`, `streams`, `peers`, `top` and `cost` (when `--url` is omitted). `hash-token`, `ca-init` and `scan` do not read it. |
 | `--listen ADDR` | from `listen` in the config | Client listen address. Used by server mode and `check`. Other commands ignore it. |
 
 ### Environment
@@ -20,7 +20,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 | Variable | Used by | Meaning |
 | --- | --- | --- |
 | `REIKI_LISTEN` | server mode, `check` | Client listen address. Overridden by `--listen`; overrides `listen` in the config. |
-| `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. |
+| `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top`, `cost` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. `streams` uses the separate `REIKI_STREAM_ADMIN_TOKEN` by default. |
 | `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup and after reload. |
 
 `--listen` and `REIKI_LISTEN` accept an `IP:port` address or a `host:port` name.
@@ -284,7 +284,7 @@ reiki streams [--url URL] [--token-file PATH] [--reason TEXT] [--idempotency-key
 | `audit verify FILE` | Verify a JSONL audit log, its hash chain and its sibling `audit.head` sidecar offline. |
 | `audit head FILE [--n N]` | Print the first `N` audit records (default 10) offline. |
 
-`--reason` is required for every mutation and is written to the audit log; `--idempotency-key` is generated when omitted. With two-party confirmation configured, the second raw token is read from `confirm_env`. `audit` needs no running instance and no token, but both audit commands require the sibling `audit.head` sidecar next to the JSONL file. Exit `0` on success, `1` when the API refuses a request, and `2` for a usage, config, transport or audit-verification error. There is no CLI delete command and no audit HTTP route. See [monitoring](monitoring.md#stream-administration-routes).
+`--reason` is required for every mutation and is written to the audit log; `--idempotency-key` is generated when omitted. With two-party confirmation configured, the second raw token is read from `confirm_env`. `audit` needs no running instance or token; the JSONL file must exist. Verification also reads the sibling `audit.head` sidecar when one is present. Without it, a non-empty chain is refused, while an empty log verifies as zero records. Exit `0` on success, `1` when the API refuses a request, and `2` for a usage, config, transport or audit-verification error. There is no CLI delete command and no audit HTTP route. See [monitoring](monitoring.md#stream-administration-routes).
 
 ## failures
 
@@ -333,7 +333,7 @@ reiki cost export --period YYYY-MM --format csv|json [--url URL] [--token-file P
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--period YYYY-MM` | current UTC month | Period to export. The endpoint also accepts day and hour periods; this command requires a month. |
+| `--period PERIOD` | current UTC month | UTC period to export: `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH`. |
 | `--format` | `json` | `csv` or `json`. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. Never pass the token as an argument. |

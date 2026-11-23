@@ -13,9 +13,12 @@ mod cost;
 pub use cost::{CostTotals, LocalCost};
 
 pub mod matrix;
+pub mod streams;
 #[cfg(feature = "tui")]
 pub mod ui;
 pub mod view;
+
+use streams::StreamsView;
 
 /// One peer's health plus when this host received it.
 #[derive(Debug, Clone)]
@@ -39,6 +42,10 @@ pub struct Fleet {
     local_failures: HashMap<String, Vec<Failure>>,
     /// Estimated spend from the local admin listener. Never accepted from peers.
     local_cost: Option<LocalCost>,
+    /// Read-only stream console from the local admin listener. Never accepted from peers.
+    local_streams: Option<StreamsView>,
+    /// Why the local stream console could not be refreshed, if it could not.
+    streams_error: Option<String>,
 }
 
 /// One upstream row of the provider summary: counts summed over every fresh peer.
@@ -78,6 +85,8 @@ impl Fleet {
             errors: HashMap::new(),
             local_failures: HashMap::new(),
             local_cost: None,
+            local_streams: None,
+            streams_error: None,
         }
     }
 
@@ -89,6 +98,28 @@ impl Fleet {
     /// The local instance's estimated cost summary, when its admin listener provided one.
     pub fn local_cost(&self) -> Option<&LocalCost> {
         self.local_cost.as_ref()
+    }
+
+    /// Replaces the local read-only stream console and clears its last refresh error.
+    pub fn set_local_streams(&mut self, streams: StreamsView) {
+        self.local_streams = Some(streams);
+        self.streams_error = None;
+    }
+
+    /// The local stream console, when the admin listener provided one.
+    pub fn local_streams(&self) -> Option<&StreamsView> {
+        self.local_streams.as_ref()
+    }
+
+    /// Records why the local stream console could not be refreshed. The last good snapshot stays
+    /// on screen, so a transport failure degrades the view instead of clearing it.
+    pub fn set_streams_error(&mut self, error: impl Into<String>) {
+        self.streams_error = Some(error.into());
+    }
+
+    /// The last stream-console refresh error, if any.
+    pub fn streams_error(&self) -> Option<&str> {
+        self.streams_error.as_deref()
     }
 
     /// Replaces the full failure list for one published instance.

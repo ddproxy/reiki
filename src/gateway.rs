@@ -161,6 +161,9 @@ struct Inner {
     streams: BTreeMap<String, StreamState>,
     /// Concurrency is in memory only: a restart has no in-flight requests.
     active: BTreeMap<String, u32>,
+    /// Last admitted request per stream, as Unix seconds. Also in memory only: it is a live
+    /// freshness hint for the read-only stream console, not a durable counter.
+    last_used: BTreeMap<String, u64>,
     /// Weighted round-robin counts for contested keys, reset each minute.
     fair_epoch: i64,
     fair_served: BTreeMap<(String, String), u64>,
@@ -241,6 +244,9 @@ impl Gateway {
         }
         inner
             .streams
+            .retain(|name, _| config.streams.contains_key(name));
+        inner
+            .last_used
             .retain(|name, _| config.streams.contains_key(name));
         inner
             .usage_minute
@@ -564,6 +570,9 @@ impl Gateway {
             state.tokens_total = state.tokens_total.saturating_add(estimate);
         }
         *inner.active.entry(stream.to_owned()).or_default() += 1;
+        inner
+            .last_used
+            .insert(stream.to_owned(), second.max(0) as u64);
         inner.dirty = true;
         drop(inner);
 
@@ -584,6 +593,16 @@ impl Gateway {
     /// All durable counters, for the admin view.
     pub fn all_states(&self) -> BTreeMap<String, StreamState> {
         self.lock().streams.clone()
+    }
+
+    /// Requests currently in flight for one stream.
+    pub fn active_count(&self, stream: &str) -> u32 {
+        self.lock().active.get(stream).copied().unwrap_or_default()
+    }
+
+    /// Unix seconds of the last admitted request, when the stream has served one this process.
+    pub fn last_used(&self, stream: &str) -> Option<u64> {
+        self.lock().last_used.get(stream).copied()
     }
 
     /// True when a write is pending, so the caller can wake the state writer.
@@ -1297,6 +1316,22 @@ mod tests {
         );
         assert_eq!(gateway.store_errors(), 1);
         assert_eq!(gateway.stream_state("s").requests_total, 1);
+    }
+
+    #[test]
+    fn live_usage_tracks_last_use_and_in_flight_requests() {
+        let config = stream("");
+        let gateway = Gateway::new();
+        assert_eq!(gateway.last_used("s"), None);
+        assert_eq!(gateway.active_count("s"), 0);
+        let mut permit = gateway
+            .admit(&config, "s", "zen", "k1", Some("m"), now(), 10)
+            .expect("admission succeeds");
+        assert!(gateway.last_used("s").is_some_and(|second| second > 0));
+        assert_eq!(gateway.active_count("s"), 1);
+        permit.complete(10);
+        assert_eq!(gateway.active_count("s"), 0);
+        assert!(gateway.last_used("s").is_some());
     }
 
     #[test]

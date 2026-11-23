@@ -20,6 +20,8 @@ Without the feature the subcommand and its `--help` entry are absent.
 
 It needs `[peers] enabled = true` and at least one `[peers.NAME]` table, exactly as `reiki peers`; each entry must point at an instance that publishes health and at a token file that instance issued (see [peers](peers.md)).
 
+The Streams screen additionally uses the local instance's `[admin] listen` address and the ordinary admin token from `REIKI_ADMIN_TOKEN`, the same configuration as the local failure rows. It never reads or uses the separate stream-admin token (see [stream administration routes](monitoring.md#stream-administration-routes)).
+
 ## Use
 
 ```bash
@@ -99,6 +101,16 @@ The full recent-failure list is shown only for the local instance, and only when
 
 See [`GET /v1/failures`](monitoring.md#get-v1failures) for the fields and the `reiki failures` command.
 
+### Streams
+
+Press `t` to open a read-only view of the local instance's streams; `t` returns to the matrix. It reads [`GET /v1/stream-console`](monitoring.md#get-v1stream-console) with the ordinary admin token. A remote peer's stream names never enter this screen.
+
+The table lists every configured stream, static and dynamic, sorted by current request rate, then concurrency, then name. Its columns are `stream`, `type` (`static` or `dynamic`), `chain` (the upstream order), `expires` (countdown to the next live token), `rpm` and `conc` (current/limit, `-` for no limit), `last` (time since the last admitted request) and `state`. `j`/`k`, the arrows and `Tab`/`Shift-Tab` move the row selection.
+
+The detail pane shows the selected stream's numeric limits, then its credentials by short id with expiry and active/expired state, then recent audit records for that stream, newest first. Credential values, hashes, audit-chain hashes, file paths and the actor hash are never sent to the screen. `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll the detail.
+
+When `[stream_admin]` is not configured the screen says `stream_admin is disabled; dynamic streams and audit are unavailable` and keeps the static rows. A failed refresh shows a short reason and keeps the last good answer on screen; retries back off from the health poll interval to at most one minute. Without `[admin]` or `REIKI_ADMIN_TOKEN` the table says it is waiting for the local admin listener. Nothing on this screen can create, rotate or revoke a stream or a token.
+
 ### Keys
 
 In the matrix:
@@ -111,6 +123,7 @@ In the matrix:
 - `m`: cycle the chart metric: load, disk, sessions, requests. `s`: toggle the Requests chart between overlaid lines and a stacked total. `a`: select the `ALL` row and close the detail pane.
 - `c`: clear the provider filter and the selection, so the chart shows the fleet again.
 - `v` or `E`: switch to the full view.
+- `t`: open the read-only Streams view; `t` there returns to the matrix.
 - `p`: freeze the screen as a snapshot and show its age; updates keep arriving, and resuming shows the live view. The frozen snapshot keeps its sparklines.
 - `?`: list every key. Any key closes the list.
 - `q` or `Esc` quits.
@@ -119,7 +132,7 @@ In the full view (`v` or `--full`):
 
 - `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll.
 - `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
-- `p` freezes, `v` returns to the matrix, `?` lists the keys, `q` or `Esc` quits.
+- `p` freezes, `v` returns to the matrix, `t` opens Streams, `?` lists the keys, `q` or `Esc` quits.
 
 Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
 

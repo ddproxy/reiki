@@ -384,7 +384,7 @@ Exit codes:
 
 ## top
 
-A live terminal view of every peer's key health. The screen is a peers-by-providers matrix, with the selected peer's detail below it. See [top](top.md) for the screens and columns. This page lists the keys.
+A live terminal view of every peer's key health. The screen is a peers-by-providers matrix, with the selected peer's detail below it; `t` opens a read-only local Streams view. See [top](top.md) for the screens and columns. This page lists the keys.
 
 ```
 reiki top [--once] [--interval SECS] [--full] [--provider NAME]

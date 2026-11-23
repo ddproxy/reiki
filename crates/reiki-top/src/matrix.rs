@@ -1,6 +1,7 @@
 //! Pure model for the matrix view: peers x providers, no drawing. A peer that does not use a
 //! provider is `Absent`, never a failure, because peers publish different provider sets.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -545,9 +546,136 @@ fn merge_pressures(pressures: &[&Pressure]) -> Option<Pressure> {
     Some(out)
 }
 
+/// A column the matrix rows can be sorted by, in left-to-right display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerColumn {
+    Name,
+    /// A provider column, by upstream name. Sorts by requests in the last hour.
+    Provider(String),
+    Version,
+    Load,
+    Disk,
+    Sessions,
+}
+
+/// The matrix sort: a column and a direction. Without one the display order is the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSort {
+    pub column: PeerColumn,
+    pub descending: bool,
+}
+
+/// Every sortable column of `matrix`: the name, each provider, then version, load, disk and
+/// sessions.
+pub fn peer_columns(matrix: &Matrix) -> Vec<PeerColumn> {
+    let mut out = vec![PeerColumn::Name];
+    out.extend(
+        matrix
+            .columns
+            .iter()
+            .map(|c| PeerColumn::Provider(c.upstream.clone())),
+    );
+    out.extend([
+        PeerColumn::Version,
+        PeerColumn::Load,
+        PeerColumn::Disk,
+        PeerColumn::Sessions,
+    ]);
+    out
+}
+
+/// One row's value in a sorted column. Missing and unavailable values are `None`.
+enum Key {
+    Text(String),
+    Number(f64),
+}
+
+/// The row's value in `column`. Stale rows show no host figures, so their host values are
+/// unavailable too.
+fn peer_key(matrix: &Matrix, row: &Row, column: &PeerColumn) -> Option<Key> {
+    let fresh = |value: Option<f64>| (!row.stale).then_some(value).flatten().map(Key::Number);
+    match column {
+        PeerColumn::Name => Some(Key::Text(row.peer.clone())),
+        PeerColumn::Version => row.version.clone().map(Key::Text),
+        PeerColumn::Load => fresh(row.host.load1),
+        PeerColumn::Disk => fresh(row.host.disk_percent),
+        PeerColumn::Sessions => fresh(row.host.sessions.map(|n| n as f64)),
+        PeerColumn::Provider(upstream) => {
+            let idx = matrix
+                .columns
+                .iter()
+                .position(|c| &c.upstream == upstream)?;
+            let pressure = row.pressure.get(idx)?.as_ref()?;
+            Some(Key::Number(pressure.requests_1h as f64))
+        }
+    }
+}
+
+/// One run of text or of ASCII digits, for natural order.
+#[derive(PartialEq, Eq)]
+enum Chunk {
+    Text(String),
+    Digits(String),
+}
+
+fn natural_chunks(value: &str) -> Vec<Chunk> {
+    let mut out: Vec<Chunk> = Vec::new();
+    for ch in value.trim().chars() {
+        let digit = ch.is_ascii_digit();
+        match out.last_mut() {
+            Some(Chunk::Digits(run)) if digit => run.push(ch),
+            Some(Chunk::Text(run)) if !digit => run.extend(ch.to_lowercase()),
+            _ if digit => out.push(Chunk::Digits(ch.to_string())),
+            _ => out.push(Chunk::Text(ch.to_lowercase().collect())),
+        }
+    }
+    out
+}
+
+/// Case-insensitive natural order: `peer2` sorts before `peer10`. Matches the sort in fw-tui's
+/// table widget, so the two screens order names alike.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (x, y) = (natural_chunks(a), natural_chunks(b));
+    for (left, right) in x.iter().zip(&y) {
+        let order = match (left, right) {
+            (Chunk::Text(p), Chunk::Text(q)) => p.cmp(q),
+            (Chunk::Digits(p), Chunk::Digits(q)) => {
+                let (p, q) = (p.trim_start_matches('0'), q.trim_start_matches('0'));
+                p.len().cmp(&q.len()).then_with(|| p.cmp(q))
+            }
+            (Chunk::Text(_), Chunk::Digits(_)) => Ordering::Less,
+            (Chunk::Digits(_), Chunk::Text(_)) => Ordering::Greater,
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    x.len().cmp(&y.len())
+}
+
+/// Unavailable values sort last in both directions; the direction flips only real values.
+fn compare_keys(a: Option<&Key>, b: Option<&Key>, descending: bool) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let order = match (x, y) {
+                (Key::Text(p), Key::Text(q)) => natural_cmp(p, q),
+                (Key::Number(p), Key::Number(q)) => p.total_cmp(q),
+                _ => Ordering::Equal,
+            };
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// Display order: `ALL` first, then problem peers (stale, or any `Partial`/`Cooling`/`Disabled`
 /// cell), then by name. A peer with only `Absent` and `Healthy` cells is not a problem.
-pub fn order_peers(matrix: &Matrix) -> Vec<usize> {
+///
+/// With a sort, `ALL` still comes first and the peers follow the sort. Equal keys keep the
+/// default order in both directions, so ties never shuffle.
+pub fn order_peers(matrix: &Matrix, sort: Option<&PeerSort>) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..matrix.rows.len()).collect();
     idx.sort_by(|&a, &b| {
         let (ra, rb) = (&matrix.rows[a], &matrix.rows[b]);
@@ -555,6 +683,19 @@ pub fn order_peers(matrix: &Matrix) -> Vec<usize> {
             .cmp(&is_fleet_row(ra))
             .then_with(|| is_problem(rb).cmp(&is_problem(ra)))
             .then_with(|| ra.peer.cmp(&rb.peer))
+    });
+    let Some(sort) = sort else {
+        return idx;
+    };
+    let keys: Vec<Option<Key>> = matrix
+        .rows
+        .iter()
+        .map(|row| peer_key(matrix, row, &sort.column))
+        .collect();
+    idx.sort_by(|&a, &b| {
+        is_fleet_row(&matrix.rows[b])
+            .cmp(&is_fleet_row(&matrix.rows[a]))
+            .then_with(|| compare_keys(keys[a].as_ref(), keys[b].as_ref(), sort.descending))
     });
     idx
 }
@@ -1326,7 +1467,7 @@ mod tests {
             t0 - Duration::from_secs(95),
         );
         let m = Matrix::build(&f, &names(&["peer-a", "peer-b", "peer-c", "peer-d"]), t0);
-        let order = order_peers(&m);
+        let order = order_peers(&m, None);
         assert_eq!(
             order
                 .iter()
@@ -1635,7 +1776,7 @@ mod tests {
         let a = Matrix::build(&f, &peers, t0);
         let b = Matrix::build(&f, &peers, t0);
         assert_eq!(a, b);
-        assert_eq!(order_peers(&a), order_peers(&b));
+        assert_eq!(order_peers(&a, None), order_peers(&b, None));
     }
 
     #[test]
@@ -1804,7 +1945,7 @@ mod tests {
             },
             "first duplicate wins"
         );
-        assert_eq!(order_peers(&m).len(), 2);
+        assert_eq!(order_peers(&m, None).len(), 2);
         let mut h = History::new(0);
         h.push("peer-a", Sample::default());
         assert!(h.series("peer-a", Metric::Load1).is_empty());
@@ -2078,7 +2219,7 @@ mod tests {
         let m = Matrix::build_fleet(&f, &peers, t0);
         assert_eq!(m.rows.len(), 4);
         assert_eq!(m.rows[0].peer, FLEET_PEER);
-        assert_eq!(order_peers(&m)[0], 0, "ALL is the first display row");
+        assert_eq!(order_peers(&m, None)[0], 0, "ALL is the first display row");
         assert_eq!(m.fresh_counts(), (2, 3));
         assert!(!is_problem(&m.rows[0]));
         assert_eq!(m.columns[0].peers_with, 3, "tallies ignore ALL");
@@ -2184,5 +2325,192 @@ mod tests {
 
         let empty = Matrix::build_fleet(&f, &[], t0);
         assert!(usage_by_provider(&empty, UsageMetric::Requests).is_empty());
+    }
+
+    fn sort_row(peer: &str, load: Option<f64>, version: Option<&str>, stale: bool) -> Row {
+        Row {
+            peer: peer.to_owned(),
+            cells: Vec::new(),
+            combos: Vec::new(),
+            pressure: Vec::new(),
+            host: HostSummary {
+                load1: load,
+                disk_percent: None,
+                sessions: None,
+            },
+            version: version.map(str::to_owned),
+            error: None,
+            stale,
+            age: None,
+        }
+    }
+
+    fn sort_matrix(rows: Vec<Row>) -> Matrix {
+        Matrix {
+            columns: Vec::new(),
+            rows,
+            hidden_columns: 0,
+        }
+    }
+
+    fn sorted_names(m: &Matrix, sort: &PeerSort) -> Vec<String> {
+        order_peers(m, Some(sort))
+            .into_iter()
+            .map(|i| m.rows[i].peer.clone())
+            .collect()
+    }
+
+    fn by(column: PeerColumn, descending: bool) -> PeerSort {
+        PeerSort { column, descending }
+    }
+
+    #[test]
+    fn names_sort_naturally_and_ignore_case_with_all_pinned_first() {
+        let m = sort_matrix(vec![
+            sort_row("peer10", None, None, false),
+            sort_row("Peer2", None, None, false),
+            sort_row("alpha", None, None, false),
+            sort_row("peer1", None, None, false),
+            sort_row(FLEET_PEER, None, None, false),
+        ]);
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Name, false)),
+            ["ALL", "alpha", "peer1", "Peer2", "peer10"],
+        );
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Name, true)),
+            ["ALL", "peer10", "Peer2", "peer1", "alpha"],
+        );
+    }
+
+    #[test]
+    fn load_sorts_by_value_and_unavailable_values_go_last_in_both_directions() {
+        let m = sort_matrix(vec![
+            sort_row("peer-a", Some(1.5), None, false),
+            sort_row("peer-b", None, None, false),
+            sort_row("peer-c", Some(0.2), None, false),
+            sort_row("peer-d", Some(9.0), None, true),
+            sort_row("peer-e", Some(3.0), None, false),
+            sort_row(FLEET_PEER, Some(7.0), None, false),
+        ]);
+        // A stale peer shows no load, so it is unavailable. Unavailable rows keep the default
+        // order between themselves: the stale peer is a problem, so it comes first.
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Load, false)),
+            ["ALL", "peer-c", "peer-a", "peer-e", "peer-d", "peer-b"],
+        );
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Load, true)),
+            ["ALL", "peer-e", "peer-a", "peer-c", "peer-d", "peer-b"],
+        );
+    }
+
+    #[test]
+    fn equal_keys_keep_the_default_order_in_both_directions() {
+        let m = sort_matrix(vec![
+            sort_row("peer-b", Some(1.0), None, false),
+            sort_row(FLEET_PEER, None, None, false),
+            sort_row("peer-c", Some(1.0), None, false),
+            sort_row("peer-a", Some(1.0), None, false),
+        ]);
+        let expected = ["ALL", "peer-a", "peer-b", "peer-c"];
+        assert_eq!(sorted_names(&m, &by(PeerColumn::Load, false)), expected);
+        assert_eq!(sorted_names(&m, &by(PeerColumn::Load, true)), expected);
+    }
+
+    #[test]
+    fn versions_sort_naturally_and_a_missing_version_is_last() {
+        let m = sort_matrix(vec![
+            sort_row("peer-a", None, Some("0.10.3"), false),
+            sort_row("peer-b", None, None, false),
+            sort_row("peer-c", None, Some("0.9.0"), false),
+        ]);
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Version, false)),
+            ["peer-c", "peer-a", "peer-b"],
+        );
+        assert_eq!(
+            sorted_names(&m, &by(PeerColumn::Version, true)),
+            ["peer-a", "peer-c", "peer-b"],
+        );
+    }
+
+    #[test]
+    fn provider_columns_sort_by_requests_and_absent_usage_goes_last() {
+        let zen = Column {
+            upstream: "zen".to_owned(),
+            peers_with: 3,
+            healthy_peers: 3,
+        };
+        let usage = |requests_1h: u64| Pressure {
+            requests_1h,
+            limited_1h: 0,
+            tokens_1h: 0,
+            buckets: [0; 12],
+            minutes: None,
+            token_buckets: None,
+            token_minutes: None,
+        };
+        let mut a = sort_row("peer-a", None, None, false);
+        a.pressure = vec![Some(usage(5))];
+        let b = sort_row("peer-b", None, None, false);
+        let mut c = sort_row("peer-c", None, None, false);
+        c.pressure = vec![Some(usage(12))];
+        let m = Matrix {
+            columns: vec![zen],
+            rows: vec![a, b, c],
+            hidden_columns: 0,
+        };
+        let column = PeerColumn::Provider("zen".to_owned());
+        assert_eq!(
+            sorted_names(&m, &by(column.clone(), true)),
+            ["peer-c", "peer-a", "peer-b"],
+        );
+        assert_eq!(
+            sorted_names(&m, &by(column, false)),
+            ["peer-a", "peer-c", "peer-b"],
+        );
+    }
+
+    #[test]
+    fn a_column_the_matrix_lacks_leaves_the_default_order() {
+        let m = sort_matrix(vec![
+            sort_row("peer-b", None, None, false),
+            sort_row("peer-a", None, None, false),
+        ]);
+        let gone = by(PeerColumn::Provider("gone".to_owned()), false);
+        assert_eq!(sorted_names(&m, &gone), ["peer-a", "peer-b"]);
+    }
+
+    #[test]
+    fn peer_columns_follow_the_display_order() {
+        let m = Matrix {
+            columns: vec![
+                Column {
+                    upstream: "zen".to_owned(),
+                    peers_with: 1,
+                    healthy_peers: 1,
+                },
+                Column {
+                    upstream: "open".to_owned(),
+                    peers_with: 1,
+                    healthy_peers: 1,
+                },
+            ],
+            rows: Vec::new(),
+            hidden_columns: 0,
+        };
+        assert_eq!(
+            peer_columns(&m),
+            [
+                PeerColumn::Name,
+                PeerColumn::Provider("zen".to_owned()),
+                PeerColumn::Provider("open".to_owned()),
+                PeerColumn::Version,
+                PeerColumn::Load,
+                PeerColumn::Disk,
+                PeerColumn::Sessions,
+            ],
+        );
     }
 }

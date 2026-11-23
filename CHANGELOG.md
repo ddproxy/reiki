@@ -20,6 +20,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 
 ### Added
 
+- `reiki top` sorts the peer matrix by column: `o` and `O` step through the peer name, each provider (by requests in the last hour), version, load, disk and sessions, and back to the default order; `r` reverses the direction. The sorted header shows `▲` or `▼`, `ALL` stays first, and the cursor follows its peer through re-sorts and refreshes. The key list in `?` names the new keys. Streams is not sortable yet.
 - `reiki top` gains a read-only Streams screen (`t`) backed by the new ordinary-admin `GET /v1/stream-console` route. It shows static and dynamic streams sorted by usage, chains, limits, current rate/concurrency, expiries, last use and state, with token ids and a bounded redacted audit tail in the detail pane. It reuses `REIKI_ADMIN_TOKEN` and `[admin] listen`, never reads the stream-management token, says when `[stream_admin]` is disabled, keeps the last good answer on refresh failure with backoff, and offers no mutation keys. See [top](docs/top.md#streams), [monitoring](docs/monitoring.md#get-v1stream-console) and [keys](docs/keys.md#dynamic-stream-credentials).
 
 ### Fixed

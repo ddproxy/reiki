@@ -2,6 +2,15 @@
 
 Upgrade the binary, apply config, and verify health. Read [CHANGELOG.md](../CHANGELOG.md) first for behaviour changes and new keys.
 
+## Upgrading to 0.15.0
+
+0.15.0 adds no config key and does not change the binary version in `Cargo.toml` until the release is tagged. The keys below belong to the opt-in features introduced in 0.14.0; this release documents and checks them.
+
+- `[gateway]` has `on_store_error` (default `"closed"`) and `usage_rpm` (default `60`). A counter-store failure refuses admission with `503` under the default; `"open"` is an explicit fail-open choice. Per-stream `rate_limit_per_minute` is gone; use `[streams.NAME.limits]` with `rpm`, `tpm`, `concurrent`, daily/monthly budgets, `period_zone` and allowlists.
+- To enable dynamic streams, add `[stream_admin]` with `token_sha256`, `actor_id_sha256`, `audit_log`, `max_streams`, `ceilings` and `allowed_listen`. `allowed_keys` is optional but empty by default, which refuses stream creation until a configured key is marked `assignable = true`. Defaults: `token_env = "REIKI_STREAM_ADMIN_TOKEN"`, `confirm_env = "REIKI_STREAM_ADMIN_CONFIRM_TOKEN"`, `state_file = "stream-admin.json"`, `max_tokens_per_stream = 3`, `default_ttl = 3600`, `max_ttl = 86400`, `max_body_bytes = 16384`, `lockout_threshold = 5`, `lockout_secs = 900` and `rpm = 60`. `default_limits` is validated but not applied by current code.
+- Adding, removing or editing `[stream_admin]` needs a restart; a reload preview reports it in `restart_needed`. Management fails closed: a failed audit append or state write refuses the mutation, an invalid state file drops dynamic streams while static streams keep working, and `GET /v1/status` reports `stream_admin.state_error`.
+- The dynamic state file, audit JSONL and its `.head` sidecar live in the state directory beside `<config>.state`, are mode `0600`, and hold token hashes rather than raw tokens. Back up and restore all three as a set with the instance stopped; never truncate or rotate them under a running instance. See [state file](#state-file), [dynamic streams](dynamic-streams.md#backup-and-restore) and [configuration](configuration.md#stream_admin).
+
 Reiki does not load new binary code on reload. `SIGHUP`, `reiki reload`, `POST /v1/reload` and `[reload] watch` re-read the config and restart nothing. A reload builds the whole new state, including key files, plugin settings, tunnel policy, TLS material and the log level, before it swaps anything. A bad reload keeps the running state. Requests and tunnels already open keep the state they started with.
 
 ```bash

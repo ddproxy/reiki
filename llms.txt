@@ -1,0 +1,56 @@
+# Reiki
+
+Security proxy for agent and LLM traffic: isolates keys, filters what leaves, keeps access reliable.
+
+- [README](README.md): install, ten-minute proof, configuration, operations, limits and security model.
+- [AGENTS](AGENTS.md): build, test, lint, docs-check commands, repo map and conventions.
+- [Security policy](SECURITY.md): private reporting, supported versions and response targets.
+- [Changelog](CHANGELOG.md): release notes by version and section.
+
+## Start
+
+- [Documentation index](docs/README.md): the reading order and every page.
+- [Quickstart](docs/quickstart.md): proof-first setup with expected output and a negative test.
+- [Install](docs/install.md): tuishou one-liner status, manual install and verification.
+- [Overview](docs/overview.md): the model, listeners and request path.
+- [Architecture](docs/architecture.md): request flow, key states and source map.
+- [Glossary](docs/glossary.md): CLI and status vocabulary.
+- [Command line](docs/cli.md): every subcommand, flag and exit code.
+- [Configuration](docs/configuration.md): every table, field, default and validation rule.
+
+## Keys, traffic and providers
+
+- [Keys and streams](docs/keys.md): key files, hashes, chains and dynamic stream credentials.
+- [Providers](docs/providers.md): upstream mapping, provider status and test coverage.
+- [OpenCode](docs/opencode.md): base URL, token, proof check and bypasses.
+- [Claude Code](docs/claude-code.md): base URL, token, proof check and bypasses.
+- [Failover](docs/failover.md): chains and key states.
+- [Classification](docs/classification.md): response rules, cooldowns and client errors.
+- [Shaping](docs/shaping.md): outbound limits and stream admission.
+- [Dynamic streams](docs/dynamic-streams.md): operating the opt-in stream admin API, audit and backups.
+
+## Security and data
+
+- [Security](docs/security.md): assets, trust boundaries and fail-closed behavior.
+- [Limits and non-goals](docs/limits.md): what Reiki does not protect against.
+- [Redaction reference](docs/redaction.md): exact scrubbed forms.
+- [Plugins](docs/plugins.md): build-time plugin set and order.
+- [Plugin authoring](docs/plugin-authoring.md): hooks, tests and registration.
+- [Wasm plugins](docs/wasm-plugins.md): opt-in runtime plugin host and capabilities.
+- [Placeholders](docs/placeholders.md), [PHI](docs/phi.md), [Finance](docs/finance.md), [Controlled](docs/controlled.md), [Tool policy](docs/toolpolicy.md), [Cost](docs/cost.md): egress controls and opt-in accounting.
+- [Tunnel](docs/tunnel.md): opaque CONNECT and TLS interception.
+- [Request log](docs/requestlog.md): summary records and optional masked capture.
+
+## Operate
+
+- [Operations](docs/operations.md): upgrade, rollback, backup, restore, logs and health checks.
+- [Deploy](docs/deploy.md): install paths, directory layout, listeners and service unit.
+- [Upgrades](docs/upgrades.md): reload versus restart and state files.
+- [Monitoring](docs/monitoring.md): admin routes, status, metrics and cost endpoints.
+- [Peers](docs/peers.md) and [peers publishing](docs/peers-publishing.md): read-only health sharing.
+- [Top](docs/top.md): live fleet view.
+- [Troubleshooting](docs/troubleshooting.md): exact messages and fixes.
+- [FAQ](docs/faq.md): short answers.
+- [Examples](docs/examples.md): verified command output formats.
+- [Rollout](docs/rollout.md): observe first, then enforce.
+- [Security scanning](docs/security-scanning.md): repository checks and release verification.

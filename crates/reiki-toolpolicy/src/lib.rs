@@ -69,6 +69,10 @@ impl Plugin for ToolPolicy {
         true
     }
 
+    fn needs_final_response(&self) -> bool {
+        true
+    }
+
     fn uses_bodies(&self) -> bool {
         self.config.mode == Mode::Block
     }
@@ -119,9 +123,14 @@ impl Plugin for ToolPolicy {
         }
     }
 
-    fn on_response_chunk(&self, ctx: &mut ChunkCtx<'_>) {
+    fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {
+        // Leave the bytes for downstream plugins. The check runs on the host's final body, after
+        // placeholders have restored anything they changed.
+    }
+
+    fn on_final_response(&self, ctx: &mut ChunkCtx<'_>) {
         if let Some(state) = ctx.state.downcast_mut::<Session>() {
-            state.feed(ctx.chunk, ctx.is_last);
+            state.feed(ctx.chunk, true);
         }
     }
 
@@ -151,6 +160,7 @@ mod tests {
         assert_eq!(plugin.name(), NAME);
         assert!(!plugin.fails_closed());
         assert!(plugin.needs_response_hooks());
+        assert!(plugin.needs_final_response());
         assert!(!plugin.uses_bodies());
         assert_eq!(plugin.admin_paths(), [metrics::ADMIN_PATH]);
     }
@@ -199,6 +209,10 @@ mod tests {
             let mut ctx = ChunkCtx::new(&mut body, true, &mut *state);
             plugin.on_response_chunk(&mut ctx);
         }
+        {
+            let mut ctx = ChunkCtx::new(&mut body, true, &mut *state);
+            plugin.on_final_response(&mut ctx);
+        }
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
             text.contains("[toolpolicy] blocked tool call: run"),
@@ -233,6 +247,10 @@ mod tests {
         {
             let mut ctx = ChunkCtx::new(&mut body, true, &mut *state);
             plugin.on_response_chunk(&mut ctx);
+        }
+        {
+            let mut ctx = ChunkCtx::new(&mut body, true, &mut *state);
+            plugin.on_final_response(&mut ctx);
         }
         assert_eq!(&body[..], b"unrelated response");
     }

@@ -78,8 +78,8 @@ fn catalog(manifest: &str) -> Vec<Plugin> {
     parse_catalog(&text).unwrap_or_else(|e| fail(&format!("{manifest}: {e}")))
 }
 
-/// Rejects an order that logs before masking, and warns about orders that only weaken detection
-/// or leave `requestlog` without a masking plugin ahead of it.
+/// Rejects an order that logs before masking, checks before restoration, and warns about orders
+/// that only weaken detection or leave `requestlog` without a masking plugin ahead of it.
 fn check_order(chosen: &[&Plugin]) -> Result<Vec<String>, String> {
     let position = |name: &str| chosen.iter().position(|p| p.name == name);
     let placeholders = position("placeholders");
@@ -91,6 +91,14 @@ fn check_order(chosen: &[&Plugin]) -> Result<Vec<String>, String> {
                 "REIKI_PLUGINS puts `requestlog` before `placeholders`; placeholders must come first so logged bodies are masked"
                     .to_owned(),
             );
+    }
+    if let (Some(placeholders), Some(toolpolicy)) = (placeholders, position("toolpolicy"))
+        && toolpolicy < placeholders
+    {
+        return Err(
+            "REIKI_PLUGINS puts `toolpolicy` before `placeholders`; toolpolicy must run after restoration so it checks the final tool arguments"
+                .to_owned(),
+        );
     }
     let mut warnings = Vec::new();
     if let Some(requestlog) = requestlog
@@ -245,6 +253,7 @@ mod tests {
         let placeholders = plugin("placeholders");
         let requestlog = plugin("requestlog");
         let phi = plugin("phi");
+        let toolpolicy = plugin("toolpolicy");
 
         assert!(check_order(&[&placeholders]).unwrap().is_empty());
         assert!(
@@ -253,6 +262,17 @@ mod tests {
                 .is_empty()
         );
         assert!(check_order(&[&phi, &placeholders]).unwrap().is_empty());
+        assert!(
+            check_order(&[&placeholders, &toolpolicy])
+                .unwrap()
+                .is_empty()
+        );
+
+        let bad_toolpolicy = check_order(&[&toolpolicy, &placeholders]).unwrap_err();
+        assert!(
+            bad_toolpolicy.contains("toolpolicy` before `placeholders`"),
+            "{bad_toolpolicy}"
+        );
 
         let reversed = check_order(&[&requestlog, &placeholders]).unwrap_err();
         assert!(reversed.contains("before `placeholders`"), "{reversed}");

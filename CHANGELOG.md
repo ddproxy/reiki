@@ -11,12 +11,15 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - A checked quickstart in the README with expected `check`, key-table and proof output, plus a documentation test that replays the wrong-token proof and the `keys` and `failures` commands against a throwaway instance.
 - `make docs-check`, `tests/docs_examples.rs` and a CI job that validate documented TOML with `reiki check`, CLI flags with help output, config keys with the docs, local links and anchors, and the README proof.
 - `AGENTS.md` with commands, repo map, conventions and stable exit codes, and `llms.txt` as a short docs index.
+- A final-response plugin phase for security checks that must inspect the body after placeholder restoration. It adds `Plugin::needs_final_response` and `Plugin::on_final_response` to the native plugin API; the host buffers the body only for plugins that opt in and fails closed when the buffer bound is exceeded.
 
 ### Changed
 
 - The README and docs follow one template: proof-first quickstart, how it works, configuration, operating, security model, compatibility matrix, limits and non-goals, development and links. The docs index lists every page, including the new install, operations and dynamic stream pages.
 - Upgrade notes spell out the new keys and defaults, fail-closed behavior, the state directory beside `<config>.state`, mode `0600` files, and the audit log and sidecar names.
 - Stream administration is cross-linked from configuration, CLI, keys and monitoring docs; static and dynamic stream controls are described with the same vocabulary.
+- `REIKI_PLUGINS` now rejects a build order that puts `toolpolicy` before `placeholders`; the late security check must see restored tool arguments. No config, CLI flag or config-key shape changed.
+- `toolpolicy` canonicalizes JSON argument objects before applying host and tripwire rules, so escaped spellings of the same value cannot evade a check. Raw arguments still reach body rewriting and the journal.
 
 ### Added
 
@@ -28,11 +31,15 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
 - Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.
 - Corrected stale documentation links and version strings, and clarified that a failed audit append refuses the management mutation instead of silently continuing.
+- A decoded, buffered success no longer replaces its gateway token estimate with zero; the permit is dropped so the estimate stays charged while the provider's `usage` object remains ignored for compressed bodies.
+- Gateway completions keep the estimate in the window where the request was admitted, instead of subtracting it from a minute, day or month that rolled over in flight.
 
 ### Security
 
 - Documentation only: spell out that stream management uses a dedicated token with optional two-party confirmation, that state and audit files are mode `0600` and hold hashes rather than raw tokens, and that a failed audit write fails closed.
 - Clarify the trust boundary: gateway counter failures refuse with `503` under the default `[gateway] on_store_error = "closed"`, native plugins are trusted in-process code, and runtime Wasm plugins are sandboxed behind `plugin-wasm`. No behavior changed in this release.
+- Builtin credential patterns are also matched against decoded JSON string values, so escaped prefixes and separators cannot reach the model unmasked. Escaped matches are restored by their decoded value.
+- `toolpolicy` now observes the final restored response body, closing the gap where a configured term equal to a forbidden host was checked in masked form. The existing `requestlog`, metrics and wasm slot ordering is unchanged.
 
 ### Changed
 

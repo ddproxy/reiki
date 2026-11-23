@@ -73,9 +73,30 @@ impl Masker {
     /// The masked text, or `None` if nothing matched, recording restorable originals in `reverse`.
     pub fn mask(&self, text: &str, reverse: &mut HashMap<String, String>) -> Option<String> {
         let parsed = serde_json::from_str::<Value>(text).ok();
+        let mut strings = Vec::new();
+        let mut at = 0;
+        let json_strings =
+            parsed.is_some() && collect_strings(text, &mut at, "", &mut strings, 0).is_some();
         let mut found = Vec::new();
         if self.builtin {
+            let mut decoded_strings = Vec::new();
+            if json_strings {
+                // Builtin patterns are found in the decoded text of every JSON string value, so
+                // an escaped credential cannot slip past the raw-text scanner.
+                for &(start, end, _) in &strings {
+                    if self.find_builtins_in_string(text, start, end, &mut found) {
+                        decoded_strings.push((start, end));
+                    }
+                }
+            }
             for span in reiki_redact::scan(text) {
+                // Raw hits inside a decoded string would mask only part of an escape.
+                if decoded_strings
+                    .iter()
+                    .any(|&(start, end)| span.start >= start && span.end <= end)
+                {
+                    continue;
+                }
                 found.push(Found {
                     start: span.start,
                     end: span.end,
@@ -89,11 +110,9 @@ impl Masker {
             }
         }
         if let Some(matcher) = &self.matcher {
-            let mut strings = Vec::new();
-            let mut at = 0;
-            if parsed.is_some() && collect_strings(text, &mut at, "", &mut strings, 0).is_some() {
+            if json_strings {
                 // String values are matched on their decoded text; object keys are not scanned.
-                for (start, end, _) in strings {
+                for &(start, end, _) in &strings {
                     self.find_terms_in_string(matcher, text, start, end, &mut found);
                 }
             } else {
@@ -111,6 +130,61 @@ impl Masker {
                 .any(|&(start, end)| item.start >= start && item.end <= end)
         });
         self.render(text, found, reverse)
+    }
+
+    /// Scans one decoded JSON string value for builtin patterns. Returns false when the
+    /// string cannot be decoded, so raw hits in it stay in scope.
+    fn find_builtins_in_string(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        found: &mut Vec<Found>,
+    ) -> bool {
+        let body_start = start + 1;
+        let body_end = end.saturating_sub(1);
+        if body_end <= body_start {
+            return true;
+        }
+        let body = &text[body_start..body_end];
+        let (decoded, offsets) = if body.contains('\\') {
+            #[cfg(test)]
+            self.decodes.fetch_add(1, Ordering::Relaxed);
+            let Some(decoded) = decode_string_body(body) else {
+                return false;
+            };
+            let Some(offsets) = RawOffsets::new(body, &decoded) else {
+                return false;
+            };
+            (decoded, Some(offsets))
+        } else {
+            (body.to_owned(), None)
+        };
+        for span in reiki_redact::scan(&decoded) {
+            let (raw_start, raw_end) = match &offsets {
+                Some(offsets) => {
+                    let Some(span) = offsets.map_span(span.start, span.end) else {
+                        continue;
+                    };
+                    span
+                }
+                None => (span.start, span.end),
+            };
+            if raw_start >= raw_end {
+                continue;
+            }
+            found.push(Found {
+                start: body_start + raw_start,
+                end: body_start + raw_end,
+                kind: if span.private_key {
+                    Kind::PrivateKey
+                } else {
+                    Kind::Secret
+                },
+                json: offsets.is_some(),
+            });
+        }
+        true
     }
 
     fn find_terms_in_text(&self, matcher: &AhoCorasick, text: &str, found: &mut Vec<Found>) {
@@ -171,8 +245,7 @@ impl Masker {
             if decoded_start >= decoded_end {
                 continue;
             }
-            let (Some(raw_start), Some(raw_end)) = (raw.map(decoded_start), raw.map(decoded_end))
-            else {
+            let Some((raw_start, raw_end)) = raw.map_span(decoded_start, decoded_end) else {
                 continue;
             };
             if raw_start >= raw_end {
@@ -225,8 +298,8 @@ impl Masker {
         for item in spans {
             out.push_str(&text[copied..item.start]);
             let original = &text[item.start..item.end];
-            // An escaped term is keyed and restored by its decoded text, so both spellings agree.
-            let masked = if item.json && item.kind == Kind::Term {
+            // An escaped match is keyed and restored by its decoded text, so both spellings agree.
+            let masked = if item.json {
                 match decode_string_body(original) {
                     Some(decoded) => self.placeholder(item.kind, &decoded, reverse),
                     None => self.placeholder(item.kind, original, reverse),
@@ -350,25 +423,49 @@ impl RawOffsets {
         Some(Self { escapes })
     }
 
-    /// The raw offset for a decoded byte offset, or `None` inside a character made by one escape.
-    fn map(&self, offset: usize) -> Option<usize> {
-        let offset = u32::try_from(offset).ok()?;
+    /// Raw offset where a decoded span starts. A start inside an escape covers the whole escape.
+    fn raw_at_start(&self, offset: usize) -> usize {
+        let Ok(offset) = u32::try_from(offset) else {
+            return offset;
+        };
         let index = self
             .escapes
             .partition_point(|&(decoded_start, _, _, _)| decoded_start <= offset);
         if index == 0 {
-            return Some(offset as usize);
+            return offset as usize;
         }
-        let (decoded_start, raw_start, decoded_end, raw_end) = self.escapes[index - 1];
-        if offset == decoded_start {
-            Some(raw_start as usize)
-        } else if offset == decoded_end {
-            Some(raw_end as usize)
-        } else if offset > decoded_end {
-            Some((raw_end + (offset - decoded_end)) as usize)
+        let (_, raw_start, decoded_end, raw_end) = self.escapes[index - 1];
+        if offset < decoded_end {
+            raw_start as usize
         } else {
-            None
+            (raw_end + (offset - decoded_end)) as usize
         }
+    }
+
+    /// Raw offset just past a decoded span. An end inside an escape covers the whole escape.
+    fn raw_at_end(&self, offset: usize) -> usize {
+        let Ok(offset) = u32::try_from(offset) else {
+            return offset;
+        };
+        let index = self
+            .escapes
+            .partition_point(|&(decoded_start, _, _, _)| decoded_start < offset);
+        if index == 0 {
+            return offset as usize;
+        }
+        let (_, _, decoded_end, raw_end) = self.escapes[index - 1];
+        if offset <= decoded_end {
+            raw_end as usize
+        } else {
+            (raw_end + (offset - decoded_end)) as usize
+        }
+    }
+
+    /// Raw byte bounds covering a whole decoded span.
+    fn map_span(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        let raw_start = self.raw_at_start(start);
+        let raw_end = self.raw_at_end(end);
+        (raw_start < raw_end).then_some((raw_start, raw_end))
     }
 }
 
@@ -712,6 +809,23 @@ mod tests {
         assert!(
             !out.contains(&key),
             "an API key leaked into the masked body"
+        );
+        assert_eq!(reverse.values().next().unwrap(), &key);
+    }
+
+    #[test]
+    fn builtin_credentials_are_masked_when_json_escaped() {
+        let m = masker(&[], true);
+        let key = fake("ghp_", "0123456789abcdef0123456789abcdef0123");
+        // The escape is assembled at runtime so no token-shaped literal sits in the source.
+        let escaped = key.replacen('p', r"\u0070", 1);
+        let body = format!(r#"{{"text":"use {escaped} now"}}"#);
+        let mut reverse = HashMap::new();
+        let out = m.mask(&body, &mut reverse).unwrap();
+        assert!(!out.contains("ghp_"), "the escaped prefix leaked: {out}");
+        assert!(
+            !out.contains("0123456789abcdef"),
+            "the escaped key leaked: {out}"
         );
         assert_eq!(reverse.values().next().unwrap(), &key);
     }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.14.1
+
+No functional change from 0.14.0. This patch release exercises the unattended update path (tuishou auto-update on a canary node): same code, new version and attestation.
+
 ## 0.14.0
 
 ### Changed

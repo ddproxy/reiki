@@ -41,7 +41,7 @@ Install the pinned driver first with `cargo install cargo-fuzz --locked --versio
 Download the release assets and check the attestation, the checksums and the SBOM:
 
 ```bash
-tag=v0.14.0
+tag=v0.14.1
 gh release download "$tag" --repo ddproxy/reiki \
   --pattern '*.tar.gz' --pattern '*.sha256' --pattern '*-sbom.json' --dir dist
 

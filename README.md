@@ -15,7 +15,7 @@
 
 Reiki is a security proxy that keeps upstream API keys on the Reiki host and gives each client a revocable stream token, so agent and LLM traffic passes one inspectable point.
 
-**Status:** stable at 0.14.0. Dynamic streams (`[stream_admin]`), runtime Wasm plugins (`plugin-wasm`) and cost accounting (`plugin-cost`) are preview: they are opt-in and have their own pages.
+**Status:** stable at 0.15.0. Dynamic streams (`[stream_admin]`), runtime Wasm plugins (`plugin-wasm`) and cost accounting (`plugin-cost`) are preview: they are opt-in and have their own pages.
 
 ## What and why
 
@@ -252,9 +252,9 @@ Reiki protects upstream credentials from the client, limits and records what a s
 | Item | Last checked | Notes |
 | --- | --- | --- |
 | Rust toolchain | 1.99 (MSRV in `Cargo.toml`, edition 2024) | Enforced by CI. |
-| `x86_64-unknown-linux-musl` | 0.14.0 release workflow | Static archive; qemu smoke check at CPU baseline. |
-| `aarch64-unknown-linux-musl` | 0.14.0 release workflow | Static archive. |
-| `aarch64-apple-darwin`, `x86_64-apple-darwin` | 0.14.0 release workflow | macOS archives. |
+| `x86_64-unknown-linux-musl` | 0.15.0 release workflow | Static archive; qemu smoke check at CPU baseline. |
+| `aarch64-unknown-linux-musl` | 0.15.0 release workflow | Static archive. |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | 0.15.0 release workflow | macOS archives. |
 | Built-in plugins, `top`, `peers` | 0.14.0 CI and workspace tests | Default features plus `top`. |
 | `plugin-wasm` (Wasmtime 51.0.0) | 0.14.0 workspace tests and component fixtures | Off by default; see [Wasm plugins](docs/wasm-plugins.md). |
 | `plugin-cost` | 0.14.0 workspace tests and cost-feature tests | Off by default; see [cost](docs/cost.md). |

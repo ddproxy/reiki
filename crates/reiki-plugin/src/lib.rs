@@ -98,6 +98,18 @@ pub trait Plugin: Send + Sync {
     /// empty, call after which the plugin must release anything it held back.
     fn on_response_chunk(&self, _ctx: &mut ChunkCtx<'_>) {}
 
+    /// True when the host must buffer the whole response and call
+    /// [`Plugin::on_final_response`] once, before releasing any body bytes.
+    fn needs_final_response(&self) -> bool {
+        false
+    }
+
+    /// Runs once on the complete response body, after every other response hook.
+    /// A security check that must see restored tool arguments uses this phase
+    /// instead of [`Plugin::on_response_chunk`]. The host buffers the body for
+    /// these plugins, so a hook may replace the bytes before they are released.
+    fn on_final_response(&self, _ctx: &mut ChunkCtx<'_>) {}
+
     /// Called once when the process is stopping, after requests in flight have finished or the
     /// drain time ran out. A plugin that buffers output (a log writer) writes it out here and
     /// returns; it must not wait for long.

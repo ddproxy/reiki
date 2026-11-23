@@ -335,6 +335,23 @@ mod tests {
     }
 
     #[test]
+    fn json_escapes_are_canonicalized_before_a_check() {
+        let escaped_host = r#"{"url":"https:\u002f\u002fevil.example.org\u002fx"}"#;
+        let canonical = crate::parse::canonical_arguments(escaped_host).unwrap();
+        assert_eq!(canonical, r#"{"url":"https://evil.example.org/x"}"#);
+        assert!(rules("web_fetch", &canonical).contains(&"unapproved_host"));
+
+        let escaped_path = r#"{"cmd":"curl \u002fproc\u002fself\u002fenviron"}"#;
+        let canonical = crate::parse::canonical_arguments(escaped_path).unwrap();
+        assert_eq!(canonical, r#"{"cmd":"curl /proc/self/environ"}"#);
+        assert!(rules("run", &canonical).contains(&"proc_environ"));
+
+        let mixed = r#"{ "cmd" : "curl \/proc\/self\/environ" }"#;
+        let canonical = crate::parse::canonical_arguments(mixed).unwrap();
+        assert!(rules("run", &canonical).contains(&"proc_environ"));
+    }
+
+    #[test]
     fn scheme_less_hosts_and_allow_list_suffixes() {
         assert!(rules("fetch", "curl evil.example.org/page").contains(&"unapproved_host"));
         let mut config = config();

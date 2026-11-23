@@ -1578,6 +1578,21 @@ async fn a_compressed_response_is_not_watched_for_usage() {
     assert_eq!(first.status(), 200);
     assert_eq!(first.text().await.unwrap(), String::from_utf8_lossy(json));
 
+    // The decoded body carries no token usage, but its admission estimate must stay charged.
+    let usage = h
+        .client
+        .get(format!("{}/v1/usage", h.relay))
+        .bearer_auth("tok-a")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let usage: serde_json::Value = serde_json::from_str(&usage).unwrap();
+    assert_eq!(usage["streams"][0]["tokens"], 100);
+    assert_eq!(usage["streams"][0]["minute_tokens"], 100);
+
     // The compressed body was decoded and buffered, so its usage must be ignored.
     let second = h
         .post("tok-a", "/zen/x", &"x".repeat(40))

@@ -37,6 +37,8 @@ use reiki_detect::body_is_encoded as is_encoded;
 use reiki_plugin::{Event, FailureKind};
 
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+/// Bodies held for a final security hook are bounded like request bodies.
+const MAX_FINAL_RESPONSE_BODY: usize = 8 * 1024 * 1024;
 const FORWARDER_FAILED_BODY: &[u8] =
     b"{\"error\":{\"type\":\"bad_gateway\",\"message\":\"the upstream could not be reached\"}}";
 const MAX_ERROR_BODY: usize = 64 * 1024;
@@ -2292,9 +2294,8 @@ async fn forward(app: &App, fwd: Forward<'_>, body: Bytes) -> Result<Response, B
             };
             let permit = if buffered { None } else { permit };
             let gateway = if buffered {
-                for mut admitted in gateway_permits {
-                    admitted.complete(0);
-                }
+                // Dropping the permits releases the slots but keeps the estimate charged: a
+                // compressed body is counted once, with no measured token total to replace it.
                 Vec::new()
             } else {
                 gateway_permits
@@ -3462,6 +3463,7 @@ fn stream_response(
                 session,
                 inner: body_stream(response),
                 done: false,
+                final_buffer: Vec::new(),
             },
             permit,
             usage,
@@ -3498,6 +3500,9 @@ fn finish_buffered(
     session.on_response_head(key, upstream, &mut status, &mut headers);
     let mut body = body;
     session.on_response_chunk(&mut body, true);
+    if session.needs_final_response() {
+        session.on_final_response(&mut body);
+    }
     if session.failed() {
         return json_error(
             PLUGIN_FAILURE_STATUS,
@@ -3517,6 +3522,19 @@ struct PluginBody {
     session: PluginSession,
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     done: bool,
+    /// Set only when a final security hook needs the complete body before release.
+    final_buffer: Vec<u8>,
+}
+
+impl PluginBody {
+    /// Adds rewritten bytes to the buffer for the final hook, bounded like a request body.
+    fn hold_final(&mut self, chunk: &[u8]) -> bool {
+        if self.final_buffer.len().saturating_add(chunk.len()) > MAX_FINAL_RESPONSE_BODY {
+            return false;
+        }
+        self.final_buffer.extend_from_slice(chunk);
+        true
+    }
 }
 
 impl Drop for PluginBody {
@@ -3550,12 +3568,32 @@ impl Stream for PluginBody {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     this.done = true;
+                    let final_hook = this.session.needs_final_response();
                     let mut tail = Bytes::new();
                     this.session.on_response_chunk(&mut tail, true);
                     if this.session.failed() {
                         return Poll::Ready(Some(Err(std::io::Error::other(
                             PLUGIN_FAILURE_MESSAGE,
                         ))));
+                    }
+                    if final_hook {
+                        if !this.hold_final(&tail) {
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                PLUGIN_FAILURE_MESSAGE,
+                            ))));
+                        }
+                        let mut body = Bytes::from(std::mem::take(&mut this.final_buffer));
+                        this.session.on_final_response(&mut body);
+                        if this.session.failed() {
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                PLUGIN_FAILURE_MESSAGE,
+                            ))));
+                        }
+                        return if body.is_empty() {
+                            Poll::Ready(None)
+                        } else {
+                            Poll::Ready(Some(Ok(body)))
+                        };
                     }
                     return if tail.is_empty() {
                         Poll::Ready(None)
@@ -3570,6 +3608,7 @@ impl Stream for PluginBody {
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
+                    let final_hook = this.session.needs_final_response();
                     this.session.on_response_chunk(&mut chunk, false);
                     if this.session.failed() {
                         // Headers are already on the wire, so the only safe response is to cut
@@ -3580,6 +3619,15 @@ impl Stream for PluginBody {
                         ))));
                     }
                     if chunk.is_empty() {
+                        continue;
+                    }
+                    if final_hook {
+                        if !this.hold_final(&chunk) {
+                            this.done = true;
+                            return Poll::Ready(Some(Err(std::io::Error::other(
+                                PLUGIN_FAILURE_MESSAGE,
+                            ))));
+                        }
                         continue;
                     }
                     return Poll::Ready(Some(Ok(chunk)));
@@ -4186,6 +4234,7 @@ mod tests {
             session,
             inner: Box::pin(Stuck),
             done: false,
+            final_buffer: Vec::new(),
         };
         drop(plugin_body);
         let seen = CHUNKS.lock().unwrap();
@@ -4237,6 +4286,7 @@ mod tests {
             session,
             inner: Box::pin(futures_util::stream::iter(chunks)),
             done: false,
+            final_buffer: Vec::new(),
         };
         assert!(body.next().await.unwrap().is_ok());
         assert!(body.next().await.unwrap().is_err());
@@ -4330,6 +4380,7 @@ mod tests {
                 b"unprocessed secret",
             ))])),
             done: false,
+            final_buffer: Vec::new(),
         };
         let error = body.next().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("fail-closed plugin"), "{error}");

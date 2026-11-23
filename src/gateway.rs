@@ -573,6 +573,10 @@ impl Gateway {
         inner
             .last_used
             .insert(stream.to_owned(), second.max(0) as u64);
+        let (minute_start, day_start_seen, month_start_seen) = {
+            let state = &inner.streams[stream];
+            (state.minute.start, state.daily.start, state.monthly.start)
+        };
         inner.dirty = true;
         drop(inner);
 
@@ -581,6 +585,9 @@ impl Gateway {
             owner: self.shared.owner.get().cloned(),
             stream: stream.to_owned(),
             estimate,
+            minute_start,
+            day_start: day_start_seen,
+            month_start: month_start_seen,
             done: false,
         })
     }
@@ -630,17 +637,27 @@ pub struct Permit {
     owner: Option<Weak<App>>,
     stream: String,
     estimate: u64,
+    /// Window starts captured at admission, so a completion after a rollover cannot take the
+    /// estimate out of a window that never received it.
+    minute_start: i64,
+    day_start: i64,
+    month_start: i64,
     done: bool,
 }
 
 impl Permit {
     /// Replaces the estimate with the final usage and releases the slot. Safe to call once.
     pub fn complete(&mut self, tokens: u64) {
+        self.complete_at(tokens, SystemTime::now());
+    }
+
+    /// The same completion with an explicit clock, so tests can cross a window boundary.
+    fn complete_at(&mut self, tokens: u64, now: SystemTime) {
         if self.done {
             return;
         }
         self.done = true;
-        let second = unix_seconds(SystemTime::now());
+        let second = unix_seconds(now);
         let minute = second.div_euclid(60);
         let settings = self
             .owner
@@ -653,43 +670,40 @@ impl Permit {
             .and_then(|stream| stream.limits.as_ref())
             .and_then(|limits| limits.period_zone.as_deref())
             .unwrap_or("UTC");
-        let day_start = period_start(second, zone, false);
-        let month_start = period_start(second, zone, true);
-        let (minute_start, day_window_start, month_window_start) = {
-            let inner = self.gateway.lock();
-            inner
-                .streams
-                .get(&self.stream)
-                .map_or((minute, day_start, month_start), |state| {
-                    (state.minute.start, state.daily.start, state.monthly.start)
-                })
-        };
+        let day_now = period_start(second, zone, false);
+        let month_now = period_start(second, zone, true);
         {
             let mut inner = self.gateway.lock();
             if let Some(state) = inner.streams.get_mut(&self.stream) {
-                // Only adjust the current windows; a long body that crosses a boundary keeps
-                // its charge in the window where it was admitted.
-                adjust(
-                    &mut state.minute,
-                    minute_start,
-                    minute,
-                    self.estimate,
-                    tokens,
-                );
-                adjust(
-                    &mut state.daily,
-                    day_window_start,
-                    day_start,
-                    self.estimate,
-                    tokens,
-                );
-                adjust(
-                    &mut state.monthly,
-                    month_window_start,
-                    month_start,
-                    self.estimate,
-                    tokens,
-                );
+                // A completion after a rollover must not remove the estimate from a window that
+                // never received it. Only the windows this permit was admitted into can change.
+                if state.minute.start == self.minute_start && minute == self.minute_start {
+                    adjust(
+                        &mut state.minute,
+                        self.minute_start,
+                        self.minute_start,
+                        self.estimate,
+                        tokens,
+                    );
+                }
+                if state.daily.start == self.day_start && day_now == self.day_start {
+                    adjust(
+                        &mut state.daily,
+                        self.day_start,
+                        self.day_start,
+                        self.estimate,
+                        tokens,
+                    );
+                }
+                if state.monthly.start == self.month_start && month_now == self.month_start {
+                    adjust(
+                        &mut state.monthly,
+                        self.month_start,
+                        self.month_start,
+                        self.estimate,
+                        tokens,
+                    );
+                }
                 state.tokens_total = state.tokens_total.saturating_sub(self.estimate) + tokens;
             }
             if let Some(active) = inner.active.get_mut(&self.stream) {
@@ -988,6 +1002,7 @@ pub fn eligible_streams(config: &Config, key: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1070,6 +1085,27 @@ mod tests {
         assert_eq!(refusal.reason, RejectReason::Tokens);
         drop(first);
         assert_eq!(gateway.stream_state("s").minute.tokens, 10);
+    }
+
+    #[test]
+    fn a_completion_after_a_rollover_keeps_its_estimate_in_the_admitted_window() {
+        let config = stream("");
+        let gateway = Gateway::new();
+        let mut permit = admit(&gateway, &config, "s");
+        let later = now() + Duration::from_secs(120);
+        // Another request rolls the counters into the next minute before the first completes.
+        let mut later_permit = gateway
+            .admit(&config, "s", "zen", "k1", Some("m"), later, 1)
+            .unwrap();
+        permit.complete_at(4, later);
+        later_permit.complete_at(1, later);
+
+        let state = gateway.stream_state("s");
+        assert_eq!(
+            state.minute.tokens, 1,
+            "the old estimate was taken from the new window"
+        );
+        assert_eq!(state.tokens_total, 5);
     }
 
     #[test]

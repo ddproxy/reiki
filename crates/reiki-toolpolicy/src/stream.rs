@@ -10,7 +10,7 @@ use crate::checks::check_call;
 use crate::config::{Config, Mode, Severity};
 use crate::journal::{Entry, Journal};
 use crate::metrics::Metrics;
-use crate::parse::{Call, Format, MAX_CALLS, RequestParse, notice};
+use crate::parse::{Call, Format, MAX_CALLS, RequestParse, canonical_arguments, notice};
 
 const MAX_ARGS: usize = 64 * 1024;
 const MAX_BUFFERED_BODY: usize = 8 * 1024 * 1024;
@@ -122,6 +122,9 @@ impl Session {
         }
     }
 
+    /// Runs the response pipeline on the complete body handed to the final hook. The host has
+    /// already passed the bytes through every `on_response_chunk` hook, so placeholders had a
+    /// chance to restore terms before this check sees them.
     pub fn feed(&mut self, chunk: &mut Bytes, is_last: bool) {
         if !self.active || self.done {
             return;
@@ -504,9 +507,11 @@ impl Session {
     }
 
     fn evaluate(&self, call: &Call) -> bool {
+        let checked =
+            canonical_arguments(&call.arguments).unwrap_or_else(|| call.arguments.clone());
         let findings = check_call(
             &call.name,
-            &call.arguments,
+            &checked,
             &self.declared,
             &self.provenance,
             &self.config,
@@ -864,6 +869,23 @@ mod tests {
         let output = text_of(&done);
         assert!(output.contains("could not be parsed"), "{output}");
         assert!(!output.contains("evil.example.org"), "{output}");
+    }
+
+    #[test]
+    fn escaped_arguments_are_checked_on_the_final_body() {
+        let (mut state, _) = session(Mode::Block);
+        configure(&mut state, Format::OpenAiChat);
+        state.set_head("zen", false, true);
+        let mut body = Bytes::from(
+            r#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"run","arguments":"{\"cmd\":\"curl \\u002fproc\\u002fself\\u002fenviron\"}"}}]}}]}"#.to_owned(),
+        );
+        state.feed(&mut body, true);
+        let output = text_of(&body);
+        assert!(
+            output.contains("[toolpolicy] blocked tool call: run"),
+            "{output}"
+        );
+        assert!(!output.contains("environ"), "{output}");
     }
 
     #[test]

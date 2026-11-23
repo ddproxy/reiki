@@ -743,6 +743,11 @@ impl PluginChain {
         self.entries.iter().any(|e| e.plugin.needs_response_hooks())
     }
 
+    /// True when the host must buffer the response for a final security hook.
+    pub fn needs_final_response(&self) -> bool {
+        self.entries.iter().any(|e| e.plugin.needs_final_response())
+    }
+
     /// Delivers a relay-level event to every plugin; a panicking hook is logged and skipped.
     pub fn on_event(&self, event: &Event<'_>) {
         let stream = event_stream(event);
@@ -1106,6 +1111,37 @@ impl PluginChain {
         }
         failed
     }
+
+    /// Runs `on_final_response` in chain order, after the reverse-order chunk hooks, so a
+    /// security check sees the body after every rewrite (including placeholder restoration).
+    pub fn on_final_response(
+        &self,
+        states: &mut [Box<dyn Any + Send>],
+        scope: &[bool],
+        chunk: &mut Bytes,
+    ) -> bool {
+        let mut failed = false;
+        for ((entry, state), runs) in self
+            .entries
+            .iter()
+            .zip(states.iter_mut())
+            .zip(scope.iter().copied())
+        {
+            if !runs {
+                continue;
+            }
+            let mut ctx = ChunkCtx::new(&mut *chunk, true, &mut **state);
+            if guard(entry.plugin.name(), "on_final_response", || {
+                entry.plugin.on_final_response(&mut ctx);
+            })
+            .is_none()
+                && entry.on_error == OnError::Reject
+            {
+                failed = true;
+            }
+        }
+        failed
+    }
 }
 
 /// One request's plugin chain and per-plugin state. It owns the chain it started with, so a reload
@@ -1139,6 +1175,11 @@ impl PluginSession {
     /// True when any plugin in this session needs the response hooks.
     pub fn needs_response_hooks(&self) -> bool {
         self.chain.needs_response_hooks()
+    }
+
+    /// True when the host must buffer the whole body for a final security hook.
+    pub fn needs_final_response(&self) -> bool {
+        self.chain.needs_final_response()
     }
 
     /// The chain this session runs.
@@ -1252,6 +1293,13 @@ impl PluginSession {
         self.failed |= self
             .chain
             .on_response_chunk(&mut self.states, &self.scope, chunk, is_last);
+        self.failed
+    }
+
+    pub fn on_final_response(&mut self, chunk: &mut Bytes) -> bool {
+        self.failed |= self
+            .chain
+            .on_final_response(&mut self.states, &self.scope, chunk);
         self.failed
     }
 }

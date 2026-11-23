@@ -311,6 +311,17 @@ fn push_call(extracted: &mut Extracted, name: String, arguments: String) {
     extracted.calls.push(Call { name, arguments });
 }
 
+/// Parses and re-serializes a JSON argument object so every spelling of a string (unicode
+/// escapes, escaped slashes, extra whitespace) reaches the policy check in one form. The raw
+/// text stays in [`Call::arguments`] for body rewriting and journal fidelity.
+pub fn canonical_arguments(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
 pub fn notice(names: &[String]) -> String {
     let mut out = String::from("[toolpolicy] blocked tool call");
     for name in names {

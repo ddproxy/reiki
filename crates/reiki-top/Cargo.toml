@@ -18,7 +18,7 @@ serde_json = "1"
 unicode-width = "0.2"
 crossterm = { version = "0.29", optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29"], optional = true }
-fw-tui = { git = "https://github.com/ddproxy/fw-tui", rev = "05af6efa4634e3a52d8e0720ccdc54a5241936dd", default-features = false, features = ["tui"], optional = true }
+fw-tui = { git = "https://github.com/ddproxy/fw-tui", rev = "8a9fb414c79d7784009e1a3ec3a3688e197931fe", default-features = false, features = ["tui"], optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

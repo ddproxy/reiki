@@ -37,7 +37,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 ### Security
 
 - Documentation only: spell out that stream management uses a dedicated token with optional two-party confirmation, that state and audit files are mode `0600` and hold hashes rather than raw tokens, and that a failed audit write fails closed.
-- Clarify the trust boundary: gateway counter failures refuse with `503` under the default `[gateway] on_store_error = "closed"`, native plugins are trusted in-process code, and runtime Wasm plugins are sandboxed behind `plugin-wasm`. No behavior changed in this release.
+- Clarify the trust boundary: gateway counter failures refuse with `503` under the default `[gateway] on_store_error = "closed"`, native plugins are trusted in-process code, and runtime Wasm plugins are sandboxed behind `plugin-wasm`. This clarification changes no behavior; the items below do.
 - Builtin credential patterns are also matched against decoded JSON string values, so escaped prefixes and separators cannot reach the model unmasked. Escaped matches are restored by their decoded value.
 - `toolpolicy` now observes the final restored response body, closing the gap where a configured term equal to a forbidden host was checked in masked form. The existing `requestlog`, metrics and wasm slot ordering is unchanged.
 

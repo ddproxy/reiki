@@ -59,6 +59,13 @@ pub enum ConfigError {
     },
     BadAdminTokenHash,
     AdminTokenReused(String),
+    /// `[admin].read_token_sha256` is not a SHA-256 hex digest.
+    BadReadTokenHash,
+    /// `[admin].read_token_sha256` equals `[admin].token_sha256`, which would make the read-only
+    /// token a full admin token.
+    ReadTokenEqualsAdmin,
+    /// `[admin].read_token_sha256` equals another credential, named in the payload.
+    ReadTokenReused(String),
     /// `[stream_admin]` is present but not safe to enable.
     BadStreamAdmin(String),
     ReservedStreamName(String),
@@ -170,6 +177,16 @@ impl fmt::Display for ConfigError {
                 f,
                 "admin token_sha256 is the same as the token of stream `{stream}`, which would give that stream admin access"
             ),
+            Self::BadReadTokenHash => {
+                write!(f, "[admin].read_token_sha256 is not 64 hex characters")
+            }
+            Self::ReadTokenEqualsAdmin => write!(
+                f,
+                "[admin].read_token_sha256 must differ from [admin].token_sha256; the read-only token must not be the full admin token"
+            ),
+            Self::ReadTokenReused(other) => {
+                write!(f, "[admin].read_token_sha256 is the same as {other}")
+            }
             Self::BadStreamAdmin(reason) => write!(f, "invalid [stream_admin]: {reason}"),
             Self::ReservedStreamName(name) => {
                 write!(
@@ -1160,7 +1177,13 @@ fn default_strategy() -> StrategyConfig {
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     pub listen: String,
+    /// SHA-256 of the full admin token, accepted on every admin route.
     pub token_sha256: String,
+    /// Optional SHA-256 of a read-only admin token. It opens the read routes (status, failures,
+    /// stream console, metrics, OpenAPI) and never the mutating ones. Must differ from every
+    /// other credential.
+    #[serde(default)]
+    pub read_token_sha256: Option<String>,
 }
 
 /// Opt-in runtime stream administration. Absent means the feature is off: no
@@ -2294,6 +2317,9 @@ impl Config {
             if let Some(sa) = &self.stream_admin {
                 validate_stream_admin_config(self, admin, sa)?;
             }
+            if let Some(read) = &admin.read_token_sha256 {
+                self.validate_read_token(admin, read)?;
+            }
         } else if self.stream_admin.is_some() {
             return Err(ConfigError::BadStreamAdmin(
                 "[admin] must be configured to enable [stream_admin]".to_owned(),
@@ -2942,6 +2968,47 @@ fn peer_entry_problem(name: &str, peer: &PeerEntry) -> Option<String> {
         ));
     }
     None
+}
+
+impl Config {
+    /// The read-only admin token must differ from every other credential, so holding it can never
+    /// stand in for the admin token, a stream token, a peer token or the stream-management token.
+    fn validate_read_token(&self, admin: &AdminConfig, read: &str) -> Result<(), ConfigError> {
+        if !is_sha256_hex(read) {
+            return Err(ConfigError::BadReadTokenHash);
+        }
+        let hash = read.to_ascii_lowercase();
+        if hash == admin.token_sha256.to_ascii_lowercase() {
+            return Err(ConfigError::ReadTokenEqualsAdmin);
+        }
+        if let Some((stream, _)) = self
+            .streams
+            .iter()
+            .find(|(_, stream)| stream.token_sha256.to_ascii_lowercase() == hash)
+        {
+            return Err(ConfigError::ReadTokenReused(format!(
+                "the token of stream `{stream}`"
+            )));
+        }
+        if self
+            .stream_admin
+            .as_ref()
+            .is_some_and(|sa| sa.token_sha256.to_ascii_lowercase() == hash)
+        {
+            return Err(ConfigError::ReadTokenReused(
+                "the stream-management token".to_owned(),
+            ));
+        }
+        if let Some(peers) = &self.peers
+            && peers
+                .tokens
+                .iter()
+                .any(|token| token.token_sha256.to_ascii_lowercase() == hash)
+        {
+            return Err(ConfigError::ReadTokenReused("a peer token".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -4268,6 +4335,37 @@ socket = "/run/forwarder.sock"
         assert_eq!(
             Config::parse(&text).unwrap_err(),
             ConfigError::AdminTokenReused("s".into())
+        );
+    }
+
+    #[test]
+    fn the_read_only_admin_token_must_differ_from_every_other_credential() {
+        let admin = format!(
+            "[admin]\nlisten = \"127.0.0.1:4098\"\ntoken_sha256 = \"{HASH_A}\"\nread_token_sha256 = "
+        );
+        let equal_to_admin = base(&format!("{admin}\"{HASH_A}\"\n"));
+        assert_eq!(
+            Config::parse(&equal_to_admin).unwrap_err(),
+            ConfigError::ReadTokenEqualsAdmin
+        );
+        let equal_to_stream = base(&format!(
+            "[streams.s]\ntoken_sha256 = \"{HASH_B}\"\nchain = [\"zen-a\"]\n{admin}\"{}\"\n",
+            HASH_B.to_ascii_uppercase()
+        ));
+        assert_eq!(
+            Config::parse(&equal_to_stream).unwrap_err(),
+            ConfigError::ReadTokenReused("the token of stream `s`".into())
+        );
+        let malformed = base(&format!("{admin}\"not-a-hash\"\n"));
+        assert_eq!(
+            Config::parse(&malformed).unwrap_err(),
+            ConfigError::BadReadTokenHash
+        );
+        let distinct = base(&format!("{admin}\"{HASH_B}\"\n"));
+        let config = Config::parse(&distinct).unwrap();
+        assert_eq!(
+            config.admin.unwrap().read_token_sha256.as_deref(),
+            Some(HASH_B)
         );
     }
 

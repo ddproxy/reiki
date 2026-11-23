@@ -43,6 +43,7 @@ Restore with the instance stopped: put files back with the owner and mode from t
 - Request log: `GET /v1/requestlog/metrics` when `[plugins.requestlog]` is configured; summaries only unless `capture_bodies = true`. See [request log](requestlog.md).
 - Metrics: `GET /v1/metrics` on the admin listener. Series include key and stream request counts, gateway rejections and store errors, and stream-admin counters when configured. Labels are bounded and carry no token, key or model value. See [monitoring](monitoring.md#get-v1metrics).
 - Audit: no HTTP route. Verify offline with `reiki streams audit verify FILE`. See [dynamic streams](dynamic-streams.md#verify-the-audit-log).
+- Dashboards and `reiki top`: give them the optional read-only token (`[admin] read_token_sha256`, sent as `REIKI_ADMIN_READ_TOKEN` for `top`). It opens the read routes and answers `403` (`read_only_token`) on reload and key enable. Reload and key-enable audit events carry the caller's `X-Reiki-Actor` label when one is sent. See [monitoring](monitoring.md#read-only-token).
 
 ## Health checks
 

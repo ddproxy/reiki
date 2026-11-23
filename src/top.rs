@@ -55,6 +55,14 @@ pub(crate) enum FeedEvent {
     LocalStreamsError(String),
 }
 
+/// The first non-empty of the read-only and full admin tokens; reading needs only the former.
+fn local_token(read_only: Option<String>, full: Option<String>) -> Option<String> {
+    [read_only, full]
+        .into_iter()
+        .flatten()
+        .find(|token| !token.is_empty())
+}
+
 /// Where the local instance's admin listener is, and which published name is ours.
 #[derive(Clone)]
 pub struct LocalFailures {
@@ -64,13 +72,16 @@ pub struct LocalFailures {
 }
 
 impl LocalFailures {
-    /// The local admin address and token, or `None` without `[admin]` or `REIKI_ADMIN_TOKEN`.
-    /// Only then can `reiki top` show full failure rows; remote peers keep counts only.
+    /// The local admin address and token, or `None` without `[admin]` and either
+    /// `REIKI_ADMIN_READ_TOKEN` or `REIKI_ADMIN_TOKEN`. `reiki top` only reads, so the read-only
+    /// token is preferred when both are set. With the read-only token the failure rows come
+    /// without their body snippets. Remote peers keep counts only.
     pub fn from_config(config: &Config) -> Option<Self> {
         let admin = config.admin.as_ref()?;
-        let token = std::env::var("REIKI_ADMIN_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty())?;
+        let token = local_token(
+            std::env::var("REIKI_ADMIN_READ_TOKEN").ok(),
+            std::env::var("REIKI_ADMIN_TOKEN").ok(),
+        )?;
         let instance = config
             .peers
             .as_ref()
@@ -1858,6 +1869,19 @@ mod tests {
             Duration::from_secs(1),
         );
         assert!(history.series("peer-a", Metric::Sessions).is_empty());
+    }
+
+    #[test]
+    fn the_read_only_token_is_preferred_for_top() {
+        assert_eq!(
+            local_token(Some("read".into()), Some("full".into())).as_deref(),
+            Some("read")
+        );
+        assert_eq!(
+            local_token(Some(String::new()), Some("full".into())).as_deref(),
+            Some("full")
+        );
+        assert_eq!(local_token(None, Some(String::new())), None);
     }
 
     #[test]

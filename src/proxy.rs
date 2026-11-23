@@ -980,12 +980,13 @@ impl App {
         let _ = self.config_path.set(path);
     }
 
-    /// The `config` object of `/v1/status`: the reload generation, when it loaded and how the last reload went.
-    pub fn reload_status_json(&self) -> String {
+    /// The `config` object of `/v1/status`: the reload generation, when it loaded and how the last
+    /// reload went. `redact` hides the failed reload's message for the read-only admin token.
+    pub fn reload_status_json(&self, redact: bool) -> String {
         self.reload_state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .status_json()
+            .status_json(redact)
     }
 
     /// Failed service-log file writes dropped since start, for `/v1/status`.
@@ -3035,7 +3036,7 @@ fn record_ring(
         retry_after,
         cooled,
         cooling_seconds,
-        note: snippet,
+        note: Some(snippet),
     });
 }
 
@@ -4574,12 +4575,10 @@ mod tests {
         assert_eq!(rows[0].retry_after.as_deref(), Some("12 0"));
         assert!(rows[0].cooled);
         assert_eq!(rows[0].cooling_seconds, Some(30));
-        assert!(!rows[0].note.contains(secret), "{}", rows[0].note);
-        assert!(!rows[0].note.chars().any(char::is_control));
-        assert_eq!(
-            rows[0].note.chars().count(),
-            crate::failures::MAX_NOTE_CHARS
-        );
+        let note = rows[0].note.clone().unwrap_or_default();
+        assert!(!note.contains(secret), "{note}");
+        assert!(!note.chars().any(char::is_control));
+        assert_eq!(note.chars().count(), crate::failures::MAX_NOTE_CHARS);
     }
 
     #[test]
@@ -4608,7 +4607,7 @@ mod tests {
             None,
         );
         let rows = app.failures().snapshot(1, None);
-        assert_eq!(rows[0].note, WITHHELD_NOTE);
+        assert_eq!(rows[0].note.as_deref(), Some(WITHHELD_NOTE));
         assert_eq!(rows[0].class, "request_error");
         assert!(!rows[0].cooled);
     }

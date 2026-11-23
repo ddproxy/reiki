@@ -310,6 +310,10 @@ fn docs_keep_adding_config_keys_and_stream_flags() {
             "--tpm",
             "audit verify",
             "audit head",
+            "read_token_sha256",
+            "REIKI_ADMIN_READ_TOKEN",
+            "X-Reiki-Actor",
+            "read_only_token",
         ],
         "docs",
     );

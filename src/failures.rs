@@ -44,8 +44,8 @@ pub struct FailureRecord {
     pub cooled: bool,
     /// Seconds left on the key's cooldown, when it has one.
     pub cooling_seconds: Option<u64>,
-    /// Scrubbed, printable body snippet.
-    pub note: String,
+    /// Scrubbed, printable body snippet. `None` for read-only admin callers, who get no free text.
+    pub note: Option<String>,
 }
 
 /// The last [`CAPACITY`] failures, newest last.
@@ -139,7 +139,7 @@ pub fn render_table(records: &[FailureRecord], width: usize) -> String {
                     (true, None) => "yes".to_owned(),
                     (false, _) => "-".to_owned(),
                 },
-                record.note.clone(),
+                record.note.clone().unwrap_or_default(),
             ]
         })
         .collect();
@@ -209,7 +209,7 @@ mod tests {
             retry_after: Some("120".to_owned()),
             cooled: true,
             cooling_seconds: Some(10),
-            note: format!("failure {label}"),
+            note: Some(format!("failure {label}")),
         }
     }
 

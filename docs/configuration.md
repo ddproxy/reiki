@@ -61,6 +61,7 @@ The admin listener serves `GET /v1/status`, `GET /v1/failures`, `POST /v1/reload
 | --- | --- | --- | --- |
 | `listen` | string | required | Admin listener address: a literal loopback IP and port, such as `127.0.0.1:9090` or `[::1]:9090`. Hostnames such as `localhost:9090` and non-loopback IPs are config errors. Must differ from `listen`. There is no admin TLS option; terminate TLS in front and bind on loopback for remote access. |
 | `token_sha256` | string | required | SHA-256 hex of the admin token, 64 characters. Must differ from every stream token. Make it with `reiki hash-token`, from a token of at least 16 characters. |
+| `read_token_sha256` | string | unset | SHA-256 hex of an optional read-only admin token, 64 characters. It opens the read routes only (`GET` status, failures, stream console, metrics, OpenAPI and plugin routes); mutating routes answer `403`. Must differ from `token_sha256`, every stream token, the stream-management token and every peer token, or startup fails. See [monitoring](monitoring.md#read-only-token). |
 
 ## `[stream_admin]`
 

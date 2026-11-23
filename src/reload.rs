@@ -66,9 +66,12 @@ fn single_line(text: &str) -> String {
         .collect()
 }
 
-/// The JSON body for a failed reload.
+/// What a read-only admin caller sees in place of a failed reload's message.
+pub const REDACTED_RELOAD_ERROR: &str = "reload_refused";
+
+/// The JSON body for a failed reload, in the admin error envelope.
 pub fn error_json(error: &str) -> String {
-    format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(error))
+    crate::admin::error_envelope("config_refused", error)
 }
 
 fn json_list(items: &[String]) -> String {
@@ -122,17 +125,25 @@ impl ReloadState {
         });
     }
 
-    /// The `config` object of `/status`.
-    pub fn status_json(&self) -> String {
+    /// The `config` object of `/status`. With `redact`, a failed reload's message is replaced by
+    /// [`REDACTED_RELOAD_ERROR`], since the message can name paths and config fragments.
+    pub fn status_json(&self, redact: bool) -> String {
         let last = match &self.last {
             None => "null".to_owned(),
             Some(last) => match &last.error {
                 None => format!("{{\"ok\":true,\"at\":\"{}\"}}", rfc3339(last.at)),
-                Some(error) => format!(
-                    "{{\"ok\":false,\"at\":\"{}\",\"error\":\"{}\"}}",
-                    rfc3339(last.at),
-                    json_escape(error)
-                ),
+                Some(error) => {
+                    let shown = if redact {
+                        REDACTED_RELOAD_ERROR
+                    } else {
+                        error.as_str()
+                    };
+                    format!(
+                        "{{\"ok\":false,\"at\":\"{}\",\"error\":\"{}\"}}",
+                        rfc3339(last.at),
+                        json_escape(shown)
+                    )
+                }
             },
         };
         format!(
@@ -282,14 +293,14 @@ mod tests {
     #[test]
     fn the_state_counts_successes_and_remembers_the_last_failure() {
         let mut state = ReloadState::new();
-        assert!(state.status_json().contains("\"generation\":0"));
-        assert!(state.status_json().contains("\"last_reload\":null"));
+        assert!(state.status_json(false).contains("\"generation\":0"));
+        assert!(state.status_json(false).contains("\"last_reload\":null"));
         assert_eq!(state.next_generation(), 1);
         state.record_ok(&report(1));
-        assert!(state.status_json().contains("\"generation\":1"));
-        assert!(state.status_json().contains("\"ok\":true"));
+        assert!(state.status_json(false).contains("\"generation\":1"));
+        assert!(state.status_json(false).contains("\"ok\":true"));
         state.record_error("config: bad \"thing\"");
-        let json = state.status_json();
+        let json = state.status_json(false);
         assert!(
             json.contains("\"generation\":1"),
             "a failure does not count: {json}"
@@ -297,6 +308,11 @@ mod tests {
         assert!(
             json.contains("\"ok\":false") && json.contains("bad \\\"thing\\\""),
             "{json}"
+        );
+        let redacted = state.status_json(true);
+        assert!(
+            redacted.contains("\"error\":\"reload_refused\"") && !redacted.contains("thing"),
+            "a read-only caller gets a code, not the message: {redacted}"
         );
     }
 

@@ -986,8 +986,8 @@ fn failure_line(failure: &crate::Failure, width: usize) -> Line {
             .map_or_else(|| "cooled".to_owned(), |secs| format!("cooled {secs}s"));
         spans.push(span(format!("  {left}"), Style::Warn));
     }
-    if !failure.note.is_empty() {
-        spans.push(span(format!("  {}", failure.note), Style::Dim));
+    if let Some(note) = failure.note.as_deref().filter(|note| !note.is_empty()) {
+        spans.push(span(format!("  {note}"), Style::Dim));
     }
     line(spans, width)
 }
@@ -4100,7 +4100,7 @@ mod tests {
                 retry_after: Some("120".to_owned()),
                 cooled: true,
                 cooling_seconds: Some(30),
-                note: "body".to_owned(),
+                note: Some("body".to_owned()),
             }],
         );
         let local = texts(&peer_detail(&f, "peer-a", t0, 100));

@@ -21,6 +21,7 @@ reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 | --- | --- | --- |
 | `REIKI_LISTEN` | server mode, `check` | Client listen address. Overridden by `--listen`; overrides `listen` in the config. |
 | `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top`, `cost` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. `streams` uses the separate `REIKI_STREAM_ADMIN_TOKEN` by default. |
+| `REIKI_ADMIN_READ_TOKEN` | `top` | Optional read-only admin token. `top` prefers it over `REIKI_ADMIN_TOKEN`; its failure rows then have no body snippets. Mutating commands do not read it. |
 | `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup and after reload. |
 
 `--listen` and `REIKI_LISTEN` accept an `IP:port` address or a `host:port` name.
@@ -180,7 +181,7 @@ Output is the JSON answer from `/v1/reload`, printed to stdout for both success 
 
 Fields: `ok`, `dry_run`, `generation` (successful reloads since startup), `keys` and `streams` (counts after the reload), `changed` (what differs, such as `plugins phi`), `restart_needed` (settings that apply only after a restart).
 
-A failed reload answers `{"ok":false,"error":"..."}` and exits `1`.
+A failed reload answers the admin error envelope, `{"ok":false,"error":{"code":"config_refused","message":"..."}}`, and exits `1`. See [the error envelope](monitoring.md#error-envelope).
 
 Example:
 

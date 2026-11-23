@@ -91,7 +91,8 @@ pub struct Failure {
     pub retry_after: Option<String>,
     pub cooled: bool,
     pub cooling_seconds: Option<u64>,
-    pub note: String,
+    /// Scrubbed body snippet; `null` when the caller holds only the read-only admin token.
+    pub note: Option<String>,
 }
 
 /// Quota numbers a passthrough upstream reported in its response headers. Every field is present

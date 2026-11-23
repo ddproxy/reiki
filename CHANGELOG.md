@@ -20,6 +20,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 
 ### Fixed
 
+- Wasm host input bounds: guest strings are capped before sanitization, `log` rejects oversized template ids and argument vectors, `request_state.get` rejects oversized keys, and finding-kind interning is isolated per plugin inside the bounded global table. All violations poison or degrade fail-closed.
 - Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
 - Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.
 - Corrected stale documentation links and version strings, and clarified that a failed audit append refuses the management mutation instead of silently continuing.
@@ -29,8 +30,13 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - Documentation only: spell out that stream management uses a dedicated token with optional two-party confirmation, that state and audit files are mode `0600` and hold hashes rather than raw tokens, and that a failed audit write fails closed.
 - Clarify the trust boundary: gateway counter failures refuse with `503` under the default `[gateway] on_store_error = "closed"`, native plugins are trusted in-process code, and runtime Wasm plugins are sandboxed behind `plugin-wasm`. No behavior changed in this release.
 
+### Changed
+
+- Wasm embedded manifests now reject log and reject template keys longer than 256 bytes at load time, matching the host call-time bound; invalid manifest errors no longer echo the key. No CLI or public API change.
+
 ### Tests
 
+- Added Wasm host input-bound, template-key, and per-plugin interning regression tests.
 - Added config validation edge cases for token hashes, duplicates, rate limits, chains, reserved names, admin credentials, listener collisions and auth bounds.
 - Added documentation checks for config snippets, new keys and flags, local links and anchors, and the README proof against a live throwaway instance.
 

@@ -12,7 +12,7 @@ use wasmtime::{Store, StoreLimits, StoreLimitsBuilder, Trap};
 use crate::capability::Capability;
 use crate::config::{EffectiveLimits, WasmPluginConfig};
 use crate::host::{EPOCH_TICK_MS, LoadedComponent, WasmEngine};
-use crate::manifest::Manifest;
+use crate::manifest::{MAX_TEMPLATE_ID_BYTES, Manifest};
 
 wasmtime::component::bindgen!({
     world: "plugin",
@@ -24,6 +24,17 @@ wasmtime::component::bindgen!({
 });
 
 use reiki::plugin::types;
+
+// Guest-controlled strings are capped before filtering, so a long run of
+// filtered-out characters cannot make the host scan an unbounded string.
+const MAX_REASON_INPUT_CHARS: usize = 4096;
+const MAX_LABEL_INPUT_CHARS: usize = 512;
+const MAX_TOOL_NAME_INPUT_CHARS: usize = 512;
+// Manifest log templates are at most 200 bytes; 128 slots cover every
+// realistic template index while bounding guest-supplied argument vectors.
+const MAX_LOG_ARGS: usize = 128;
+const MAX_REQUEST_STATE_KEY_BYTES: usize = 256;
+const MAX_REQUEST_STATE_VALUE_BYTES: usize = 16 * 1024;
 
 pub struct HostRequest {
     pub stream: String,
@@ -42,6 +53,7 @@ enum TrapKind {
 }
 
 struct HostState {
+    plugin_name: String,
     table: ResourceTable,
     wasi: wasmtime_wasi::WasiCtx,
     limits: StoreLimits,
@@ -231,6 +243,7 @@ impl WasmPlugin {
             .unwrap_or_default()
             .into_bytes();
         HostState {
+            plugin_name: self.name.clone(),
             table: ResourceTable::new(),
             wasi,
             limits,
@@ -549,7 +562,12 @@ fn fail_closed_result(msg: &str, reject: bool) -> PluginError {
 }
 
 fn sanitize_reason(msg: &str) -> String {
-    let out: String = msg.chars().filter(|c| !c.is_control()).take(200).collect();
+    let out: String = msg
+        .chars()
+        .take(MAX_REASON_INPUT_CHARS)
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
     if out.trim().is_empty() {
         "skipped".to_owned()
     } else {
@@ -560,6 +578,7 @@ fn sanitize_reason(msg: &str) -> String {
 fn sanitize_tool_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
+        .take(MAX_TOOL_NAME_INPUT_CHARS)
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'))
         .take(64)
         .collect();
@@ -801,7 +820,7 @@ impl reiki::plugin::finding::Host for HostState {
             }
         });
         self.findings.push(reiki_plugin::Reported {
-            kind: intern_kind(kind),
+            kind: intern_kind(&self.plugin_name, kind),
             detail,
             count: f.count as usize,
             blocked: f.blocked,
@@ -811,29 +830,50 @@ impl reiki::plugin::finding::Host for HostState {
 }
 
 const MAX_INTERNED_KINDS: usize = 1024;
+const MAX_KINDS_PER_PLUGIN: usize = 64;
 const UNKNOWN_KIND: &str = "wasm.unknown";
 
-fn intern_kind(kind: String) -> &'static str {
-    static KINDS: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
-    let kinds = KINDS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut kinds = kinds.lock().unwrap_or_else(|e| e.into_inner());
-    intern_kind_in(&mut kinds, kind, MAX_INTERNED_KINDS)
+/// The global table stays bounded, but each plugin gets its own namespace and
+/// quota so one plugin cannot exhaust the slots available to another.
+#[derive(Default)]
+struct InternedKinds {
+    by_key: BTreeMap<String, &'static str>,
+    per_plugin: BTreeMap<String, usize>,
 }
 
-fn intern_kind_in(kinds: &mut BTreeSet<&'static str>, kind: String, limit: usize) -> &'static str {
-    if let Some(interned) = kinds.get(kind.as_str()) {
-        return interned;
+impl InternedKinds {
+    fn intern(
+        &mut self,
+        plugin: &str,
+        kind: String,
+        global_limit: usize,
+        per_plugin_limit: usize,
+    ) -> &'static str {
+        let key = format!("{plugin}\0{kind}");
+        if let Some(interned) = self.by_key.get(&key) {
+            return interned;
+        }
+        let used = self.per_plugin.get(plugin).copied().unwrap_or(0);
+        if used >= per_plugin_limit || self.by_key.len() >= global_limit {
+            return UNKNOWN_KIND;
+        }
+        let interned: &'static str = Box::leak(kind.into_boxed_str());
+        self.by_key.insert(key, interned);
+        self.per_plugin.insert(plugin.to_owned(), used + 1);
+        interned
     }
-    if kinds.len() >= limit {
-        return UNKNOWN_KIND;
-    }
-    let interned: &'static str = Box::leak(kind.into_boxed_str());
-    kinds.insert(interned);
-    interned
+}
+
+fn intern_kind(plugin: &str, kind: String) -> &'static str {
+    static KINDS: OnceLock<Mutex<InternedKinds>> = OnceLock::new();
+    let kinds = KINDS.get_or_init(|| Mutex::new(InternedKinds::default()));
+    let mut kinds = kinds.lock().unwrap_or_else(|e| e.into_inner());
+    kinds.intern(plugin, kind, MAX_INTERNED_KINDS, MAX_KINDS_PER_PLUGIN)
 }
 
 fn sanitize_label(s: &str, max: usize) -> String {
     s.chars()
+        .take(MAX_LABEL_INPUT_CHARS)
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '*' | '/' | '-'))
         .take(max)
         .collect()
@@ -860,6 +900,12 @@ impl reiki::plugin::log::Host for HostState {
         }
         self.log_count += 1;
         if self.log_count > 256 {
+            self.poisoned = true;
+            return Ok(());
+        }
+        // Reject oversized guest input before lookup or tracing. A template id
+        // that reaches the manifest lookup is a bounded manifest key.
+        if template_id.len() > MAX_TEMPLATE_ID_BYTES || args.len() > MAX_LOG_ARGS {
             self.poisoned = true;
             return Ok(());
         }
@@ -959,13 +1005,17 @@ impl reiki::plugin::request_state::Host for HostState {
         if self.poisoned || self.check_deadline().is_err() {
             return Ok(None);
         }
+        if key.len() > MAX_REQUEST_STATE_KEY_BYTES {
+            self.poisoned = true;
+            return Ok(None);
+        }
         Ok(self.request_state.get(&key).cloned())
     }
     fn set(&mut self, key: String, value: Vec<u8>) -> Result<(), wasmtime::Error> {
         if self.poisoned || self.check_deadline().is_err() {
             return Ok(());
         }
-        if key.len() > 256 || value.len() > 16 * 1024 {
+        if key.len() > MAX_REQUEST_STATE_KEY_BYTES || value.len() > MAX_REQUEST_STATE_VALUE_BYTES {
             self.poisoned = true;
             return Ok(());
         }
@@ -1027,13 +1077,55 @@ mod tests {
     }
 
     #[test]
-    fn finding_kinds_are_interned_with_a_bounded_table() {
-        let mut kinds = BTreeSet::new();
-        let first = intern_kind_in(&mut kinds, "wasm.rule".to_owned(), 2);
-        assert_eq!(first, intern_kind_in(&mut kinds, "wasm.rule".to_owned(), 2));
-        intern_kind_in(&mut kinds, "wasm.edit".to_owned(), 2);
+    fn kind_interning_is_isolated_per_plugin() {
+        let mut kinds = InternedKinds::default();
+        for i in 0..MAX_KINDS_PER_PLUGIN {
+            assert_ne!(
+                kinds.intern(
+                    "a",
+                    format!("k{i}"),
+                    MAX_INTERNED_KINDS,
+                    MAX_KINDS_PER_PLUGIN
+                ),
+                UNKNOWN_KIND
+            );
+        }
         assert_eq!(
-            intern_kind_in(&mut kinds, "wasm.other".to_owned(), 2),
+            kinds.intern(
+                "a",
+                "overflow".to_owned(),
+                MAX_INTERNED_KINDS,
+                MAX_KINDS_PER_PLUGIN
+            ),
+            UNKNOWN_KIND
+        );
+        // Another plugin keeps its own quota, and repeats do not consume slots.
+        assert_eq!(
+            kinds.intern(
+                "b",
+                "k0".to_owned(),
+                MAX_INTERNED_KINDS,
+                MAX_KINDS_PER_PLUGIN
+            ),
+            "k0"
+        );
+        assert_eq!(
+            kinds.intern(
+                "a",
+                "k0".to_owned(),
+                MAX_INTERNED_KINDS,
+                MAX_KINDS_PER_PLUGIN
+            ),
+            "k0"
+        );
+        // The table as a whole remains bounded.
+        assert_eq!(
+            kinds.intern(
+                "c",
+                "late".to_owned(),
+                MAX_KINDS_PER_PLUGIN,
+                MAX_KINDS_PER_PLUGIN
+            ),
             UNKNOWN_KIND
         );
     }
@@ -1045,6 +1137,112 @@ mod tests {
             PluginError::Skip(msg) => assert_eq!(msg, "line[31mreason"),
             other => panic!("expected skip, got {other:?}"),
         }
+    }
+
+    fn test_state() -> HostState {
+        let manifest = Manifest::parse(
+            r#"
+[plugin]
+name = "t"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+
+[log-templates]
+hit = "hit {0}"
+"#,
+        )
+        .unwrap();
+        HostState {
+            plugin_name: "t".to_owned(),
+            table: ResourceTable::new(),
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            limits: StoreLimitsBuilder::new().memory_size(1024 * 1024).build(),
+            manifest,
+            grants: BTreeSet::new(),
+            config_toml: Vec::new(),
+            start: Instant::now(),
+            deadline: Duration::from_secs(10),
+            request: None,
+            request_state: BTreeMap::new(),
+            findings: Vec::new(),
+            poisoned: false,
+            trap: None,
+            log_count: 0,
+            finding_count: 0,
+        }
+    }
+
+    #[test]
+    fn sanitizers_cap_input_before_filtering() {
+        let hidden_reason = format!(
+            "{}\u{1b}visible",
+            "\u{1b}".repeat(MAX_REASON_INPUT_CHARS + 1)
+        );
+        assert_eq!(sanitize_reason(&hidden_reason), "skipped");
+        let visible_reason = format!("{}visible", "\u{1b}".repeat(100));
+        assert_eq!(sanitize_reason(&visible_reason), "visible");
+
+        let hidden_label = format!("{}kind", " ".repeat(MAX_LABEL_INPUT_CHARS + 1));
+        assert!(sanitize_label(&hidden_label, 64).is_empty());
+        assert_eq!(
+            sanitize_label(&format!("{}kind", " ".repeat(100)), 64),
+            "kind"
+        );
+
+        let hidden_tool = format!("{}tool", " ".repeat(MAX_TOOL_NAME_INPUT_CHARS + 1));
+        assert_eq!(sanitize_tool_name(&hidden_tool), "unnamed");
+        assert_eq!(
+            sanitize_tool_name(&format!("{}tool", " ".repeat(100))),
+            "tool"
+        );
+    }
+
+    #[test]
+    fn log_bounds_guest_template_id_and_args() {
+        use reiki::plugin::log::Host as _;
+
+        let mut state = test_state();
+        state
+            .log(2, "x".repeat(MAX_TEMPLATE_ID_BYTES + 1), vec![])
+            .unwrap();
+        assert!(state.poisoned);
+        assert_eq!(state.log_count, 1);
+
+        let mut state = test_state();
+        state
+            .log(2, "hit".to_owned(), vec![1; MAX_LOG_ARGS + 1])
+            .unwrap();
+        assert!(state.poisoned);
+
+        let mut state = test_state();
+        state.log(2, "hit".to_owned(), vec![7]).unwrap();
+        assert!(!state.poisoned);
+        assert_eq!(state.log_count, 1);
+    }
+
+    #[test]
+    fn request_state_validates_get_keys_like_set() {
+        use reiki::plugin::request_state::Host as _;
+
+        let mut state = test_state();
+        assert!(
+            state
+                .get("k".repeat(MAX_REQUEST_STATE_KEY_BYTES + 1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.poisoned);
+
+        let mut state = test_state();
+        state
+            .set("k".repeat(MAX_REQUEST_STATE_KEY_BYTES + 1), vec![1])
+            .unwrap();
+        assert!(state.poisoned);
+
+        let mut state = test_state();
+        state.set("k".to_owned(), vec![1]).unwrap();
+        assert_eq!(state.get("k".to_owned()).unwrap(), Some(vec![1]));
+        assert!(!state.poisoned);
     }
 
     #[test]

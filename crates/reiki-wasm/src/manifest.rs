@@ -7,6 +7,10 @@ use crate::capability::Capability;
 /// The embedded manifest custom section name.
 pub const SECTION_NAME: &str = "reiki-manifest";
 
+/// Maximum byte length of a log or reject template key. The host applies the
+/// same bound to guest-supplied template ids before looking them up.
+pub(crate) const MAX_TEMPLATE_ID_BYTES: usize = 256;
+
 /// TOML manifest embedded in the component as a custom section.
 /// The manifest is the human-readable justification; capabilities are derived from imports (D1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,9 +214,9 @@ impl Manifest {
             return Err("log-templates has more than 64 entries".to_owned());
         }
         for (id, tpl) in &self.log_templates {
-            if id.is_empty() || tpl.len() > 200 {
+            if id.is_empty() || id.len() > MAX_TEMPLATE_ID_BYTES || tpl.len() > 200 {
                 return Err(format!(
-                    "log template `{id}` must have id 1+ bytes and text <= 200 bytes"
+                    "log template id must be 1-{MAX_TEMPLATE_ID_BYTES} bytes and text <= 200 bytes"
                 ));
             }
         }
@@ -220,9 +224,9 @@ impl Manifest {
             return Err("reject-templates has more than 64 entries".to_owned());
         }
         for (id, tpl) in &self.reject_templates {
-            if id.is_empty() || tpl.message.len() > 200 {
+            if id.is_empty() || id.len() > MAX_TEMPLATE_ID_BYTES || tpl.message.len() > 200 {
                 return Err(format!(
-                    "reject template `{id}` must have id 1+ bytes and message <= 200 bytes"
+                    "reject template id must be 1-{MAX_TEMPLATE_ID_BYTES} bytes and message <= 200 bytes"
                 ));
             }
             if !matches!(tpl.status, 400 | 403 | 413 | 422 | 451) {
@@ -429,6 +433,40 @@ request-body-read = true
         bytes.extend(section(SECTION_NAME, b"second"));
         let err = extract_embedded_manifest(&bytes).unwrap_err();
         assert!(err.contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn template_ids_are_bounded_at_manifest_load() {
+        let toml = format!(
+            r#"
+[plugin]
+name = "t"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+
+[log-templates]
+"{}" = "ok"
+"#,
+            "x".repeat(MAX_TEMPLATE_ID_BYTES + 1)
+        );
+        let err = Manifest::parse(&toml).unwrap_err();
+        assert!(err.contains("log template id"), "{err}");
+
+        let toml = format!(
+            r#"
+[plugin]
+name = "t"
+version = "0.1.0"
+wit-world = "reiki:plugin/plugin@1.0.0"
+
+[reject-templates."{}"]
+status = 403
+message = "no"
+"#,
+            "x".repeat(MAX_TEMPLATE_ID_BYTES + 1)
+        );
+        let err = Manifest::parse(&toml).unwrap_err();
+        assert!(err.contains("reject template id"), "{err}");
     }
 
     #[test]

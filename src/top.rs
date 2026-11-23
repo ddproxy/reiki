@@ -7,18 +7,29 @@
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reiki_top::matrix::{
     History, HostSummary, Matrix, Metric, Sample, fleet_series, is_fleet_row, is_problem,
     key_counts, order_peers, resolve, usage_by_provider,
 };
+use reiki_top::streams::StreamsView;
 use reiki_top::ui::{self, ChartMetric, ChartSeries, crossterm, ratatui};
 use reiki_top::{Fleet, Health, view};
 use tokio::sync::mpsc;
 
 use crate::config::{Config, PeerEntry, PeersConfig};
 use crate::peers::client::{self, Chunk, MAX_BODY, SseItem, SseParser};
+
+/// A failed stream-console refresh retries at most once a minute.
+const STREAMS_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Unix seconds for the labels that count down token and cooldown deadlines.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
 
 /// One message from a peer's feed task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +49,10 @@ pub(crate) enum FeedEvent {
     },
     /// The local instance's estimated cost, from its admin listener. Not a peer event.
     LocalCost(reiki_top::LocalCost),
+    /// The local read-only stream console, from the same admin listener. Not a peer event.
+    LocalStreams(StreamsView),
+    /// Why the local stream console could not be refreshed.
+    LocalStreamsError(String),
 }
 
 /// Where the local instance's admin listener is, and which published name is ours.
@@ -101,6 +116,29 @@ impl LocalFailures {
             return Err(format!("the admin listener answered {status}"));
         }
         reiki_top::LocalCost::from_json(&body)
+    }
+
+    /// Fetches the read-only stream console with the ordinary admin token. The stream-admin
+    /// token is never read here: this route cannot create, rotate or revoke anything.
+    async fn fetch_streams(&self) -> Result<StreamsView, String> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/v1/stream-console", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("cannot reach the admin listener: {e}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("cannot read the admin answer: {e}"))?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err("this instance does not serve the stream console".to_owned());
+        }
+        if !status.is_success() {
+            return Err(format!("the admin listener answered {status}"));
+        }
+        StreamsView::from_json(&body)
     }
 }
 
@@ -275,6 +313,8 @@ pub(crate) fn apply_feed(fleet: &mut Fleet, name: &str, feed: FeedEvent, now: In
             fleet.set_local_failures(&instance, failures)
         }
         FeedEvent::LocalCost(cost) => fleet.set_local_cost(cost),
+        FeedEvent::LocalStreams(streams) => fleet.set_local_streams(streams),
+        FeedEvent::LocalStreamsError(reason) => fleet.set_streams_error(reason),
     }
 }
 
@@ -322,6 +362,27 @@ async fn feed_local(local: LocalFailures, poll: Duration, tx: mpsc::Sender<(Stri
             return;
         }
         tokio::time::sleep(poll).await;
+    }
+}
+
+/// Refreshes the local stream console. A failure doubles the wait up to a minute, so an admin
+/// listener that is down cannot turn the view into a tight polling loop.
+async fn feed_streams(local: LocalFailures, poll: Duration, tx: mpsc::Sender<(String, FeedEvent)>) {
+    let poll = poll.max(Duration::from_secs(1));
+    let mut backoff = poll;
+    loop {
+        let (event, delay) = match local.fetch_streams().await {
+            Ok(streams) => (FeedEvent::LocalStreams(streams), poll),
+            Err(reason) => {
+                let delay = backoff;
+                backoff = backoff.saturating_mul(2).min(STREAMS_BACKOFF_MAX);
+                (FeedEvent::LocalStreamsError(reason), delay)
+            }
+        };
+        if tx.send((local.instance.clone(), event)).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -450,7 +511,8 @@ async fn run_live_with_local(
         )));
     }
     if let Some(local) = local {
-        tasks.push(tokio::spawn(feed_local(local, poll, tx.clone())));
+        tasks.push(tokio::spawn(feed_local(local.clone(), poll, tx.clone())));
+        tasks.push(tokio::spawn(feed_streams(local, poll, tx.clone())));
     }
     drop(tx);
 
@@ -599,16 +661,25 @@ async fn live_loop(
                             return 1;
                         }
                     };
-                let problem = selected_peer(shown, &all, shown_at, &state)
-                    .is_some_and(|(_, problem)| problem);
-                if action == ui::Action::CycleProvider {
-                    if state.mode == ui::Mode::Matrix {
-                        let matrix = Matrix::build_fleet(shown, &all, shown_at);
-                        let providers: Vec<String> =
-                            matrix.columns.iter().map(|c| c.upstream.clone()).collect();
-                        state.cycle_provider(&providers);
+                let keep = if state.mode == ui::Mode::Streams {
+                    let rows = shown.local_streams().map_or(0, |view| view.rows.len());
+                    apply_streams_action(&mut state, action, rows, total, viewport)
+                } else {
+                    let problem = selected_peer(shown, &all, shown_at, &state)
+                        .is_some_and(|(_, problem)| problem);
+                    if action == ui::Action::CycleProvider {
+                        if state.mode == ui::Mode::Matrix {
+                            let matrix = Matrix::build_fleet(shown, &all, shown_at);
+                            let providers: Vec<String> =
+                                matrix.columns.iter().map(|c| c.upstream.clone()).collect();
+                            state.cycle_provider(&providers);
+                        }
+                        true
+                    } else {
+                        apply_action(&mut state, action, &all, total, viewport, problem)
                     }
-                } else if !apply_action(&mut state, action, &all, total, viewport, problem) {
+                };
+                if !keep {
                     return 0;
                 }
                 match (state.paused, frozen.is_some()) {
@@ -651,6 +722,54 @@ async fn terminated(signal: &mut Option<tokio::signal::unix::Signal>) {
 #[cfg(not(unix))]
 async fn terminated(_signal: &mut Option<()>) {
     std::future::pending::<()>().await;
+}
+
+/// Applies one key action on the Streams screen. Movement keys pick a stream and reset the detail
+/// scroll; paging keys scroll the detail. Nothing here can change a stream.
+fn apply_streams_action(
+    state: &mut ui::UiState,
+    action: ui::Action,
+    rows: usize,
+    detail_lines: usize,
+    viewport: usize,
+) -> bool {
+    match action {
+        ui::Action::Quit => return false,
+        ui::Action::ScrollDown | ui::Action::NextPeer => {
+            state.stream_row = (rows > 0).then(|| {
+                state
+                    .stream_row
+                    .map_or(0, |row| if row + 1 < rows { row + 1 } else { 0 })
+            });
+            state.scroll = 0;
+        }
+        ui::Action::ScrollUp | ui::Action::PrevPeer => {
+            state.stream_row = (rows > 0).then(|| {
+                state
+                    .stream_row
+                    .map_or(rows - 1, |row| row.checked_sub(1).unwrap_or(rows - 1))
+            });
+            state.scroll = 0;
+        }
+        ui::Action::PageUp => {
+            state.scroll = state.scroll.saturating_sub(viewport.max(1));
+        }
+        ui::Action::PageDown => {
+            state.scroll = state.scroll.saturating_add(viewport.max(1));
+        }
+        ui::Action::Top => state.scroll = 0,
+        ui::Action::Bottom => state.scroll = detail_lines.saturating_sub(viewport.max(1)),
+        ui::Action::ToggleStreams => {
+            state.apply(action, detail_lines, viewport);
+        }
+        _ => {
+            state.apply(action, detail_lines, viewport);
+        }
+    }
+    state.scroll = state
+        .scroll
+        .min(detail_lines.saturating_sub(viewport.max(1)));
+    true
 }
 
 /// Applies one key action. In matrix view the arrows and j/k move the selection and Enter opens
@@ -760,6 +879,7 @@ struct Parts {
     selected: Option<usize>,
     cooling: Vec<view::Line>,
     detail: Option<Vec<view::Line>>,
+    status: Vec<view::Line>,
     providers: Vec<String>,
     chart_title: String,
     chart_series: Vec<ChartSeries>,
@@ -781,6 +901,34 @@ fn build_parts(
             lines: view::render(fleet, &visible_cts(all, state), now, width),
             ..Parts::default()
         },
+        ui::Mode::Streams => {
+            // Both panes draw inside a border. The detail pane only exists on a wide frame.
+            let inner = width.saturating_sub(2);
+            let detail_width = if width >= 60 {
+                width.saturating_sub(width * 3 / 5).saturating_sub(2)
+            } else {
+                0
+            };
+            let Some(console) = fleet.local_streams() else {
+                return Parts {
+                    lines: view::streams_waiting(fleet.streams_error(), inner),
+                    detail: Some(Vec::new()),
+                    ..Parts::default()
+                };
+            };
+            let now = unix_now();
+            let selected = state
+                .stream_row
+                .filter(|row| console.rows.get(*row).is_some());
+            Parts {
+                lines: view::streams_table(console, selected, now, inner),
+                rows: console.rows.len(),
+                selected,
+                detail: Some(view::stream_detail(console, selected, now, detail_width)),
+                status: view::streams_status(console, fleet.streams_error(), inner),
+                ..Parts::default()
+            }
+        }
         ui::Mode::Matrix => {
             // The panels draw inside a border.
             let inner = width.saturating_sub(2);
@@ -846,6 +994,7 @@ fn build_parts(
                     .skip(1)
                     .collect(),
                 detail,
+                status: Vec::new(),
                 providers,
                 chart_title,
                 chart_series,
@@ -992,6 +1141,16 @@ fn measure(
             usize::from(ui::detail_height(size.height).saturating_sub(2)),
         ),
         (ui::Mode::Matrix, None) => (0, 0),
+        (ui::Mode::Streams, Some(detail)) => {
+            let body = usize::from(size.height.saturating_sub(2));
+            let viewport = if usize::from(size.width) >= 60 {
+                body.saturating_sub(2)
+            } else {
+                0
+            };
+            (detail.len(), viewport)
+        }
+        (ui::Mode::Streams, None) => (0, 0),
     })
 }
 
@@ -1032,11 +1191,7 @@ fn render_screen(
         })
         .count();
     let status = status_line(fresh, visible.len(), shown.paused_for);
-    let clock = ui::utc_clock(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-    );
+    let clock = ui::utc_clock(unix_now());
     terminal.draw(|frame| {
         let parts = build_parts(
             shown.fleet,
@@ -1065,6 +1220,16 @@ fn render_screen(
                     chart_series: &parts.chart_series,
                     chart_interval: parts.chart_interval,
                     keys: parts.keys,
+                },
+                state,
+            ),
+            ui::Mode::Streams => ui::draw_streams(
+                frame,
+                &ui::StreamsFrame {
+                    table: &parts.lines,
+                    detail: parts.detail.as_deref().unwrap_or(&[]),
+                    status: &parts.status,
+                    selected: parts.selected,
                 },
                 state,
             ),
@@ -2329,5 +2494,140 @@ mod tests {
             .unwrap_or_else(|| panic!("panel: {out}"));
         assert!(out.find("Fleet").unwrap() < cooling, "{out}");
         assert!(out[cooling..].contains("peer-b"), "{out}");
+    }
+
+    fn runtime_token() -> String {
+        ["rsk", "_", &"c".repeat(64)].concat()
+    }
+
+    fn streams_json(secret: &str) -> String {
+        format!(
+            r#"{{
+              "enabled": true,
+              "streams": [
+                {{"name": "busy", "dynamic": true, "chain": ["zen"],
+                  "limits": {{"rpm": 10, "concurrent": 2}},
+                  "tokens": [{{"id": "abcdef1234567890", "expires_at": 4102444800}}],
+                  "expiry": 4102444800, "rpm": {{"current": 9, "limit": 10}},
+                  "concurrency": {{"current": 2, "limit": 2}},
+                  "last_used": 1000, "state": "active",
+                  "token": "{secret}", "hash": "not shown"}},
+                {{"name": "quiet", "dynamic": false, "chain": ["zen", "openrouter"],
+                  "limits": {{}}, "tokens": [], "rpm": {{"current": 1, "limit": 30}},
+                  "concurrency": {{"current": 0, "limit": 2}},
+                  "last_used": null, "state": "active"}}
+              ],
+              "audit": [
+                {{"seq": 2, "time": "2026-11-23T00:01:00Z", "action": "token.add",
+                  "stream": "busy", "outcome": "success", "reason": "rotation",
+                  "changes": []}}
+              ]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn streams_feed_keeps_the_last_good_snapshot_on_a_refresh_failure() {
+        let now = Instant::now();
+        let mut fleet = fleet();
+        let streams = StreamsView::from_json(&streams_json(&runtime_token())).expect("fixture");
+        apply_feed(&mut fleet, "local", FeedEvent::LocalStreams(streams), now);
+        assert_eq!(fleet.local_streams().unwrap().rows.len(), 2);
+        assert_eq!(fleet.streams_error(), None);
+        apply_feed(
+            &mut fleet,
+            "local",
+            FeedEvent::LocalStreamsError("admin unreachable".to_owned()),
+            now,
+        );
+        assert_eq!(fleet.streams_error(), Some("admin unreachable"));
+        assert_eq!(fleet.local_streams().unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn streams_keys_move_the_row_and_page_the_detail_without_leaving_the_view() {
+        let mut state = ui::UiState {
+            mode: ui::Mode::Streams,
+            stream_row: Some(0),
+            ..ui::UiState::default()
+        };
+        apply_streams_action(&mut state, ui::Action::NextPeer, 3, 20, 5);
+        assert_eq!((state.stream_row, state.scroll), (Some(1), 0));
+        apply_streams_action(&mut state, ui::Action::PrevPeer, 3, 20, 5);
+        assert_eq!(state.stream_row, Some(0));
+        apply_streams_action(&mut state, ui::Action::ScrollUp, 3, 20, 5);
+        assert_eq!(state.stream_row, Some(2), "selection wraps");
+        apply_streams_action(&mut state, ui::Action::PageDown, 3, 20, 5);
+        assert_eq!(state.scroll, 5, "paging scrolls the detail");
+        apply_streams_action(&mut state, ui::Action::Bottom, 3, 20, 5);
+        assert_eq!(state.scroll, 15);
+        apply_streams_action(&mut state, ui::Action::Top, 3, 20, 5);
+        assert_eq!(state.scroll, 0);
+        assert!(!apply_streams_action(
+            &mut state,
+            ui::Action::Quit,
+            3,
+            20,
+            5
+        ));
+        assert_eq!(state.mode, ui::Mode::Streams, "Quit leaves the state alone");
+    }
+
+    #[test]
+    fn streams_parts_show_columns_and_never_render_a_token_value() {
+        let secret = runtime_token();
+        let mut fleet = fleet();
+        let streams = StreamsView::from_json(&streams_json(&secret)).expect("fixture");
+        fleet.set_local_streams(streams);
+        let state = ui::UiState {
+            mode: ui::Mode::Streams,
+            stream_row: Some(0),
+            ..ui::UiState::default()
+        };
+        let parts = build_parts(
+            &fleet,
+            &History::new(0),
+            &[],
+            Instant::now(),
+            &state,
+            100,
+            SAMPLE_INTERVAL,
+        );
+        let table = plain(&parts.lines).join("\n");
+        let detail = plain(parts.detail.as_ref().unwrap()).join("\n");
+        assert!(
+            table.contains("stream") && table.contains("dynamic"),
+            "{table}"
+        );
+        assert!(table.contains("9/10") && table.contains("2/2"), "{table}");
+        assert!(
+            detail.contains("abcdef12"),
+            "ids are shown, not values: {detail}"
+        );
+        assert!(detail.contains("token.add"), "{detail}");
+        assert!(!format!("{table}\n{detail}").contains(&secret));
+        assert!(parts.status.is_empty());
+    }
+
+    #[test]
+    fn streams_parts_wait_without_a_local_admin_answer() {
+        let state = ui::UiState {
+            mode: ui::Mode::Streams,
+            ..ui::UiState::default()
+        };
+        let parts = build_parts(
+            &fleet(),
+            &History::new(0),
+            &[],
+            Instant::now(),
+            &state,
+            100,
+            SAMPLE_INTERVAL,
+        );
+        assert!(
+            plain(&parts.lines)[0].contains("waiting for the local admin listener"),
+            "{:?}",
+            plain(&parts.lines)
+        );
     }
 }

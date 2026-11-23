@@ -526,6 +526,142 @@ async fn without_the_feature_the_stream_routes_are_unavailable() {
 }
 
 #[tokio::test]
+async fn stream_console_is_read_only_admin_json_without_secrets() {
+    let rig = Rig::new(Options::default()).await;
+    let anonymous = rig
+        .call(
+            Method::GET,
+            &rig.admin,
+            "/v1/stream-console",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(anonymous.status, 401, "the console needs the admin token");
+    let wrong_token = format!("Bearer {STREAM_ADMIN_TOKEN}");
+    let wrong = rig
+        .call(
+            Method::GET,
+            &rig.admin,
+            "/v1/stream-console",
+            None,
+            Some(&wrong_token),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(wrong.status, 401, "the stream token is not an admin token");
+
+    let created = rig
+        .stream_call(
+            Method::POST,
+            "/v1/streams/create",
+            Some(&create_body("dyn-a", "console fixture")),
+            Some("console-create"),
+            &[],
+        )
+        .await;
+    assert_eq!(created.status, 200, "a dynamic stream can be created");
+    let token = created_token(&created);
+
+    let reply = rig.admin_get("/v1/stream-console").await;
+    assert_eq!(reply.status, 200, "the admin token reads the console");
+    assert_no_credential(&reply, &[&token, ADMIN_TOKEN, STREAM_ADMIN_TOKEN]);
+    let body = reply.json();
+    assert_eq!(body["enabled"], true);
+    let streams = body["streams"].as_array().expect("streams array");
+    assert_eq!(
+        streams.len(),
+        2,
+        "static and dynamic streams are both listed"
+    );
+    let dynamic = streams
+        .iter()
+        .find(|row| row["name"] == "dyn-a")
+        .expect("dynamic row");
+    assert_eq!(dynamic["dynamic"], true);
+    assert_eq!(dynamic["limits"]["rpm"], 10);
+    assert_eq!(dynamic["state"], "active");
+    let token_ids = dynamic["tokens"].as_array().expect("token array");
+    assert_eq!(token_ids.len(), 1, "only the credential id is listed");
+    assert!(token_ids[0]["id"].is_string());
+    assert!(token_ids[0].get("token").is_none());
+    assert!(token_ids[0].get("token_sha256").is_none());
+    let text = reply.body.clone();
+    for forbidden in [
+        "token_sha256",
+        "\"actor\"",
+        "\"source\"",
+        "\"hash\"",
+        "\"prev\"",
+        "state_file",
+        "audit_log",
+    ] {
+        assert!(!text.contains(forbidden), "no {forbidden} in the console");
+    }
+    let audit = body["audit"].as_array().expect("audit array");
+    assert!(!audit.is_empty(), "the create action is audited");
+    assert!(
+        audit
+            .windows(2)
+            .all(|pair| pair[0]["seq"].as_u64() >= pair[1]["seq"].as_u64())
+    );
+    assert_eq!(audit[0]["action"], "create");
+    assert_eq!(audit[0]["stream"], "dyn-a");
+
+    assert_eq!(
+        rig.send_relay(STATIC_TOKEN).await,
+        200,
+        "a request is relayed"
+    );
+    let reply = rig.admin_get("/v1/stream-console").await;
+    let streams = reply.json()["streams"].as_array().unwrap().clone();
+    let static_row = streams
+        .iter()
+        .find(|row| row["name"] == "static-s")
+        .unwrap();
+    assert!(
+        static_row["last_used"]
+            .as_u64()
+            .is_some_and(|second| second > 0),
+        "last used comes from live admissions"
+    );
+    assert_eq!(static_row["rpm"]["limit"], Value::Null);
+    assert_eq!(static_row["concurrency"]["current"], 0);
+
+    let openapi = rig.admin_get("/v1/openapi.json").await;
+    let paths = openapi.json()["paths"].as_object().unwrap().clone();
+    let console = paths.get("/v1/stream-console").expect("documented route");
+    assert_eq!(
+        console["get"]["security"][0]["bearerAuth"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn stream_console_reports_a_disabled_feature_clearly() {
+    let rig = Rig::new(Options {
+        enabled: false,
+        ..Options::default()
+    })
+    .await;
+    let reply = rig.admin_get("/v1/stream-console").await;
+    assert_eq!(reply.status, 200);
+    assert_no_credential(&reply, &[STATIC_TOKEN, ADMIN_TOKEN]);
+    let body = reply.json();
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["audit"], serde_json::json!([]));
+    let streams = body["streams"]
+        .as_array()
+        .expect("static streams stay visible");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0]["name"], "static-s");
+    assert_eq!(streams[0]["dynamic"], false);
+}
+
+#[tokio::test]
 async fn bad_credentials_are_indistinguishable_and_lock_out_the_source() {
     let rig = Rig::new(Options::default()).await;
     let wrong = format!("Bearer {WRONG_TOKEN_FOR_LOG_TEST}");

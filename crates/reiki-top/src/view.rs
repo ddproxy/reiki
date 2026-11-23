@@ -296,6 +296,226 @@ fn fmt_num(n: f64) -> String {
 
 /// Local estimated spend, when the cost plugin answered the admin listener. This is a
 /// bounded copy of the operator's own figures; peer documents never carry it.
+/// Column widths for the read-only stream table, clipped to the available width.
+struct StreamColumns {
+    values: [usize; 8],
+}
+
+impl StreamColumns {
+    fn new(width: usize) -> Self {
+        const WEIGHTS: [usize; 8] = [16, 8, 18, 9, 9, 9, 7, 9];
+        const TOTAL: usize = 85;
+        let usable = width.saturating_sub(2 + WEIGHTS.len());
+        let mut values = [0; 8];
+        for (slot, weight) in values.iter_mut().zip(WEIGHTS) {
+            *slot = (usable * weight / TOTAL).max(4);
+        }
+        Self { values }
+    }
+}
+
+fn usage_style(usage: &crate::streams::UsageJson) -> Style {
+    match usage.limit {
+        Some(limit) if usage.current.saturating_mul(10) >= limit.saturating_mul(9) => Style::Warn,
+        Some(_) => Style::Good,
+        None => Style::Dim,
+    }
+}
+
+fn state_style(state: &str) -> Style {
+    match state {
+        "active" => Style::Good,
+        "expired" | "revoked" => Style::Bad,
+        _ => Style::Warn,
+    }
+}
+
+fn table_cells(row: &crate::streams::Row, now: u64) -> [(String, Style); 8] {
+    [
+        (row.name.clone(), Style::Plain),
+        (row.kind_label().to_owned(), Style::Dim),
+        (row.chain_label(), Style::Plain),
+        (row.expiry_countdown(now), Style::Dim),
+        (row.rpm_label(), usage_style(&row.rpm)),
+        (row.concurrency_label(), usage_style(&row.concurrency)),
+        (row.last_used_ago(now), Style::Dim),
+        (row.state.clone(), state_style(&row.state)),
+    ]
+}
+
+fn table_line(cells: [(String, Style); 8], columns: &StreamColumns, selected: bool) -> Line {
+    let mut spans = vec![marker(selected)];
+    for ((text, style), width) in cells.into_iter().zip(columns.values) {
+        spans.push(span(pad(&clip(&text, width), width), style));
+        spans.push(span(" ", Style::Plain));
+    }
+    line(trim_end(spans), usize::MAX)
+}
+
+/// The Streams screen's table, including its header. Rows come pre-sorted by usage.
+pub fn streams_table(
+    view: &crate::streams::StreamsView,
+    selected: Option<usize>,
+    now: u64,
+    width: usize,
+) -> Vec<Line> {
+    let columns = StreamColumns::new(width);
+    let titles = [
+        "stream", "type", "chain", "expires", "rpm", "conc", "last", "state",
+    ];
+    let header = table_line(
+        titles.map(|title| (title.to_owned(), Style::Title)),
+        &columns,
+        false,
+    );
+    let mut out = vec![header];
+    for (index, row) in view.rows.iter().enumerate() {
+        out.push(table_line(
+            table_cells(row, now),
+            &columns,
+            Some(index) == selected,
+        ));
+    }
+    out
+}
+
+/// Safe explanatory lines for the disabled, empty and degraded states.
+pub fn streams_status(
+    view: &crate::streams::StreamsView,
+    error: Option<&str>,
+    width: usize,
+) -> Vec<Line> {
+    let mut out = Vec::new();
+    if let Some(error) = error {
+        out.push(line(
+            vec![span(format!("refresh failed: {error}"), Style::Warn)],
+            width,
+        ));
+    }
+    if !view.enabled {
+        out.push(line(
+            vec![span(
+                "stream_admin is disabled; dynamic streams and audit are unavailable",
+                Style::Warn,
+            )],
+            width,
+        ));
+    }
+    if view.rows.is_empty() {
+        out.push(line(vec![span("no streams configured", Style::Dim)], width));
+    }
+    out
+}
+
+/// A placeholder for the table before the first local admin answer arrives. A refresh failure
+/// keeps the last good table on screen, so this is only used while there is nothing to show.
+pub fn streams_waiting(error: Option<&str>, width: usize) -> Vec<Line> {
+    let text = match error {
+        Some(error) => format!("stream console unavailable: {error}"),
+        None => "waiting for the local admin listener".to_owned(),
+    };
+    vec![line(vec![span(text, Style::Dim)], width)]
+}
+
+/// Detail lines for the selected stream: limits, credential ids and expiries, then a bounded
+/// newest-first audit tail. No credential value or hash exists in the view model to display.
+pub fn stream_detail(
+    view: &crate::streams::StreamsView,
+    selected: Option<usize>,
+    now: u64,
+    width: usize,
+) -> Vec<Line> {
+    let Some(row) = view.row(selected) else {
+        return vec![line(vec![span("no stream selected", Style::Dim)], width)];
+    };
+    let mut out = vec![line(
+        vec![span(format!("{} ({})", row.name, row.state), Style::Title)],
+        width,
+    )];
+    out.push(line(
+        vec![span(
+            format!(
+                "type: {} · expires: {} · last used: {}",
+                row.kind_label(),
+                row.expiry_countdown(now),
+                row.last_used_ago(now)
+            ),
+            Style::Dim,
+        )],
+        width,
+    ));
+    out.push(line(
+        vec![span(format!("chain: {}", row.chain_label()), Style::Plain)],
+        width,
+    ));
+    out.push(line(vec![span("limits", Style::Title)], width));
+    for (label, value) in row.limits.lines() {
+        out.push(line(
+            vec![span(format!("  {label}: {value}"), Style::Plain)],
+            width,
+        ));
+    }
+    out.push(line(vec![span("tokens (id only)", Style::Title)], width));
+    if row.tokens.is_empty() {
+        out.push(line(
+            vec![span("  none (static stream)", Style::Dim)],
+            width,
+        ));
+    }
+    for token in &row.tokens {
+        out.push(line(
+            vec![span(
+                format!(
+                    "  {}  {}  {}",
+                    token.short_id(),
+                    crate::streams::fmt_countdown(token.expires_at, now),
+                    token.state_at(now)
+                ),
+                if token.active_at(now) {
+                    Style::Good
+                } else {
+                    Style::Warn
+                },
+            )],
+            width,
+        ));
+    }
+    out.push(line(
+        vec![span("audit (newest first)", Style::Title)],
+        width,
+    ));
+    let mut audit = view.audit_for(&row.name).take(12).peekable();
+    if audit.peek().is_none() {
+        out.push(line(vec![span("  no recent actions", Style::Dim)], width));
+    }
+    for record in audit {
+        out.push(line(
+            vec![span(
+                format!(
+                    "  {} {} {} {}",
+                    record.time, record.action, record.outcome, record.reason
+                ),
+                match record.outcome.as_str() {
+                    "success" => Style::Plain,
+                    "denied" => Style::Warn,
+                    _ => Style::Bad,
+                },
+            )],
+            width,
+        ));
+        for change in &record.changes {
+            out.push(line(
+                vec![span(
+                    format!("    {}: {} -> {}", change.field, change.from, change.to),
+                    Style::Dim,
+                )],
+                width,
+            ));
+        }
+    }
+    out
+}
+
 pub fn cost_line(fleet: &Fleet, width: usize) -> Option<Line> {
     let cost = fleet.local_cost()?;
     let mut text = format!(
@@ -4057,5 +4277,69 @@ mod tests {
                 .any(|l| l.contains("gateway 10 req, 200 tok, 1 store errors")),
             "{card:?}"
         );
+    }
+
+    /// Built at runtime so no credential-shaped literal appears in the source.
+    fn streams_fixture(secret: &str) -> crate::streams::StreamsView {
+        crate::streams::StreamsView::from_json(&format!(
+            r#"{{
+              "enabled": true,
+              "streams": [
+                {{"name":"quiet","dynamic":false,"chain":["zen","openrouter"],
+                  "limits":{{"rpm":30,"concurrent":2}},"tokens":[],"expiry":null,
+                  "rpm":{{"current":1,"limit":30}},"concurrency":{{"current":0,"limit":2}},
+                  "last_used":1000,"state":"active"}},
+                {{"name":"busy","dynamic":true,"chain":["zen"],
+                  "limits":{{"rpm":10}},"tokens":[{{"id":"abcdef1234567890","expires_at":1900}}],
+                  "expiry":1900,"rpm":{{"current":9,"limit":10}},
+                  "concurrency":{{"current":2,"limit":2}},"last_used":1150,"state":"active",
+                  "token":"{secret}"}}
+              ],
+              "audit": [
+                {{"seq":2,"time":"2026-11-23T00:01:00Z","action":"token.add","stream":"busy",
+                  "outcome":"success","reason":"rotation","changes":[{{"field":"token.id",
+                  "from":"-","to":"abcdef12"}}]}}
+              ]
+            }}"#
+        ))
+        .expect("fixture parses")
+    }
+
+    #[test]
+    fn streams_table_builds_sorted_columns_and_marks_the_selection() {
+        let secret = ["rsk", "_", &"a".repeat(64)].concat();
+        let view = streams_fixture(&secret);
+        let rows = texts(&streams_table(&view, Some(0), 1155, 100));
+        assert_eq!(rows.len(), 3, "a header and two streams");
+        assert!(rows[0].contains("stream") && rows[0].contains("expires"));
+        assert!(rows[1].contains("> busy"), "usage sorts busy first");
+        assert!(rows[1].contains("dynamic") && rows[1].contains("9/10"));
+        assert!(rows[2].contains("static") && rows[2].contains("zen -> openrouter"));
+        let all = rows.join("\n");
+        assert!(!all.contains(&secret), "no token value in the table");
+    }
+
+    #[test]
+    fn stream_detail_shows_limits_ids_and_audit_without_token_values() {
+        let secret = ["rsk", "_", &"b".repeat(64)].concat();
+        let view = streams_fixture(&secret);
+        let lines = texts(&stream_detail(&view, Some(0), 1155, 90)).join("\n");
+        assert!(lines.contains("abcdef12"), "the short id is shown");
+        assert!(lines.contains("rpm: 10") && lines.contains("tpm: -"));
+        assert!(lines.contains("token.add") && lines.contains("rotation"));
+        assert!(lines.contains("token.id: - -> abcdef12"));
+        assert!(!lines.contains(&secret), "the token value is never shown");
+        assert!(!lines.contains("token_sha256"));
+    }
+
+    #[test]
+    fn streams_status_explains_a_disabled_feature_and_a_failed_refresh() {
+        let secret = ["rsk", "_", &"c".repeat(64)].concat();
+        let mut view = streams_fixture(&secret);
+        view.enabled = false;
+        let lines = texts(&streams_status(&view, Some("admin unreachable"), 90)).join("\n");
+        assert!(lines.contains("stream_admin is disabled"));
+        assert!(lines.contains("admin unreachable"));
+        assert!(!lines.contains(&secret));
     }
 }

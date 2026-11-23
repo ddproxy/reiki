@@ -24,9 +24,13 @@ use crate::matrix::UsageMetric;
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
-const HINTS: &str = "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix  ? keys";
+const HINTS: &str =
+    "q quit  j/k scroll  p pause  Tab next peer  c all  v matrix  t streams  ? keys";
 /// The key hints under the matrix header. Kept within 100 columns so the header's status fits.
-const HINTS_MATRIX: &str = "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys";
+const HINTS_MATRIX: &str =
+    "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  t streams  a all  ? keys";
+/// The key hints under the Streams header.
+const HINTS_STREAMS: &str = "q quit  j/k select  PgUp/PgDn detail  p pause  t matrix  ? keys";
 
 /// Rows of the matrix header panel: a border, the status line, the hints and a border.
 const HEADER_ROWS: u16 = 4;
@@ -49,6 +53,7 @@ const MATRIX_KEYS: &[&str] = &[
     "a   jump back to ALL (the fleet row)",
     "p   freeze the screen; again to resume",
     "v or E   full text view",
+    "t   read-only Streams view",
     "?   this list; any key closes it, Ctrl-C quits",
     "q or Esc   quit",
 ];
@@ -60,6 +65,17 @@ const FULL_KEYS: &[&str] = &[
     "c   clear the filter",
     "p   freeze the screen; again to resume",
     "v or E   back to the matrix",
+    "t   read-only Streams view",
+    "?   this list; any key closes it, Ctrl-C quits",
+    "q or Esc   quit",
+];
+
+/// The keys the Streams overlay lists.
+const STREAMS_KEYS: &[&str] = &[
+    "j/k, arrows, Tab, Shift-Tab   move the stream selection",
+    "PgUp/PgDn, g/Home, G/End   scroll the detail pane",
+    "p   freeze the screen; again to resume",
+    "t   back to the matrix",
     "?   this list; any key closes it, Ctrl-C quits",
     "q or Esc   quit",
 ];
@@ -89,6 +105,8 @@ pub enum Action {
     ToggleDetail,
     /// Switches between the matrix and the full text view.
     ToggleMode,
+    /// Opens the read-only Streams view, or returns to the matrix from it.
+    ToggleStreams,
     /// Cycles the matrix provider filter: all, then each column, then all.
     CycleProvider,
     /// Switches the matrix gauge between requests and tokens.
@@ -154,6 +172,8 @@ pub enum Mode {
     Matrix,
     /// The per-peer text view, with the Tab peer filter.
     Full,
+    /// The read-only local stream console.
+    Streams,
 }
 
 /// The scrolling and filter state the caller keeps between frames.
@@ -176,6 +196,8 @@ pub struct UiState {
     pub stacked: bool,
     /// Which figure the provider-coloured chart sums.
     pub chart_usage: UsageMetric,
+    /// The selected row of the Streams table. Separate from the peer selection.
+    pub stream_row: Option<usize>,
     /// Whether the key list is open over the frame.
     pub help: bool,
 }
@@ -204,9 +226,22 @@ impl UiState {
     pub fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             Mode::Matrix => Mode::Full,
-            Mode::Full => Mode::Matrix,
+            Mode::Full | Mode::Streams => Mode::Matrix,
         };
         self.scroll = 0;
+    }
+
+    /// Opens Streams from either other view, or returns to the matrix from Streams. The table
+    /// starts at its first row; the detail pane starts at its top.
+    pub fn toggle_streams(&mut self) {
+        self.mode = match self.mode {
+            Mode::Streams => Mode::Matrix,
+            Mode::Matrix | Mode::Full => Mode::Streams,
+        };
+        self.scroll = 0;
+        if self.mode == Mode::Streams {
+            self.stream_row = Some(0);
+        }
     }
 
     /// Cycles the matrix provider filter over `providers` in column order. A selected provider
@@ -247,6 +282,7 @@ impl UiState {
             }
             Action::ClearFilter => self.filter = Filter::default(),
             Action::ToggleMode => self.toggle_mode(),
+            Action::ToggleStreams => self.toggle_streams(),
             // Needs the selected peer's problem flag, so the caller calls `toggle_detail`.
             Action::ToggleDetail => {}
             // Needs the current provider columns; the caller cycles the filter.
@@ -301,6 +337,7 @@ pub fn map_key(event: KeyEvent) -> Option<Action> {
         KeyCode::Char('c') => Action::ClearFilter,
         KeyCode::Enter | KeyCode::Char('e') => Action::ToggleDetail,
         KeyCode::Char('v') | KeyCode::Char('E') => Action::ToggleMode,
+        KeyCode::Char('t') => Action::ToggleStreams,
         KeyCode::Char('f') => Action::CycleProvider,
         KeyCode::Char('u') => Action::ToggleMetric,
         KeyCode::Char('w') => Action::ToggleWindow,
@@ -916,6 +953,98 @@ fn draw_charts(
     render_frequency_chart(Panel::inner(right), frame.buffer_mut(), &bars, theme);
 }
 
+/// The data one read-only Streams frame is drawn from. The caller owns the lines so the drawing
+/// layer stays free of parsing and policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamsFrame<'a> {
+    /// Table header and rows, already sorted by usage.
+    pub table: &'a [view::Line],
+    /// Detail lines for the selected stream, scrolled by `UiState::scroll`.
+    pub detail: &'a [view::Line],
+    /// Disabled, empty and degraded-state explanations.
+    pub status: &'a [view::Line],
+    /// Selected table row, used to keep it in view.
+    pub selected: Option<usize>,
+}
+
+/// Draws the Streams screen: a status line, the stream table, the detail pane and the footer.
+/// It is read-only; no key here changes a stream. Small terminals keep the table and drop the
+/// detail pane when there is no room for two columns.
+pub fn draw_streams(frame: &mut Frame, view: &StreamsFrame<'_>, state: &UiState) {
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let theme = Theme::auto();
+    let mut rest = area;
+    let header = carve(&mut rest, 1);
+    let footer = carve(&mut rest, 1);
+    let body = rest;
+
+    if header.height > 0 {
+        let status = if view.status.is_empty() {
+            "streams: read-only local view".to_owned()
+        } else {
+            view.status
+                .iter()
+                .map(view::Line::plain_text)
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        frame.render_widget(Paragraph::new(RatLine::raw(status)), header);
+    }
+
+    if body.height > 0 && body.width > 0 {
+        let (table_area, detail_area) = if body.width >= 60 {
+            let table_width = body.width * 3 / 5;
+            let table = Rect::new(body.x, body.y, table_width, body.height);
+            let detail = Rect::new(
+                body.x.saturating_add(table_width),
+                body.y,
+                body.width.saturating_sub(table_width),
+                body.height,
+            );
+            (table, detail)
+        } else {
+            (body, Rect::new(body.x, body.y, 0, 0))
+        };
+
+        frame.render_widget(Panel::new("Streams").block(&theme), table_area);
+        let inner = Panel::inner(table_area);
+        if inner.width > 0 && inner.height > 0 {
+            let viewport = usize::from(inner.height);
+            let start = match view.selected {
+                Some(row) if row + 2 > viewport => row + 2 - viewport,
+                _ => 0,
+            };
+            let start = start.min(max_scroll(view.table.len(), viewport));
+            let end = start.saturating_add(viewport).min(view.table.len());
+            paint(frame, inner, &view.table[start..end]);
+        }
+
+        if detail_area.width > 0 && detail_area.height > 0 {
+            frame.render_widget(Panel::new("Detail").block(&theme), detail_area);
+            let inner = Panel::inner(detail_area);
+            if inner.width > 0 && inner.height > 0 {
+                let viewport = usize::from(inner.height);
+                let start = state.scroll.min(max_scroll(view.detail.len(), viewport));
+                let end = start.saturating_add(viewport).min(view.detail.len());
+                paint(frame, inner, &view.detail[start..end]);
+            }
+        }
+    }
+
+    if footer.height > 0 {
+        frame.render_widget(
+            Paragraph::new(footer_text(state, "", HINTS_STREAMS)),
+            footer,
+        );
+    }
+    if state.help {
+        draw_help(frame, area, STREAMS_KEYS);
+    }
+}
+
 /// Draws the matrix frame: a header panel, the provider tabs, the Peers panel, the cooling panel,
 /// then either the selected peer's detail card or the chart row, and the footer chips. The bands
 /// come from [`bands`]; nothing here is clipped except what a short terminal cannot fit.
@@ -1214,6 +1343,7 @@ mod tests {
             chart: ChartMetric::Disk,
             stacked: true,
             chart_usage: UsageMetric::Tokens,
+            stream_row: Some(1),
             help: true,
         };
         let before = state.clone();
@@ -1343,6 +1473,11 @@ mod tests {
                 KeyModifiers::NONE,
                 Some(Action::ClearFilter),
             ),
+            (
+                KeyCode::Char('t'),
+                KeyModifiers::NONE,
+                Some(Action::ToggleStreams),
+            ),
             (KeyCode::Char('x'), KeyModifiers::NONE, None),
             (
                 KeyCode::Enter,
@@ -1421,10 +1556,9 @@ mod tests {
         assert!(HINTS_MATRIX.contains("u metric"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("w window"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("m chart"), "{HINTS_MATRIX:?}");
-        assert!(HINTS_MATRIX.contains("s stack"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("a all"), "{HINTS_MATRIX:?}");
+        assert!(HINTS_MATRIX.contains("t streams"), "{HINTS_MATRIX:?}");
         assert!(HINTS_MATRIX.contains("? keys"), "{HINTS_MATRIX:?}");
-        assert!(HINTS_MATRIX.contains("v full"), "{HINTS_MATRIX:?}");
         assert!(
             fw_tui::text::display_width(HINTS_MATRIX) <= 98,
             "fits the panel"
@@ -1485,6 +1619,24 @@ mod tests {
         assert_eq!(state.mode, Mode::Full);
         assert_eq!(state.scroll, 0, "each view starts at the top");
         state.toggle_mode();
+        assert_eq!(state.mode, Mode::Matrix);
+    }
+
+    #[test]
+    fn t_opens_the_streams_view_and_returns_to_the_matrix() {
+        let mut state = UiState {
+            scroll: 5,
+            ..UiState::default()
+        };
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+            Some(Action::ToggleStreams)
+        );
+        state.apply(Action::ToggleStreams, 100, 10);
+        assert_eq!(state.mode, Mode::Streams);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.stream_row, Some(0));
+        state.apply(Action::ToggleStreams, 100, 10);
         assert_eq!(state.mode, Mode::Matrix);
     }
 
@@ -1564,7 +1716,7 @@ mod tests {
         assert!(title.contains("reiki top v9.8.7"), "{title:?}");
         assert!(title.contains("12:34:56Z"), "{title:?}");
         assert!(row_text(&buffer, 1).contains("live · 2 of 2 peers fresh"));
-        assert!(row_text(&buffer, 2).contains("v full"), "hints");
+        assert!(row_text(&buffer, 2).contains("t streams"), "hints");
         let tabs = row_text(&buffer, 4);
         assert!(
             tabs.contains("All") && tabs.contains("gemini") && tabs.contains("zen"),
@@ -2086,5 +2238,75 @@ mod tests {
         assert!(footer.contains("j/k scroll"), "{footer:?}");
         assert!(footer.contains("p pause"), "{footer:?}");
         assert!(footer.contains("Tab next peer"), "{footer:?}");
+    }
+
+    fn rendered_streams(
+        frame: &StreamsFrame<'_>,
+        state: &UiState,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("a test terminal");
+        terminal
+            .draw(|f| draw_streams(f, frame, state))
+            .expect("drawing succeeds");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_streams_screen_renders_both_panes_without_a_token_value() {
+        let secret = ["rsk", "_", &"d".repeat(64)].concat();
+        let mut snapshot = crate::streams::StreamsView::from_json(&format!(
+            r#"{{
+              "enabled": true,
+              "streams": [
+                {{"name":"quiet","dynamic":false,"chain":["zen"],"limits":{{"rpm":30}},
+                  "tokens":[],"rpm":{{"current":1}},"concurrency":{{"current":0}},
+                  "last_used":1000,"state":"active"}},
+                {{"name":"busy","dynamic":true,"chain":["zen"],"limits":{{"rpm":10}},
+                  "tokens":[{{"id":"abcdef1234567890","expires_at":1900}}],"expiry":1900,
+                  "rpm":{{"current":9,"limit":10}},"concurrency":{{"current":2,"limit":2}},
+                  "last_used":1150,"state":"active","token":"{secret}"}}
+              ],
+              "audit":[{{"seq":1,"time":"2026-11-23T00:01:00Z","action":"create",
+                "stream":"busy","outcome":"success","reason":"setup","changes":[]}}]
+            }}"#
+        ))
+        .expect("fixture parses");
+        let table = view::streams_table(&snapshot, Some(0), 1155, 60);
+        let detail = view::stream_detail(&snapshot, Some(0), 1155, 40);
+        let status = view::streams_status(&snapshot, None, 100);
+        let frame = StreamsFrame {
+            table: &table,
+            detail: &detail,
+            status: &status,
+            selected: Some(0),
+        };
+        let buffer = rendered_streams(&frame, &UiState::default(), 100, 24);
+        let text = all_text(&buffer);
+        assert!(text.contains("Streams"), "the table pane has a title");
+        assert!(text.contains("busy"), "the sorted table renders");
+        assert!(text.contains("abcdef12"), "a short credential id renders");
+        assert!(text.contains("create"), "recent audit renders");
+        assert!(!text.contains(&secret), "no token value on screen");
+        assert!(text.contains("t matrix"), "the Streams hints name t");
+
+        snapshot.enabled = false;
+        let status = view::streams_status(&snapshot, Some("admin unreachable"), 100);
+        let frame = StreamsFrame {
+            status: &status,
+            ..frame
+        };
+        let text = all_text(&rendered_streams(&frame, &UiState::default(), 100, 24));
+        assert!(
+            text.contains("stream_admin is disabled"),
+            "clear disabled message"
+        );
+        assert!(
+            text.contains("admin unreachable"),
+            "degraded refresh is visible"
+        );
+        assert!(!text.contains(&secret));
     }
 }

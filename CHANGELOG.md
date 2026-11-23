@@ -18,6 +18,10 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - Upgrade notes spell out the new keys and defaults, fail-closed behavior, the state directory beside `<config>.state`, mode `0600` files, and the audit log and sidecar names.
 - Stream administration is cross-linked from configuration, CLI, keys and monitoring docs; static and dynamic stream controls are described with the same vocabulary.
 
+### Added
+
+- `reiki top` gains a read-only Streams screen (`t`) backed by the new ordinary-admin `GET /v1/stream-console` route. It shows static and dynamic streams sorted by usage, chains, limits, current rate/concurrency, expiries, last use and state, with token ids and a bounded redacted audit tail in the detail pane. It reuses `REIKI_ADMIN_TOKEN` and `[admin] listen`, never reads the stream-management token, says when `[stream_admin]` is disabled, keeps the last good answer on refresh failure with backoff, and offers no mutation keys. See [top](docs/top.md#streams), [monitoring](docs/monitoring.md#get-v1stream-console) and [keys](docs/keys.md#dynamic-stream-credentials).
+
 ### Fixed
 
 - Wasm host input bounds: guest strings are capped before sanitization, `log` rejects oversized template ids and argument vectors, `request_state.get` rejects oversized keys, and finding-kind interning is isolated per plugin inside the bounded global table. All violations poison or degrade fail-closed.

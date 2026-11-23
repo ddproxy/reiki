@@ -45,6 +45,11 @@ const ROUTES: &[(&str, &str, &str)] = &[
         "get",
         "Recent key failures, newest first, from an in-memory ring",
     ),
+    (
+        "/stream-console",
+        "get",
+        "Read-only stream usage, credentials and audit tail for reiki top; admin token only",
+    ),
 ];
 
 /// True when a plugin path would collide with a route the admin listener serves itself.
@@ -66,6 +71,7 @@ fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
         ("/reload", "post") => post(reload),
         ("/keys/enable", "post") => post(enable_key),
         ("/failures", "get") => get(failures),
+        ("/stream-console", "get") => get(stream_console),
         _ => get(status),
     }
 }
@@ -156,6 +162,13 @@ async fn openapi(
             op["responses"]["400"] = serde_json::json!({
                 "description": "limit is not 1..=64, a flag is repeated, or the key name is empty or invalid percent-encoding"
             });
+        }
+        if *path == "/stream-console" {
+            op["responses"]["200"]["description"] = serde_json::json!(
+                "Read-only streams, safe credential ids and bounded audit tail; enabled is false without [stream_admin]"
+            );
+            op["responses"]["500"] =
+                serde_json::json!({"description": "The audit chain could not be verified"});
         }
         if *path == "/keys/enable" {
             op["parameters"] = serde_json::json!([{
@@ -549,6 +562,138 @@ async fn failures(
             "{\"ok\":false,\"error\":\"cannot write the failure ring\"}".to_owned(),
         ),
     }
+}
+
+/// A read-only view of every configured stream for the local `reiki top` screen. This uses the
+/// ordinary admin token, never the stream-management token: nothing here can mutate a stream and
+/// no credential value, hash, file path or audit-chain hash is included.
+async fn stream_console(
+    State(app): State<Arc<App>>,
+    peer: Option<Extension<Peer>>,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.map(|Extension(peer)| peer.0);
+    if let Err(refusal) = authorize(&app, peer, "/stream-console", &headers) {
+        return *refusal;
+    }
+    let snapshot = app.snapshot();
+    let gateway = app.gateway();
+    let manager = app.stream_admin();
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+
+    let streams = snapshot
+        .config
+        .streams
+        .iter()
+        .map(|(name, stream)| {
+            let usage = gateway.stream_state(name);
+            let limits = console_limits(stream.limits.as_ref());
+            let dynamic = stream.dynamic.is_some();
+            let (tokens, expiry, state) = if dynamic {
+                let tokens: Vec<Value> = stream
+                    .dynamic_tokens
+                    .iter()
+                    .map(|token| {
+                        let state = match token.expires_at {
+                            Some(expires) if expires <= now => "expired",
+                            _ => "active",
+                        };
+                        serde_json::json!({
+                            "id": token.id,
+                            "expires_at": token.expires_at,
+                            "state": state,
+                        })
+                    })
+                    .collect();
+                let live: Vec<u64> = stream
+                    .dynamic_tokens
+                    .iter()
+                    .filter_map(|token| token.expires_at)
+                    .filter(|expires| *expires > now)
+                    .collect();
+                let expiry = live.iter().copied().min();
+                let state = if tokens.is_empty() {
+                    "revoked"
+                } else if live.is_empty() {
+                    "expired"
+                } else {
+                    "active"
+                };
+                (tokens, expiry, state)
+            } else {
+                (Vec::new(), None, "active")
+            };
+            serde_json::json!({
+                "name": name,
+                "dynamic": dynamic,
+                "chain": stream.chain,
+                "limits": limits,
+                "tokens": tokens,
+                "expiry": expiry,
+                "rpm": {"current": usage.minute.requests, "limit": stream.limits.as_ref().and_then(|l| l.rpm).map(u64::from)},
+                "concurrency": {"current": gateway.active_count(name), "limit": stream.limits.as_ref().and_then(|l| l.concurrent).map(u64::from)},
+                "last_used": gateway.last_used(name),
+                "state": state,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let audit = match manager {
+        Some(manager) => match manager.audit_tail(64) {
+            Ok(records) => records
+                .iter()
+                .map(|record| {
+                    serde_json::json!({
+                        "seq": record.seq,
+                        "time": record.time,
+                        "action": record.action,
+                        "stream": record.stream,
+                        "outcome": record.outcome,
+                        "reason": record.reason,
+                        "changes": record.changes.iter().map(|change| {
+                            serde_json::json!({
+                                "field": change.field,
+                                "from": change.from,
+                                "to": change.to,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "application/json",
+                    "{\"ok\":false,\"error\":\"audit chain unavailable\"}".to_owned(),
+                );
+            }
+        },
+        None => Vec::new(),
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "enabled": manager.is_some(),
+            "streams": streams,
+            "audit": audit,
+        }),
+    )
+}
+
+/// The numeric ceilings of one stream. `period_zone` and store-error mode are deliberately left
+/// out: the console shows limits, not configuration knobs.
+fn console_limits(limits: Option<&crate::config::StreamLimits>) -> Value {
+    serde_json::json!({
+        "rpm": limits.and_then(|l| l.rpm).map(u64::from),
+        "tpm": limits.and_then(|l| l.tpm),
+        "concurrent": limits.and_then(|l| l.concurrent).map(u64::from),
+        "daily_requests": limits.and_then(|l| l.daily_requests).map(u64::from),
+        "daily_tokens": limits.and_then(|l| l.daily_tokens),
+        "monthly_requests": limits.and_then(|l| l.monthly_requests).map(u64::from),
+        "monthly_tokens": limits.and_then(|l| l.monthly_tokens),
+    })
 }
 
 /// Reads `limit` and `key` strictly: a repeated or unknown flag, a bare `limit`, an empty key or

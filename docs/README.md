@@ -27,7 +27,7 @@ Reiki's documentation is one page per subsystem. Commands and flags are checked 
 | `POST` | `/v1/streams/{name}/tokens/{token_id}/revoke` | Revoke one token. |
 | `POST` | `/v1/streams/{name}/revoke` | Revoke every token on a stream. |
 
-Writes need an `Idempotency-Key` header and a `reason` in strict JSON; unknown fields are refused, and `X-Confirm-Token` is required when two-party confirmation is configured. Audit records are read offline with the CLI, never over HTTP. See [monitoring](monitoring.md#stream-administration-routes) for the route reference and [configuration](configuration.md#stream_admin) for the settings.
+Writes need an `Idempotency-Key` header and a `reason` in strict JSON; unknown fields are refused, and `X-Confirm-Token` is required when two-party confirmation is configured. Audit records are read offline with the CLI, never over HTTP. The separate read-only [`GET /v1/stream-console`](monitoring.md#get-v1stream-console) uses the ordinary admin token for `reiki top`'s Streams screen. See [monitoring](monitoring.md#stream-administration-routes) for the route reference and [configuration](configuration.md#stream_admin) for the settings.
 
 The CLI reads the raw token from the configured environment variable or `--token-file`; it is never an argument. `create` and `token add` print a new token once.
 

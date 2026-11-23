@@ -14,7 +14,7 @@ Both fields are required. The address is bound at startup, so moving `[admin]` n
 
 Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The built-in routes and plugin routes are served under `/v1`. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
 
-The `/v1/streams*` routes are the exception: they exist only with `[stream_admin]` and require the dedicated stream-management token instead of the admin token. See [stream administration routes](#stream-administration-routes).
+The `/v1/streams*` routes are the exception: they exist only with `[stream_admin]` and require the dedicated stream-management token instead of the admin token. See [stream administration routes](#stream-administration-routes). `GET /v1/stream-console` is not one of them: it uses the ordinary admin token even when stream administration is off.
 
 ```bash
 export ADMIN_TOKEN='...'
@@ -183,6 +183,50 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 The ring holds 64 entries, starts empty after a restart, and drops a record when another thread holds the buffer. `reiki failures --limit 20` prints this data as a table; `--json` prints the array. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
 
+## GET /v1/stream-console
+
+Method `GET`. Auth: ordinary bearer token. Query: none. Read-only snapshot of every configured stream for the Streams screen of [`reiki top`](top.md#streams). It exists with or without `[stream_admin]`; the stream-management token is refused. Nothing here changes a stream.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://127.0.0.1:4098/v1/stream-console | jq .
+```
+
+```json
+{
+  "enabled": true,
+  "streams": [
+    {
+      "name": "client-a",
+      "dynamic": true,
+      "chain": ["zen-a", "zen-b"],
+      "limits": { "rpm": 120, "tpm": null, "concurrent": 4 },
+      "tokens": [
+        { "id": "<token id>", "expires_at": 1790000000, "state": "active" }
+      ],
+      "expiry": 1790000000,
+      "rpm": { "current": 12, "limit": 120 },
+      "concurrency": { "current": 1, "limit": 4 },
+      "last_used": 1763465051,
+      "state": "active"
+    }
+  ],
+  "audit": [
+    {
+      "seq": 2,
+      "time": "2026-11-23T00:01:00Z",
+      "action": "token.add",
+      "stream": "client-a",
+      "outcome": "success",
+      "reason": "rotation",
+      "changes": [{ "field": "token.id", "from": "-", "to": "<first 8 of id>" }]
+    }
+  ]
+}
+```
+
+`enabled` is false when `[stream_admin]` is absent; static streams are still listed and `audit` is empty. `tokens` carries only an id, expiry and derived state, never a credential value or hash. `rpm.current` is admissions in the current fixed 60-second window, `concurrency.current` is in-flight requests, and `last_used` is the Unix time of the last admission in this process (`null` before one). `expiry` is the soonest live token expiry, and `state` is `active`, `expired` or `revoked`. Audit records are newest first, capped at 64, and carry only `seq`, `time`, `action`, `stream`, `outcome`, `reason` and field-level `changes`; the actor hash, source, `prev`, `hash` and raw log path are omitted. A corrupt audit chain answers `500` instead of returning partial records. See [keys](keys.md#dynamic-stream-credentials) for the audit log itself.
+
 ## POST /v1/keys/enable
 
 Method `POST`. Auth: bearer token. Query: `key` (required, percent-encoded key name). Clears the key's cooldown, disabled flag, consecutive failures and combination cooldowns, and saves the change so a restart keeps it.
@@ -222,7 +266,7 @@ A successful apply has the same fields with `"dry_run":false`; `changed` lists w
 
 ## Stream administration routes
 
-With `[stream_admin]` configured, the admin listener also serves these routes. All of them require `Authorization: Bearer <stream-admin token>`: the ordinary admin token and a stream token are refused. There is no HTTP route for the audit log.
+With `[stream_admin]` configured, the admin listener also serves these routes. All of them require `Authorization: Bearer <stream-admin token>`: the ordinary admin token and a stream token are refused. There is no HTTP route for the raw audit log file; the ordinary-token [`GET /v1/stream-console`](#get-v1stream-console) exposes a bounded, redacted tail for the TUI.
 
 | Route | Purpose |
 | --- | --- |
@@ -254,6 +298,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 /v1/openapi.json
 /v1/reload
 /v1/status
+/v1/stream-console
 /v1/usage
 ```
 
@@ -267,6 +312,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Bearer token | Prometheus summary-export drop counter |
 | `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Bearer token | Prometheus tool-call counters |
 | `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
+| `GET /v1/stream-console` | Admin listener | Bearer token | Read-only stream table and redacted audit tail for `reiki top` |
 | `GET /v1/cost` | Admin listener, `cost` plugin | Bearer token | Estimated spend with period, stream and upstream filters |
 | `GET /v1/cost/metrics` | Admin listener, `cost` plugin | Bearer token | Cost estimate metrics in Prometheus text |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
@@ -424,4 +470,4 @@ groups:
 
 Reiki publishes `reiki_keys` globally, with no `stream` label. The two `reiki_status_*` and `reiki_stream_healthy_keys` series come from a JSON exporter that reads `GET /v1/status` with the admin token: `reiki_status_intercept_ca_days_left` from `intercept.ca_days_left`, and `reiki_stream_healthy_keys{stream="..."}` from the keys named in each `streams[].chain` whose `state` is `available`. Those names are exporter series, not built-in Reiki metrics. Reiki logs a CA warning within 30 days of expiry and reports `ca_days_left` on `/v1/status`; see [tunnel](tunnel.md#interception).
 
-When `[peers] expose_usage` is on (the default), peer health publishes `streams.static_streams` and `streams.dynamic_streams` as counts only. `reiki top` sums fresh peers into a `Streams: N static, M dynamic` line in its full text view; it never shows stream names, since a dynamic name can identify a tenant. See [reiki top](top.md#--once).
+When `[peers] expose_usage` is on (the default), peer health publishes `streams.static_streams` and `streams.dynamic_streams` as counts only. `reiki top` sums fresh peers into a `Streams: N static, M dynamic` line in its full text view; it never shows stream names from peers, since a dynamic name can identify a tenant. Pressing `t` in the live view is different: it uses the local admin token to read [`GET /v1/stream-console`](#get-v1stream-console) and shows this instance's stream names, ids and redacted audit tail only. See [reiki top](top.md#streams).

@@ -1399,6 +1399,16 @@ impl Manager {
             .collect()
     }
 
+    /// The last `limit` audit records, newest first. The whole chain is verified first: a
+    /// truncated or edited log is an error, never a partial answer for the read-only console.
+    pub(crate) fn audit_tail(&self, limit: usize) -> Result<Vec<AuditRecord>, String> {
+        let records = self.audit.read()?;
+        let skip = records.len().saturating_sub(limit);
+        let mut tail: Vec<AuditRecord> = records.into_iter().skip(skip).collect();
+        tail.reverse();
+        Ok(tail)
+    }
+
     pub(crate) fn show(&self, name: &str) -> Option<serde_json::Value> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let stream = state.streams.get(name)?;

@@ -48,7 +48,7 @@ const ROUTES: &[(&str, &str, &str)] = &[
     (
         "/stream-console",
         "get",
-        "Read-only stream usage, credentials and audit tail for reiki top; admin token only",
+        "Read-only stream usage, credentials and audit tail for reiki top; either admin token",
     ),
 ];
 
@@ -64,6 +64,78 @@ pub(crate) fn is_reserved_path(path: &str) -> bool {
         || bare == "/streams"
         || bare.starts_with("/streams/")
         || ROUTES.iter().any(|(route, _, _)| bare == *route)
+}
+
+/// The credential class a request presented. The read-only class opens the read routes only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenClass {
+    Full,
+    ReadOnly,
+}
+
+impl TokenClass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
+/// What a route does. A mutating route refuses the read-only token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Access {
+    Read,
+    Mutate,
+}
+
+/// Header a caller may set to name itself in the audit log. Never used for authorization.
+const ACTOR_HEADER: &str = "x-reiki-actor";
+const ACTOR_MAX_CHARS: usize = 64;
+
+/// The one error shape of every admin route: `{"ok":false,"error":{"code","message"}}`. `code` is a
+/// stable snake_case identifier clients may branch on; `message` is fixed or operator-facing text,
+/// never a token, hash or caller-supplied value outside what the request already named.
+pub(crate) fn error_envelope(code: &str, message: &str) -> String {
+    serde_json::json!({"ok": false, "error": {"code": code, "message": message}}).to_string()
+}
+
+pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    text_response(status, "application/json", error_envelope(code, message))
+}
+
+/// The caller's audit label: `X-Reiki-Actor` cut to 64 characters, with anything outside
+/// `[A-Za-z0-9._@:-]` replaced by `_`. Invalid UTF-8 is replaced rather than dropped, so the label
+/// still says something. Absent or empty means no label.
+pub(crate) fn actor_label(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(ACTOR_HEADER)?;
+    let text = String::from_utf8_lossy(raw.as_bytes());
+    let label: String = text
+        .trim()
+        .chars()
+        .take(ACTOR_MAX_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// One structured record per mutating request: the credential class that acted, the caller's
+/// label and the outcome. The label is for people reading the log; it grants nothing.
+fn audit_mutation(action: &'static str, class: TokenClass, actor: Option<&str>, outcome: &str) {
+    tracing::info!(
+        target: "reiki::admin_audit",
+        action,
+        token_class = class.name(),
+        actor = actor.unwrap_or(""),
+        outcome,
+        "admin mutation"
+    );
 }
 
 fn handler(path: &str, method: &str) -> MethodRouter<Arc<App>> {
@@ -123,6 +195,10 @@ fn operation(summary: &str) -> serde_json::Value {
     })
 }
 
+/// The 403 text of a mutating route, for OpenAPI.
+const FULL_TOKEN_ONLY: &str =
+    "The read-only token was presented; this route needs the full admin token";
+
 /// The OpenAPI 3.1 description of the v1 routes, including those plugins add.
 async fn openapi(
     State(app): State<Arc<App>>,
@@ -130,7 +206,7 @@ async fn openapi(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/v1/openapi.json", &headers) {
+    if let Err(refusal) = authorize(&app, peer, "/v1/openapi.json", Access::Read, &headers) {
         return *refusal;
     }
     let mut paths = serde_json::Map::new();
@@ -143,6 +219,7 @@ async fn openapi(
             }]);
             op["responses"]["400"] =
                 serde_json::json!({"description": "Unreadable dry_run value; nothing changed"});
+            op["responses"]["403"] = serde_json::json!({"description": FULL_TOKEN_ONLY});
             op["responses"]["422"] =
                 serde_json::json!({"description": "The config was refused; nothing changed"});
         }
@@ -178,6 +255,7 @@ async fn openapi(
             op["responses"]["400"] = serde_json::json!({
                 "description": "Missing, repeated or unknown flag, or a name that is not valid percent-encoding"
             });
+            op["responses"]["403"] = serde_json::json!({"description": FULL_TOKEN_ONLY});
             op["responses"]["404"] = serde_json::json!({"description": "No such key"});
         }
         paths.insert(format!("{V1}{path}"), serde_json::json!({ *method: op }));
@@ -240,7 +318,10 @@ async fn openapi(
     let mut document = serde_json::json!({
         "openapi": "3.1.0",
         "info": {"title": "Reiki admin API", "version": VERSION},
-        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+        "components": {"securitySchemes": {"bearerAuth": {
+            "type": "http", "scheme": "bearer",
+            "description": "The full admin token, or the read-only token on read routes. Errors use the admin error envelope.",
+        }}},
         "paths": paths,
     });
     #[cfg(feature = "peers")]
@@ -265,9 +346,11 @@ async fn status(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/status", &headers) {
-        return *refusal;
-    }
+    let class = match authorize(&app, peer, "/status", Access::Read, &headers) {
+        Ok(class) => class,
+        Err(refusal) => return *refusal,
+    };
+    let redact = class == TokenClass::ReadOnly;
     let snapshot = app.snapshot();
     let now = Instant::now();
     let body = {
@@ -277,7 +360,7 @@ async fn status(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         build_status(&snapshot, app.gateway(), &mut health, now)
     };
-    let config = app.reload_status_json();
+    let config = app.reload_status_json(redact);
     let intercept = app.ca_not_after().map(|not_after| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -330,10 +413,18 @@ async fn status(
     }
     fields.push(("log", &log));
     let stream_status = app.stream_admin().map(|manager| {
+        // A state error names the state file's path and parse position; read-only callers get a code.
+        let state_error = manager.state_error().map(|error| {
+            if redact {
+                "state_unavailable".to_owned()
+            } else {
+                error
+            }
+        });
         serde_json::json!({
             "enabled": true,
             "streams": manager.list().len(),
-            "state_error": manager.state_error(),
+            "state_error": state_error,
         })
         .to_string()
     });
@@ -342,10 +433,10 @@ async fn status(
     }
     let Some(body) = merge_status_objects(&body, &fields) else {
         // An unmergeable status must not become a corrupt JSON document on the wire.
-        return text_response(
+        return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "application/json",
-            r#"{"error":"status_unavailable"}"#.to_owned(),
+            "status_unavailable",
+            "the status document could not be assembled",
         );
     };
     text_response(StatusCode::OK, "application/json", body)
@@ -359,16 +450,18 @@ async fn reload(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/reload", &headers) {
-        return *refusal;
-    }
+    let class = match authorize(&app, peer, "/reload", Access::Mutate, &headers) {
+        Ok(class) => class,
+        Err(refusal) => return *refusal,
+    };
+    let actor = actor_label(&headers);
     let Ok(dry_run) = parse_dry_run(uri.query().unwrap_or("")) else {
         // Fail closed: an unreadable preview flag must not apply a live reload.
-        return text_response(
+        audit_mutation("reload", class, actor.as_deref(), "refused_dry_run_flag");
+        return error_response(
             StatusCode::BAD_REQUEST,
-            "application/json",
-            "{\"ok\":false,\"error\":\"dry_run must be given once, as true, 1, false or 0\"}"
-                .to_owned(),
+            "bad_dry_run",
+            "dry_run must be given once, as true, 1, false or 0",
         );
     };
     let worker = Arc::clone(&app);
@@ -380,18 +473,28 @@ async fn reload(
         }
     })
     .await;
+    let action = if dry_run { "reload_preview" } else { "reload" };
     match outcome {
-        Ok(Ok(report)) => text_response(StatusCode::OK, "application/json", report.to_json()),
-        Ok(Err(error)) => text_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "application/json",
-            crate::reload::error_json(&error),
-        ),
-        Err(_) => text_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "application/json",
-            crate::reload::error_json("the reload task failed"),
-        ),
+        Ok(Ok(report)) => {
+            audit_mutation(action, class, actor.as_deref(), "ok");
+            text_response(StatusCode::OK, "application/json", report.to_json())
+        }
+        Ok(Err(error)) => {
+            audit_mutation(action, class, actor.as_deref(), "refused");
+            text_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "application/json",
+                crate::reload::error_json(&error),
+            )
+        }
+        Err(_) => {
+            audit_mutation(action, class, actor.as_deref(), "task_failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reload_task_failed",
+                "the reload task failed",
+            )
+        }
     }
 }
 
@@ -487,17 +590,16 @@ async fn enable_key(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/keys/enable", &headers) {
-        return *refusal;
-    }
+    let class = match authorize(&app, peer, "/keys/enable", Access::Mutate, &headers) {
+        Ok(class) => class,
+        Err(refusal) => return *refusal,
+    };
+    let actor = actor_label(&headers);
     let key = match parse_key_query(uri.query().unwrap_or("")) {
         Ok(key) => key,
         Err(e) => {
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                "application/json",
-                format!("{{\"ok\":false,\"error\":{}}}", json_string(e)),
-            );
+            audit_mutation("keys_enable", class, actor.as_deref(), "refused_bad_query");
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", e);
         }
     };
     // Persisting the state writes and syncs a file, which must not stall the runtime.
@@ -506,28 +608,24 @@ async fn enable_key(
         tokio::task::spawn_blocking(move || worker.enable_key(&name)).await
     };
     let Ok(enabled) = enabled else {
-        return text_response(
+        audit_mutation("keys_enable", class, actor.as_deref(), "task_failed");
+        return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "application/json",
-            "{\"ok\":false,\"error\":\"the enable task failed\"}".to_owned(),
+            "enable_task_failed",
+            "the enable task failed",
         );
     };
     if enabled {
         tracing::info!(key, "key re-enabled through the admin listener");
+        audit_mutation("keys_enable", class, actor.as_deref(), "ok");
         text_response(
             StatusCode::OK,
             "application/json",
             format!("{{\"ok\":true,\"key\":{}}}", json_string(&key)),
         )
     } else {
-        text_response(
-            StatusCode::NOT_FOUND,
-            "application/json",
-            format!(
-                "{{\"ok\":false,\"error\":\"unknown key\",\"key\":{}}}",
-                json_string(&key)
-            ),
-        )
+        audit_mutation("keys_enable", class, actor.as_deref(), "unknown_key");
+        error_response(StatusCode::NOT_FOUND, "unknown_key", "unknown key")
     }
 }
 
@@ -540,42 +638,46 @@ async fn failures(
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/failures", &headers) {
-        return *refusal;
-    }
+    let class = match authorize(&app, peer, "/failures", Access::Read, &headers) {
+        Ok(class) => class,
+        Err(refusal) => return *refusal,
+    };
     let (limit, key) = match parse_failures_query(uri.query().unwrap_or("")) {
         Ok(query) => query,
-        Err(e) => {
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                "application/json",
-                format!("{{\"ok\":false,\"error\":{}}}", json_string(e)),
-            );
-        }
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", e),
     };
-    let records = app.failures().snapshot(limit, key.as_deref());
+    let mut records = app.failures().snapshot(limit, key.as_deref());
+    if class == TokenClass::ReadOnly {
+        // Snippets are upstream body text; the read-only token gets the facts without them.
+        for record in &mut records {
+            record.note = None;
+        }
+    }
     match serde_json::to_string(&records) {
         Ok(body) => text_response(StatusCode::OK, "application/json", body),
-        Err(_) => text_response(
+        Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "application/json",
-            "{\"ok\":false,\"error\":\"cannot write the failure ring\"}".to_owned(),
+            "failures_unavailable",
+            "cannot write the failure ring",
         ),
     }
 }
 
-/// A read-only view of every configured stream for the local `reiki top` screen. This uses the
+/// A read-only view of every configured stream for the local `reiki top` screen. It accepts either
 /// ordinary admin token, never the stream-management token: nothing here can mutate a stream and
-/// no credential value, hash, file path or audit-chain hash is included.
+/// no credential value, hash, file path or audit-chain hash is included. For the read-only token
+/// the audit records' free-text reasons are withheld.
 async fn stream_console(
     State(app): State<Arc<App>>,
     peer: Option<Extension<Peer>>,
     headers: HeaderMap,
 ) -> Response {
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, "/stream-console", &headers) {
-        return *refusal;
-    }
+    let class = match authorize(&app, peer, "/stream-console", Access::Read, &headers) {
+        Ok(class) => class,
+        Err(refusal) => return *refusal,
+    };
+    let redact = class == TokenClass::ReadOnly;
     let snapshot = app.snapshot();
     let gateway = app.gateway();
     let manager = app.stream_admin();
@@ -651,7 +753,7 @@ async fn stream_console(
                         "action": record.action,
                         "stream": record.stream,
                         "outcome": record.outcome,
-                        "reason": record.reason,
+                        "reason": if redact { Value::Null } else { Value::from(record.reason.clone()) },
                         "changes": record.changes.iter().map(|change| {
                             serde_json::json!({
                                 "field": change.field,
@@ -663,10 +765,10 @@ async fn stream_console(
                 })
                 .collect::<Vec<_>>(),
             Err(_) => {
-                return text_response(
+                return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "application/json",
-                    "{\"ok\":false,\"error\":\"audit chain unavailable\"}".to_owned(),
+                    "audit_unavailable",
+                    "the audit chain could not be verified",
                 );
             }
         },
@@ -745,10 +847,10 @@ async fn plugin_route(
     // Plugins answer GET only. Other methods on an unknown path are still a 404, not a 405 from
     // a GET-only fallback.
     if method != Method::GET {
-        return text_response(StatusCode::NOT_FOUND, "text/plain", String::new());
+        return not_found();
     }
     let peer = peer.map(|Extension(peer)| peer.0);
-    if let Err(refusal) = authorize(&app, peer, uri.path(), &headers) {
+    if let Err(refusal) = authorize(&app, peer, uri.path(), Access::Read, &headers) {
         return *refusal;
     }
     let snapshot = app.snapshot();
@@ -773,7 +875,7 @@ async fn plugin_route(
         .strip_prefix(V1)
         .filter(|rest| rest.starts_with('/'))
     else {
-        return text_response(StatusCode::NOT_FOUND, "text/plain", String::new());
+        return not_found();
     };
     let usage = snapshot
         .config
@@ -793,42 +895,52 @@ async fn plugin_route(
         extra,
     ) {
         Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
-        None => text_response(StatusCode::NOT_FOUND, "text/plain", String::new()),
+        None => not_found(),
     }
 }
 
-/// Checks a request's bearer token against the configured admin token hash, logging each failure
-/// with the peer and path and counting it for the peer's lockout. The presented token is never
-/// logged. A missing config or header is a plain refusal.
+/// Checks a request's bearer token against the admin token hashes, logging each failure with the
+/// peer and path and counting it for the peer's lockout. Returns the class of the token that
+/// matched. The read-only class is refused on a mutating route with 403; a missing or wrong token
+/// is 401. The presented token is never logged.
 fn authorize(
     app: &App,
     peer: Option<IpAddr>,
     path: &str,
+    access: Access,
     headers: &HeaderMap,
-) -> Result<(), Box<Response>> {
+) -> Result<TokenClass, Box<Response>> {
     // Check and reserve in one lock, so a burst cannot all pass before any attempt is counted.
     let attempt = peer.map(|ip| app.admin_logins().reserve(ip, Instant::now()));
     if let Some(Err(wait)) = attempt {
         tracing::warn!(?peer, path = %path, "too many failed admin logins, refusing");
-        return Err(Box::new(throttled(wait)));
+        return Err(Box::new(admin_throttled(wait)));
     }
-    match token_matches(app, headers) {
-        Ok(()) => {
+    match token_class(app, headers) {
+        Ok(class) => {
             if let Some(ip) = peer {
                 app.admin_logins().succeed(ip);
             }
-            Ok(())
+            if access == Access::Mutate && class == TokenClass::ReadOnly {
+                tracing::warn!(?peer, path = %path, "read-only admin token refused on a mutating route");
+                return Err(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    "read_only_token",
+                    "the read-only token cannot change state; this route needs the full admin token",
+                )));
+            }
+            Ok(class)
         }
         Err(reason) => {
             let failures = attempt.and_then(Result::ok).map(|a| a.failures());
             tracing::warn!(?peer, reason, ?failures, path = %path, "failed admin login");
-            Err(Box::new(unauthorized()))
+            Err(Box::new(admin_unauthorized()))
         }
     }
 }
 
-/// Why a request's credential does not match, or `Ok` when it does.
-fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
+/// Which admin token, if any, a request presents. Both hashes are compared in constant time.
+fn token_class(app: &App, headers: &HeaderMap) -> Result<TokenClass, &'static str> {
     let snapshot = app.snapshot();
     let Some(admin) = snapshot.config.admin.as_ref() else {
         return Err("no admin token configured");
@@ -844,12 +956,44 @@ fn token_matches(app: &App, headers: &HeaderMap) -> Result<(), &'static str> {
     };
     let hash = sha256_hex(token);
     if constant_time_eq(&admin.token_sha256.to_ascii_lowercase(), &hash) {
-        Ok(())
-    } else {
-        Err("wrong token")
+        return Ok(TokenClass::Full);
     }
+    if let Some(read) = admin.read_token_sha256.as_ref()
+        && constant_time_eq(&read.to_ascii_lowercase(), &hash)
+    {
+        return Ok(TokenClass::ReadOnly);
+    }
+    Err("wrong token")
 }
 
+/// The 401 of every admin route. Missing and wrong credentials get the same body.
+pub(crate) fn admin_unauthorized() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or wrong admin token",
+    )
+}
+
+/// The 429 of a throttled admin client, with the seconds to wait.
+pub(crate) fn admin_throttled(wait: Duration) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_attempts",
+        "too many failed logins; wait before retrying",
+    );
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not_found", "no such admin route")
+}
+
+#[cfg(feature = "peers")]
 pub(crate) fn unauthorized() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::UNAUTHORIZED;
@@ -857,6 +1001,7 @@ pub(crate) fn unauthorized() -> Response {
 }
 
 /// A refused client waiting out a login lockout, with the remaining seconds.
+#[cfg(feature = "peers")]
 pub(crate) fn throttled(wait: Duration) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
@@ -1280,16 +1425,16 @@ fn authorize_stream(
 ) -> Result<(), Box<Response>> {
     let source = stream_source(peer);
     let Some(manager) = app.stream_admin() else {
-        return Err(Box::new(unauthorized()));
+        return Err(Box::new(admin_unauthorized()));
     };
     let now = Instant::now();
     if let Err(wait) = app.stream_rpm().reserve(source, now) {
         manager.note_denied(source, action, stream, "rate_limited");
-        return Err(Box::new(throttled(wait)));
+        return Err(Box::new(admin_throttled(wait)));
     }
     if let Err(wait) = app.stream_logins().reserve(source, now) {
         manager.note_denied(source, action, stream, "locked_out");
-        return Err(Box::new(throttled(wait)));
+        return Err(Box::new(admin_throttled(wait)));
     }
     let expected = manager.config().token_sha256.to_ascii_lowercase();
     let supplied = headers
@@ -1299,7 +1444,7 @@ fn authorize_stream(
     let matched = supplied.is_some_and(|token| constant_time_eq(&expected, &sha256_hex(token)));
     if !matched {
         manager.note_denied(source, action, stream, "credential_refused");
-        return Err(Box::new(unauthorized()));
+        return Err(Box::new(admin_unauthorized()));
     }
     if mutating && !manager.config().require_two_party.is_empty() {
         let supplied = headers
@@ -1316,7 +1461,7 @@ fn authorize_stream(
         }
         if !confirmed {
             manager.note_denied(source, action, stream, "confirmation_refused");
-            return Err(Box::new(unauthorized()));
+            return Err(Box::new(admin_unauthorized()));
         }
     }
     app.stream_rpm().succeed(source);
@@ -1334,10 +1479,7 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
 }
 
 fn api_error_response(error: ApiError) -> Response {
-    json_response(
-        error.status,
-        serde_json::json!({"error": {"type": "stream_admin_refused", "message": error.message}}),
-    )
+    error_response(error.status, error_code(error), error.message)
 }
 
 fn error_code(error: ApiError) -> &'static str {
@@ -1459,7 +1601,7 @@ async fn stream_list(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     json_response(
         StatusCode::OK,
@@ -1478,7 +1620,7 @@ async fn stream_show(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     match manager.show(&name) {
         Some(stream) => json_response(StatusCode::OK, stream),
@@ -1497,7 +1639,7 @@ async fn stream_create(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: CreateStreamRequest =
@@ -1540,7 +1682,7 @@ async fn stream_update(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: UpdateStreamRequest =
@@ -1582,7 +1724,7 @@ async fn stream_token_add(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: TokenRequest =
@@ -1625,7 +1767,7 @@ async fn stream_token_revoke(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: ReasonRequest =
@@ -1663,7 +1805,7 @@ async fn stream_revoke_all(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: ReasonRequest =
@@ -1701,7 +1843,7 @@ async fn stream_delete(
         return *refusal;
     }
     let Some(manager) = app.stream_admin() else {
-        return unauthorized();
+        return admin_unauthorized();
     };
     let max = manager.config().max_body_bytes;
     let request: ReasonRequest =
@@ -1877,6 +2019,54 @@ mod tests {
             let response = router.call(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
         }
+    }
+
+    fn actor_headers(value: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACTOR_HEADER,
+            HeaderValue::from_bytes(value).expect("a valid header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn the_actor_label_keeps_a_safe_charset_and_drops_the_rest() {
+        assert_eq!(
+            actor_label(&actor_headers(b"ops.bot_1@host:9-x")).as_deref(),
+            Some("ops.bot_1@host:9-x")
+        );
+        assert_eq!(
+            actor_label(&actor_headers(b"a b;rm\"'<>\\")).as_deref(),
+            Some("a_b_rm_____")
+        );
+        // Non-ASCII and invalid UTF-8 never reach the log as-is.
+        assert_eq!(
+            actor_label(&actor_headers(b"x\xc3\xa9y\xff")).as_deref(),
+            Some("x_y_")
+        );
+    }
+
+    #[test]
+    fn the_actor_label_is_capped_and_absent_when_empty() {
+        let long = "a".repeat(200);
+        let label = actor_label(&actor_headers(long.as_bytes())).unwrap();
+        assert_eq!(label.chars().count(), ACTOR_MAX_CHARS);
+        assert_eq!(actor_label(&actor_headers(b"   ")), None);
+        assert_eq!(actor_label(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn the_error_envelope_has_one_shape() {
+        let body: Value =
+            serde_json::from_str(&error_envelope("unknown_key", "unknown key")).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ok": false,
+                "error": {"code": "unknown_key", "message": "unknown key"},
+            })
+        );
     }
 
     #[tokio::test]

@@ -568,7 +568,7 @@ mod tests {
                 retry_after: Some("120".to_owned()),
                 cooled: true,
                 cooling_seconds: Some(1),
-                note: "n".to_owned(),
+                note: Some("n".to_owned()),
             }],
         );
         assert_eq!(fleet.local_failures("peer-a").unwrap().len(), 1);

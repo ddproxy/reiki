@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional read-only admin token: `[admin] read_token_sha256`. It opens the read routes (status, failures, stream console, metrics, OpenAPI and plugin GET routes) and gets `403` on `POST /v1/reload` and `POST /v1/keys/enable`. Startup refuses a hash equal to the admin token or to any other credential. See [monitoring](docs/monitoring.md#read-only-token).
+- Read-only callers get no free text: `failures[].note` is `null`, `last_reload.error` reads `reload_refused`, `stream_admin.state_error` reads `state_unavailable` and audit `reason` is `null`.
+- Audit event `reiki::admin_audit` for reload, dry-run reload and key enable, with `action`, `token_class`, `actor` and `outcome`. The actor comes from an optional `X-Reiki-Actor` header, cut to 64 characters and limited to `A-Z a-z 0-9 . _ - @ :`; it never affects authorization.
+- `reiki top` reads `REIKI_ADMIN_READ_TOKEN`, preferred over `REIKI_ADMIN_TOKEN` when both are set.
+
+### Changed
+
+- Every admin-listener refusal uses one envelope, `{"ok":false,"error":{"code","message"}}`. Stream-management errors keep `error.message` and replace `error.type` with `error.code`. A `401` from the stream routes now has this body instead of an empty one. Reload's `422` carries `config_refused` and keys' `404` drops its echoed `key` field.
+
 ## 0.15.0 (unreleased)
 
 The opt-in features introduced in 0.14.0 — the multi-stream gateway with admission limits, dynamic streams with a hash-chained audit log, the `plugin-wasm` runtime host and `plugin-cost` estimates — now have operator documentation that is checked against the binary. Their behavior is unchanged here; see the 0.14.0 entries below for the original feature and behavior changes. `Cargo.toml` is intentionally still at 0.14.0.

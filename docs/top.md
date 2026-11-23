@@ -20,7 +20,7 @@ Without the feature the subcommand and its `--help` entry are absent.
 
 It needs `[peers] enabled = true` and at least one `[peers.NAME]` table, exactly as `reiki peers`; each entry must point at an instance that publishes health and at a token file that instance issued (see [peers](peers.md)).
 
-The Streams screen additionally uses the local instance's `[admin] listen` address and the ordinary admin token from `REIKI_ADMIN_TOKEN`, the same configuration as the local failure rows. It never reads or uses the separate stream-admin token (see [stream administration routes](monitoring.md#stream-administration-routes)).
+The Streams screen additionally uses the local instance's `[admin] listen` address and an admin token, the same configuration as the local failure rows. `reiki top` reads only, so it prefers the read-only token from `REIKI_ADMIN_READ_TOKEN` and falls back to `REIKI_ADMIN_TOKEN`. With the read-only token the failure rows show their time, key, status and class but no body snippet. It never reads or uses the separate stream-admin token (see [stream administration routes](monitoring.md#stream-administration-routes)).
 
 ## Use
 
@@ -97,19 +97,19 @@ Every peer's health document carries a `failures` object: counts of recent key f
 
 A peer with summary export enabled also publishes `requestlog_export_dropped_total`. When it is above zero, the detail card prints it as `export drops: N`; older peers without the field count as zero. See [summary export](requestlog.md#summary-export).
 
-The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_TOKEN` holds its admin token (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, cooldown left and the scrubbed body snippet. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
+The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_READ_TOKEN` or `REIKI_ADMIN_TOKEN` holds one of its admin tokens (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, cooldown left and the scrubbed body snippet. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
 
 See [`GET /v1/failures`](monitoring.md#get-v1failures) for the fields and the `reiki failures` command.
 
 ### Streams
 
-Press `t` to open a read-only view of the local instance's streams; `t` returns to the matrix. It reads [`GET /v1/stream-console`](monitoring.md#get-v1stream-console) with the ordinary admin token. A remote peer's stream names never enter this screen.
+Press `t` to open a read-only view of the local instance's streams; `t` returns to the matrix. It reads [`GET /v1/stream-console`](monitoring.md#get-v1stream-console) with the admin token `reiki top` was given (the read-only one when set). A remote peer's stream names never enter this screen.
 
 The table lists every configured stream, static and dynamic, sorted by current request rate, then concurrency, then name. Its columns are `stream`, `type` (`static` or `dynamic`), `chain` (the upstream order), `expires` (countdown to the next live token), `rpm` and `conc` (current/limit, `-` for no limit), `last` (time since the last admitted request) and `state`. `j`/`k`, the arrows and `Tab`/`Shift-Tab` move the row selection.
 
 The detail pane shows the selected stream's numeric limits, then its credentials by short id with expiry and active/expired state, then recent audit records for that stream, newest first. Credential values, hashes, audit-chain hashes, file paths and the actor hash are never sent to the screen. `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll the detail.
 
-When `[stream_admin]` is not configured the screen says `stream_admin is disabled; dynamic streams and audit are unavailable` and keeps the static rows. A failed refresh shows a short reason and keeps the last good answer on screen; retries back off from the health poll interval to at most one minute. Without `[admin]` or `REIKI_ADMIN_TOKEN` the table says it is waiting for the local admin listener. Nothing on this screen can create, rotate or revoke a stream or a token.
+When `[stream_admin]` is not configured the screen says `stream_admin is disabled; dynamic streams and audit are unavailable` and keeps the static rows. A failed refresh shows a short reason and keeps the last good answer on screen; retries back off from the health poll interval to at most one minute. Without `[admin]` or either token variable the table says it is waiting for the local admin listener. Nothing on this screen can create, rotate or revoke a stream or a token.
 
 ### Keys
 

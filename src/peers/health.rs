@@ -621,7 +621,7 @@ mod tests {
                 retry_after: Some("120".to_owned()),
                 cooled: true,
                 cooling_seconds: Some(10),
-                note: "a body with secret-key-name in it".to_owned(),
+                note: Some("a body with secret-key-name in it".to_owned()),
             });
         }
         let peers = app.snapshot().config.peers.clone().unwrap();

@@ -492,9 +492,10 @@ async fn without_the_feature_the_stream_routes_are_unavailable() {
             matches!(reply.status, 401 | 404),
             "a disabled stream route must not be usable"
         );
-        assert!(
-            reply.body.is_empty(),
-            "a disabled route must not describe itself"
+        assert_eq!(
+            reply.json()["error"]["code"],
+            "unauthorized",
+            "a disabled route answers the same envelope as a refusal"
         );
     }
     assert!(
@@ -700,9 +701,14 @@ async fn bad_credentials_are_indistinguishable_and_lock_out_the_source() {
         .await;
     for reply in [&missing, &wrong_token, &malformed] {
         assert_eq!(reply.status, 401, "every refused credential looks the same");
-        assert!(
-            reply.body.is_empty(),
+        assert_eq!(
+            reply.json()["error"]["code"],
+            "unauthorized",
             "a refusal must not explain the reason"
+        );
+        assert_eq!(
+            reply.body, missing.body,
+            "one refusal shape for every credential"
         );
         assert_no_credential(reply, &[WRONG_TOKEN_FOR_LOG_TEST, STREAM_ADMIN_TOKEN]);
     }
@@ -1298,8 +1304,9 @@ async fn two_party_confirmation_requires_the_second_raw_token() {
         .await;
     for reply in [&missing, &wrong] {
         assert_eq!(reply.status, 401, "a mutation needs the second credential");
-        assert!(
-            reply.body.is_empty(),
+        assert_eq!(
+            reply.json()["error"]["code"],
+            "unauthorized",
             "a confirmation refusal reveals nothing"
         );
         assert_no_credential(reply, &[CONFIRM_TOKEN, STREAM_ADMIN_TOKEN]);

@@ -66,7 +66,7 @@ Budgets use recorded estimates, not provider invoices. A price change applies to
 
 ### Admin `GET /v1/cost`
 
-Requires the ordinary admin token. Returns every configured stream by default, for the current UTC month.
+Requires an admin token; the read-only token is enough. Returns every configured stream by default, for the current UTC month.
 
 | Query | Meaning |
 | --- | --- |

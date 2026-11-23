@@ -8,13 +8,47 @@ Reiki serves an admin listener on its own socket when an `[admin]` table exists.
 [admin]
 listen = "127.0.0.1:4098"
 token_sha256 = "<sha256 of the admin token>"
+read_token_sha256 = "<sha256 of the read-only token>"   # optional
 ```
 
-Both fields are required. The address is bound at startup, so moving `[admin]` needs a restart; a changed token hash applies on reload. Generate the hash with `printf '%s' "$ADMIN_TOKEN" | reiki hash-token`. `reiki check` prints the admin address next to the client one.
+`listen` and `token_sha256` are required. The address is bound at startup, so moving `[admin]` needs a restart; a changed token hash applies on reload. Generate each hash with `printf '%s' "$TOKEN" | reiki hash-token`. `reiki check` prints the admin address next to the client one.
 
-Every route below requires `Authorization: Bearer <admin token>`. The token hash is compared in constant time. A missing or wrong token gets a bare `401`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The built-in routes and plugin routes are served under `/v1`. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
+Two credentials can open the listener:
 
-The `/v1/streams*` routes are the exception: they exist only with `[stream_admin]` and require the dedicated stream-management token instead of the admin token. See [stream administration routes](#stream-administration-routes). `GET /v1/stream-console` is not one of them: it uses the ordinary admin token even when stream administration is off.
+| Token | Config key | Opens |
+| --- | --- | --- |
+| Full admin token | `token_sha256` | Every route below |
+| Read-only token | `read_token_sha256` (optional) | Read routes only: `GET /v1/status`, `/v1/failures`, `/v1/stream-console`, `/v1/metrics`, `/v1/openapi.json` and the other `GET` plugin routes |
+
+Startup refuses a read-only hash that equals the admin hash, a stream token, the stream-management token or a peer token, so a holder of the read-only token can never reach a mutating route. Each route checks the presented token with a constant-time comparison.
+
+Every route below requires `Authorization: Bearer <token>`. A missing or wrong token gets `401`. A read-only token on a mutating route gets `403`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. Every admin response carries `X-Reiki-Version`. The built-in routes and plugin routes are served under `/v1`. An unknown path gets `404`. The listener has no TLS option: config validation refuses a non-loopback `listen`, so terminate TLS in front of a loopback bind for remote access.
+
+### Error envelope
+
+Every refusal on the admin listener, including `401`, `403`, `404`, `400`, `422`, `429` and `5xx`, has one JSON body:
+
+```json
+{"ok":false,"error":{"code":"read_only_token","message":"the read-only token cannot change state; this route needs the full admin token"}}
+```
+
+`code` is a stable snake_case identifier to branch on. `message` is text for people and may change between releases. Codes in use: `unauthorized` (missing or wrong token; the same body for both), `too_many_attempts`, `read_only_token`, `not_found`, `bad_request`, `bad_dry_run`, `unknown_key`, `config_refused`, `reload_task_failed`, `enable_task_failed`, `status_unavailable`, `failures_unavailable`, `audit_unavailable`, and the stream-management codes listed under [stream administration routes](#stream-administration-routes). Success bodies keep their own shapes.
+
+### Read-only token
+
+Give the read-only token to dashboards and `reiki top`. It gets the same data as the full token with two exceptions, both free text that can carry upstream or operator wording:
+
+- `GET /v1/failures` rows have `"note": null`.
+- `GET /v1/status` shows `config.last_reload.error` as `"reload_refused"` and `stream_admin.state_error` as `"state_unavailable"`.
+- `GET /v1/stream-console` audit records have `"reason": null`.
+
+`reiki top` reads `REIKI_ADMIN_READ_TOKEN` and falls back to `REIKI_ADMIN_TOKEN`. `reiki reload` and `reiki keys --enable` need the full token.
+
+### Mutation audit
+
+`POST /v1/reload` (including `dry_run`) and `POST /v1/keys/enable` each write one structured `tracing` event with target `reiki::admin_audit`, fields `action`, `token_class` (`full` or `read_only`), `actor` and `outcome`. A request may name itself with the `X-Reiki-Actor` header. The label is cut to 64 characters, and any character outside `A-Z a-z 0-9 . _ - @ :` becomes `_`. It is for reading logs only and never affects authorization. Refused requests, including a read-only token on these routes, are not audited as actions; they go to the warning log with the peer and path.
+
+The `/v1/streams*` routes are the exception: they exist only with `[stream_admin]` and require the dedicated stream-management token instead of the admin token. See [stream administration routes](#stream-administration-routes). `GET /v1/stream-console` is not one of them: either admin token opens it, with or without stream administration.
 
 ```bash
 export ADMIN_TOKEN='...'
@@ -136,7 +170,7 @@ Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current
 
 ## GET /v1/failures
 
-Method `GET`. Auth: bearer token. Query: `limit` (1 to 64, default 64), `key` (one key name). Returns the in-memory ring, newest first. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding gets `400` with `{"ok":false,"error":"..."}`.
+Method `GET`. Auth: either token. Query: `limit` (1 to 64, default 64), `key` (one key name). Returns the in-memory ring, newest first. `note` is the scrubbed body snippet for the full token and `null` for the read-only token. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding gets `400` with the [error envelope](#error-envelope).
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -185,7 +219,7 @@ The ring holds 64 entries, starts empty after a restart, and drops a record when
 
 ## GET /v1/stream-console
 
-Method `GET`. Auth: ordinary bearer token. Query: none. Read-only snapshot of every configured stream for the Streams screen of [`reiki top`](top.md#streams). It exists with or without `[stream_admin]`; the stream-management token is refused. Nothing here changes a stream.
+Method `GET`. Auth: either admin token. Query: none. Read-only snapshot of every configured stream for the Streams screen of [`reiki top`](top.md#streams). It exists with or without `[stream_admin]`; the stream-management token is refused. Nothing here changes a stream. For the read-only token the audit `reason` fields are `null`.
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -229,7 +263,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ## POST /v1/keys/enable
 
-Method `POST`. Auth: bearer token. Query: `key` (required, percent-encoded key name). Clears the key's cooldown, disabled flag, consecutive failures and combination cooldowns, and saves the change so a restart keeps it.
+Method `POST`. Auth: full admin token; the read-only token gets `403`. Query: `key` (required, percent-encoded key name). Clears the key's cooldown, disabled flag, consecutive failures and combination cooldowns, and saves the change so a restart keeps it. Writes an [audit event](#mutation-audit).
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -243,15 +277,16 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 | Status | Response |
 | --- | --- |
 | `200` | `{"ok":true,"key":"<name>"}`; also for a key that was available |
-| `400` | Missing `key`, a repeated or bare `key` flag, an unknown flag, or a name with invalid percent-encoding |
-| `401` | Missing or wrong token |
-| `404` | No configured key with that name |
+| `400` | Missing `key`, a repeated or bare `key` flag, an unknown flag, or a name with invalid percent-encoding (`bad_request`) |
+| `401` | Missing or wrong token (`unauthorized`) |
+| `403` | The read-only token (`read_only_token`) |
+| `404` | No configured key with that name (`unknown_key`) |
 
 The CLI equivalent is `reiki keys --enable zen-a --token-file /etc/reiki/admin.token`.
 
 ## POST /v1/reload
 
-Method `POST`. Auth: bearer token. Query: `dry_run` with `true`, `1`, `false` or `0`; anything else gets `400` and applies nothing. Re-reads the config, key files and CA files, then swaps the new state in when every part validates.
+Method `POST`. Auth: full admin token; the read-only token gets `403`, even for a preview. Query: `dry_run` with `true`, `1`, `false` or `0`; anything else gets `400` (`bad_dry_run`) and applies nothing. Writes an [audit event](#mutation-audit). Re-reads the config, key files and CA files, then swaps the new state in when every part validates.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -262,7 +297,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 {"ok":true,"dry_run":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
-A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with `{"ok":false,"error":"..."}`; a failed task gets `500`. `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/v1/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
+A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with error code `config_refused`, and its message names the problem with the file, never a value from it; a failed task gets `500` (`reload_task_failed`). `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/v1/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
 
 ## Stream administration routes
 
@@ -308,13 +343,13 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | --- | --- | --- | --- |
 | `GET /__reiki/healthz` | Client listener | None | Returns `200` with body `ok` while Reiki is up |
 | `GET /v1/usage` | Client listener | Stream token | JSON request and token totals for that stream only |
-| `GET /v1/metrics` | Admin listener, `metrics` plugin | Bearer token | Prometheus text exposition |
-| `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Bearer token | Prometheus summary-export drop counter |
-| `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Bearer token | Prometheus tool-call counters |
-| `GET /v1/usage` | Admin listener, `metrics` plugin | Bearer token | JSON token totals per stream and upstream |
-| `GET /v1/stream-console` | Admin listener | Bearer token | Read-only stream table and redacted audit tail for `reiki top` |
-| `GET /v1/cost` | Admin listener, `cost` plugin | Bearer token | Estimated spend with period, stream and upstream filters |
-| `GET /v1/cost/metrics` | Admin listener, `cost` plugin | Bearer token | Cost estimate metrics in Prometheus text |
+| `GET /v1/metrics` | Admin listener, `metrics` plugin | Either admin token | Prometheus text exposition |
+| `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Either admin token | Prometheus summary-export drop counter |
+| `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Either admin token | Prometheus tool-call counters |
+| `GET /v1/usage` | Admin listener, `metrics` plugin | Either admin token | JSON token totals per stream and upstream |
+| `GET /v1/stream-console` | Admin listener | Either admin token | Read-only stream table and redacted audit tail for `reiki top` |
+| `GET /v1/cost` | Admin listener, `cost` plugin | Either admin token | Estimated spend with period, stream and upstream filters |
+| `GET /v1/cost/metrics` | Admin listener, `cost` plugin | Either admin token | Cost estimate metrics in Prometheus text |
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 

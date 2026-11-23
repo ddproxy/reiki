@@ -263,5 +263,9 @@ async fn the_watcher_picks_up_a_renewed_ca_file() {
         }
     }
     assert!(trusted, "the watcher applied the renewed CA");
-    assert!(rig.app.reload_status_json().contains("\"generation\":1"));
+    assert!(
+        rig.app
+            .reload_status_json(false)
+            .contains("\"generation\":1")
+    );
 }

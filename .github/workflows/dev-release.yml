@@ -77,6 +77,10 @@ jobs:
           base=${stable#v}
           IFS=. read -r major minor patch <<< "$base"
           count=$(git rev-list --count "$stable..$HEAD_SHA")
+          if [ "$count" -eq 0 ]; then
+            echo "$HEAD_SHA is $stable itself; skipping"
+            exit 0
+          fi
           short=$(git rev-parse --short=8 "$HEAD_SHA")
           tag="v$major.$minor.$((patch + 1))-dev.$count.g$short"
 

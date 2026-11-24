@@ -19,9 +19,8 @@ jobs:
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -32,6 +31,7 @@ jobs:
       - name: Tag dev build
         id: tag
         env:
+          GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
@@ -97,32 +97,7 @@ jobs:
             fi
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-      - name: Prune dev releases
-        if: steps.tag.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mapfile -t old < <(
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
-              --json tagName --jq '.[].tagName' \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.' \
-              | sort -V \
-              | head -n -10 || true
-          )
-          for tag in "${old[@]}"; do
-            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-          done
-
-  release:
-    name: release
-    needs: tag
-    if: needs.tag.outputs.tag != ''
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.tag.outputs.tag }}
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+          # Tag pushes made with GITHUB_TOKEN start no workflows, and a reusable
+          # call would sign with a caller identity; dispatching on the tag ref
+          # signs as release.yml@refs/tags/<tag>, which `tuishou verify` expects.
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"

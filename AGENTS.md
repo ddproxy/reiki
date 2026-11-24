@@ -34,7 +34,7 @@ Optional checks when the tools are installed: `cargo deny check`, `vale --config
 | `docs/`, `README.md`, `CHANGELOG.md` | User documentation and release notes; `docs/README.md` is the index. |
 | `tests/`, `tests/golden/` | Integration tests and golden admin documents; `tests/docs_examples.rs` checks documentation. |
 | `scripts/check-workflows/`, `scripts/set-release-version.py`, `scripts/tests/` | Workflow policy checker and release version validation with unit tests. |
-| `.github/workflows/` | CI, stable and dev release, CodeQL, audit, fuzz and docs checks. |
+| `.github/workflows/` | CI, stable release (tag push) and dev release (tags, then dispatches the release workflow on the tag ref, which also prunes old dev pre-releases), CodeQL, audit, fuzz and docs checks. |
 
 ## Conventions
 

@@ -176,6 +176,8 @@ struct Inner {
 struct Shared {
     inner: Mutex<Inner>,
     store_ok: AtomicBool,
+    /// Set when the store closed because a write failed, as opposed to unreadable state at load.
+    write_failure: AtomicBool,
     store_errors: AtomicU64,
     owner: std::sync::OnceLock<Weak<App>>,
 }
@@ -191,6 +193,7 @@ impl Gateway {
         Self {
             shared: Arc::new(Shared {
                 store_ok: AtomicBool::new(true),
+                write_failure: AtomicBool::new(false),
                 ..Shared::default()
             }),
         }
@@ -277,13 +280,29 @@ impl Gateway {
     }
 
     /// Marks counter state unavailable, for example when it could not be read at startup.
+    /// Logs once on the transition, not once per refused request.
     pub fn store_failed(&self) {
-        self.shared.store_ok.store(false, Ordering::Release);
+        if self
+            .shared
+            .store_ok
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!("gateway counter store unavailable");
+        }
     }
 
     /// Marks counter state available again after a successful write.
+    /// Logs once on the transition, not once per successful keepalive write.
     fn store_succeeded(&self) {
-        self.shared.store_ok.store(true, Ordering::Release);
+        if self
+            .shared
+            .store_ok
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::info!("gateway counter store recovered");
+        }
     }
 
     pub fn store_recovered(&self) {
@@ -622,11 +641,20 @@ impl Gateway {
     }
 
     pub fn write_succeeded(&self) {
+        self.shared.write_failure.store(false, Ordering::Release);
         self.store_succeeded();
     }
 
     pub fn write_failed(&self) {
+        self.shared.write_failure.store(true, Ordering::Release);
         self.store_failed();
+    }
+
+    /// True when the store is closed by a failed write, so a probe write is worth trying. A store
+    /// closed by unreadable state at startup is not probed: rewriting would replace the file
+    /// with zeroed counters.
+    pub fn write_probe_due(&self) -> bool {
+        !self.store_ok() && self.shared.write_failure.load(Ordering::Acquire)
     }
 }
 

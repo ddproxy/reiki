@@ -51,6 +51,8 @@ Refusals carry a fixed JSON `error.type` and message; no model name, token, requ
 
 `on_store_error = "closed"` (the default) is fail-closed. `"open"` serves requests without a reliable counter and emits `GatewayStoreError` events and `reiki_gateway_store_errors_total{stream}`; the mode can be overridden per stream in `[streams.NAME.limits]`.
 
+A failed state write closes the store immediately. A store closed by an unreadable state file at startup is not probed, so a timer alone never rewrites the file with empty counters. The state writer then probes the current counters without waiting for new traffic: after 5 seconds, doubling through 10 and 20 to a 30-second cap while writes keep failing. A successful probe reopens admission. The transition logs one `WARN` on close and one `INFO` on recovery, not one line per refused request. `reiki_gateway_store_ok` is `0` while closed and `1` while open.
+
 Each stream's token can call `GET /v1/usage` on the client listener to see only its own request and token totals. That route has its own budget, `[gateway] usage_rpm`, separate from request admission. See [monitoring](monitoring.md#get-v1usage-client-listener).
 
 ## Key limits

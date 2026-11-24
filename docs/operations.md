@@ -55,6 +55,8 @@ REIKI_ADMIN_TOKEN="$(cat /etc/reiki/admin.token)" reiki failures --limit 20
 
 The health probe needs no token and answers `ok` while the listener is up; it does not prove an upstream works. `reiki keys` shows `ok`, `cooling` or `disabled` per key and exits `0` on a good answer, `1` on a refusal and `2` when the admin listener cannot be reached. `reiki top --once` adds a fleet view when peers are configured. See [monitoring](monitoring.md) and [top](top.md).
 
+A gateway store closed by a failed state write retries a probe write of the current counters every 5 to 30 seconds, so it reopens after disk space or permissions return without a restart or new traffic. Watch `reiki_gateway_store_ok` on `/v1/metrics` (`0` while closed); the service log has one `WARN` on close and one `INFO` on recovery.
+
 ## Common failures
 
 | Exact message or status | Meaning | Fix |

@@ -29,6 +29,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 
 ### Fixed
 
+- A failed state write no longer latches the gateway closed until restart. The state writer probes the current counters every 5 to 30 seconds while the store is failed and reopens admission on the first successful write; close and recovery each log once, and `reiki_gateway_store_ok` exposes the state on `/v1/metrics`.
 - Wasm host input bounds: guest strings are capped before sanitization, `log` rejects oversized template ids and argument vectors, `request_state.get` rejects oversized keys, and finding-kind interning is isolated per plugin inside the bounded global table. All violations poison or degrade fail-closed.
 - Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
 - Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.

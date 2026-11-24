@@ -26,6 +26,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked --features top -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo test --locked --workspace --features top
+      - run: python3 -m unittest discover -s scripts/tests -v
 
   docs:
     name: docs-check

@@ -282,7 +282,7 @@ make check       # workspace cargo check
 make docs-check  # validate documentation examples and links
 ```
 
-Commit messages are terse and describe the change, not the process. Build-time plugin order is described in [plugins](docs/plugins.md); the release process uses tagged builds on `main` with release archives, checksums and attestations. See [AGENTS.md](AGENTS.md) for the repo map and agent workflow.
+Commit messages are terse and describe the change, not the process. Build-time plugin order is described in [plugins](docs/plugins.md); the release process uses tagged builds on `main` with release archives, checksums and attestations. Successful CI pushes also publish dev pre-releases with the same asset layout; see [install](docs/install.md#development-builds). See [AGENTS.md](AGENTS.md) for the repo map and agent workflow.
 
 ## License and links
 

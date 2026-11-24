@@ -43,6 +43,10 @@ install -m 0755 dist/reiki-"$tag"-x86_64-unknown-linux-musl/reiki ~/.local/bin/r
 
 Archives also ship a CycloneDX SBOM and build provenance attestations; [security scanning](security-scanning.md#verify-a-release) shows the verification commands.
 
+## Development builds
+
+A successful CI push to `main` that changes more than documentation also publishes a pre-release tagged `vX.Y.(Z+1)-dev.<commits since last stable tag>.g<short hash>`. The tag without the leading `v` is the version in that build's `Cargo.toml`; it sorts after the base stable version and before the next stable version. Dev archives, checksums, SBOM and attestations use the same layout as stable archives. Only the ten newest dev pre-releases are kept, and older dev tags are removed with them. A stable tag still has to equal the checked-in `Cargo.toml` version. Prefer stable releases for production.
+
 ## Verify the install
 
 ```sh

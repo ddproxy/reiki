@@ -1,4 +1,4 @@
-.PHONY: help build install uninstall test lint check docs-check ci du clean clean-debug clean-release clean-stale
+.PHONY: help build install uninstall test test-scripts lint check docs-check ci du clean clean-debug clean-release clean-stale
 
 # root installs to /usr/local, anyone else to ~/.local; override with PREFIX=
 PREFIX ?= $(if $(filter 0,$(shell id -u)),/usr/local,$(HOME)/.local)
@@ -28,7 +28,14 @@ lint:  ## fmt check plus clippy with warnings denied, default and top features
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 	cargo clippy --workspace --all-targets --locked --features top -- -D warnings
 
-test:  ## workspace tests, default and top features
+test-scripts:  ## version script tests (skipped when python3 is absent)
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 -m unittest discover -s scripts/tests -v; \
+	else \
+		echo "python3 not found; skipping version script tests"; \
+	fi
+
+test: test-scripts ## workspace tests, default and top features
 	cargo test --locked --workspace
 	cargo test --locked --workspace --features top
 

@@ -7,6 +7,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const LOCAL_WORKFLOW_POLICIES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "./.github/workflows/release.yml",
+        &[
+            ("contents", "write"),
+            ("id-token", "write"),
+            ("attestations", "write"),
+        ],
+    ),
+];
+
 fn text(value: &Value) -> Option<&str> {
     match value {
         Value::String(s) => Some(s),
@@ -92,9 +103,40 @@ fn required_permissions(
             Some(other) => {
                 errors.push(format!("{job_name}: no permission rule for {other}"));
             }
-            None if run.contains("gh release ") => add(&mut need, "contents", "write"),
+            None if run.contains("gh release ") || run.contains("git push ") => {
+                add(&mut need, "contents", "write")
+            }
             None => {}
         }
+    }
+    need
+}
+
+fn called_workflow_permissions(
+    uses: &str,
+    job: &Mapping,
+    errors: &mut Vec<String>,
+    job_name: &str,
+) -> BTreeMap<String, String> {
+    let mut need = BTreeMap::new();
+    match LOCAL_WORKFLOW_POLICIES
+        .iter()
+        .find(|(path, _)| *path == uses)
+    {
+        Some((_, scopes)) => {
+            for &(scope, level) in *scopes {
+                add(&mut need, scope, level);
+            }
+        }
+        None => errors.push(format!("{job_name}: no policy row for local workflow {uses}")),
+    }
+    if uses == "./.github/workflows/release.yml"
+        && !job
+            .get("with")
+            .and_then(Value::as_mapping)
+            .is_some_and(|with| with.get("tag").is_some())
+    {
+        errors.push(format!("{job_name}: local workflow call needs a tag input"));
     }
     need
 }
@@ -107,6 +149,9 @@ fn check_pin(line: &str, file: &str, number: usize, errors: &mut Vec<String>) ->
     let Some(reference) = parts.next() else {
         return true;
     };
+    if reference.starts_with("./") {
+        return false;
+    }
     let Some((_, sha)) = reference.rsplit_once('@') else {
         errors.push(format!("{file}:{number}: {reference} is not pinned by SHA"));
         return true;
@@ -164,7 +209,11 @@ fn check_workflow(path: &Path, errors: &mut Vec<String>) -> usize {
             errors.push(format!("{job_name}: job is not a mapping"));
             continue;
         };
-        let need = required_permissions(job, errors, &job_name);
+        let need = if let Some(uses) = job.get("uses").and_then(text) {
+            called_workflow_permissions(uses, job, errors, &job_name)
+        } else {
+            required_permissions(job, errors, &job_name)
+        };
         let Some(Value::Mapping(granted)) = job.get("permissions") else {
             errors.push(format!("{job_name}: missing job permissions"));
             continue;

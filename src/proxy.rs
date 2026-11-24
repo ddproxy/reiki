@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -369,6 +369,57 @@ impl Snapshot {
 
 /// Pause before a quota 429 is sent again on the same key when `confirm_quota` is set.
 const QUOTA_CONFIRM_DELAY: Duration = Duration::from_secs(3);
+
+/// First retry after a failed state write, and the cap for repeated failures.
+const STORE_RETRY_BASE: Duration = Duration::from_secs(5);
+const STORE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Why the state writer woke. A timer is only a probe when the gateway store is failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterWake {
+    Signal,
+    Timer,
+    Closed,
+}
+
+/// Backoff for consecutive failed writes: 5s, 10s, 20s, then 30s.
+fn store_retry_delay(failures: u32) -> Duration {
+    if failures == 0 {
+        return STORE_RETRY_BASE;
+    }
+    let step = (failures - 1).min(3);
+    STORE_RETRY_BASE
+        .saturating_mul(1u32 << step)
+        .min(STORE_RETRY_MAX)
+}
+
+/// Waits for work, then writes the current state. A failed store is probed on every timer even
+/// when no request marked it dirty, so a closed gateway can reopen without new traffic. Success
+/// resets the backoff; a fresh signal still attempts a write immediately.
+fn drive_state_writer(
+    mut wait: impl FnMut(Duration) -> WriterWake,
+    mut store_failed: impl FnMut() -> bool,
+    mut write: impl FnMut() -> bool,
+) {
+    let mut failures = 0u32;
+    loop {
+        match wait(store_retry_delay(failures)) {
+            WriterWake::Closed => return,
+            WriterWake::Signal => {}
+            WriterWake::Timer => {
+                if !store_failed() {
+                    failures = 0;
+                    continue;
+                }
+            }
+        }
+        if write() {
+            failures = 0;
+        } else {
+            failures = failures.saturating_add(1);
+        }
+    }
+}
 
 pub struct App {
     snapshot: RwLock<Arc<Snapshot>>,
@@ -796,22 +847,40 @@ impl App {
     /// Starts the thread that writes the state file. From then on [`App::persist_state`] only
     /// wakes it, so a request that records a failure never waits on a disk. A wake that arrives
     /// while a write runs is kept and becomes one more write that reads the latest state, so
-    /// a burst of failures costs a few writes, not one each.
+    /// a burst of failures costs a few writes, not one each. While the gateway store is failed,
+    /// the writer also probes it on a bounded backoff, so closed mode recovers without waiting
+    /// for new traffic.
     pub fn start_state_writer(self: &Arc<Self>) {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         if self.persist_tx.set(tx).is_err() {
             return;
         }
         let weak = Arc::downgrade(self);
+        let wait_weak = Weak::clone(&weak);
+        let status_weak = Weak::clone(&weak);
         let spawned = std::thread::Builder::new()
             .name("reiki-state".to_owned())
             .spawn(move || {
-                while rx.recv().is_ok() {
-                    let Some(app) = weak.upgrade() else {
-                        break;
-                    };
-                    app.persist_state_now();
-                }
+                drive_state_writer(
+                    |delay| {
+                        if wait_weak.upgrade().is_none() {
+                            return WriterWake::Closed;
+                        }
+                        match rx.recv_timeout(delay) {
+                            Ok(()) => WriterWake::Signal,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WriterWake::Timer,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                WriterWake::Closed
+                            }
+                        }
+                    },
+                    || {
+                        status_weak
+                            .upgrade()
+                            .is_some_and(|app| app.gateway().write_probe_due())
+                    },
+                    || weak.upgrade().is_some_and(|app| app.persist_state_now()),
+                );
             });
         if let Err(error) = spawned {
             // The receiver went with the closure, so `persist_state` falls back to writing inline.
@@ -841,9 +910,11 @@ impl App {
         self.persist_state_now();
     }
 
-    pub(crate) fn persist_state_now(&self) {
+    /// Writes the current state and reports whether the store is usable afterwards. Callers that
+    /// only need the side effect may ignore the result.
+    pub(crate) fn persist_state_now(&self) -> bool {
         let Some(path) = self.state_path.get() else {
-            return;
+            return self.gateway.store_ok();
         };
         let _guard = self
             .persist_lock
@@ -866,14 +937,17 @@ impl App {
             &config.keys,
             &config.config,
         );
-        match written {
-            Ok(()) => self.gateway.write_succeeded(),
-            Err(_) => self.gateway.write_failed(),
+        let ok = written.is_ok();
+        if ok {
+            self.gateway.write_succeeded();
+        } else {
+            self.gateway.write_failed();
         }
         *self
             .shaper_saved
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = (shaper, Some(now));
+        ok
     }
 
     /// Saves after the shaper learns something, skipping a write when its durable
@@ -3733,6 +3807,130 @@ mod tests {
             crate::auth::sha256_hex("tok")
         ))
         .unwrap()
+    }
+
+    /// Runs the writer against a fake state sink. `fail_until` is the number of initial writes
+    /// that fail; later writes succeed. Returns the delays chosen before each wait, whether the
+    /// store was failed at each wait, and the number of writes attempted.
+    fn run_writer_with_script(
+        gateway: &Gateway,
+        events: Vec<WriterWake>,
+        fail_until: usize,
+    ) -> (Vec<Duration>, Vec<bool>, usize) {
+        let mut events = events.into_iter();
+        let mut delays = Vec::new();
+        let mut failed_at_wait = Vec::new();
+        let mut attempts = 0usize;
+        drive_state_writer(
+            |delay| {
+                delays.push(delay);
+                failed_at_wait.push(!gateway.store_ok());
+                events.next().unwrap_or(WriterWake::Closed)
+            },
+            || gateway.write_probe_due(),
+            || {
+                attempts += 1;
+                if attempts <= fail_until {
+                    gateway.write_failed();
+                    false
+                } else {
+                    gateway.write_succeeded();
+                    true
+                }
+            },
+        );
+        (delays, failed_at_wait, attempts)
+    }
+
+    #[test]
+    fn a_failed_store_recovers_from_a_timer_probe_without_new_traffic() {
+        let config = gateway_test_config("", "");
+        let gateway = Gateway::new();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(60 * 1_000);
+        let mut permit = gateway
+            .admit(&config, "s", "zen", "a", None, now, 0)
+            .unwrap();
+        permit.complete(0);
+
+        let (_, failed_at_wait, attempts) = run_writer_with_script(
+            &gateway,
+            vec![WriterWake::Signal, WriterWake::Timer, WriterWake::Closed],
+            1,
+        );
+        assert_eq!(attempts, 2, "only the initial write and the timer probe");
+        assert_eq!(
+            failed_at_wait,
+            vec![false, true, false],
+            "the timer probe reopened the store"
+        );
+        assert!(gateway.store_ok());
+        assert!(
+            gateway
+                .admit(&config, "s", "zen", "a", None, now, 0)
+                .is_ok(),
+            "closed mode admits again after recovery"
+        );
+        assert_eq!(gateway.snapshot()["s"].requests_total, 2);
+    }
+
+    #[test]
+    fn a_store_closed_by_unreadable_state_is_not_probed() {
+        let gateway = Gateway::new();
+        gateway.store_failed();
+        let (_, _, attempts) = run_writer_with_script(
+            &gateway,
+            vec![WriterWake::Timer, WriterWake::Timer, WriterWake::Closed],
+            0,
+        );
+        assert_eq!(attempts, 0);
+        assert!(!gateway.store_ok());
+    }
+
+    #[test]
+    fn repeated_state_write_failures_back_off_to_the_cap() {
+        let gateway = Gateway::new();
+        let (delays, _, attempts) = run_writer_with_script(
+            &gateway,
+            vec![
+                WriterWake::Signal,
+                WriterWake::Timer,
+                WriterWake::Timer,
+                WriterWake::Timer,
+                WriterWake::Timer,
+                WriterWake::Closed,
+            ],
+            usize::MAX,
+        );
+        assert_eq!(attempts, 5);
+        assert_eq!(
+            delays,
+            vec![5, 5, 10, 20, 30, 30]
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect::<Vec<_>>()
+        );
+        assert!(!gateway.store_ok());
+    }
+
+    #[test]
+    fn open_mode_serves_while_state_writes_keep_failing() {
+        let config = gateway_test_config("", "[gateway]\non_store_error = \"open\"\n");
+        let gateway = Gateway::new();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(60 * 1_000);
+        let (_, _, attempts) = run_writer_with_script(
+            &gateway,
+            vec![WriterWake::Signal, WriterWake::Timer, WriterWake::Closed],
+            usize::MAX,
+        );
+        assert_eq!(attempts, 2);
+        assert!(!gateway.store_ok());
+        assert!(
+            gateway
+                .admit(&config, "s", "zen", "a", None, now, 0)
+                .is_ok(),
+            "open mode never refuses on a failed store"
+        );
+        assert_eq!(gateway.store_errors(), 1);
     }
 
     #[test]

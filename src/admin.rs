@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -837,6 +838,17 @@ fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static
     Ok((limit, key))
 }
 
+/// Host-owned gauge appended to `/v1/metrics`, so a closed store is visible even without
+/// request traffic to increment a counter.
+fn gateway_store_metrics(ok: bool) -> String {
+    let mut out = String::from(
+        "# HELP reiki_gateway_store_ok Per-stream counter store availability.\n\
+                                # TYPE reiki_gateway_store_ok gauge\n",
+    );
+    let _ = writeln!(out, "reiki_gateway_store_ok {}", u8::from(ok));
+    out
+}
+
 async fn plugin_route(
     State(app): State<Arc<App>>,
     peer: Option<Extension<Peer>>,
@@ -885,6 +897,7 @@ async fn plugin_route(
     let mut extra = app
         .stream_admin()
         .map_or_else(String::new, |manager| manager.metrics().render());
+    extra.push_str(&gateway_store_metrics(app.gateway().store_ok()));
     extra.push_str(&app.plugins().metrics_text());
     match app.plugins().on_admin_with_extra(
         path,
@@ -1884,6 +1897,15 @@ mod tests {
         assert_eq!(decode_query_value("%4"), None);
         assert_eq!(decode_query_value("%"), None);
         assert_eq!(decode_query_value("%zz"), None);
+    }
+
+    #[test]
+    fn gateway_store_gauge_shows_both_states() {
+        let ok = gateway_store_metrics(true);
+        let closed = gateway_store_metrics(false);
+        assert!(ok.contains("# TYPE reiki_gateway_store_ok gauge\n"));
+        assert!(ok.ends_with("reiki_gateway_store_ok 1\n"));
+        assert!(closed.ends_with("reiki_gateway_store_ok 0\n"));
     }
 
     #[test]

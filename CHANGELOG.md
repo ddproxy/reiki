@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.1
+
+### Added
+
+- `reiki top` sorts the Streams table by stream name, usage, chain, request rate or expiry with the matrix keys `o`, `O` and `r`; past the last column the table returns to the default usage order. The sorted header shows `▲` or `▼`, unavailable values sort last in both directions, and equal values keep the default order. The Streams key list and hints name the new keys. See [top](docs/top.md#streams).
+
+### Fixed
+
+- A failed state write no longer latches the gateway closed until restart. The state writer probes the current counters every 5 to 30 seconds while the store is failed and reopens admission on the first successful write; close and recovery each log once, and `reiki_gateway_store_ok` exposes the state on `/v1/metrics`.
+- The `reiki top` Streams selection and detail pane follow a stream by name instead of by row index, so a refresh or re-sort no longer highlights and describes a different stream.
+
 ## 0.15.0
 
 The opt-in features introduced in 0.14.0 — the multi-stream gateway with admission limits, dynamic streams with a hash-chained audit log, the `plugin-wasm` runtime host and `plugin-cost` estimates — now have operator documentation that is checked against the binary. Their behavior is unchanged here; see the 0.14.0 entries below for the original feature and behavior changes. `Cargo.toml` is intentionally still at 0.14.0.
@@ -12,7 +23,6 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - `make docs-check`, `tests/docs_examples.rs` and a CI job that validate documented TOML with `reiki check`, CLI flags with help output, config keys with the docs, local links and anchors, and the README proof.
 - `AGENTS.md` with commands, repo map, conventions and stable exit codes, and `llms.txt` as a short docs index.
 - A final-response plugin phase for security checks that must inspect the body after placeholder restoration. It adds `Plugin::needs_final_response` and `Plugin::on_final_response` to the native plugin API; the host buffers the body only for plugins that opt in and fails closed when the buffer bound is exceeded.
-- `reiki top` sorts the Streams table by stream name, usage, chain, request rate or expiry with the matrix keys `o`, `O` and `r`; past the last column the table returns to the default usage order. The sorted header shows `▲` or `▼`, unavailable values sort last in both directions, and equal values keep the default order. The Streams key list and hints name the new keys. See [top](docs/top.md#streams).
 
 ### Changed
 
@@ -29,14 +39,12 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 
 ### Fixed
 
-- A failed state write no longer latches the gateway closed until restart. The state writer probes the current counters every 5 to 30 seconds while the store is failed and reopens admission on the first successful write; close and recovery each log once, and `reiki_gateway_store_ok` exposes the state on `/v1/metrics`.
 - Wasm host input bounds: guest strings are capped before sanitization, `log` rejects oversized template ids and argument vectors, `request_state.get` rejects oversized keys, and finding-kind interning is isolated per plugin inside the bounded global table. All violations poison or degrade fail-closed.
 - Documentation: corrected key-file permission and length rules, listener collision and reload-watch rules, key JSON `scopes`, failure classes, `reiki plugin inspect`, file paths and version strings.
 - Config validation now treats a wildcard client listener and a loopback admin or tunnel listener on the same port as a collision, instead of only comparing the strings.
 - Corrected stale documentation links and version strings, and clarified that a failed audit append refuses the management mutation instead of silently continuing.
 - A decoded, buffered success no longer replaces its gateway token estimate with zero; the permit is dropped so the estimate stays charged while the provider's `usage` object remains ignored for compressed bodies.
 - Gateway completions keep the estimate in the window where the request was admitted, instead of subtracting it from a minute, day or month that rolled over in flight.
-- The `reiki top` Streams selection and detail pane follow a stream by name instead of by row index, so a refresh or re-sort no longer highlights and describes a different stream.
 
 ### Security
 

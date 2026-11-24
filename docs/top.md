@@ -106,7 +106,9 @@ See [`GET /v1/failures`](monitoring.md#get-v1failures) for the fields and the `r
 
 Press `t` to open a read-only view of the local instance's streams; `t` returns to the matrix. It reads [`GET /v1/stream-console`](monitoring.md#get-v1stream-console) with the admin token `reiki top` was given (the read-only one when set). A remote peer's stream names never enter this screen.
 
-The table lists every configured stream, static and dynamic, sorted by current request rate, then concurrency, then name. Its columns are `stream`, `type` (`static` or `dynamic`), `chain` (the upstream order), `expires` (countdown to the next live token), `rpm` and `conc` (current/limit, `-` for no limit), `last` (time since the last admitted request) and `state`. `j`/`k`, the arrows and `Tab`/`Shift-Tab` move the row selection.
+The table lists every configured stream, static and dynamic. Its default order is current request rate, then concurrency, then name. Its columns are `stream`, `type` (`static` or `dynamic`), `chain` (the upstream order), `expires` (countdown to the next live token), `rpm` and `conc` (current/limit, `-` for no limit), `last` (time since the last admitted request) and `state`. `j`/`k`, the arrows and `Tab`/`Shift-Tab` move the row selection. The selection follows a stream by name, so a refresh that changes the usage order, or a re-sort, does not move it to a different stream.
+
+`o` sorts by the next column and `O` by the previous one; past the last column, or before the first, the table returns to the default usage order. The columns are the stream name, usage (`conc`), chain, rate (`rpm`) and expiry (`expires`), in that order. The first press sorts ascending and `r` reverses the direction. The sorted header shows `▲` or `▼`, and equal values keep the default order. A value the screen does not show, such as an empty chain or no expiry, sorts last in both directions. `type`, `last` and `state` are display-only columns.
 
 The detail pane shows the selected stream's numeric limits, then its credentials by short id with expiry and active/expired state, then recent audit records for that stream, newest first. Credential values, hashes, audit-chain hashes, file paths and the actor hash are never sent to the screen. `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll the detail.
 
@@ -135,6 +137,12 @@ In the full view (`v` or `--full`):
 - `j`/`k`, the arrows, `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll.
 - `Tab`/`Shift-Tab` filter to the next or previous peer; `c` clears the filter.
 - `p` freezes, `v` returns to the matrix, `t` opens Streams, `?` lists the keys, `q` or `Esc` quits.
+
+On the Streams screen (`t`):
+
+- `j`/`k`, the arrows and `Tab`/`Shift-Tab` move the stream selection; `PgUp`/`PgDn`, `g`/`Home` and `G`/`End` scroll the detail pane.
+- `o`/`O` step through the sortable columns and back to the default order; `r` reverses the direction (see [Streams](#streams)).
+- `p` freezes the screen, `t` returns to the matrix, `?` lists the keys, `q` or `Esc` quits.
 
 Live mode needs stdout to be a terminal; otherwise it prints one line and exits 2, so use `--once`.
 

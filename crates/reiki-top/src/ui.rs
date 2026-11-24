@@ -21,6 +21,7 @@ use ratatui::text::{Line as RatLine, Span as RatSpan};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::matrix::{PeerColumn, PeerSort, UsageMetric};
+use crate::streams::{StreamColumn, StreamSort};
 use crate::view::{self, GaugeMetric, GaugeMode, GaugeWindow, Span, Style};
 
 /// The key hints on the footer's right side, full view.
@@ -30,7 +31,8 @@ const HINTS: &str =
 const HINTS_MATRIX: &str =
     "q quit  j/k  Enter detail  f filter  u metric  w window  m chart  t streams  a all  ? keys";
 /// The key hints under the Streams header.
-const HINTS_STREAMS: &str = "q quit  j/k select  PgUp/PgDn detail  p pause  t matrix  ? keys";
+const HINTS_STREAMS: &str =
+    "q quit  j/k select  PgUp/PgDn detail  o sort  p pause  t matrix  ? keys";
 
 /// Rows of the matrix header panel: a border, the status line, the hints and a border.
 const HEADER_ROWS: u16 = 4;
@@ -76,6 +78,8 @@ const FULL_KEYS: &[&str] = &[
 const STREAMS_KEYS: &[&str] = &[
     "j/k, arrows, Tab, Shift-Tab   move the stream selection",
     "PgUp/PgDn, g/Home, G/End   scroll the detail pane",
+    "o or O   sort by the next or previous column; past the last, default usage order",
+    "r   reverse the sort",
     "p   freeze the screen; again to resume",
     "t   back to the matrix",
     "?   this list; any key closes it, Ctrl-C quits",
@@ -123,12 +127,13 @@ pub enum Action {
     SelectFleet,
     /// Opens or closes the key list.
     ToggleHelp,
-    /// Sorts the matrix by the next column, or unsorted after the last. Needs the matrix's
-    /// columns, so the caller applies it with [`UiState::cycle_sort`].
+    /// Sorts the current screen by the next column, or unsorted after the last. Needs the screen's
+    /// columns, so the caller applies it with [`UiState::cycle_sort`] or
+    /// [`UiState::cycle_stream_sort`].
     SortNext,
-    /// Sorts the matrix by the previous column, or unsorted before the first.
+    /// Sorts the current screen by the previous column, or unsorted before the first.
     SortPrev,
-    /// Flips the matrix sort's direction. A no-op while the rows are unsorted.
+    /// Flips the current screen's sort direction. A no-op while the rows are unsorted.
     SortReverse,
 }
 
@@ -205,12 +210,15 @@ pub struct UiState {
     pub stacked: bool,
     /// Which figure the provider-coloured chart sums.
     pub chart_usage: UsageMetric,
-    /// The selected row of the Streams table. Separate from the peer selection.
-    pub stream_row: Option<usize>,
+    /// The stream under the cursor on the Streams screen, by name. A refresh or a re-sort moves
+    /// the display row with the stream. `None` selects the first row.
+    pub selected_stream: Option<String>,
     /// Whether the key list is open over the frame.
     pub help: bool,
     /// The matrix sort. `None` keeps the default order.
     pub peer_sort: Option<PeerSort>,
+    /// The Streams sort. `None` keeps the default usage order.
+    pub stream_sort: Option<StreamSort>,
     /// The peer under the cursor, by name. `selected` is its position in the last order the
     /// caller resolved, so a refresh or re-sort moves the cursor with the peer.
     pub selected_peer: Option<String>,
@@ -254,7 +262,7 @@ impl UiState {
         };
         self.scroll = 0;
         if self.mode == Mode::Streams {
-            self.stream_row = Some(0);
+            self.selected_stream = None;
         }
     }
 
@@ -303,6 +311,41 @@ impl UiState {
     /// Flips the sort's direction. Returns false while the rows are unsorted.
     pub fn reverse_sort(&mut self) -> bool {
         match self.peer_sort.as_mut() {
+            Some(sort) => {
+                sort.descending = !sort.descending;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Steps the Streams sort through `columns` and back to the default usage order, like
+    /// [`UiState::cycle_sort`] does for the matrix.
+    pub fn cycle_stream_sort(&mut self, columns: &[StreamColumn], forward: bool) {
+        if columns.is_empty() {
+            return;
+        }
+        let slots = columns.len() + 1;
+        let current = self.stream_sort.map_or(0, |sort| {
+            columns
+                .iter()
+                .position(|c| *c == sort.column)
+                .map_or(0, |i| i + 1)
+        });
+        let next = if forward {
+            (current + 1) % slots
+        } else {
+            (current + slots - 1) % slots
+        };
+        self.stream_sort = (next > 0).then(|| StreamSort {
+            column: columns[next - 1],
+            descending: false,
+        });
+    }
+
+    /// Flips the Streams sort's direction. Returns false while the rows are unsorted.
+    pub fn reverse_stream_sort(&mut self) -> bool {
+        match self.stream_sort.as_mut() {
             Some(sort) => {
                 sort.descending = !sort.descending;
                 true
@@ -360,7 +403,8 @@ impl UiState {
                 self.scroll = 0;
             }
             Action::ToggleHelp => self.help = !self.help,
-            // The matrix columns live in the caller; it calls `cycle_sort` and `reverse_sort`.
+            // The screen's columns live in the caller; it calls `cycle_sort`/`cycle_stream_sort`
+            // and `reverse_sort`/`reverse_stream_sort`.
             Action::SortNext | Action::SortPrev | Action::SortReverse => {}
         }
         self.scroll = self.scroll.min(max_scroll(total_lines, viewport));
@@ -1013,7 +1057,7 @@ fn draw_charts(
 /// layer stays free of parsing and policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamsFrame<'a> {
-    /// Table header and rows, already sorted by usage.
+    /// Table header and rows, already in display order.
     pub table: &'a [view::Line],
     /// Detail lines for the selected stream, scrolled by `UiState::scroll`.
     pub detail: &'a [view::Line],
@@ -1224,6 +1268,7 @@ fn footer_text(state: &UiState, status: &str, hints: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streams::stream_columns;
     use crossterm::event::KeyEvent;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1399,10 +1444,14 @@ mod tests {
             chart: ChartMetric::Disk,
             stacked: true,
             chart_usage: UsageMetric::Tokens,
-            stream_row: Some(1),
+            selected_stream: Some("busy".to_owned()),
             help: true,
             peer_sort: Some(PeerSort {
                 column: PeerColumn::Load,
+                descending: true,
+            }),
+            stream_sort: Some(StreamSort {
+                column: StreamColumn::Rate,
                 descending: true,
             }),
             selected_peer: Some("peer-b".to_owned()),
@@ -1731,6 +1780,66 @@ mod tests {
     }
 
     #[test]
+    fn o_and_o_step_through_the_stream_columns_and_back_to_default() {
+        let columns = stream_columns();
+        let mut state = UiState::default();
+        let mut seen = Vec::new();
+        for _ in 0..columns.len() + 1 {
+            state.cycle_stream_sort(&columns, true);
+            seen.push(state.stream_sort);
+        }
+        let sort = |column| {
+            Some(StreamSort {
+                column,
+                descending: false,
+            })
+        };
+        assert_eq!(
+            seen,
+            [
+                sort(StreamColumn::Name),
+                sort(StreamColumn::Usage),
+                sort(StreamColumn::Chain),
+                sort(StreamColumn::Rate),
+                sort(StreamColumn::Expiry),
+                None,
+            ]
+        );
+        state.cycle_stream_sort(&columns, false);
+        assert_eq!(state.stream_sort, sort(StreamColumn::Expiry));
+        for _ in 0..columns.len() - 1 {
+            state.cycle_stream_sort(&columns, false);
+        }
+        assert_eq!(state.stream_sort, sort(StreamColumn::Name));
+        state.cycle_stream_sort(&columns, false);
+        assert_eq!(state.stream_sort, None, "past the first is default order");
+    }
+
+    #[test]
+    fn r_reverses_the_stream_sort_only_while_sorted() {
+        let mut state = UiState::default();
+        assert!(!state.reverse_stream_sort());
+        state.cycle_stream_sort(&stream_columns(), true);
+        assert!(state.reverse_stream_sort());
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Name,
+                descending: true,
+            })
+        );
+        state.cycle_stream_sort(&stream_columns(), true);
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Usage,
+                descending: false,
+            }),
+            "moving to a column sorts it ascending"
+        );
+    }
+
+    #[test]
     fn key_releases_are_ignored_even_for_quit_keys() {
         for (code, modifiers) in [
             (KeyCode::Char('q'), KeyModifiers::NONE),
@@ -1800,7 +1909,7 @@ mod tests {
         state.apply(Action::ToggleStreams, 100, 10);
         assert_eq!(state.mode, Mode::Streams);
         assert_eq!(state.scroll, 0);
-        assert_eq!(state.stream_row, Some(0));
+        assert_eq!(state.selected_stream, None, "the first row is the default");
         state.apply(Action::ToggleStreams, 100, 10);
         assert_eq!(state.mode, Mode::Matrix);
     }
@@ -2439,8 +2548,8 @@ mod tests {
             }}"#
         ))
         .expect("fixture parses");
-        let table = view::streams_table(&snapshot, Some(0), 1155, 60);
-        let detail = view::stream_detail(&snapshot, Some(0), 1155, 40);
+        let table = view::streams_table(&snapshot, Some("busy"), None, 1155, 60);
+        let detail = view::stream_detail(&snapshot, Some("busy"), 1155, 40);
         let status = view::streams_status(&snapshot, None, 100);
         let frame = StreamsFrame {
             table: &table,
@@ -2456,6 +2565,10 @@ mod tests {
         assert!(text.contains("create"), "recent audit renders");
         assert!(!text.contains(&secret), "no token value on screen");
         assert!(text.contains("t matrix"), "the Streams hints name t");
+        assert!(
+            text.contains("o sort"),
+            "the Streams hints name the sort key"
+        );
 
         snapshot.enabled = false;
         let status = view::streams_status(&snapshot, Some("admin unreachable"), 100);

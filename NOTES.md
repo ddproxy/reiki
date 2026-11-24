@@ -81,3 +81,28 @@ no upper bound. A bounded range or checked addition would be the fix; it is Low 
 
 No secret-shaped literals were added. Tokens, hashes and escaped prefixes in new tests are built at
 runtime, following the existing fixture style.
+
+## Streams sorting task: claim verification
+
+Checked against the code before changing anything:
+
+- The peer matrix uses `o`/`O`/`r` (`ui.rs::map_key`), a module-local `compare_keys` plus
+  `natural_cmp` (`matrix.rs`), and tracks the cursor by peer name in `UiState::selected_peer`
+  (`ui.rs`, `top.rs::follow_cursor`). The sorted-header marker is `view.rs::sorted_header`.
+- The Streams selection was an index (`UiState::stream_row`), and the same index was passed to
+  both `view::streams_table` and `view::stream_detail` in `top.rs::build_parts`.
+
+Two claims in the task wording disagree with the code; the code was followed:
+
+- The table is not server-ordered. `admin.rs::stream_console` emits streams in config order, and
+  `streams.rs::StreamsAnswer::into_view` sorts the rows on this host by `rpm.current`,
+  `concurrency.current` and name. The default order therefore remains a client-side rule, now
+  expressed as the unsorted slot of the Streams sort cycle.
+- There is no stream id in the wire model or admin answer. `streams.rs::StreamJson` has `name`,
+  `dynamic`, `chain`, limits, tokens, expiry, usage and state; token `id` values are separate and
+  only appear in the detail pane as short ids. Stream identity is therefore the stream name,
+  which is the config key the admin listener iterates.
+
+The new `o`/`O`/`r` cycle follows the requested column order (name, usage, chain, rate, expiry).
+"Usage" is the `conc` column and "rate" is the `rpm` column, matching the two current/limit pairs
+actually published by the admin listener.

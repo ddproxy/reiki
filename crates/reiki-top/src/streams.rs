@@ -2,8 +2,10 @@
 //!
 //! The admin listener supplies one snapshot: every configured stream (static and dynamic),
 //! current usage against limits, token ids and expiries, and a bounded audit tail. This module
-//! parses that answer and turns it into rows sorted by usage. It carries no token values, no
-//! hashes and no clock: the caller supplies the current Unix time for countdowns.
+//! parses that answer and turns it into rows in a default usage order. It carries no token
+//! values, no hashes and no clock: the caller supplies the current Unix time for countdowns.
+
+use std::cmp::Ordering;
 
 use serde::Deserialize;
 
@@ -253,6 +255,87 @@ fn fmt_parts(secs: u64) -> String {
     }
 }
 
+/// A column of the Streams table that the user can sort by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamColumn {
+    /// The `stream` column.
+    Name,
+    /// The `conc` column: current concurrent usage.
+    Usage,
+    /// The `chain` column.
+    Chain,
+    /// The `rpm` column: current request rate.
+    Rate,
+    /// The `expires` column.
+    Expiry,
+}
+
+/// The Streams sort: a column and a direction. Without one the default usage order is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSort {
+    pub column: StreamColumn,
+    pub descending: bool,
+}
+
+/// The columns `o` and `O` step through, in that order.
+pub fn stream_columns() -> Vec<StreamColumn> {
+    vec![
+        StreamColumn::Name,
+        StreamColumn::Usage,
+        StreamColumn::Chain,
+        StreamColumn::Rate,
+        StreamColumn::Expiry,
+    ]
+}
+
+/// One row's value in a sorted column. Missing values are `None`.
+enum SortKey {
+    Text(String),
+    Number(u64),
+}
+
+fn stream_key(row: &Row, column: StreamColumn) -> Option<SortKey> {
+    match column {
+        StreamColumn::Name => Some(SortKey::Text(row.name.clone())),
+        StreamColumn::Usage => Some(SortKey::Number(row.concurrency.current)),
+        StreamColumn::Chain => (!row.chain.is_empty()).then(|| SortKey::Text(row.chain_label())),
+        StreamColumn::Rate => Some(SortKey::Number(row.rpm.current)),
+        StreamColumn::Expiry => row.expiry.map(SortKey::Number),
+    }
+}
+
+/// Unavailable values sort last in both directions; the direction flips only real values.
+fn compare_keys(a: Option<&SortKey>, b: Option<&SortKey>, descending: bool) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let order = match (x, y) {
+                (SortKey::Text(p), SortKey::Text(q)) => crate::matrix::natural_cmp(p, q),
+                (SortKey::Number(p), SortKey::Number(q)) => p.cmp(q),
+                _ => Ordering::Equal,
+            };
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Display positions of `rows` in the default order, or in `sort`'s column order. The default
+/// order is already in `rows`, and Rust's stable sort keeps it for equal keys in both directions.
+pub fn order_rows(rows: &[Row], sort: Option<&StreamSort>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let Some(sort) = sort else {
+        return order;
+    };
+    let keys: Vec<Option<SortKey>> = rows
+        .iter()
+        .map(|row| stream_key(row, sort.column))
+        .collect();
+    order.sort_by(|&a, &b| compare_keys(keys[a].as_ref(), keys[b].as_ref(), sort.descending));
+    order
+}
+
 /// The whole screen's data, ready to render.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamsView {
@@ -274,6 +357,11 @@ impl StreamsView {
     /// The selected row, or `None` when the list is empty or the index is stale.
     pub fn row(&self, index: Option<usize>) -> Option<&Row> {
         self.rows.get(index?)
+    }
+
+    /// A row by stream name. Names are the stable identity of a stream, unlike a display index.
+    pub fn row_named(&self, name: &str) -> Option<&Row> {
+        self.rows.iter().find(|row| row.name == name)
     }
 
     /// Recent actions for one stream, newest first, in the order the listener sent them.
@@ -475,5 +563,130 @@ mod tests {
         for text in ["", "{", "not json", r#"{"streams":"many"}"#] {
             assert!(StreamsView::from_json(text).is_err(), "{text}");
         }
+    }
+
+    fn sorted_row(name: &str, chain: &[&str], expiry: Option<u64>, rate: u64, usage: u64) -> Row {
+        Row {
+            name: name.to_owned(),
+            dynamic: false,
+            chain: chain.iter().map(|part| (*part).to_owned()).collect(),
+            expiry,
+            rpm: UsageJson {
+                current: rate,
+                limit: None,
+            },
+            concurrency: UsageJson {
+                current: usage,
+                limit: None,
+            },
+            last_used: None,
+            state: "active".to_owned(),
+            limits: LimitsJson::default(),
+            tokens: Vec::new(),
+        }
+    }
+
+    /// Already in the default order: rate descending, usage descending, then name.
+    fn ordered_rows() -> Vec<Row> {
+        vec![
+            sorted_row("busy", &["zen"], Some(300), 4, 1),
+            sorted_row("quiet", &[], None, 4, 0),
+            sorted_row("late", &["alpha", "zen"], Some(900), 2, 5),
+            sorted_row("idle", &["zen"], Some(100), 0, 0),
+            sorted_row("none", &[], None, 0, 0),
+        ]
+    }
+
+    fn names_in_order(rows: &[Row], sort: Option<StreamSort>) -> Vec<&str> {
+        order_rows(rows, sort.as_ref())
+            .into_iter()
+            .map(|i| rows[i].name.as_str())
+            .collect()
+    }
+
+    fn assert_order(column: StreamColumn, ascending: &[&str], descending: &[&str]) {
+        let rows = ordered_rows();
+        let sort = |descending| Some(StreamSort { column, descending });
+        assert_eq!(names_in_order(&rows, sort(false)), ascending, "{column:?}");
+        assert_eq!(
+            names_in_order(&rows, sort(true)),
+            descending,
+            "{column:?} reversed"
+        );
+        assert_eq!(
+            names_in_order(&rows, None),
+            ["busy", "quiet", "late", "idle", "none"],
+            "unsorted keeps the default order"
+        );
+    }
+
+    #[test]
+    fn stream_columns_are_the_documented_cycle() {
+        assert_eq!(
+            stream_columns(),
+            [
+                StreamColumn::Name,
+                StreamColumn::Usage,
+                StreamColumn::Chain,
+                StreamColumn::Rate,
+                StreamColumn::Expiry,
+            ]
+        );
+    }
+
+    #[test]
+    fn each_column_sorts_with_unavailable_values_last_and_ties_still() {
+        assert_order(
+            StreamColumn::Name,
+            &["busy", "idle", "late", "none", "quiet"],
+            &["quiet", "none", "late", "idle", "busy"],
+        );
+        assert_order(
+            StreamColumn::Usage,
+            &["quiet", "idle", "none", "busy", "late"],
+            &["late", "busy", "quiet", "idle", "none"],
+        );
+        assert_order(
+            StreamColumn::Chain,
+            &["late", "busy", "idle", "quiet", "none"],
+            &["busy", "idle", "late", "quiet", "none"],
+        );
+        assert_order(
+            StreamColumn::Rate,
+            &["idle", "none", "late", "busy", "quiet"],
+            &["busy", "quiet", "late", "idle", "none"],
+        );
+        assert_order(
+            StreamColumn::Expiry,
+            &["idle", "busy", "late", "quiet", "none"],
+            &["late", "busy", "idle", "quiet", "none"],
+        );
+    }
+
+    #[test]
+    fn natural_name_order_keeps_digits_in_human_order() {
+        let rows = vec![
+            sorted_row("stream10", &[], None, 0, 0),
+            sorted_row("stream2", &[], None, 0, 0),
+        ];
+        let sort = Some(StreamSort {
+            column: StreamColumn::Name,
+            descending: false,
+        });
+        assert_eq!(names_in_order(&rows, sort), ["stream2", "stream10"]);
+    }
+
+    #[test]
+    fn a_row_can_be_found_by_its_stable_name() {
+        let view = StreamsView {
+            enabled: true,
+            rows: ordered_rows(),
+            audit: Vec::new(),
+        };
+        assert_eq!(
+            view.row_named("idle").map(|row| row.name.as_str()),
+            Some("idle")
+        );
+        assert!(view.row_named("gone").is_none());
     }
 }

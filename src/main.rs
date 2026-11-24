@@ -1283,9 +1283,34 @@ async fn main() {
         .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", cli.config.display())));
     let config = Config::parse(&text).unwrap_or_else(|e| fail(&format!("config: {e}")));
     let checking = matches!(cli.command, Some(Command::Check));
+    let mut deferred_warnings = Vec::new();
+    let mut log_with_file = !checking;
+    if !checking && let Some(file) = &config.log.file {
+        let dir = std::path::Path::new(file)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match reiki::state::check_writable_startup(
+            dir,
+            "log directory",
+            // A log file that cannot be written must never keep the gateway from starting: the
+            // request log already counts write errors, so fall back to no file logging.
+            reiki::config::StoreErrorMode::Open,
+        ) {
+            Ok(None) => {}
+            Ok(Some(warning)) => {
+                deferred_warnings.push(warning);
+                log_with_file = false;
+            }
+            Err(e) => fail(&e),
+        }
+    }
     let logging =
-        Arc::new(reiki::logging::init(&config.log, !checking).unwrap_or_else(|e| fail(&e)));
+        Arc::new(reiki::logging::init(&config.log, log_with_file).unwrap_or_else(|e| fail(&e)));
     reiki::logging::install_panic_hook();
+    for warning in deferred_warnings {
+        tracing::warn!("{warning}");
+    }
     let keys = load_keys(&config).unwrap_or_else(|e| {
         // Name the key and the kind of failure; the key file's contents never reach stderr.
         fail(&format!("cannot load key `{}`: {}", e.key(), e.kind()))
@@ -1402,7 +1427,15 @@ async fn main() {
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    reiki::state::check_writable(state_dir).unwrap_or_else(|e| fail(&e));
+    match reiki::state::check_writable_startup(
+        state_dir,
+        "state directory",
+        config.gateway.on_store_error,
+    ) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Err(e) => fail(&e),
+    }
 
     let tunnel_config = config.tunnel.clone();
     let caps = config.server;

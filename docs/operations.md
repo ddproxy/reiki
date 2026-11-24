@@ -57,6 +57,12 @@ The health probe needs no token and answers `ok` while the listener is up; it do
 
 `reiki_gateway_store_ok` on `/v1/metrics` is `0` while the gateway store is closed. A store closed by a failed state write retries a probe write of the current counters every 5 to 30 seconds and reopens after disk space or permissions return, without a restart or new traffic. A store closed by an unreadable state file at startup is not probed by the timer; see [Troubleshoot gateway store unavailable](#troubleshoot-gateway-store-unavailable).
 
+## Startup checks
+
+Before binding listeners, Reiki probes the state directory (the parent of `<config>.state`) and, when `[log] file` is configured, the log directory. Each probe creates and removes a uniquely named temp file in that directory and writes a few KB to exercise write permission and free space. The probe does not create files outside the configured paths and does not leave a probe file behind.
+
+With `[gateway] on_store_error = "closed"` (the default), a state directory probe failure exits with a message naming the path and the OS error. With `"open"`, Reiki logs one `WARN` and continues. A log directory probe failure never stops startup in either mode: Reiki logs one `WARN` and disables the log file for that run.
+
 ## Troubleshoot gateway store unavailable
 
 A client gets `503` with `{"error":{"type":"gateway_store_unavailable","message":"per-stream counters are unavailable"}}` when the gateway store is closed and the stream is fail-closed (`[gateway] on_store_error = "closed"`, the default, or a per-stream override). With `"open"`, requests continue while the failure is counted in `reiki_gateway_store_errors_total{stream}` and reported as `GatewayStoreError` events. See [gateway admission](shaping.md#gateway-admission) for the two modes.
@@ -84,7 +90,8 @@ journalctl -u reiki -f
 | `503 gateway_store_unavailable` | Counter state is unavailable and `[gateway] on_store_error = "closed"`. | Check the state directory and `<config>.state`; `"open"` is an explicit fail-open choice. See [troubleshooting](#troubleshoot-gateway-store-unavailable). |
 | `429 gateway_usage_limited` | `/v1/usage` exceeded `[gateway] usage_rpm` (default 60). | Wait for `Retry-After` or raise the budget. |
 | `503 a fail-closed plugin failed; the request was not processed` | A masking or blocking plugin skipped closed. | Read the service log, fix the plugin; `on_error = "pass_through"` opts out deliberately. |
-| `state directory ... is not writable` | The parent of `<config>.state` could not be probed before binding. | Fix owner or mode, or add it to `ReadWritePaths=`. |
+| `state directory ... is not writable` | The startup probe could not create, write and remove a temp file in the parent of `<config>.state`. With `[gateway] on_store_error = "closed"` (default) startup fails; with `"open"` Reiki logs a `WARN` and continues. | Fix owner, mode or free space, or add the directory to `ReadWritePaths=`. |
+| `log directory ... is not writable` | The startup probe could not create, write and remove a temp file in the directory of `[log] file`. With `[gateway] on_store_error = "closed"` (default) startup fails; with `"open"` Reiki logs a `WARN` and continues without the log file. | Fix owner, mode or free space, or remove `[log] file`. |
 | `admin listen must differ from the client listen address` | Two listeners share an address. | Give each listener its own loopback address and port. |
 | `state directory ... is not writable` after a reload | Reload cannot persist the new state. | Restore write access before reloading again. |
 | `audit line N: broken chain` | The JSONL file or the `.head` sidecar was edited, truncated or lost. | Restore both from the last good backup; a fresh file starts a new chain. |

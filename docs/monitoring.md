@@ -502,8 +502,16 @@ groups:
         for: 5m
         annotations:
           summary: A Reiki stream chain has no available key
+
+      - alert: ReikiGatewayStoreClosed
+        expr: reiki_gateway_store_ok == 0
+        for: 1m
+        annotations:
+          summary: Reiki's per-stream counter store has been closed for over a minute
 ```
 
 Reiki publishes `reiki_keys` globally, with no `stream` label. The two `reiki_status_*` and `reiki_stream_healthy_keys` series come from a JSON exporter that reads `GET /v1/status` with the admin token: `reiki_status_intercept_ca_days_left` from `intercept.ca_days_left`, and `reiki_stream_healthy_keys{stream="..."}` from the keys named in each `streams[].chain` whose `state` is `available`. Those names are exporter series, not built-in Reiki metrics. Reiki logs a CA warning within 30 days of expiry and reports `ca_days_left` on `/v1/status`; see [tunnel](tunnel.md#interception).
+
+`reiki_gateway_store_ok` is appended by Reiki itself to every `/v1/metrics` scrape, so the alert fires even when no stream has sent traffic. `0` means per-stream counters are unavailable; with `[gateway] on_store_error = "closed"` (the default), new admissions get `503 gateway_store_unavailable`. A store closed by a failed state write probes itself on a timer, while one closed at startup by an unreadable state file needs the file repaired; see [operations](operations.md#troubleshoot-gateway-store-unavailable).
 
 When `[peers] expose_usage` is on (the default), peer health publishes `streams.static_streams` and `streams.dynamic_streams` as counts only. `reiki top` sums fresh peers into a `Streams: N static, M dynamic` line in its full text view; it never shows stream names from peers, since a dynamic name can identify a tenant. Pressing `t` in the live view is different: it uses the local admin token to read [`GET /v1/stream-console`](#get-v1stream-console) and shows this instance's stream names, ids and redacted audit tail only. See [reiki top](top.md#streams).

@@ -2,7 +2,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::hash::{BuildHasher, Hasher};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,9 +30,23 @@ pub fn path_for(config_path: &Path) -> PathBuf {
 
 /// Probes a directory by creating and removing a file, so the daemon fails before binding
 /// listeners instead of silently losing state later.
-pub fn check_writable(dir: &Path) -> Result<(), String> {
+pub fn check_writable(dir: &Path, label: &str) -> Result<(), String> {
     let name = format!(".reiki-probe-{}-{:016x}", std::process::id(), probe_nonce());
-    probe_file(dir, &name)
+    probe_file(dir, &name, label)
+}
+
+/// Startup writability check: in `closed` mode a probe failure is an error; in `open` mode it
+/// returns the warning to log while startup continues.
+pub fn check_writable_startup(
+    dir: &Path,
+    label: &str,
+    on_store_error: crate::config::StoreErrorMode,
+) -> Result<Option<String>, String> {
+    match check_writable(dir, label) {
+        Ok(()) => Ok(None),
+        Err(e) if on_store_error == crate::config::StoreErrorMode::Open => Ok(Some(e)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Nonce for the probe name, so a squatter cannot plant a symlink at a predictable path.
@@ -49,7 +63,7 @@ fn probe_nonce() -> u64 {
 }
 
 /// `name` is separate from [`check_writable`] so tests can plant a file or symlink at it.
-fn probe_file(dir: &Path, name: &str) -> Result<(), String> {
+fn probe_file(dir: &Path, name: &str, label: &str) -> Result<(), String> {
     let probe = dir.join(name);
     let mut options = std::fs::OpenOptions::new();
     // A pre-existing file is never reused: it may be a symlink to something the caller
@@ -60,12 +74,14 @@ fn probe_file(dir: &Path, name: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
     }
-    let failure =
-        |e: std::io::Error| format!("state directory {} is not writable: {e}", dir.display());
-    options
-        .open(&probe)
-        .map_err(failure)
-        .and_then(|_| std::fs::remove_file(&probe).map_err(failure))
+    let failure = |e: std::io::Error| format!("{label} {} is not writable: {e}", dir.display());
+    let mut file = options.open(&probe).map_err(failure)?;
+    // Exercise write permission and a few KB of free space; the probe is removed before returning.
+    let payload = [0u8; 4096];
+    let write_result = file.write_all(&payload).and_then(|()| file.sync_all());
+    let remove_result = std::fs::remove_file(&probe);
+    write_result.map_err(failure)?;
+    remove_result.map_err(failure)
 }
 
 #[derive(Debug, Default)]
@@ -444,18 +460,61 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("reiki-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(check_writable(&dir).is_ok());
+        assert!(check_writable(&dir, "state directory").is_ok());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Root bypasses mode bits, so there is nothing to assert on a root runner.
         let root_bypasses = std::fs::File::create(dir.join(".root-check")).is_ok();
         if !root_bypasses {
-            let err = check_writable(&dir).unwrap_err();
+            let err = check_writable(&dir, "state directory").unwrap_err();
             assert!(err.contains(&dir.display().to_string()), "{err}");
             assert!(
                 err.contains("not writable") && err.contains("Permission denied"),
                 "{err}"
             );
         }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_directory_is_refused_by_the_probe() {
+        let dir = std::env::temp_dir().join(format!("reiki-probe-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = check_writable(&dir, "state directory").unwrap_err();
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        assert!(err.contains("not writable"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn startup_probe_respects_store_error_mode() {
+        use crate::config::StoreErrorMode;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("reiki-probe-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            check_writable_startup(&dir, "state directory", StoreErrorMode::Closed).unwrap(),
+            None
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root_bypasses = std::fs::File::create(dir.join(".root-check")).is_ok();
+        if !root_bypasses {
+            let closed = check_writable_startup(&dir, "state directory", StoreErrorMode::Closed)
+                .unwrap_err();
+            assert!(closed.contains(&dir.display().to_string()), "{closed}");
+            assert!(closed.contains("not writable"), "{closed}");
+
+            let open =
+                check_writable_startup(&dir, "state directory", StoreErrorMode::Open).unwrap();
+            let warning = open.expect("open mode warns");
+            assert!(warning.contains(&dir.display().to_string()), "{warning}");
+            assert!(warning.contains("not writable"), "{warning}");
+        }
+
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -469,7 +528,7 @@ mod tests {
         std::fs::write(&victim, "precious").unwrap();
 
         std::fs::write(dir.join("planted"), "precious").unwrap();
-        let err = probe_file(&dir, "planted").unwrap_err();
+        let err = probe_file(&dir, "planted", "state directory").unwrap_err();
         assert!(
             err.contains("not writable") && err.contains("exists"),
             "{err}"
@@ -482,12 +541,12 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&victim, dir.join("linked")).unwrap();
-            let err = probe_file(&dir, "linked").unwrap_err();
+            let err = probe_file(&dir, "linked", "state directory").unwrap_err();
             assert!(err.contains("not writable"), "{err}");
             assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
         }
 
-        check_writable(&dir).unwrap();
+        check_writable(&dir, "state directory").unwrap();
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())

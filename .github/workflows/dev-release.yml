@@ -1,0 +1,128 @@
+name: dev-release
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  tag:
+    name: tag
+    if: >
+      github.server_url == 'https://github.com' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: true
+      - name: Tag dev build
+        id: tag
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          main_is_head() {
+            [ "$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')" = "$HEAD_SHA" ]
+          }
+
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          if ! main_is_head; then
+            echo "main moved on; skipping"
+            exit 0
+          fi
+
+          parent=$(git rev-parse "$HEAD_SHA^1" 2>/dev/null || true)
+          if [ -z "$parent" ]; then
+            mapfile -t changed < <(git ls-tree -r --name-only "$HEAD_SHA")
+          else
+            mapfile -t changed < <(git diff --name-only "$parent" "$HEAD_SHA")
+          fi
+          docs_only=1
+          for path in "${changed[@]}"; do
+            case "$path" in
+              docs/*|README.md|CHANGELOG.md|llms.txt|AGENTS.md) ;;
+              *) docs_only=0; break ;;
+            esac
+          done
+          if [ "$docs_only" -eq 1 ]; then
+            echo "docs-only change; skipping"
+            exit 0
+          fi
+
+          stable=$(
+            git tag --merged "$HEAD_SHA" --list 'v[0-9]*.[0-9]*.[0-9]*' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1 || true
+          )
+          if [ -z "$stable" ]; then
+            echo "no reachable stable tag; skipping" >&2
+            exit 1
+          fi
+          base=${stable#v}
+          IFS=. read -r major minor patch <<< "$base"
+          count=$(git rev-list --count "$stable..$HEAD_SHA")
+          short=$(git rev-parse --short=8 "$HEAD_SHA")
+          tag="v$major.$minor.$((patch + 1))-dev.$count.g$short"
+
+          if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag exists; skipping"
+            exit 0
+          fi
+          if ! main_is_head; then
+            echo "main moved on; skipping"
+            exit 0
+          fi
+
+          git tag "$tag" "$HEAD_SHA"
+          if ! git push origin "refs/tags/$tag"; then
+            if git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null; then
+              echo "$tag already pushed; skipping"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Prune dev releases
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t old < <(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName --jq '.[].tagName' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.' \
+              | sort -V \
+              | head -n -10 || true
+          )
+          for tag in "${old[@]}"; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
+
+  release:
+    name: release
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write

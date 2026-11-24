@@ -10,7 +10,8 @@ Run these from the repository root. Rust 1.99 or newer is required. `make help` 
 | --- | --- |
 | `make build` | Release build with `reiki top` (`cargo build --release --locked --features top`). |
 | `make check` | `cargo check --workspace --all-targets --locked`. |
-| `make test` | Workspace tests with default features and with `--features top`. |
+| `make test` | Version script tests (when `python3` is present) and workspace tests with default features and with `--features top`. |
+| `make test-scripts` | Version script tests; skipped locally without `python3`, always run in CI. |
 | `make lint` | `cargo fmt --all --check` and clippy for all targets with `-D warnings`, default and `top`. |
 | `make docs-check` | `cargo test --locked --test docs_examples`: validates documented config examples, CLI flags and links, and runs the quickstart against a throwaway instance. |
 | `make ci` | All of the above. |
@@ -32,7 +33,8 @@ Optional checks when the tools are installed: `cargo deny check`, `vale --config
 | `crates/reiki-*` | Plugin API and built-in plugins: detect, phi, finance, controlled, placeholders, requestlog, metrics, toolpolicy, cost, wasm, health, top. |
 | `docs/`, `README.md`, `CHANGELOG.md` | User documentation and release notes; `docs/README.md` is the index. |
 | `tests/`, `tests/golden/` | Integration tests and golden admin documents; `tests/docs_examples.rs` checks documentation. |
-| `.github/workflows/` | CI, release, CodeQL, audit, fuzz and docs checks. |
+| `scripts/check-workflows/`, `scripts/set-release-version.py`, `scripts/tests/` | Workflow policy checker and release version validation with unit tests. |
+| `.github/workflows/` | CI, stable and dev release, CodeQL, audit, fuzz and docs checks. |
 
 ## Conventions
 

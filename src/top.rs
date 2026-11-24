@@ -13,7 +13,7 @@ use reiki_top::matrix::{
     History, HostSummary, Matrix, Metric, Sample, fleet_series, is_fleet_row, is_problem,
     key_counts, order_peers, peer_columns, resolve, usage_by_provider,
 };
-use reiki_top::streams::StreamsView;
+use reiki_top::streams::{StreamSort, StreamsView, order_rows, stream_columns};
 use reiki_top::ui::{self, ChartMetric, ChartSeries, crossterm, ratatui};
 use reiki_top::{Fleet, Health, view};
 use tokio::sync::mpsc;
@@ -681,8 +681,8 @@ async fn live_loop(
                     follow_cursor(&mut state, &matrix);
                 }
                 let keep = if state.mode == ui::Mode::Streams {
-                    let rows = shown.local_streams().map_or(0, |view| view.rows.len());
-                    apply_streams_action(&mut state, action, rows, total, viewport)
+                    let names = stream_names(shown.local_streams(), state.stream_sort.as_ref());
+                    apply_streams_action(&mut state, action, &names, total, viewport)
                 } else if sorting {
                     if state.mode == ui::Mode::Matrix {
                         let matrix = shown_matrix(shown, &all, shown_at, &state);
@@ -759,30 +759,81 @@ async fn terminated(_signal: &mut Option<()>) {
     std::future::pending::<()>().await;
 }
 
-/// Applies one key action on the Streams screen. Movement keys pick a stream and reset the detail
-/// scroll; paging keys scroll the detail. Nothing here can change a stream.
+/// Stream names in display order. Keeping this in one place makes key movement, the table and the
+/// detail pane agree on which row is selected after a refresh or a re-sort.
+fn stream_names(view: Option<&StreamsView>, sort: Option<&StreamSort>) -> Vec<String> {
+    view.map_or_else(Vec::new, |console| {
+        order_rows(&console.rows, sort)
+            .into_iter()
+            .map(|i| console.rows[i].name.clone())
+            .collect()
+    })
+}
+
+/// The selected stream's display position. Before a stream is chosen the first row is selected;
+/// a stream that left the snapshot starts again from that row.
+fn stream_position(names: &[String], state: &ui::UiState) -> Option<usize> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(
+        state
+            .selected_stream
+            .as_deref()
+            .and_then(|name| names.iter().position(|candidate| candidate == name))
+            .unwrap_or(0),
+    )
+}
+
+/// The selected display row and its stream name. An explicit choice wins; before one is made the
+/// first row is shown. Both the table marker and the detail pane use the same answer.
+fn selected_stream<'a>(
+    view: &'a StreamsView,
+    order: &[usize],
+    state: &ui::UiState,
+) -> Option<(usize, &'a str)> {
+    let position = state
+        .selected_stream
+        .as_deref()
+        .and_then(|name| order.iter().position(|&i| view.rows[i].name == name))
+        .or_else(|| (!order.is_empty()).then_some(0))?;
+    Some((position, view.rows[order[position]].name.as_str()))
+}
+
+/// Applies one key action on the Streams screen. Movement keys pick a stream by name and reset the
+/// detail scroll; paging keys scroll the detail. Sorting keys work like the matrix's, with the
+/// default usage order between the last and first columns. Nothing here can change a stream.
 fn apply_streams_action(
     state: &mut ui::UiState,
     action: ui::Action,
-    rows: usize,
+    names: &[String],
     detail_lines: usize,
     viewport: usize,
 ) -> bool {
     match action {
         ui::Action::Quit => return false,
+        ui::Action::SortNext | ui::Action::SortPrev => {
+            state.cycle_stream_sort(&stream_columns(), action == ui::Action::SortNext);
+            return true;
+        }
+        ui::Action::SortReverse => {
+            state.reverse_stream_sort();
+            return true;
+        }
         ui::Action::ScrollDown | ui::Action::NextPeer => {
-            state.stream_row = (rows > 0).then(|| {
-                state
-                    .stream_row
-                    .map_or(0, |row| if row + 1 < rows { row + 1 } else { 0 })
+            let current = stream_position(names, state);
+            state.selected_stream = (!names.is_empty()).then(|| {
+                let next = current.map_or(0, |row| if row + 1 < names.len() { row + 1 } else { 0 });
+                names[next].clone()
             });
             state.scroll = 0;
         }
         ui::Action::ScrollUp | ui::Action::PrevPeer => {
-            state.stream_row = (rows > 0).then(|| {
-                state
-                    .stream_row
-                    .map_or(rows - 1, |row| row.checked_sub(1).unwrap_or(rows - 1))
+            let current = stream_position(names, state);
+            state.selected_stream = (!names.is_empty()).then(|| {
+                let last = names.len() - 1;
+                let prev = current.map_or(last, |row| row.checked_sub(1).unwrap_or(last));
+                names[prev].clone()
             });
             state.scroll = 0;
         }
@@ -991,14 +1042,17 @@ fn build_parts(
                 };
             };
             let now = unix_now();
-            let selected = state
-                .stream_row
-                .filter(|row| console.rows.get(*row).is_some());
+            let order = order_rows(&console.rows, state.stream_sort.as_ref());
+            let selected_stream = selected_stream(console, &order, state);
+            let (selected, name) = match selected_stream {
+                Some((position, name)) => (Some(position), Some(name)),
+                None => (None, None),
+            };
             Parts {
-                lines: view::streams_table(console, selected, now, inner),
+                lines: view::streams_table(console, name, state.stream_sort.as_ref(), now, inner),
                 rows: console.rows.len(),
                 selected,
-                detail: Some(view::stream_detail(console, selected, now, detail_width)),
+                detail: Some(view::stream_detail(console, name, now, detail_width)),
                 status: view::streams_status(console, fleet.streams_error(), inner),
                 ..Parts::default()
             }
@@ -2590,6 +2644,10 @@ mod tests {
     }
 
     fn streams_json(secret: &str) -> String {
+        streams_json_with_usage(secret, 9, 1)
+    }
+
+    fn streams_json_with_usage(secret: &str, busy_rate: u64, quiet_rate: u64) -> String {
         format!(
             r#"{{
               "enabled": true,
@@ -2597,12 +2655,12 @@ mod tests {
                 {{"name": "busy", "dynamic": true, "chain": ["zen"],
                   "limits": {{"rpm": 10, "concurrent": 2}},
                   "tokens": [{{"id": "abcdef1234567890", "expires_at": 4102444800}}],
-                  "expiry": 4102444800, "rpm": {{"current": 9, "limit": 10}},
+                  "expiry": 4102444800, "rpm": {{"current": {busy_rate}, "limit": 10}},
                   "concurrency": {{"current": 2, "limit": 2}},
                   "last_used": 1000, "state": "active",
                   "token": "{secret}", "hash": "not shown"}},
                 {{"name": "quiet", "dynamic": false, "chain": ["zen", "openrouter"],
-                  "limits": {{}}, "tokens": [], "rpm": {{"current": 1, "limit": 30}},
+                  "limits": {{}}, "tokens": [], "rpm": {{"current": {quiet_rate}, "limit": 30}},
                   "concurrency": {{"current": 0, "limit": 2}},
                   "last_used": null, "state": "active"}}
               ],
@@ -2637,29 +2695,168 @@ mod tests {
     fn streams_keys_move_the_row_and_page_the_detail_without_leaving_the_view() {
         let mut state = ui::UiState {
             mode: ui::Mode::Streams,
-            stream_row: Some(0),
             ..ui::UiState::default()
         };
-        apply_streams_action(&mut state, ui::Action::NextPeer, 3, 20, 5);
-        assert_eq!((state.stream_row, state.scroll), (Some(1), 0));
-        apply_streams_action(&mut state, ui::Action::PrevPeer, 3, 20, 5);
-        assert_eq!(state.stream_row, Some(0));
-        apply_streams_action(&mut state, ui::Action::ScrollUp, 3, 20, 5);
-        assert_eq!(state.stream_row, Some(2), "selection wraps");
-        apply_streams_action(&mut state, ui::Action::PageDown, 3, 20, 5);
+        let names = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        apply_streams_action(&mut state, ui::Action::NextPeer, &names, 20, 5);
+        assert_eq!(
+            (state.selected_stream.as_deref(), state.scroll),
+            (Some("b"), 0)
+        );
+        apply_streams_action(&mut state, ui::Action::PrevPeer, &names, 20, 5);
+        assert_eq!(state.selected_stream.as_deref(), Some("a"));
+        apply_streams_action(&mut state, ui::Action::ScrollUp, &names, 20, 5);
+        assert_eq!(
+            state.selected_stream.as_deref(),
+            Some("c"),
+            "selection wraps"
+        );
+        apply_streams_action(&mut state, ui::Action::PageDown, &names, 20, 5);
         assert_eq!(state.scroll, 5, "paging scrolls the detail");
-        apply_streams_action(&mut state, ui::Action::Bottom, 3, 20, 5);
+        apply_streams_action(&mut state, ui::Action::Bottom, &names, 20, 5);
         assert_eq!(state.scroll, 15);
-        apply_streams_action(&mut state, ui::Action::Top, 3, 20, 5);
+        apply_streams_action(&mut state, ui::Action::Top, &names, 20, 5);
         assert_eq!(state.scroll, 0);
         assert!(!apply_streams_action(
             &mut state,
             ui::Action::Quit,
-            3,
+            &names,
             20,
             5
         ));
         assert_eq!(state.mode, ui::Mode::Streams, "Quit leaves the state alone");
+    }
+
+    #[test]
+    fn streams_sort_keys_follow_the_same_o_o_r_rule_as_the_matrix() {
+        use reiki_top::streams::StreamColumn;
+
+        let mut state = ui::UiState {
+            mode: ui::Mode::Streams,
+            ..ui::UiState::default()
+        };
+        let names = ["busy".to_owned(), "quiet".to_owned()];
+        apply_streams_action(&mut state, ui::Action::SortReverse, &names, 20, 5);
+        assert_eq!(state.stream_sort, None, "r is a no-op while unsorted");
+        apply_streams_action(&mut state, ui::Action::SortNext, &names, 20, 5);
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Name,
+                descending: false,
+            })
+        );
+        apply_streams_action(&mut state, ui::Action::SortReverse, &names, 20, 5);
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Name,
+                descending: true,
+            })
+        );
+        apply_streams_action(&mut state, ui::Action::SortNext, &names, 20, 5);
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Usage,
+                descending: false,
+            }),
+            "a new column starts ascending"
+        );
+        apply_streams_action(&mut state, ui::Action::SortPrev, &names, 20, 5);
+        assert_eq!(
+            state.stream_sort,
+            Some(StreamSort {
+                column: StreamColumn::Name,
+                descending: false,
+            })
+        );
+        apply_streams_action(&mut state, ui::Action::SortPrev, &names, 20, 5);
+        assert_eq!(state.stream_sort, None, "before the first is default order");
+        assert_eq!(
+            state.selected_stream, None,
+            "sorting does not pick a stream"
+        );
+    }
+
+    #[test]
+    fn a_stream_stays_selected_across_a_refresh_and_a_resort() {
+        use reiki_top::streams::StreamColumn;
+
+        let secret = runtime_token();
+        let mut fleet = fleet();
+        fleet.set_local_streams(StreamsView::from_json(&streams_json(&secret)).expect("fixture"));
+        let mut state = ui::UiState {
+            mode: ui::Mode::Streams,
+            selected_stream: Some("quiet".to_owned()),
+            ..ui::UiState::default()
+        };
+        let parts = build_parts(
+            &fleet,
+            &History::new(0),
+            &[],
+            Instant::now(),
+            &state,
+            100,
+            SAMPLE_INTERVAL,
+        );
+        assert_eq!(parts.selected, Some(1), "quiet is second by default");
+        assert!(
+            plain(parts.detail.as_ref().unwrap())
+                .join("\n")
+                .contains("quiet")
+        );
+
+        fleet.set_local_streams(
+            StreamsView::from_json(&streams_json_with_usage(&secret, 0, 5)).expect("fixture"),
+        );
+        let parts = build_parts(
+            &fleet,
+            &History::new(0),
+            &[],
+            Instant::now(),
+            &state,
+            100,
+            SAMPLE_INTERVAL,
+        );
+        assert_eq!(
+            parts.selected,
+            Some(0),
+            "the refresh moved quiet to the top"
+        );
+        assert!(
+            plain(parts.detail.as_ref().unwrap())
+                .join("\n")
+                .contains("quiet")
+        );
+
+        state.stream_sort = Some(StreamSort {
+            column: StreamColumn::Name,
+            descending: false,
+        });
+        let names = stream_names(fleet.local_streams(), state.stream_sort.as_ref());
+        assert_eq!(names, ["busy", "quiet"]);
+        let parts = build_parts(
+            &fleet,
+            &History::new(0),
+            &[],
+            Instant::now(),
+            &state,
+            100,
+            SAMPLE_INTERVAL,
+        );
+        assert_eq!(parts.selected, Some(1), "the re-sort moved quiet again");
+        assert!(
+            plain(parts.detail.as_ref().unwrap())
+                .join("\n")
+                .contains("quiet")
+        );
+        assert!(
+            !plain(parts.detail.as_ref().unwrap())
+                .join("\n")
+                .contains("busy (")
+        );
+        assert_eq!(state.selected_stream.as_deref(), Some("quiet"));
     }
 
     #[test]
@@ -2670,7 +2867,7 @@ mod tests {
         fleet.set_local_streams(streams);
         let state = ui::UiState {
             mode: ui::Mode::Streams,
-            stream_row: Some(0),
+            selected_stream: Some("busy".to_owned()),
             ..ui::UiState::default()
         };
         let parts = build_parts(

@@ -634,7 +634,7 @@ fn natural_chunks(value: &str) -> Vec<Chunk> {
 
 /// Case-insensitive natural order: `peer2` sorts before `peer10`. Matches the sort in fw-tui's
 /// table widget, so the two screens order names alike.
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (x, y) = (natural_chunks(a), natural_chunks(b));
     for (left, right) in x.iter().zip(&y) {
         let order = match (left, right) {

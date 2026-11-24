@@ -352,28 +352,52 @@ fn table_line(cells: [(String, Style); 8], columns: &StreamColumns, selected: bo
     line(trim_end(spans), usize::MAX)
 }
 
-/// The Streams screen's table, including its header. Rows come pre-sorted by usage.
+/// A Streams header label with the sort direction marked when `column` is sorted.
+fn sorted_stream_header(
+    text: &str,
+    column: crate::streams::StreamColumn,
+    sort: Option<&crate::streams::StreamSort>,
+) -> String {
+    match sort {
+        Some(sort) if sort.column == column => {
+            let arrow = if sort.descending { "▼" } else { "▲" };
+            format!("{text} {arrow}")
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// The Streams screen's table, including its header. `selected` is a stream name, so a refresh or
+/// re-sort keeps the mark on the same stream. Rows are in the order [`crate::streams::order_rows`]
+/// returns for `sort`.
 pub fn streams_table(
     view: &crate::streams::StreamsView,
-    selected: Option<usize>,
+    selected: Option<&str>,
+    sort: Option<&crate::streams::StreamSort>,
     now: u64,
     width: usize,
 ) -> Vec<Line> {
+    use crate::streams::StreamColumn;
+
     let columns = StreamColumns::new(width);
     let titles = [
-        "stream", "type", "chain", "expires", "rpm", "conc", "last", "state",
+        sorted_stream_header("stream", StreamColumn::Name, sort),
+        "type".to_owned(),
+        sorted_stream_header("chain", StreamColumn::Chain, sort),
+        sorted_stream_header("expires", StreamColumn::Expiry, sort),
+        sorted_stream_header("rpm", StreamColumn::Rate, sort),
+        sorted_stream_header("conc", StreamColumn::Usage, sort),
+        "last".to_owned(),
+        "state".to_owned(),
     ];
-    let header = table_line(
-        titles.map(|title| (title.to_owned(), Style::Title)),
-        &columns,
-        false,
-    );
+    let header = table_line(titles.map(|title| (title, Style::Title)), &columns, false);
     let mut out = vec![header];
-    for (index, row) in view.rows.iter().enumerate() {
+    for index in crate::streams::order_rows(&view.rows, sort) {
+        let row = &view.rows[index];
         out.push(table_line(
             table_cells(row, now),
             &columns,
-            Some(index) == selected,
+            selected == Some(row.name.as_str()),
         ));
     }
     out
@@ -421,11 +445,11 @@ pub fn streams_waiting(error: Option<&str>, width: usize) -> Vec<Line> {
 /// newest-first audit tail. No credential value or hash exists in the view model to display.
 pub fn stream_detail(
     view: &crate::streams::StreamsView,
-    selected: Option<usize>,
+    selected: Option<&str>,
     now: u64,
     width: usize,
 ) -> Vec<Line> {
-    let Some(row) = view.row(selected) else {
+    let Some(row) = selected.and_then(|name| view.row_named(name)) else {
         return vec![line(vec![span("no stream selected", Style::Dim)], width)];
     };
     let mut out = vec![line(
@@ -4353,7 +4377,7 @@ mod tests {
     fn streams_table_builds_sorted_columns_and_marks_the_selection() {
         let secret = ["rsk", "_", &"a".repeat(64)].concat();
         let view = streams_fixture(&secret);
-        let rows = texts(&streams_table(&view, Some(0), 1155, 100));
+        let rows = texts(&streams_table(&view, Some("busy"), None, 1155, 100));
         assert_eq!(rows.len(), 3, "a header and two streams");
         assert!(rows[0].contains("stream") && rows[0].contains("expires"));
         assert!(rows[1].contains("> busy"), "usage sorts busy first");
@@ -4364,10 +4388,56 @@ mod tests {
     }
 
     #[test]
+    fn streams_table_marks_the_sorted_header_and_keeps_the_mark_on_its_stream() {
+        use crate::streams::{StreamColumn, StreamSort};
+
+        let secret = ["rsk", "_", &"e".repeat(64)].concat();
+        let view = streams_fixture(&secret);
+        let sort = StreamSort {
+            column: StreamColumn::Name,
+            descending: false,
+        };
+        let rows = texts(&streams_table(&view, Some("quiet"), Some(&sort), 1155, 100));
+        assert!(
+            rows[0].contains("stream ▲"),
+            "the sorted header has a marker"
+        );
+        assert!(
+            !rows[0].contains("conc ▲"),
+            "only the sorted column is marked"
+        );
+        assert!(
+            rows[1].contains("busy") && !rows[1].contains("> busy"),
+            "name order puts busy first, unmarked"
+        );
+        assert!(
+            rows[2].contains("> quiet"),
+            "the mark follows the stream name"
+        );
+        let reverse = StreamSort {
+            column: StreamColumn::Name,
+            descending: true,
+        };
+        let rows = texts(&streams_table(
+            &view,
+            Some("quiet"),
+            Some(&reverse),
+            1155,
+            100,
+        ));
+        assert!(rows[0].contains("stream ▼"));
+        assert!(rows[1].contains("> quiet"), "the mark survives a reverse");
+        assert!(
+            rows[2].contains("busy") && !rows[2].contains("> busy"),
+            "the reverse order leaves busy unmarked"
+        );
+    }
+
+    #[test]
     fn stream_detail_shows_limits_ids_and_audit_without_token_values() {
         let secret = ["rsk", "_", &"b".repeat(64)].concat();
         let view = streams_fixture(&secret);
-        let lines = texts(&stream_detail(&view, Some(0), 1155, 90)).join("\n");
+        let lines = texts(&stream_detail(&view, Some("busy"), 1155, 90)).join("\n");
         assert!(lines.contains("abcdef12"), "the short id is shown");
         assert!(lines.contains("rpm: 10") && lines.contains("tpm: -"));
         assert!(lines.contains("token.add") && lines.contains("rotation"));

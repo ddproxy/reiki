@@ -12,6 +12,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - `make docs-check`, `tests/docs_examples.rs` and a CI job that validate documented TOML with `reiki check`, CLI flags with help output, config keys with the docs, local links and anchors, and the README proof.
 - `AGENTS.md` with commands, repo map, conventions and stable exit codes, and `llms.txt` as a short docs index.
 - A final-response plugin phase for security checks that must inspect the body after placeholder restoration. It adds `Plugin::needs_final_response` and `Plugin::on_final_response` to the native plugin API; the host buffers the body only for plugins that opt in and fails closed when the buffer bound is exceeded.
+- `reiki top` sorts the Streams table by stream name, usage, chain, request rate or expiry with the matrix keys `o`, `O` and `r`; past the last column the table returns to the default usage order. The sorted header shows `▲` or `▼`, unavailable values sort last in both directions, and equal values keep the default order. The Streams key list and hints name the new keys. See [top](docs/top.md#streams).
 
 ### Changed
 
@@ -23,7 +24,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 
 ### Added
 
-- `reiki top` sorts the peer matrix by column: `o` and `O` step through the peer name, each provider (by requests in the last hour), version, load, disk and sessions, and back to the default order; `r` reverses the direction. The sorted header shows `▲` or `▼`, `ALL` stays first, and the cursor follows its peer through re-sorts and refreshes. The key list in `?` names the new keys. Streams is not sortable yet.
+- `reiki top` sorts the peer matrix by column: `o` and `O` step through the peer name, each provider (by requests in the last hour), version, load, disk and sessions, and back to the default order; `r` reverses the direction. The sorted header shows `▲` or `▼`, `ALL` stays first, and the cursor follows its peer through re-sorts and refreshes. The key list in `?` names the new keys.
 - `reiki top` gains a read-only Streams screen (`t`) backed by the new ordinary-admin `GET /v1/stream-console` route. It shows static and dynamic streams sorted by usage, chains, limits, current rate/concurrency, expiries, last use and state, with token ids and a bounded redacted audit tail in the detail pane. It reuses `REIKI_ADMIN_TOKEN` and `[admin] listen`, never reads the stream-management token, says when `[stream_admin]` is disabled, keeps the last good answer on refresh failure with backoff, and offers no mutation keys. See [top](docs/top.md#streams), [monitoring](docs/monitoring.md#get-v1stream-console) and [keys](docs/keys.md#dynamic-stream-credentials).
 
 ### Fixed
@@ -34,6 +35,7 @@ The opt-in features introduced in 0.14.0 — the multi-stream gateway with admis
 - Corrected stale documentation links and version strings, and clarified that a failed audit append refuses the management mutation instead of silently continuing.
 - A decoded, buffered success no longer replaces its gateway token estimate with zero; the permit is dropped so the estimate stays charged while the provider's `usage` object remains ignored for compressed bodies.
 - Gateway completions keep the estimate in the window where the request was admitted, instead of subtracting it from a minute, day or month that rolled over in flight.
+- The `reiki top` Streams selection and detail pane follow a stream by name instead of by row index, so a refresh or re-sort no longer highlights and describes a different stream.
 
 ### Security
 

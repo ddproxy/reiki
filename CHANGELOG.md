@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- A failed state write no longer latches the gateway closed until restart. The state writer probes the current counters every 5 to 30 seconds while the store is failed and reopens admission on the first successful write; close and recovery each log once, and `reiki_gateway_store_ok` exposes the state on `/v1/metrics`.
+- A failed state write no longer latches the gateway closed until restart. The state writer probes the current counters every 5 to 30 seconds while the store is failed and reopens admission on the first successful write; close and recovery each log once, and `reiki_gateway_store_ok` exposes the state on `/v1/metrics`. Alert and troubleshooting guidance is in [monitoring](docs/monitoring.md#alert-rules) and [operations](docs/operations.md#troubleshoot-gateway-store-unavailable).
 - The `reiki top` Streams selection and detail pane follow a stream by name instead of by row index, so a refresh or re-sort no longer highlights and describes a different stream.
 
 ## 0.15.0

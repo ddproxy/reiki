@@ -55,14 +55,33 @@ REIKI_ADMIN_TOKEN="$(cat /etc/reiki/admin.token)" reiki failures --limit 20
 
 The health probe needs no token and answers `ok` while the listener is up; it does not prove an upstream works. `reiki keys` shows `ok`, `cooling` or `disabled` per key and exits `0` on a good answer, `1` on a refusal and `2` when the admin listener cannot be reached. `reiki top --once` adds a fleet view when peers are configured. See [monitoring](monitoring.md) and [top](top.md).
 
-A gateway store closed by a failed state write retries a probe write of the current counters every 5 to 30 seconds, so it reopens after disk space or permissions return without a restart or new traffic. Watch `reiki_gateway_store_ok` on `/v1/metrics` (`0` while closed); the service log has one `WARN` on close and one `INFO` on recovery.
+`reiki_gateway_store_ok` on `/v1/metrics` is `0` while the gateway store is closed. A store closed by a failed state write retries a probe write of the current counters every 5 to 30 seconds and reopens after disk space or permissions return, without a restart or new traffic. A store closed by an unreadable state file at startup is not probed by the timer; see [Troubleshoot gateway store unavailable](#troubleshoot-gateway-store-unavailable).
+
+## Troubleshoot gateway store unavailable
+
+A client gets `503` with `{"error":{"type":"gateway_store_unavailable","message":"per-stream counters are unavailable"}}` when the gateway store is closed and the stream is fail-closed (`[gateway] on_store_error = "closed"`, the default, or a per-stream override). With `"open"`, requests continue while the failure is counted in `reiki_gateway_store_errors_total{stream}` and reported as `GatewayStoreError` events. See [gateway admission](shaping.md#gateway-admission) for the two modes.
+
+The store closes when a state write fails, for example `ENOSPC`, a read-only state file or directory, or another I/O error. It also closes at startup when an existing `<config>.state` cannot be read or parsed, including a corrupt file. A missing state file is not an error: counters and saved cooldowns start fresh. Check free space, mounts, and the owner and mode of the state directory and file (mode `0600`; see [backup and restore](#backup-and-restore)).
+
+For a failed write, the background `reiki-state` writer probes the current counters on a timer without waiting for new traffic: 5 seconds after the failure, again after 5, then 10, 20 and a 30-second cap while writes keep failing. The first successful write reopens admission. The transition logs one `WARN` on close and one `INFO` on recovery, not one line per refused request. `reiki_gateway_store_ok` is `0` while closed and `1` while open; see the [alert rules](monitoring.md#alert-rules).
+
+A store closed at startup because the state file was unreadable or corrupt is different. The timer deliberately does not probe it, because writing would replace the file with zeroed counters. Any later successful state write, such as one triggered by traffic, would still reopen the store and overwrite the file, so do not wait for it: restore or repair `<config>.state`, fix its owner and mode, and restart Reiki. Removing a damaged file also works if losing saved counters and cooldowns is acceptable.
+
+Check the journal for the transition and the underlying cause:
+
+```sh
+journalctl -u reiki --since '1 hour ago' | grep -E 'gateway counter store|cannot write key state|cannot read key state|ignoring key state'
+journalctl -u reiki -f
+```
+
+`gateway counter store unavailable` is the `WARN` on close and `gateway counter store recovered` the `INFO` on recovery. `cannot write key state` carries the path and OS cause of a failed write. At startup, `cannot read key state; starting fresh` and `ignoring key state in an unsupported format; starting fresh` carry the path and the read or parse cause. All are visible at the default `info` level; see [logs and metrics](#logs-and-metrics).
 
 ## Common failures
 
 | Exact message or status | Meaning | Fix |
 | --- | --- | --- |
 | `unauthorized` / `unknown token` | The client token does not match a stream hash. | Send `Authorization: Bearer <stream token>` and reload after changing `token_sha256`. |
-| `503 gateway_store_unavailable` | Counter state is unavailable and `[gateway] on_store_error = "closed"`. | Check the state directory and `<config>.state`; `"open"` is an explicit fail-open choice. |
+| `503 gateway_store_unavailable` | Counter state is unavailable and `[gateway] on_store_error = "closed"`. | Check the state directory and `<config>.state`; `"open"` is an explicit fail-open choice. See [troubleshooting](#troubleshoot-gateway-store-unavailable). |
 | `429 gateway_usage_limited` | `/v1/usage` exceeded `[gateway] usage_rpm` (default 60). | Wait for `Retry-After` or raise the budget. |
 | `503 a fail-closed plugin failed; the request was not processed` | A masking or blocking plugin skipped closed. | Read the service log, fix the plugin; `on_error = "pass_through"` opts out deliberately. |
 | `state directory ... is not writable` | The parent of `<config>.state` could not be probed before binding. | Fix owner or mode, or add it to `ReadWritePaths=`. |

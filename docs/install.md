@@ -45,7 +45,7 @@ Archives also ship a CycloneDX SBOM and build provenance attestations; [security
 
 ## Development builds
 
-A successful CI push to `main` that changes more than documentation also publishes a pre-release tagged `vX.Y.(Z+1)-dev.<commits since last stable tag>.g<short hash>`. The tag without the leading `v` is the version in that build's `Cargo.toml`; it sorts after the base stable version and before the next stable version. Dev archives, checksums, SBOM and attestations use the same layout as stable archives. Only the ten newest dev pre-releases are kept, and older dev tags are removed with them. A stable tag still has to equal the checked-in `Cargo.toml` version. Prefer stable releases for production.
+A successful CI push to `main` that changes more than documentation also publishes a pre-release tagged `vX.Y.(Z+1)-dev.<commits since last stable tag>.g<short hash>`. The tag without the leading `v` is the version in that build's `Cargo.toml`; it sorts after the base stable version and before the next stable version. The dev workflow pushes the tag and then dispatches the release workflow on that tag ref, so the signing identity is `release.yml@refs/tags/<tag>`, the same shape as a stable release; dev tags do not trigger the stable tag-push path. Dev archives, checksums, SBOM and attestations use the same layout as stable archives, and dev releases are marked pre-release so they never become the latest release. Only the ten newest dev pre-releases are kept, and older dev tags are removed with them. A stable tag still has to equal the checked-in `Cargo.toml` version. Prefer stable releases for production.
 
 ## Verify the install
 

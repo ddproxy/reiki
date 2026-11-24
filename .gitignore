@@ -12,3 +12,4 @@ bom.json
 /examples/*/*.component.wasm
 /examples/wasm-no-grant/no-grant.wasm
 /examples/wasm-body-edit/body-edit.wasm
+__pycache__/

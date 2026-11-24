@@ -2,30 +2,25 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_call:
-    inputs:
-      tag:
-        description: Tag to build and publish
-        required: true
-        type: string
+    tags: ["v*", "!v*-dev.*"]
+  # Dev tags are dispatched on the tag ref by dev-release.yml so the signing
+  # identity is release.yml@refs/tags/<tag>.
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   create:
-    if: >
-      github.server_url == 'https://github.com' &&
-      (github.event_name != 'push' || !contains(github.ref_name, '-dev.'))
+    if: github.server_url == 'https://github.com' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
       - name: Check release version
         run: python3 scripts/set-release-version.py --tag "$RELEASE_TAG"
@@ -42,6 +37,7 @@ jobs:
 
   build:
     needs: create
+    if: github.ref_type == 'tag'
     strategy:
       fail-fast: false
       matrix:
@@ -54,11 +50,11 @@ jobs:
     permissions:
       contents: read
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
       - name: Set release version
         run: python3 scripts/set-release-version.py --tag "$RELEASE_TAG"
@@ -123,23 +119,24 @@ jobs:
         with:
           name: reiki-${{ matrix.target }}
           path: |
-            reiki-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz
-            reiki-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            reiki-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            reiki-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   publish:
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           persist-credentials: false
       - name: Set release version
         run: python3 scripts/set-release-version.py --tag "$RELEASE_TAG"
@@ -169,3 +166,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  prune:
+    needs: publish
+    if: github.ref_type == 'tag' && contains(github.ref_name, '-dev.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Prune dev releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t old < <(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName --jq '.[].tagName' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.' \
+              | sort -V \
+              | head -n -10 || true
+          )
+          for tag in "${old[@]}"; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done

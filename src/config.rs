@@ -4612,7 +4612,7 @@ socket = "/run/forwarder.sock"
             (publish("127.0.0.1:4098", HASH_C), "must differ"),
             (publish("0.0.0.0:4098", HASH_C), "must differ"),
             (publish("localhost:4099", HASH_C), "IP:port"),
-            (publish("10.0.0.5:4099", HASH_C), "loopback"),
+            (publish("192.0.2.5:4099", HASH_C), "loopback"),
             (publish("127.0.0.1:4099", "short"), "64 hex"),
             (publish("127.0.0.1:4099", HASH_B), "admin token"),
             (
@@ -4796,7 +4796,7 @@ socket = "/run/forwarder.sock"
         );
         for (peers, needle) in [
             (
-                peer("a", "url = \"http://10.0.0.5:4099\"\ntoken_file = \"/t\""),
+                peer("a", "url = \"http://192.0.2.5:4099\"\ntoken_file = \"/t\""),
                 "https",
             ),
             (
@@ -5346,7 +5346,10 @@ socket = "/run/forwarder.sock"
 
         #[test]
         fn the_hub_listener_is_loopback_only() {
-            let text = edit("listen = \"127.0.0.1:4443\"", "listen = \"10.0.0.40:4443\"");
+            let text = edit(
+                "listen = \"127.0.0.1:4443\"",
+                "listen = \"192.0.2.40:4443\"",
+            );
             assert!(hub_error(&text).contains("must be a loopback address"));
             let text = edit("listen = \"127.0.0.1:4443\"", "listen = \"nonsense\"");
             assert!(hub_error(&text).contains("IP:port"));

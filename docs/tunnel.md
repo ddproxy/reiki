@@ -39,7 +39,7 @@ An opaque tunnel cannot be logged, masked or given a key. `[tunnel.intercept]` c
 
 ```toml
 [tunnel]
-listen = "10.0.0.1:4098"
+listen = "192.0.2.1:4098"
 allow = ["api.example.com"]
 
 [tunnel.intercept]

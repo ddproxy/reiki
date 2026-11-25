@@ -2267,7 +2267,7 @@ mod tests {
                 color: Color::Green,
             },
             ChartSeries {
-                name: "worklog".to_owned(),
+                name: "sample1".to_owned(),
                 points: latest(1.0),
                 color: Color::Yellow,
             },
@@ -2291,7 +2291,7 @@ mod tests {
         assert!(text.contains("Requests · fleet · req/interval"), "{text}");
         assert!(text.contains("■ zen 12"), "legend: {text}");
         assert!(text.contains("■ openrouter 3"), "legend: {text}");
-        assert!(text.contains("■ worklog 1"), "legend: {text}");
+        assert!(text.contains("■ sample1 1"), "legend: {text}");
         assert!(text.contains("-12m"), "x axis: {text}");
         assert!(text.contains("now"), "x axis: {text}");
         assert!(text.contains("0"), "y baseline: {text}");

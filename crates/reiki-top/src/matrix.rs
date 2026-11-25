@@ -2254,7 +2254,7 @@ mod tests {
                     "[2,2,2,2,2,2,2,2,2,2]",
                 ),
                 rich_upstream(
-                    "worklog",
+                    "sample1",
                     3,
                     1,
                     6,
@@ -2285,7 +2285,7 @@ mod tests {
             &mut f,
             "peer-c",
             &doc(&rich_upstream(
-                "forgejo",
+                "sample2",
                 90,
                 0,
                 900,
@@ -2304,8 +2304,8 @@ mod tests {
                 .iter()
                 .map(|s| s.upstream.as_str())
                 .collect::<Vec<_>>(),
-            ["zen", "worklog"],
-            "the stale-only forgejo is excluded; credential upstreams are kept"
+            ["zen", "sample1"],
+            "the stale-only sample2 is excluded; credential upstreams are kept"
         );
         assert_eq!(requests[0].series.interval, MINUTE_INTERVAL);
         assert_eq!(requests[0].series.points.len(), CHART_POINTS);

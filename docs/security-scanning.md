@@ -4,7 +4,7 @@ The workflows in `.github/workflows` run the checks below. Findings appear as pu
 
 | Workflow | Runs on | Checks | Where results appear |
 | --- | --- | --- | --- |
-| `ci` | pushes, pull requests, manual | Formatting, clippy, tests with and without `top` | `test` check on the commit or pull request |
+| `ci` | pushes, pull requests, manual | Formatting, clippy, repository hygiene, tests with and without `top` | `test` check on the commit or pull request |
 | `codeql` | pushes to `main`, pull requests, weekly | CodeQL for Rust with build mode `none` | `Analyze (rust)` check and code scanning alerts in the Security tab |
 | `scorecard` | pushes to `main`, weekly | OpenSSF Scorecard, with results published to the Scorecard API | `Scorecard` check, code scanning alerts, the [README badge](../README.md) and a `scorecard-results` artifact kept for 5 days |
 | `dependency-review` | pull requests | New high or critical vulnerabilities, and licences outside `deny.toml`'s allow-list | `dependency-review` check and its summary on the pull request |
@@ -13,6 +13,10 @@ The workflows in `.github/workflows` run the checks below. Findings appear as pu
 | `release` | `v*` tags | Builds archives, generates a CycloneDX JSON SBOM with checksums, and attests the archives | Release assets, release summary and GitHub's attestation store |
 
 The dependency-review licence list mirrors `deny.toml`; keep both lists together when adding a licence. Scorecard publishes results, which is what keeps the badge current. Maintainers can check workflow YAML, SHA pinning and job permissions with `cargo run --quiet --manifest-path scripts/check-workflows/Cargo.toml`.
+
+## Repository hygiene
+
+`scripts/check-repo-hygiene.py`, also available as `make hygiene`, scans tracked files for private development hostnames and internal domain suffixes. A finding fails the check and CI. Add an exception to `scripts/check-repo-hygiene.allowlist` only for a match that is not a hostname, with a comment saying why. Examples use documentation IP ranges and neutral upstream names.
 
 ## Fuzzing
 

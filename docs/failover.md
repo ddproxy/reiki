@@ -56,7 +56,7 @@ Only two failures are scoped: a `rate_limited` failure and a 402 that is treated
 
 A key with many cooling models is treated as broken. `scope_escalate_after` sets the per-upstream threshold (default 3, range 2–16). A combination failure escalates to a whole-key cooldown when that many distinct models are already cooling, or when the number of remembered combinations would reach twice that. At most 64 combinations are remembered; the soonest-ending one is evicted when full. A whole-key cooldown clears the scoped entries. Scoped cooldowns live in memory; the state file holds key-level health.
 
-The `cooling_combinations` count in a peer's view is the number of combinations cooling on that upstream's keys. See [peers](peers.md).
+The `cooling_combinations` count in a peer's view is the number of combinations cooling on that upstream's keys. See [provider health](provider-health.md).
 
 ## Client responses when keys run out
 

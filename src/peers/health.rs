@@ -718,4 +718,126 @@ mod tests {
         assert_eq!(status_class(Some(302)), None);
         assert_eq!(status_class(None), None);
     }
+
+    fn validate_schema(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+        if let Some(options) = schema.get("enum").and_then(Value::as_array)
+            && !options.iter().any(|option| option == value)
+        {
+            return Err(format!("{path}: value {value} not in enum {options:?}"));
+        }
+        if let Some(types) = schema.get("type") {
+            let ok = match types {
+                Value::String(t) => type_matches(value, t),
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| type_matches(value, t)),
+                _ => false,
+            };
+            if !ok {
+                return Err(format!("{path}: {value} does not match type {types}"));
+            }
+        }
+        if let Some(min) = schema.get("minimum").and_then(Value::as_f64)
+            && let Some(n) = value.as_f64()
+            && n < min
+        {
+            return Err(format!("{path}: {n} < minimum {min}"));
+        }
+        if let Value::Object(obj) = value {
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for name in required.iter().filter_map(Value::as_str) {
+                    if !obj.contains_key(name) {
+                        return Err(format!("{path}: missing required {name}"));
+                    }
+                }
+            }
+            if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+                for (name, prop_schema) in props {
+                    if let Some(child) = obj.get(name) {
+                        validate_schema(child, prop_schema, &format!("{path}.{name}"))?;
+                    }
+                }
+            }
+            let additional = schema
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !additional && let Some(props) = schema.get("properties").and_then(Value::as_object)
+            {
+                for name in obj.keys() {
+                    if !props.contains_key(name) {
+                        return Err(format!("{path}: unexpected property {name}"));
+                    }
+                }
+            }
+        }
+        if let Value::Array(items) = value {
+            if let Some(min) = schema.get("minItems").and_then(Value::as_u64)
+                && (items.len() as u64) < min
+            {
+                return Err(format!("{path}: {} items < minItems {min}", items.len()));
+            }
+            if let Some(max) = schema.get("maxItems").and_then(Value::as_u64)
+                && (items.len() as u64) > max
+            {
+                return Err(format!("{path}: {} items > maxItems {max}", items.len()));
+            }
+            if let Some(item_schema) = schema.get("items") {
+                for (index, item) in items.iter().enumerate() {
+                    validate_schema(item, item_schema, &format!("{path}[{index}]"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn type_matches(value: &Value, ty: &str) -> bool {
+        match ty {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_health_document_matches_the_generated_schema() {
+        let config = Config::parse(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/a\"\n\
+             [peers]\nexpose_usage = true\nexpose_host_stats = true\nexpose_key_labels = true\n",
+        )
+        .unwrap();
+        let app = crate::proxy::App::new(
+            config,
+            [("a".to_owned(), crate::proxy::Secret::new("secret"))].into(),
+            Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let peers = app.snapshot().config.peers.clone().unwrap();
+        let doc = document(&app, &peers).await;
+        let schema = crate::peers::openapi::health_schema();
+        validate_schema(&doc, &schema, "$").unwrap();
+
+        let base = Config::parse(
+            "[upstream.zen]\nbase_url = \"https://opencode.ai/zen/v1\"\n\
+             [keys.a]\nupstream = \"zen\"\nfile = \"/a\"\n\
+             [peers]\n",
+        )
+        .unwrap();
+        let app = crate::proxy::App::new(
+            base,
+            [("a".to_owned(), crate::proxy::Secret::new("secret"))].into(),
+            Policy::default(),
+            crate::plugins::PluginChain::default(),
+        );
+        let peers = app.snapshot().config.peers.clone().unwrap();
+        let doc = document(&app, &peers).await;
+        validate_schema(&doc, &schema, "$").unwrap();
+    }
 }

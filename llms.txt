@@ -47,7 +47,7 @@ Security proxy for agent and LLM traffic: isolates keys, filters what leaves, ke
 - [Deploy](docs/deploy.md): install paths, directory layout, listeners and service unit.
 - [Upgrades](docs/upgrades.md): reload versus restart and state files.
 - [Monitoring](docs/monitoring.md): admin routes, status, metrics and cost endpoints.
-- [Peers](docs/peers.md) and [peers publishing](docs/peers-publishing.md): read-only health sharing.
+- [Provider health](docs/provider-health.md): read-only peer health contract and endpoint.
 - [Top](docs/top.md): live fleet view.
 - [Troubleshooting](docs/troubleshooting.md): exact messages and fixes.
 - [FAQ](docs/faq.md): short answers.

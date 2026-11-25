@@ -7,7 +7,6 @@ use serde::Deserialize;
 
 /// The `totals` object of `GET /v1/cost`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct CostTotals {
     pub requests: u64,
     pub estimated_micros: String,
@@ -17,7 +16,6 @@ pub struct CostTotals {
 
 /// A bounded parse of the admin cost answer. Only the fields `top` renders are kept.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 struct CostAnswer {
     currency: String,
     period: String,
@@ -78,10 +76,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_or_unestimated_answers() {
+    fn rejects_unestimated_answers_but_ignores_unknown_fields() {
         let body = r#"{"currency":"USD","period":"2026-11","estimated":false,"note":"x","state_healthy":true,"totals":{"requests":0,"estimated_micros":"0","estimated_display":"0.000000","unpriced_requests":0}}"#;
         assert!(LocalCost::from_json(body).is_err());
-        let borrowed = body.replace("\"note\":\"x\"", "\"note\":\"x\",\"extra\":1");
-        assert!(LocalCost::from_json(&borrowed).is_err());
+        let borrowed = r#"{"currency":"USD","period":"2026-11","estimated":true,"note":"x","state_healthy":true,"extra":1,"totals":{"requests":0,"estimated_micros":"0","estimated_display":"0.000000","unpriced_requests":0,"extra":2}}"#;
+        assert!(LocalCost::from_json(borrowed).is_ok());
     }
 }

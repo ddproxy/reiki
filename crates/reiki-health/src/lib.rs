@@ -1,7 +1,8 @@
 //! Shared wire types for Reiki peer health documents and `reiki top` events.
 //!
 //! Both the publisher and the reader use these types, so the JSON shape is defined in one place.
-//! Unknown fields are errors; only the config-gated fields may be absent.
+//! Readers ignore unknown fields and unknown enum-like values for forward compatibility; only the
+//! config-gated fields may be absent.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +12,6 @@ use serde_json::Value;
 
 /// The whole `/v1/health` document in the current wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Health {
     /// The published instance name, or the fixed `reiki`.
     pub instance: String,
@@ -50,7 +50,6 @@ pub struct Health {
 /// Aggregate stream counts published to peers. Names are omitted: a dynamic stream name can
 /// identify a tenant, while a count says only how many streams a peer serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StreamCounts {
     pub static_streams: u64,
     pub dynamic_streams: u64,
@@ -59,7 +58,6 @@ pub struct StreamCounts {
 /// Aggregate gateway counters published to peers. Every field is a count with a fixed name, so a
 /// peer sees how much traffic a gateway admitted without learning who sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GatewayCounts {
     /// Requests admitted across all streams.
     pub requests: u64,
@@ -80,7 +78,6 @@ impl Health {
 /// One recent key failure, as `/v1/failures` returns it. Only the local instance's admin
 /// listener supplies these; a remote peer publishes counts only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Failure {
     /// Unix seconds.
     pub time: u64,
@@ -105,7 +102,6 @@ fn default_failure_action() -> String {
 /// Quota numbers a passthrough upstream reported in its response headers. Every field is present
 /// on the wire and may be `null`; other JSON types are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObservedQuota {
     #[serde(deserialize_with = "required_nullable_u64")]
     pub requests_limit: Option<u64>,
@@ -124,7 +120,6 @@ pub struct ObservedQuota {
 /// One observed passthrough account. `retry_after_seconds` is the remaining wait on the host's
 /// clock, not a value copied from the upstream; `null` means it has elapsed or was never reported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObservedUpstream {
     #[serde(deserialize_with = "safe_label_field")]
     pub upstream: String,
@@ -322,10 +317,10 @@ pub struct Upstream {
     pub token_minutes: Option<[u32; 10]>,
 }
 
-/// The wire form of [`Upstream`]. `deny_unknown_fields` and the required nullable pair are
-/// enforced here; the public struct keeps plain `Option` fields for callers.
+/// The wire form of [`Upstream`]. The required nullable pair is enforced here; the public
+/// struct keeps plain `Option` fields for callers. Unknown fields are ignored for forward
+/// compatibility.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UpstreamWire {
     name: String,
     healthy_keys: u32,
@@ -470,7 +465,6 @@ pub struct KeyView {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct KeyViewWire {
     name: String,
     state: String,
@@ -593,7 +587,8 @@ mod tests {
         assert_eq!(value["gateway"]["tokens"], 345);
         assert_eq!(value["gateway"]["store_errors"], 1);
         let unknown = text.replace("\"requests\": 12,", "\"requests\": 12, \"surprise\": 1,");
-        assert!(Health::from_json(&unknown).is_err());
+        let health = Health::from_json(&unknown).unwrap();
+        assert_eq!(health.gateway.unwrap().requests, 12);
     }
 
     #[test]
@@ -658,15 +653,36 @@ mod tests {
             "\"mode\": \"observed\",",
             "\"mode\": \"observed\", \"surprise\": 1,",
         );
-        assert!(Health::from_json(&unknown).is_err());
+        let health = Health::from_json(&unknown).unwrap();
+        assert_eq!(health.observed[0].mode, "observed");
     }
 
     #[test]
-    fn an_unknown_upstream_field_is_an_error() {
+    fn unknown_fields_and_enum_like_values_are_ignored_for_forward_compat() {
         let text = BASE.replace(
             "\"last_status_class\": null,",
-            "\"last_status_class\": null, \"surprise\": 1,",
+            "\"last_status_class\": \"7xx\", \"surprise\": 1, \"capacity_group\": \"team-a\",",
         );
-        assert!(Health::from_json(&text).is_err());
+        let text = text.replace(
+            "\"cooldown_seconds\": null}]",
+            "\"cooldown_seconds\": null, \"cooldown_class\": \"future\", \"quota_reset_at\": null, \"extra_key\": true}]",
+        );
+        let text = text.replace(
+            "\"sessions\": {\"active_sessions\": 1}",
+            "\"sessions\": {\"active_sessions\": 1, \"extra_session\": 1}, \"gateway\": {\"requests\":1,\"tokens\":2,\"store_errors\":3,\"extra\":4}, \"streams\": {\"static_streams\":1,\"dynamic_streams\":2,\"extra\":3}, \"extra_top\": {\"x\":1}",
+        );
+        let health = Health::from_json(&text).unwrap();
+        assert_eq!(
+            health.upstreams[0].last_status_class.as_deref(),
+            Some("7xx")
+        );
+        assert_eq!(
+            health.upstreams[0].keys.as_ref().unwrap()[0]
+                .cooldown_class
+                .as_deref(),
+            Some("future")
+        );
+        assert_eq!(health.gateway.unwrap().requests, 1);
+        assert_eq!(health.streams.unwrap().static_streams, 1);
     }
 }

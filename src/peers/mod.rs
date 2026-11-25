@@ -10,6 +10,6 @@ mod sessions;
 mod stream;
 pub mod tls;
 
-pub use openapi::openapi_paths;
+pub use openapi::{openapi_paths, provider_health_openapi};
 pub(crate) use publisher::TlsReload;
 pub use publisher::{Publisher, router, serve, serve_with_per_addr};

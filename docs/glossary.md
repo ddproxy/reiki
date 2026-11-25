@@ -18,7 +18,7 @@ Terms used in the documentation and command output. Each term links to the page 
 | available | A key state where the key can be selected by a chain. Called `ok` in `reiki keys`. | [failover](failover.md#key-states) |
 | passthrough | An upstream mode that forwards the client's own credentials and query string without using a Reiki key or token check. | [providers](providers.md#passing-the-clients-own-credentials-through) |
 | fallback | Another upstream tried once when the source upstream's chain cannot serve a request. | [failover](failover.md#fallback-upstream), [providers](providers.md#falling-back-to-another-upstream) |
-| peer | Another Reiki instance whose published key health this instance can read. Peers do not route requests. | [peers](peers.md) |
+| peer | Another Reiki instance whose published key health this instance can read. Peers do not route requests. | [provider health](provider-health.md) |
 | leaf | A short-lived certificate minted by the interception CA for one intercepted host. | [tunnel](tunnel.md#interception), [security](security.md#interception) |
 | hub | A planned shared-key service described by `[hub]`, `[hubs.*]` and `[accounts.*]` tables. In this release the tables are parsed and validated only. | [hub](hub.md) |
 | plugin | A compiled-in component that can inspect or change requests and responses. | [plugins](plugins.md) |

@@ -37,8 +37,7 @@
     - { title: Deploy, url: /docs/deploy.html }
     - { title: Upgrades, url: /docs/upgrades.html }
     - { title: Monitoring, url: /docs/monitoring.html }
-    - { title: Peers, url: /docs/peers.html }
-    - { title: Peers publishing, url: /docs/peers-publishing.html }
+    - { title: Provider health, url: /docs/provider-health.html }
     - { title: reiki top, url: /docs/top.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
     - { title: Examples, url: /docs/examples.html }

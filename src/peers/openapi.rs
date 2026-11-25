@@ -7,7 +7,7 @@ use crate::config::Config;
 fn upstream_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["name", "healthy_keys", "cooling_keys", "disabled_keys",
                      "cooling_combinations",
                      "soonest_cooldown_seconds", "last_status_class"],
@@ -20,7 +20,8 @@ fn upstream_schema() -> Value {
                 "description": "How many (route, model) combinations are cooling on this upstream's keys; a count only, never names"},
             "soonest_cooldown_seconds": {"type": ["integer", "null"], "minimum": 1,
                 "description": "Rounded up to a multiple of cooldown_bucket_secs, unless it is 0"},
-            "last_status_class": {"enum": ["2xx", "4xx", "5xx", null]},
+            "last_status_class": {"type": ["string", "null"],
+                "description": "2xx, 4xx, 5xx, or null before one; readers ignore unknown values"},
             "capacity_group": {"type": "string", "maxLength": 64,
                 "pattern": "^[ -~]+$",
                 "description": "Opaque, operator-set group for this upstream; only when [upstream.NAME] capacity_group is configured, never derived from a key label or response"},
@@ -45,13 +46,13 @@ fn upstream_schema() -> Value {
             "keys": {
                 "description": "Only with expose_key_labels",
                 "type": "array",
-                "items": {"type": "object", "properties": {
+                "items": {"type": "object", "additionalProperties": true, "properties": {
                     "name": {"type": "string"},
-                    "state": {"enum": ["available", "cooling", "out_of_rotation"]},
+                    "state": {"type": "string",
+                        "description": "available, cooling, out_of_rotation; readers ignore unknown values"},
                     "cooldown_seconds": {"type": ["integer", "null"]},
                     "cooldown_class": {"type": "string",
-                        "enum": ["rate_limited", "quota_exhausted", "transient"],
-                        "description": "Only while cooling, and only when the class is known"},
+                        "description": "Only while cooling, and only when the class is known; readers ignore unknown values"},
                     "quota_reset_at": {"type": "string", "format": "date-time",
                         "description": "RFC3339 UTC reset behind a quota cooldown, when the key names a reset schedule or the response supplied Retry-After; only for a cooling quota key"},
                 }},
@@ -60,11 +61,43 @@ fn upstream_schema() -> Value {
     })
 }
 
-fn health_schema() -> Value {
+fn observed_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": false,
-        "required": ["instance", "reiki_version", "observed_at", "age_seconds", "failures", "upstreams"],
+        "additionalProperties": true,
+        "required": ["upstream", "account", "mode", "status_class", "observed_at",
+                     "retry_after_seconds", "cooldown_class", "quota"],
+        "properties": {
+            "upstream": {"type": "string"},
+            "account": {"type": "string"},
+            "mode": {"type": "string"},
+            "status_class": {"type": "string"},
+            "observed_at": {"type": "string"},
+            "retry_after_seconds": {"type": ["integer", "null"], "minimum": 0},
+            "cooldown_class": {"type": ["string", "null"]},
+            "quota": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["requests_limit", "requests_remaining", "requests_reset_seconds",
+                             "tokens_limit", "tokens_remaining", "tokens_reset_seconds"],
+                "properties": {
+                    "requests_limit": {"type": ["integer", "null"], "minimum": 0},
+                    "requests_remaining": {"type": ["integer", "null"], "minimum": 0},
+                    "requests_reset_seconds": {"type": ["integer", "null"], "minimum": 0},
+                    "tokens_limit": {"type": ["integer", "null"], "minimum": 0},
+                    "tokens_remaining": {"type": ["integer", "null"], "minimum": 0},
+                    "tokens_reset_seconds": {"type": ["integer", "null"], "minimum": 0}
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn health_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["instance", "reiki_version", "observed_at", "age_seconds", "failures", "upstreams", "observed"],
         "properties": {
             "instance": {"type": "string"},
             "reiki_version": {"type": "string", "maxLength": 32,
@@ -73,32 +106,58 @@ fn health_schema() -> Value {
             "age_seconds": {"type": "integer", "minimum": 0,
                 "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},
             "upstreams": {"type": "array", "items": upstream_schema()},
+            "observed": {"type": "array", "items": observed_schema(),
+                "description": "Passthrough upstreams observed by the publisher; always present, may be empty"},
             "requestlog_export_dropped_total": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Only with request-log export; summary records dropped by the bounded queue or failed syslog sends",
+                "description": "Summary records dropped by the bounded queue or failed syslog sends; present when the request-log export reports drops",
             },
             "failures": {
                 "type": "object",
                 "description": "Counts of recent key failures by class over a bounded in-memory ring, newest or not; never bodies, key names or streams",
                 "additionalProperties": {"type": "integer", "minimum": 0},
             },
-            "host": {
-                "description": "Only with expose_host_stats",
+            "gateway": {
+                "description": "Only with expose_usage; aggregate gateway counters, counts only",
                 "type": "object",
+                "additionalProperties": true,
+                "required": ["requests", "tokens", "store_errors"],
+                "properties": {
+                    "requests": {"type": "integer", "minimum": 0},
+                    "tokens": {"type": "integer", "minimum": 0},
+                    "store_errors": {"type": "integer", "minimum": 0}
+                }
+            },
+            "streams": {
+                "description": "Only with expose_usage; aggregate stream counts",
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["static_streams", "dynamic_streams"],
+                "properties": {
+                    "static_streams": {"type": "integer", "minimum": 0},
+                    "dynamic_streams": {"type": "integer", "minimum": 0}
+                }
+            },
+            "host": {
+                "description": "Optional non-core extension: present only with expose_host_stats; off by default",
+                "x-reiki-extension": "host_stats",
+                "x-reiki-default": false,
+                "type": "object",
+                "additionalProperties": true,
                 "properties": {
                     "load_average": {"type": ["array", "null"], "items": {"type": "number"}},
                     "cores": {"type": "integer"},
-                    "memory": {"type": ["object", "null"], "properties": {
+                    "memory": {"type": ["object", "null"], "additionalProperties": true, "properties": {
                         "total_bytes": {"type": "integer"},
                         "available_bytes": {"type": "integer"},
                         "swap_total_bytes": {"type": "integer"},
                         "swap_free_bytes": {"type": "integer"},
                     }},
-                    "disks": {"type": "array", "items": {"type": "object",
+                    "disks": {"type": "array", "items": {"type": "object", "additionalProperties": true,
                         "description": "Figures are null for a role whose filesystem could not be queried in time",
                         "properties": {
-                        "roles": {"type": "array", "items": {"enum": ["config", "state", "log", "requestlog"]}},
+                        "roles": {"type": "array", "items": {"type": "string"}},
                         "total_bytes": {"type": ["integer", "null"]},
                         "available_bytes": {"type": ["integer", "null"]},
                         "used_percent": {"type": ["number", "null"]},
@@ -106,15 +165,18 @@ fn health_schema() -> Value {
                 },
             },
             "sessions": {
-                "description": "Only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder",
+                "description": "Optional non-core extension: present only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder. Off by default",
+                "x-reiki-extension": "host_stats",
+                "x-reiki-default": false,
                 "type": "object",
+                "additionalProperties": true,
                 "properties": {
                     "window_seconds": {"type": "integer"},
                     "active_sessions": {
                         "type": "integer",
                         "description": "Client-reported distinct values of session_header in the window, not a count of verified devices",
                     },
-                    "streams": {"type": "array", "items": {"type": "object", "properties": {
+                    "streams": {"type": "array", "items": {"type": "object", "additionalProperties": true, "properties": {
                         "stream": {"type": "string"},
                         "active_sessions": {
                             "type": "integer",
@@ -124,6 +186,79 @@ fn health_schema() -> Value {
                 },
             },
         },
+    })
+}
+
+/// The provider-health contract as a standalone OpenAPI document.
+///
+/// This is the machine-readable contract for `/v1/health` on the peer listener.
+/// It is generated from the same schema code as the admin OpenAPI and checked by
+/// tests against `docs/provider-health.openapi.json`.
+pub fn provider_health_openapi() -> Value {
+    let health = json!({
+        "get": {
+            "summary": "Coarse key health per upstream, for peers",
+            "security": [{"peerAuth": []}],
+            "responses": {
+                "200": {"description": "OK", "content": {"application/json": {"schema": health_schema()}}},
+                "401": {"description": "Missing or wrong peer token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "429": {"description": "Too many failed peer logins from this address", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+            },
+        },
+    });
+    let stream = json!({
+        "get": {
+            "summary": "Server-Sent Events: a snapshot, then key, sessions and host events",
+            "description": "event: snapshot carries the /v1/health document; event: key carries {observed_at, age_seconds, upstream} for one upstream whose key counts or states changed; event: sessions and event: host carry {observed_at, sessions|host} with expose_host_stats; a `: heartbeat` comment comes every 15 s",
+            "security": [{"peerAuth": []}],
+            "responses": {
+                "200": {"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}},
+                "401": {"description": "Missing or wrong peer token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address, or max_subscribers_per_token with this token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "503": {"description": "max_subscribers streams are open", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+            },
+        },
+    });
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Reiki provider health contract",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Contract for the read-only peer listener health document. Readers must ignore unknown fields and unknown enum-like values. Optional fields may be absent; host and sessions are non-core extensions and are off by default."
+        },
+        "paths": {
+            super::publisher::HEALTH_PATH: health,
+            super::stream::STREAM_PATH: stream,
+        },
+        "components": {
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["code", "message"],
+                    "properties": {
+                        "code": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+                "ErrorEnvelope": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["ok", "error"],
+                    "properties": {
+                        "ok": {"type": "boolean", "const": false},
+                        "error": {"$ref": "#/components/schemas/Error"}
+                    }
+                }
+            },
+            "securitySchemes": {
+                "peerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "The read-only peer token; accepted on the peer listener only"
+                }
+            }
+        }
     })
 }
 
@@ -148,8 +283,8 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
             "security": [{"peerAuth": []}],
             "responses": {
                 "200": {"description": "OK", "content": {"application/json": {"schema": health_schema()}}},
-                "401": {"description": "Missing or wrong peer token"},
-                "429": {"description": "Too many failed peer logins from this address"},
+                "401": {"description": "Missing or wrong peer token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "429": {"description": "Too many failed peer logins from this address", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
             },
         },
     });
@@ -161,9 +296,9 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
             "security": [{"peerAuth": []}],
             "responses": {
                 "200": {"description": "OK", "content": {"text/event-stream": {"schema": {"type": "string"}}}},
-                "401": {"description": "Missing or wrong peer token"},
-                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address, or max_subscribers_per_token with this token"},
-                "503": {"description": "max_subscribers streams are open"},
+                "401": {"description": "Missing or wrong peer token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "429": {"description": "Too many failed logins, or max_subscribers_per_peer streams open from this address, or max_subscribers_per_token with this token", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
+                "503": {"description": "max_subscribers streams are open", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
             },
         },
     });
@@ -171,4 +306,28 @@ pub fn openapi_paths(config: &Config) -> Vec<(String, Value)> {
         (super::publisher::HEALTH_PATH.to_owned(), health),
         (super::stream::STREAM_PATH.to_owned(), stream),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_health_openapi;
+
+    fn normalize(text: &str) -> String {
+        text.replace(env!("CARGO_PKG_VERSION"), "<version>")
+    }
+
+    #[test]
+    fn provider_health_openapi_matches_contract_doc() {
+        let value = provider_health_openapi();
+        let mut actual = serde_json::to_string_pretty(&value).unwrap();
+        actual.push('\n');
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/provider-health.openapi.json");
+        if std::env::var_os("REIKI_BLESS_GOLDEN").is_some() {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert_eq!(normalize(&actual), normalize(&expected));
+    }
 }

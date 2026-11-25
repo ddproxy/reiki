@@ -10,7 +10,6 @@ use crate::config::Config;
 
 /// One cooling route-and-model combination on a key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct KeyScope {
     pub route: String,
     pub model: String,
@@ -34,7 +33,6 @@ pub struct KeyHealth {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Status {
     keys: Vec<StatusKey>,
     streams: Vec<StatusStream>,
@@ -51,7 +49,6 @@ struct Status {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StatusKey {
     name: String,
     upstream: String,
@@ -64,11 +61,11 @@ struct StatusKey {
     last_status_code: Option<u16>,
     #[serde(default)]
     cooldown_class: Option<String>,
+    #[serde(default)]
     scopes: Vec<KeyScope>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StatusStream {
     name: String,
     #[serde(rename = "strategy")]
@@ -92,7 +89,7 @@ pub fn parse_status(body: &str) -> Result<Vec<KeyHealth>, String> {
             "available" => ("ok".to_owned(), None),
             "cooling" => ("cooling".to_owned(), key.retry_after_seconds),
             "out_of_rotation" => ("disabled".to_owned(), None),
-            other => return Err(format!("unknown key state `{other}` in /v1/status")),
+            other => (other.to_owned(), key.retry_after_seconds),
         };
         let streams = status
             .streams
@@ -350,10 +347,11 @@ mod tests {
         assert!(keys[0].scopes.is_empty());
         assert_eq!(keys[1].state, "disabled");
         assert!(keys[2].streams.is_empty());
-        assert!(parse_status(
-            r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"weird","scopes":[]}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#
+        let unknown_state = parse_status(
+            r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"weird","scopes":[]}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(unknown_state[0].state, "weird");
     }
 
     #[test]
@@ -365,20 +363,36 @@ mod tests {
     }
 
     #[test]
-    fn a_status_document_without_scopes_or_with_unknown_fields_is_rejected() {
-        let missing = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available"}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
-        assert!(
-            parse_status(missing)
-                .unwrap_err()
-                .contains("cannot read /v1/status")
-        );
+    fn a_status_document_with_unknown_fields_and_enum_like_values_is_accepted() {
+        let body = r#"{
+          "keys":[{
+            "name":"a","upstream":"u","consecutive_failures":0,"state":"available",
+            "scopes":[{"route":"/v1/*","model":"m","retry_after_seconds":1,"cooldown_class":"quota_exhausted","extra_scope":true}],
+            "extra_key":1
+          }],
+          "streams":[{
+            "name":"s","strategy":"sticky","chain":["a"],"current_key":"a",
+            "limits":{"rpm":1,"extra":1},"usage":{"requests":0,"tokens":0,"minute_requests":0,"minute_tokens":0},"extra_stream":1
+          }],
+          "config":{"generation":0,"loaded_at":"t","last_reload":null},
+          "log":{"write_errors":0},
+          "observed":[],
+          "peers":{"tls_ca":[]},
+          "stream_admin":{"enabled":false},
+          "cost":{"currency":"USD"},
+          "requestlog":{},
+          "gateway":{},
+          "extra_top":true
+        }"#;
+        let keys = parse_status(body).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "a");
+        assert_eq!(keys[0].state, "ok");
 
-        let unknown = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"available","scopes":[],"old":1}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
-        assert!(
-            parse_status(unknown)
-                .unwrap_err()
-                .contains("cannot read /v1/status")
-        );
+        let unknown_state = r#"{"keys":[{"name":"a","upstream":"u","consecutive_failures":0,"state":"draining","scopes":[],"cooldown_class":"future_class"}],"streams":[],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
+        let keys = parse_status(unknown_state).unwrap();
+        assert_eq!(keys[0].state, "draining");
+        assert_eq!(keys[0].cooldown_class.as_deref(), Some("future_class"));
     }
 
     #[test]

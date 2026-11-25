@@ -917,16 +917,24 @@ pub fn usage_view(
     only: Option<&str>,
     cost: Option<&Value>,
 ) -> String {
+    const USAGE_STREAMS_MAX: usize = 256;
     let mut out = String::from("{\"streams\":[");
     let mut first = true;
+    let mut total = 0usize;
+    let mut emitted = 0usize;
     for (name, state) in states {
         if only.is_some_and(|wanted| wanted != name) {
+            continue;
+        }
+        total += 1;
+        if emitted >= USAGE_STREAMS_MAX {
             continue;
         }
         if !first {
             out.push(',');
         }
         first = false;
+        emitted += 1;
         out.push_str("{\"name\":");
         out.push_str(&json_string(name));
         out.push_str(",\"requests\":");
@@ -945,7 +953,15 @@ pub fn usage_view(
         }
         out.push('}');
     }
-    out.push_str("]}");
+    out.push_str("],\"streams_total\":");
+    out.push_str(&total.to_string());
+    out.push_str(",\"streams_truncated\":");
+    out.push_str(if total > USAGE_STREAMS_MAX {
+        "true"
+    } else {
+        "false"
+    });
+    out.push('}');
     out
 }
 

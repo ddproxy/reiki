@@ -9,7 +9,7 @@ Reiki's documentation is one page per subsystem. Commands and flags are checked 
 3. [Providers](providers.md) — upstream mapping and the provider status table. Then [failover](failover.md) (chains and key states) and [classification](classification.md) (response rules and cooldowns).
 4. [Security](security.md) — assets, trust boundaries and dynamic stream administration, and [security scanning](security-scanning.md) — repository checks and release verification. Then the [redaction reference](redaction.md) for exact forms, and [plugins](plugins.md), [placeholders](placeholders.md), [PHI](phi.md), [finance](finance.md), [controlled information](controlled.md), [tool policy](toolpolicy.md) and [cost](cost.md) for egress controls and opt-in accounting.
 5. [Request log](requestlog.md), [monitoring](monitoring.md), [troubleshooting](troubleshooting.md) and the [FAQ](faq.md) — observe a running instance and diagnose a symptom.
-6. [Tunnel](tunnel.md), [shaping](shaping.md), [peers](peers.md), [reiki top](top.md) and [hub](hub.md) — optional subsystems.
+6. [Tunnel](tunnel.md), [shaping](shaping.md), [provider health](provider-health.md), [reiki top](top.md) and [hub](hub.md) — optional subsystems.
 7. [Deploy](deploy.md), [operations](operations.md) and [upgrades](upgrades.md) — run, back up and change a service. [Dynamic streams](dynamic-streams.md) is the operator runbook for create, rotate, revoke, expiry, limits and audit. [Examples](examples.md) shows verified command output formats for common tasks.
 
 ## Stream admin API
@@ -55,7 +55,7 @@ Keep `stream-admin-audit.head` beside the JSONL file: when it is present, `audit
 | Start | [Quickstart](quickstart.md), [install](install.md), [overview](overview.md), [architecture](architecture.md), [glossary](glossary.md), [command line](cli.md), [configuration](configuration.md), [keys and streams](keys.md) |
 | Reliability | [Failover](failover.md), [classification](classification.md), [shaping](shaping.md), [providers](providers.md), [OpenCode](opencode.md), [Claude Code](claude-code.md) |
 | Security and data | [Security](security.md), [security scanning](security-scanning.md), [redaction reference](redaction.md), [plugins](plugins.md), [plugin authoring](plugin-authoring.md), [placeholders](placeholders.md), [PHI and NPPI](phi.md), [finance](finance.md), [controlled information](controlled.md), [tool policy](toolpolicy.md), [cost](cost.md), [tunnel](tunnel.md), [request log](requestlog.md) |
-| Operate | [Operations](operations.md), [dynamic streams](dynamic-streams.md), [deploy](deploy.md), [upgrades](upgrades.md), [monitoring](monitoring.md), [peers](peers.md), [peers publishing](peers-publishing.md), [reiki top](top.md), [troubleshooting](troubleshooting.md), [hub](hub.md) |
+| Operate | [Operations](operations.md), [dynamic streams](dynamic-streams.md), [deploy](deploy.md), [upgrades](upgrades.md), [monitoring](monitoring.md), [provider health](provider-health.md), [reiki top](top.md), [troubleshooting](troubleshooting.md), [hub](hub.md) |
 | Help | [Examples](examples.md), [FAQ](faq.md), [limits](limits.md), [observe, then enforce](rollout.md), [AGENTS](../AGENTS.md), [changelog](../CHANGELOG.md) |
 
 The [changelog](../CHANGELOG.md) announces behaviour changes by version heading and subsection. There is no separate schema version for the request log; see its [stability note](requestlog.md#stability-of-records).

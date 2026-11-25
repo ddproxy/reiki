@@ -552,9 +552,10 @@ impl SseParser {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct KeyEvent {
+    #[allow(dead_code)]
     observed_at: String,
+    #[allow(dead_code)]
     age_seconds: u64,
     upstream: reiki_health::Upstream,
 }
@@ -1014,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn the_current_wire_shape_is_required() {
+    fn wire_shape_tolerates_unknown_fields_and_keeps_required() {
         type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
         let base = || {
             serde_json::json!({
@@ -1039,8 +1040,10 @@ mod tests {
 
         let config_gated = {
             let mut doc = base();
+            doc["future_top_level"] = serde_json::json!({"new": true});
             doc["host"] = serde_json::json!({"cores": 8});
             doc["sessions"] = serde_json::json!({"active_sessions": 2});
+            doc["upstreams"][0]["future_upstream_field"] = serde_json::json!("ok");
             doc["upstreams"][0]["keys"] = serde_json::json!([]);
             doc["upstreams"][0]["requests_1h"] = serde_json::json!(1);
             doc["upstreams"][0]["limited_1h"] = serde_json::json!(0);
@@ -1052,7 +1055,7 @@ mod tests {
             doc
         };
         serde_json::from_value::<HealthDoc>(config_gated)
-            .expect("fields published by configuration are accepted");
+            .expect("unknown fields and config-gated fields are accepted");
 
         let cases: Vec<(&str, Mutation)> = vec![
             (
@@ -1100,20 +1103,14 @@ mod tests {
                         .remove("last_status_class");
                 }),
             ),
-            (
-                "unknown field",
-                Box::new(|doc: &mut serde_json::Value| {
-                    doc["future_field"] = serde_json::json!(1);
-                }),
-            ),
         ];
         for (name, mutate) in cases {
             let mut doc = base();
             mutate(&mut doc);
-            let error = serde_json::from_value::<HealthDoc>(doc)
-                .expect_err(&format!("{name} is not accepted"))
-                .to_string();
-            assert!(error.contains(name), "the error names {name}: {error}");
+            assert!(
+                serde_json::from_value::<HealthDoc>(doc).is_err(),
+                "missing required field {name} is rejected"
+            );
         }
     }
 

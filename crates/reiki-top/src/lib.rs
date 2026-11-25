@@ -220,7 +220,6 @@ impl Fleet {
     /// entry, so a removed key does not linger until the next snapshot.
     fn apply_key_event(&mut self, name: &str, data: &str) -> Result<(), String> {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct Event {
             /// Accepted for shape validation; freshness comes from when this host received it.
             #[allow(dead_code)]
@@ -1428,19 +1427,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_rejected() {
+    fn unknown_fields_and_enum_like_values_are_ignored() {
         let docs = [
             r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
                  "observed" : [],
-                 "failures":{},"upstreams":[],"future_field":42}"#,
+                 "failures":{},"upstreams":[],"future_field":42,"gateway":{"requests":1,"tokens":2,"store_errors":3,"extra":4}}"#,
             r#"{"instance":"p","reiki_version":"0","observed_at":"t","age_seconds":0,
                  "observed" : [],
                  "failures":{},"upstreams":[{"name":"zen","healthy_keys":0,"cooling_keys":0,
                  "disabled_keys":0,"cooling_combinations":0,"soonest_cooldown_seconds":null,
-                 "last_status_class":null,"extra":true}]}"#,
+                 "last_status_class":"7xx","extra":true}]}"#,
         ];
         for doc in docs {
-            assert!(Health::from_json(doc).is_err(), "{doc}");
+            let health = Health::from_json(doc).expect(doc);
+            assert_eq!(health.instance, "p");
         }
     }
 

@@ -1,13 +1,13 @@
 # Dynamic streams
 
-`[stream_admin]` is opt-in dynamic stream management on the admin listener. Without the table there are no management routes, no dynamic streams and no state or audit file access. The operator configures the assignable keys, ceilings and audit file first; the API only assigns what it was allowed to assign. See [configuration](configuration.md#stream_admin) for every key and default, and [keys](keys.md#dynamic-stream-credentials) for the credential model.
+`[stream_admin]` is opt-in dynamic stream management on the admin listener. Without the table there are no management routes, no dynamic streams and no state or audit file access. The operator configures the assignable keys, ceilings and audit file first; the API only assigns what it was allowed to assign. See [configuration](configuration.md#stream_admin) for every key and default, [keys](keys.md) for the credential model and [monitoring](monitoring.md#stream-administration-routes) for the route reference.
 
-This page covers the operating cycle: create, rotate, revoke, expire, limit, audit and back up. Command syntax is also in [cli](cli.md#streams) and the route list is in [monitoring](monitoring.md#stream-administration-routes).
+This page covers the operating cycle: create, rotate, revoke, expire, limit, audit and back up. Command syntax is also in [CLI](cli.md).
 
 ## Before you start
 
 1. Configure `[admin]` with a loopback `listen` and `[stream_admin]` with a dedicated `token_sha256`, an `actor_id_sha256`, `audit_log`, `max_streams`, `allowed_keys`, `ceilings` and `allowed_listen`. The configured `admin.listen` must appear literally in `allowed_listen`; hostnames are refused.
-2. Restart the instance. `[stream_admin]` is startup-only: adding, removing or editing the table needs a restart and a reload preview reports `restart_needed`.
+2. Restart the instance. `[stream_admin]` is startup-only: adding, removing or editing the table needs a restart, and a reload preview reports `restart_needed`.
 3. Store the raw management token in an owner-only file and export it to the CLI. The raw token is never a command-line argument:
 
    ```sh
@@ -27,7 +27,7 @@ Each stream name must be unique and must not collide with a static `[streams.NAM
 reiki --config /etc/reiki/reiki.toml streams --reason "tenant onboarding" create tenant-a zen-a --ttl 3600
 ```
 
-The command prints the raw client token **once**. Copy it into the client's secret store now: the config, state file and audit records hold hashes only, and no route or later command returns the value. If the token is lost, revoke its id and issue a new one. `list` and `show` show stream names, ids and expiries, never token values:
+The command prints the raw client token **once**. Copy it into the client's secret store now: config, state and audit records hold hashes only, and no route or later command returns the value. If it is lost, revoke its id and issue a new one. `list` and `show` show names, ids and expiries, never token values:
 
 ```sh
 reiki --config /etc/reiki/reiki.toml streams list
@@ -38,14 +38,14 @@ Every mutation needs `--reason` and sends an idempotency key. `--idempotency-key
 
 ```sh
 reiki --config /etc/reiki/reiki.toml streams --reason "tenant limit change" \
-  --idempotency-key tenant-a-20261123-1 update tenant-a --key zen-b --rpm 90 --tpm 100000
+  --idempotency-key tenant-a-limit-1 update tenant-a --key zen-b --rpm 90 --tpm 100000
 ```
 
 With two-party confirmation, the second operator's token in `confirm_env` must accompany every mutation. Failed attempts are throttled per source and locked out after `lockout_threshold` failures for `lockout_secs` seconds.
 
 ## Rotate and revoke tokens
 
-Rotation is additive: issue a second token, update the client, then revoke the old id. A stream can hold at most `max_tokens_per_stream` tokens including the first one, so revoke before adding when it is full.
+Rotation is additive: issue a second token, update the client, then revoke the old id. A stream can hold at most `max_tokens_per_stream` tokens including the first, so revoke before adding when it is full.
 
 ```sh
 reiki --config /etc/reiki/reiki.toml streams --reason "scheduled rotation" token add tenant-a --ttl 3600
@@ -69,7 +69,7 @@ Tokens are stored as hashes with ids and expiry times in the state file. Replaci
 
 ## Limits
 
-Dynamic streams use the same admission path as static streams. Every value sent by the API must stay within `[stream_admin.ceilings]` (`rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `monthly_requests`, `monthly_tokens`). CLI-created streams start without per-stream limits. `update NAME --rpm N --tpm N` sets those two limits, while the HTTP create route can send a fuller `limits` object. `on_store_error` from `[gateway]` defaults to `"closed"`, so a counter store failure refuses admission rather than letting unlimited traffic through; self-service `GET /v1/usage` has its own `[gateway] usage_rpm` budget. See [limits](limits.md) and [configuration](configuration.md#gateway).
+Dynamic streams use the same admission path as static streams. Every value sent by the API must stay within `[stream_admin.ceilings]` (`rpm`, `tpm`, `concurrent`, `daily_requests`, `daily_tokens`, `monthly_requests`, `monthly_tokens`). CLI-created streams start without per-stream limits. `update NAME --rpm N --tpm N` sets those two limits, while the HTTP create route can send a fuller `limits` object. `[gateway] on_store_error` defaults to `"closed"`, so a counter-store failure refuses admission rather than letting unlimited traffic through; self-service `GET /v1/usage` has its own `[gateway] usage_rpm` budget. See [shaping](shaping.md) and [configuration](configuration.md).
 
 The management API cannot set `allowed_upstreams` or `allowed_models`: those glob allowlists belong to statically configured `[streams.NAME]` entries. Keep credential-bearing routes on static streams when a tenant must be confined to particular upstreams or models. Per-stream `weight` is also a static-stream setting and controls fair sharing of contested keys.
 
@@ -82,11 +82,11 @@ reiki streams audit verify /etc/reiki/stream-admin-audit.jsonl
 reiki streams audit head /etc/reiki/stream-admin-audit.jsonl --n 5
 ```
 
-`verify` prints `ok: N audit record(s), chain verified` on success and exits `0`. A changed record can be reported as `hash mismatch`, `sequence gap`, `invalid record` or `audit line N: broken chain`; a missing sidecar for a non-empty log is reported as `audit head missing`, and tail deletion or truncation as `audit head mismatch: records were removed or truncated`. Verification errors exit `2`. The sibling `audit.head` sidecar holds the last sequence number and hash; keep it beside the JSONL file or tail deletion will not be detected, and an empty log without a sidecar verifies as zero records. Both commands need the JSONL file, but no running instance or token.
+`verify` prints `ok: N audit record(s), chain verified` on success and exits `0`. A changed record is reported as `hash mismatch`, `sequence gap`, `invalid record` or `audit line N: broken chain`; a missing sidecar for a non-empty log is `audit head missing`, and tail deletion or truncation is `audit head mismatch: records were removed or truncated`. Verification errors exit `2`. The sibling `audit.head` sidecar holds the last sequence number and hash; keep it beside the JSONL file or tail deletion will not be detected, and an empty log without a sidecar verifies as zero records. Both commands need the JSONL file, but no running instance or token.
 
 ## Backup and restore
 
-The dynamic state file is written atomically with mode `0600`. It lives in the state directory beside `<config>.state`; with the default name and `/etc/reiki/reiki.toml`, that is `/etc/reiki/stream-admin.json`. The audit log is `/etc/reiki/stream-admin-audit.jsonl` in the same directory, with its sidecar `/etc/reiki/stream-admin-audit.head`. Both names are relative in the config and may be changed with `state_file` and `audit_log`. See [operations](operations.md#backup-and-restore) for the full file table.
+The dynamic state file is written atomically with mode `0600`. It lives in the state directory beside `<config>.state`; with the default name and `/etc/reiki/reiki.toml`, that is `/etc/reiki/stream-admin.json`. The audit log is `/etc/reiki/stream-admin-audit.jsonl` in the same directory, with its sidecar `/etc/reiki/stream-admin-audit.head`. Both names are relative in the config and may be changed with `state_file` and `audit_log`. See [backup and restore](deploy.md#backup-and-restore) for the full file table.
 
 To back up, stop the instance (or copy immediately after a successful write) and copy these three files together, keeping owner and mode:
 

@@ -4,7 +4,7 @@
 
 Use GitHub's [private vulnerability reporting](https://github.com/ddproxy/reiki/security/advisories/new) (the **Report a vulnerability** button on the repository's Security tab). Do not open a public issue for an unfixed vulnerability.
 
-Reiki holds upstream API keys, so reports about credential exposure, header handling, request routing or the admin listener are especially welcome. See [security](docs/security.md) for the trust model and [security scanning](docs/security-scanning.md) for the checks this repository runs.
+Reiki holds upstream API keys, so reports about credential exposure, header handling, request routing or the admin listener are especially welcome. See [security](docs/security.md) for the trust model and release verification.
 
 ## Supported versions
 
@@ -24,4 +24,4 @@ Complex reports can take longer; you will get a status update before a target is
 ## More
 
 - [Published advisories](https://github.com/ddproxy/reiki/security/advisories)
-- [Releases and verification](https://github.com/ddproxy/reiki/releases): see [security scanning](docs/security-scanning.md) for `gh attestation verify`
+- [Releases and verification](https://github.com/ddproxy/reiki/releases): see [security](docs/security.md) for `gh attestation verify`

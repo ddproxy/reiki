@@ -20,8 +20,7 @@ const CHECKED_FILES: &[&str] = &[
     "SECURITY.md",
     "llms.txt",
     "docs/README.md",
-    "docs/install.md",
-    "docs/operations.md",
+    "docs/deploy.md",
     "docs/dynamic-streams.md",
 ];
 

@@ -238,7 +238,7 @@ fn sighup_reloads_the_running_instance() {
 }
 
 #[test]
-fn check_prints_the_connection_caps_and_names_unserved_hub_tables() {
+fn check_prints_the_connection_caps() {
     let dir = std::env::temp_dir().join(format!("reiki-check-caps-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     write_key(dir.join("key"), "upstream-secret\n");
@@ -249,8 +249,6 @@ fn check_prints_the_connection_caps_and_names_unserved_hub_tables() {
          [keys.k1]\nupstream = \"api\"\nfile = \"{}/key\"\n",
         dir.display()
     );
-    #[cfg(feature = "hub")]
-    let text = format!("{text}[accounts.acct-a]\nupstream = \"api\"\nkeys = [\"k1\"]\n");
     std::fs::write(&config, text).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_reiki"))
         .arg("--config")
@@ -265,11 +263,6 @@ fn check_prints_the_connection_caps_and_names_unserved_hub_tables() {
     assert!(out.status.success(), "{stdout}{stderr}");
     assert!(
         stdout.contains("caps: client 32 (8 per address), admin 64 (16 per address)"),
-        "{stdout}"
-    );
-    #[cfg(feature = "hub")]
-    assert!(
-        stdout.contains("hub: configured but not served in this version"),
         "{stdout}"
     );
 }

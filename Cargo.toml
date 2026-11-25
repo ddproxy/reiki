@@ -125,8 +125,6 @@ plugin-wasm = ["dep:reiki-wasm"]
 peers = ["dep:rustix"]
 # `reiki top`: a live terminal fleet view of the configured peers.
 top = ["peers", "dep:reiki-top", "reiki-top/tui"]
-# Hub config: `[hubs]`, `[hub]` and `[accounts]` parse and validate; no listener or client is built.
-hub = []
 # Exposes bounded parser entry points to the cargo-fuzz targets in `fuzz/`. Never enabled by
 # default or in a release build; see `src/fuzzing.rs` for what this adds to the public API.
 fuzzing = ["peers"]

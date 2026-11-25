@@ -30,6 +30,10 @@
 ### Removed
 
 - **Breaking:** removed `[stream_admin].default_limits`; it was validated but never applied. Delete the table from configs before upgrading.
+- **Breaking:** removed the `hub` Cargo feature and its parse-only configuration.
+- **Breaking:** removed `[hubs.NAME]`, `[hub]`, `[hub.edges.NAME]` and `[accounts.LABEL]` tables; configs using them are now refused as unknown fields.
+- **Breaking:** `reiki check` no longer prints the unserved-hub-tables line.
+- **Breaking:** documentation pages were consolidated; deleted pages and old links now point to one owner page per topic.
 
 ## 0.15.1
 

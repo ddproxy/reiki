@@ -18,24 +18,26 @@ Start with the symptom. Every command below reads local config or the admin list
 | Admin listener will not start | `journalctl -u reiki -f`, `reiki check` | `[admin].listen` is not a literal loopback IP and port; hostnames such as `localhost:9090` are refused | Use `127.0.0.1:9090` or `[::1]:9090`, with TLS terminated in front for remote access |
 | Reiki exits before listening | `journalctl -u reiki -f` | `state directory ... is not writable` names the path and the OS cause (a `log directory ... is not writable` line is only a warning and the log file is off for that run) | With `[gateway] on_store_error = "closed"` (default) fix owner, mode or free space, or add the directory to `ReadWritePaths=` in the unit; with `"open"` Reiki logs a `WARN` and continues |
 
-`reiki failures` takes `--limit` from 1 to 64, defaults to 20, filters with `--key NAME`, and prints the same ring as JSON with `--json`. `reiki keys` prints a table by default and adds `scopes` with `--json`. Both exit 0 on a good answer, 1 on a refusal and 2 when the admin listener cannot be reached.
+`reiki failures` takes `--limit` from 1 to 64, defaults to 20, filters with `--key NAME` and `--stream NAME`, and prints the same ring as JSON with `--json`. The `ACTION` column says what the failover walk did: `cooldown`, `rotate` or `pass-through`. `reiki keys` prints a table by default and adds `scopes` with `--json`. Both exit 0 on a good answer, 1 on a refusal and 2 when the admin listener cannot be reached.
 
 ## Worked example: quota, rate limit or request size
 
 Run `reiki failures --limit 20`:
 
 ```text
-TIME                 STREAM    KEY     STATUS CLASS           COOLED NOTE
-2026-11-18 10:04:11  client-a  zen-a   429    quota_exhausted  18000s quota exceeded for this key
-2026-11-18 10:04:18  client-b  zen-a   429    rate_limited     60s    rate limit exceeded
-2026-11-18 10:05:02  client-a  zen-b   402    quota_exhausted  60s    credit balance is too low
+TIME                 STREAM    KEY     STATUS CLASS           ACTION      COOLED NOTE
+2026-11-18 10:04:11  client-a  zen-a   429    quota_exhausted  cooldown    18000s quota exceeded for this key
+2026-11-18 10:04:18  client-b  zen-a   429    rate_limited     cooldown    60s    rate limit exceeded
+2026-11-18 10:05:02  client-a  zen-b   402    quota_exhausted  cooldown    60s    credit balance is too low
 ```
 
 - The `quota_exhausted` row with a whole-key cooldown of `18000s` is an out-of-quota answer. The `18000s` is the configured reset or `Retry-After`; the [cooldown table](classification.md#cooldowns) gives the precedence.
 - The `rate_limited` row with `60s` is an upstream rate limit. `reiki keys --json` shows it under `scopes` when the request carried a model, on the key itself otherwise.
-- The `402` row is quota exhaustion from a body that says the credit balance is low. A request-size refusal with `fewer max_tokens` or `can only afford` is a pass-through, so it produces no ring row; the client sees the scrubbed `402` body with the phrase. Confirm with `reiki failures --limit 20 --key zen-b --json` and the client's response body.
+- The `402` row is quota exhaustion from a body that says the credit balance is low. A request-size refusal with `fewer max_tokens` or `can only afford` is a `request_error` row with `ACTION pass-through`; the key is not cooled and the client sees the scrubbed `402` body with the phrase. Confirm with `reiki failures --limit 20 --key zen-b --json` and the client's response body.
 
-The `COOLED` column prints seconds for a key that started cooling and `yes` for a disabled key. `STATUS -` marks a transport failure. The ring is in memory, holds the latest 64 entries and starts empty after a restart.
+`ACTION` is `cooldown` when the key or one scope cooled, `rotate` when an `unauthorized` answer disabled the key until its file is replaced, and `pass-through` when the key was only skipped for that request. A `pass-through` row still has `COOLED -`.
+
+The `COOLED` column prints seconds for a key that started cooling and `yes` for a disabled key. `STATUS -` marks a transport failure. The ring is in memory, holds the latest `failure_ring_size` entries (`200` by default, `0` disables) and starts empty after a restart. `reiki_failure_ring_entries` and `reiki_failure_ring_dropped_total` on `/v1/metrics` show its current size and drops.
 
 ## Check the setup
 

@@ -225,6 +225,7 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     assert_eq!(first["stream"], "s");
     assert_eq!(first["status"], 429);
     assert_eq!(first["class"], "rate_limited");
+    assert_eq!(first["action"], "cooldown");
     assert_eq!(first["retry_after"], "120");
     assert_eq!(first["cooled"], true);
     assert!(
@@ -244,7 +245,25 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert!(empty.is_empty(), "the key filter must exclude the failure");
 
-    for bad in ["?limit=0", "?limit=65", "?limit=x", "?key=%zz", "?other=1"] {
+    let (_, body) = rig.admin_get("/v1/failures?stream=s", true).await;
+    let matched: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(matched.len(), all.len(), "the stream filter must match");
+    let (_, body) = rig.admin_get("/v1/failures?stream=t", true).await;
+    let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert!(
+        empty.is_empty(),
+        "the stream filter must exclude the failure"
+    );
+
+    for bad in [
+        "?limit=0",
+        "?limit=65",
+        "?limit=x",
+        "?key=%zz",
+        "?stream=",
+        "?stream=%zz",
+        "?other=1",
+    ] {
         let (code, _) = rig.admin_get(&format!("/v1/failures{bad}"), true).await;
         assert_eq!(code, 400, "{bad}");
     }
@@ -263,7 +282,9 @@ async fn the_failures_table_and_json_read_the_same_ring() {
     .unwrap();
     assert_eq!(code, 0, "{err}");
     let header = out.lines().next().unwrap();
-    for column in ["TIME", "STREAM", "KEY", "STATUS", "CLASS", "COOLED", "NOTE"] {
+    for column in [
+        "TIME", "STREAM", "KEY", "STATUS", "CLASS", "ACTION", "COOLED", "NOTE",
+    ] {
         assert!(header.contains(column), "{header}");
     }
     let row = out.lines().nth(1).unwrap();
@@ -272,6 +293,7 @@ async fn the_failures_table_and_json_read_the_same_ring() {
         "the failure class must be shown"
     );
     assert!(row.contains("429"), "the failure status must be shown");
+    assert!(row.contains("cooldown"), "the action must be shown");
 
     let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
     let (code, out, err) = tokio::task::spawn_blocking(move || {
@@ -294,6 +316,15 @@ async fn the_failures_table_and_json_read_the_same_ring() {
     let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
     let (code, out, err) = tokio::task::spawn_blocking(move || {
         reiki_failures(&["--url", &url, "--token-file", &token, "--key", "gone"])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "no failures\n");
+
+    let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        reiki_failures(&["--url", &url, "--token-file", &token, "--stream", "gone"])
     })
     .await
     .unwrap();

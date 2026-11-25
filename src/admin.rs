@@ -228,17 +228,22 @@ async fn openapi(
             op["parameters"] = serde_json::json!([
                 {
                     "name": "limit", "in": "query", "required": false,
-                    "schema": {"type": "integer", "minimum": 1, "maximum": crate::failures::CAPACITY},
-                    "description": "Records to return, newest first; the default is the whole ring",
+                    "schema": {"type": "integer", "minimum": 1, "maximum": crate::failures::MAX_QUERY_LIMIT},
+                    "description": "Records to return, newest first; defaults to 64",
                 },
                 {
                     "name": "key", "in": "query", "required": false,
                     "schema": {"type": "string"},
                     "description": "Only failures for this key name",
                 },
+                {
+                    "name": "stream", "in": "query", "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Only failures for this stream name",
+                },
             ]);
             op["responses"]["400"] = serde_json::json!({
-                "description": "limit is not 1..=64, a flag is repeated, or the key name is empty or invalid percent-encoding"
+                "description": "limit is not 1..=64, a flag is repeated, or a name is empty or invalid percent-encoding"
             });
         }
         if *path == "/stream-console" {
@@ -643,11 +648,13 @@ async fn failures(
         Ok(class) => class,
         Err(refusal) => return *refusal,
     };
-    let (limit, key) = match parse_failures_query(uri.query().unwrap_or("")) {
+    let (limit, key, stream) = match parse_failures_query(uri.query().unwrap_or("")) {
         Ok(query) => query,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, "bad_request", e),
     };
-    let mut records = app.failures().snapshot(limit, key.as_deref());
+    let mut records = app
+        .failures()
+        .snapshot(limit, key.as_deref(), stream.as_deref());
     if class == TokenClass::ReadOnly {
         // Snippets are upstream body text; the read-only token gets the facts without them.
         for record in &mut records {
@@ -799,11 +806,15 @@ fn console_limits(limits: Option<&crate::config::StreamLimits>) -> Value {
     })
 }
 
-/// Reads `limit` and `key` strictly: a repeated or unknown flag, a bare `limit`, an empty key or
-/// invalid percent-encoding answers 400 rather than returning a list that was not asked for.
-fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static str> {
-    let mut limit = crate::failures::CAPACITY;
+/// Reads `limit`, `key` and `stream` strictly: a repeated or unknown flag, a bare `limit`, an
+/// empty name or invalid percent-encoding answers 400 rather than returning a list that was not
+/// asked for.
+fn parse_failures_query(
+    query: &str,
+) -> Result<(usize, Option<String>, Option<String>), &'static str> {
+    let mut limit = crate::failures::MAX_QUERY_LIMIT;
     let mut key: Option<String> = None;
+    let mut stream: Option<String> = None;
     let mut saw_limit = false;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let Some((name, value)) = pair.split_once('=') else {
@@ -818,7 +829,7 @@ fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static
                 let parsed = value
                     .parse::<usize>()
                     .ok()
-                    .filter(|limit| (1..=crate::failures::CAPACITY).contains(limit))
+                    .filter(|limit| (1..=crate::failures::MAX_QUERY_LIMIT).contains(limit))
                     .ok_or("limit must be a whole number from 1 to 64")?;
                 limit = parsed;
             }
@@ -832,10 +843,20 @@ fn parse_failures_query(query: &str) -> Result<(usize, Option<String>), &'static
                         .ok_or("the key name is empty or not valid percent-encoding")?,
                 );
             }
-            _ => return Err("unknown flag; use limit and key"),
+            "stream" => {
+                if stream.is_some() {
+                    return Err("stream may be given only once");
+                }
+                stream = Some(
+                    decode_query_value(value)
+                        .filter(|stream| !stream.is_empty())
+                        .ok_or("the stream name is empty or not valid percent-encoding")?,
+                );
+            }
+            _ => return Err("unknown flag; use limit, key and stream"),
         }
     }
-    Ok((limit, key))
+    Ok((limit, key, stream))
 }
 
 /// Host-owned gauge appended to `/v1/metrics`, so a closed store is visible even without
@@ -898,6 +919,7 @@ async fn plugin_route(
         .stream_admin()
         .map_or_else(String::new, |manager| manager.metrics().render());
     extra.push_str(&gateway_store_metrics(app.gateway().store_ok()));
+    extra.push_str(&app.failures().metrics());
     extra.push_str(&app.plugins().metrics_text());
     match app.plugins().on_admin_with_extra(
         path,
@@ -1951,15 +1973,19 @@ mod tests {
 
     #[test]
     fn failures_query_defaults_and_filters_are_strict() {
-        assert_eq!(parse_failures_query(""), Ok((64, None)));
-        assert_eq!(parse_failures_query("limit=1"), Ok((1, None)));
+        assert_eq!(parse_failures_query(""), Ok((64, None, None)));
+        assert_eq!(parse_failures_query("limit=1"), Ok((1, None, None)));
         assert_eq!(
             parse_failures_query("key=a%2Fb"),
-            Ok((64, Some("a/b".to_owned())))
+            Ok((64, Some("a/b".to_owned()), None))
         );
         assert_eq!(
-            parse_failures_query("limit=64&key=a"),
-            Ok((64, Some("a".to_owned())))
+            parse_failures_query("stream=s%2Ft"),
+            Ok((64, None, Some("s/t".to_owned())))
+        );
+        assert_eq!(
+            parse_failures_query("limit=64&key=a&stream=s"),
+            Ok((64, Some("a".to_owned()), Some("s".to_owned())))
         );
         for bad in [
             "limit=0",
@@ -1970,6 +1996,9 @@ mod tests {
             "key=",
             "key=%zz",
             "key=a&key=b",
+            "stream=",
+            "stream=%zz",
+            "stream=s&stream=t",
             "other=1",
             "other",
         ] {

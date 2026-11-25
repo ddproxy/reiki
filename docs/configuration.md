@@ -52,6 +52,7 @@ Client, admin and tunnel addresses must differ from each other. A publishing pee
 | --- | --- | --- | --- |
 | `listen` | string | `"127.0.0.1:4097"` | Client listener address. `--listen` and `REIKI_LISTEN` override it. |
 | `strict_key_permissions` | bool | `true` | Refuse to load a key file with group or other read or write bits; execute bits do not matter. Set to `false` to accept it with a warning instead. |
+| `failure_ring_size` | integer | `200` | Recent key failures kept in memory across all streams; `0` disables the ring and the maximum is `10,000`. A reload applies a smaller cap by dropping the oldest records. See [GET /v1/failures](monitoring.md#get-v1failures). |
 
 ## `[admin]`
 

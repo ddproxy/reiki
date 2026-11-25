@@ -94,11 +94,11 @@ Inside the Peers panel:
 
 ### Failures
 
-Every peer's health document carries a `failures` object: counts of recent key failures by class over an in-memory ring of at most 64. The detail card prints those counts as `failures: rate_limited 2  transient 1`; names, streams and bodies are never published, so a remote peer can only be compared, not investigated.
+Every peer's health document carries a `failures` object: counts of recent key failures by class over the peer's in-memory ring (`failure_ring_size`, 200 by default). The detail card prints those counts as `failures: rate_limited 2  transient 1`; names, streams, actions and bodies are never published, so a remote peer can only be compared, not investigated.
 
 A peer with summary export enabled also publishes `requestlog_export_dropped_total`. When it is above zero, the detail card prints it as `export drops: N`; older peers without the field count as zero. See [summary export](requestlog.md#summary-export).
 
-The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_READ_TOKEN` or `REIKI_ADMIN_TOKEN` holds one of its admin tokens (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, cooldown left and the scrubbed body snippet. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
+The full recent-failure list is shown only for the local instance, and only when `REIKI_ADMIN_READ_TOKEN` or `REIKI_ADMIN_TOKEN` holds one of its admin tokens (together with `[admin] listen` in the config). `reiki top` finds the local peer by matching its published `instance` to `[peers] instance`, or `reiki` when that is not set. For that peer the card adds one line per failure: time, stream, key, status, class, action, cooldown left and the scrubbed body snippet. With the read-only token the action is still shown; only the snippet is withheld. A remote peer's card keeps the counts, even when the local admin listener is configured. If the admin listener is missing, unreachable or refuses the token, the counts still appear and only the rows are absent.
 
 See [`GET /v1/failures`](monitoring.md#get-v1failures) for the fields and the `reiki failures` command.
 

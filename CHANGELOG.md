@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The in-memory recent-key-failure ring now holds `failure_ring_size` entries (200 by default, `0` disables, 10,000 maximum) instead of a fixed 64, with reload applying a smaller cap by dropping the oldest records. Each row carries an `action` of `cooldown`, `rotate` or `pass-through`, and body snippets are capped at 200 bytes rather than characters. `GET /v1/failures` and `reiki failures` accept a `stream` filter, `reiki top` shows the action in local failure rows, and `/v1/metrics` appends `reiki_failure_ring_entries` and `reiki_failure_ring_dropped_total`. The query `limit` remains capped at 64. See [monitoring](docs/monitoring.md#get-v1failures) and [configuration](docs/configuration.md#top-level).
+
 ### Changed
 
 - Public-repo hygiene: examples and tests use documentation IP ranges and neutral upstream names. Private literals remain only in the tunnel policy tests, each with a one-line comment explaining why. A tracked-file check rejects internal hostnames and domains, with justified exceptions in an allowlist, and runs in CI. No behavior, wire format or stored value changed.

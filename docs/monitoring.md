@@ -170,11 +170,11 @@ Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current
 
 ## GET /v1/failures
 
-Method `GET`. Auth: either token. Query: `limit` (1 to 64, default 64), `key` (one key name). Returns the in-memory ring, newest first. `note` is the scrubbed body snippet for the full token and `null` for the read-only token. A repeated flag, a bad `limit`, an empty key or invalid percent-encoding gets `400` with the [error envelope](#error-envelope).
+Method `GET`. Auth: either token. Query: `limit` (1 to 64, default 64), `key` (one key name), `stream` (one stream name). Returns the in-memory ring, newest first. `note` is the scrubbed body snippet for the full token and `null` for the read-only token. A repeated flag, a bad `limit`, an empty name or invalid percent-encoding gets `400` with the [error envelope](#error-envelope).
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  'http://127.0.0.1:4098/v1/failures?limit=2&key=zen-b' | jq .
+  'http://127.0.0.1:4098/v1/failures?limit=2&stream=client-b&key=zen-b' | jq .
 ```
 
 ```json
@@ -185,6 +185,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
     "key": "zen-b",
     "status": 429,
     "class": "rate_limited",
+    "action": "cooldown",
     "retry_after": "30",
     "cooled": true,
     "cooling_seconds": 60,
@@ -192,10 +193,11 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   },
   {
     "time": 1763464980,
-    "stream": "client-a",
+    "stream": "client-b",
     "key": "zen-b",
     "status": null,
     "class": "transient",
+    "action": "pass-through",
     "retry_after": null,
     "cooled": false,
     "cooling_seconds": null,
@@ -210,12 +212,13 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 | `stream`, `key` | Where the failure happened |
 | `status` | Upstream status, or `null` for a transport failure |
 | `class` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error` |
-| `retry_after` | Received `Retry-After` header, cut to 64 characters, or `null` |
+| `action` | `cooldown` when this failure cooled a scope or the key, `rotate` when an `unauthorized` disabled the key, or `pass-through` when the key was only skipped for this request |
+| `retry_after` | Received `Retry-After` header, cut to 64 bytes, or `null` |
 | `cooled` | True when this failure started a cooldown or disabled the key |
 | `cooling_seconds` | Seconds left on the key's cooldown, or `null` |
-| `note` | Printable body snippet up to 200 characters with credentials scrubbed |
+| `note` | Printable body snippet up to 200 bytes with credentials scrubbed |
 
-The ring holds 64 entries, starts empty after a restart, and drops a record when another thread holds the buffer. `reiki failures --limit 20` prints this data as a table; `--json` prints the array. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
+The ring is in memory only: [`failure_ring_size`](configuration.md#top-level) sets its capacity, `200` by default, `0` disables it and the maximum is `10,000`. It starts empty after a restart and drops a record when it is full, disabled or another thread holds the buffer. A reload applies a smaller cap by dropping the oldest records. `limit` stays capped at `64` regardless of capacity. `reiki failures --limit 20` prints this data as a table; `--json` prints the array. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
 
 ## GET /v1/stream-console
 
@@ -389,6 +392,8 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_gateway_rejections_total` | counter | `stream`, `reason` | Requests refused by stream limits or allowlists; `reason` is a fixed label such as `rate`, `tokens`, `model`, `model_unknown`, `concurrent`, `quota_requests`, `quota_tokens`, `fairness` or `store_closed` |
 | `reiki_gateway_store_errors_total` | counter | `stream` | Counter-store failures while serving in `open` mode |
 | `reiki_gateway_store_ok` | gauge | none | `1` while counter state is readable and writable, `0` while the gateway store is closed |
+| `reiki_failure_ring_entries` | gauge | none | Recent upstream failures currently held in the in-memory ring |
+| `reiki_failure_ring_dropped_total` | counter | none | Failures not retained because the ring was full, disabled or contended |
 | `reiki_plugin_rejections_total` | counter | `plugin`, `stream` | Plugin rejections, plus skips and panics under `on_error = "reject"` |
 | `reiki_findings_total` | counter | `stream`, `plugin`, `kind`, `action` | Identifiers found in bodies by `phi`, `finance` or `controlled`; `action` is `blocked` or `reported` |
 | `reiki_tokens_total` | counter | `stream`, `upstream`, `direction` | Input and output tokens reported by providers |
@@ -407,7 +412,7 @@ The content type is `text/plain; version=0.0.4; charset=utf-8`. Counters survive
 | `reiki_dynamic_streams` | gauge | none | Active dynamic streams; only with `[stream_admin]` |
 | `reiki_stream_tokens_expiring_soon` | gauge | none | Unexpired dynamic stream tokens expiring within one hour; only with `[stream_admin]` |
 
-`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The four `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists). The observed series come from the in-memory observation store; `account` stays out of metrics to keep cardinality bounded by upstream and class. `reiki_gateway_store_ok` is appended by the host on every scrape, so it appears even without a plugin counter for store failures. The three stream-management series are appended to this same route when `[stream_admin]` is configured and are absent otherwise. The cost plugin's series are appended when `[plugins.cost]` is active. Their `stream` and `upstream` labels are capped at 64 bytes, at most 64 series are emitted, and a `model` label appears only for names in `model_label_allowlist`; no price, token or request value is ever a label.
+`status` is `success` for `100`–`399`, `client_error` for `400`–`499` and `server_error` for the rest. `class` uses the names in [response classification](classification.md#response-rules). `reiki_findings_total` keeps a plugin's `detail` label out of its series and never holds a matched identifier value. The four `reiki_upstream_*_1h` gauges are sampled from the same counters behind `GET /v1/health`: they age out, restart at zero with the process, and appear while usage exposure is on (`expose_usage` defaults to true, including when no `[peers]` table exists). The observed series come from the in-memory observation store; `account` stays out of metrics to keep cardinality bounded by upstream and class. `reiki_gateway_store_ok` and the two `reiki_failure_ring_*` series are appended by the host on every scrape, so they appear even without plugin routes for store failures or ring metrics. The three stream-management series are appended to this same route when `[stream_admin]` is configured and are absent otherwise. The cost plugin's series are appended when `[plugins.cost]` is active. Their `stream` and `upstream` labels are capped at 64 bytes, at most 64 series are emitted, and a `model` label appears only for names in `model_label_allowlist`; no price, token or request value is ever a label.
 
 ## GET /v1/toolpolicy/metrics
 

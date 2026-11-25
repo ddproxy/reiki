@@ -228,7 +228,14 @@ fn documented_commands_and_flags_exist_in_the_binary() {
         ),
         (
             vec!["failures"],
-            vec!["--limit", "--key", "--json", "--url", "--token-file"],
+            vec![
+                "--limit",
+                "--key",
+                "--stream",
+                "--json",
+                "--url",
+                "--token-file",
+            ],
         ),
         (vec!["reload"], vec!["--dry-run", "--url", "--token-file"]),
         (vec!["scan"], vec!["--plugin", "--kinds", "--all", "--json"]),
@@ -277,9 +284,25 @@ fn docs_keep_adding_config_keys_and_stream_flags() {
     for path in CHECKED_FILES {
         docs.push_str(&text(path));
     }
+    for path in [
+        "docs/configuration.md",
+        "docs/monitoring.md",
+        "docs/troubleshooting.md",
+        "docs/cli.md",
+        "docs/top.md",
+    ] {
+        docs.push_str(&text(path));
+    }
     assert_all(
         &docs,
         &[
+            "failure_ring_size",
+            "reiki_failure_ring_entries",
+            "reiki_failure_ring_dropped_total",
+            "--stream",
+            "pass-through",
+            "cooldown",
+            "rotate",
             "on_store_error",
             "usage_rpm",
             "allowed_upstreams",

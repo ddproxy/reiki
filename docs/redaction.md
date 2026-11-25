@@ -9,7 +9,7 @@ How Reiki removes an upstream key when an upstream echoes it back. Keys are neve
 | Headers relayed to the client | `scrub` in `src/proxy.rs` | `[redacted]` | Changes |
 | Upstream error body before it is cut to 64 KiB | `scrub` in `src/proxy.rs` | `[redacted]` | Changes |
 | Successful response body, streamed | `StreamScrubber` in `src/scrub.rs` | A same-length `[***…]` marker | Kept |
-| Failure-ring snippet and `Retry-After` note | `scrub_text` in `src/scrub.rs` | A same-length `[***…]` marker | Kept |
+| Failure-ring snippet and `Retry-After` note | `scrub_text` in `src/scrub.rs` | A same-length `[***…]` marker | Kept, cut to 200 and 64 bytes respectively |
 
 A successful body keeps its length, so a `content-length` stays correct. A streamed body holds back only the suffix that could still become the start of a key, so an event is not delayed when no key is pending. Scrubbing runs before plugins see the response. `tests/scrub_success.rs` covers the successful path and `tests/scrub_failures.rs` covers ring snippets.
 

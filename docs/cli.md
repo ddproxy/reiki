@@ -1,34 +1,34 @@
 # Command line
 
-`reiki` runs the proxy when given no subcommand. The other subcommands check config, read a running instance, or do one job and exit.
+`reiki` runs the proxy with no subcommand. Other subcommands check config, read a running instance or do one job and exit.
 
 ```
 reiki [--config PATH] [--listen ADDR] [COMMAND [ARGS]]
 ```
 
-`reiki COMMAND --help` prints the flags for each command. `reiki --version` prints the build version.
+`reiki COMMAND --help` prints the flags for each command; `reiki --version` prints the build version. The argument parser exits `2` for a usage error, such as an unknown or conflicting flag. Individual commands add their own codes.
 
 ## Global options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by `check`, server mode, `keys`, `failures`, `reload`, `streams`, `peers`, `top` and `cost` (when `--url` is omitted). `hash-token`, `ca-init` and `scan` do not read it. |
-| `--listen ADDR` | from `listen` in the config | Client listen address. Used by server mode and `check`. Other commands ignore it. |
+| `--config PATH` | `/etc/reiki/reiki.toml` | Config file. Read by server mode, `check`, `keys`, `failures`, `reload`, `streams`, `peers`, `top` and `cost` (when `--url` is omitted). `hash-token`, `ca-init` and `scan` do not read it. |
+| `--listen ADDR` | `listen` in the config | Client listen address. Used by server mode and `check`; other commands ignore it. |
 
 ### Environment
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
-| `REIKI_LISTEN` | server mode, `check` | Client listen address. Overridden by `--listen`; overrides `listen` in the config. |
-| `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top`, `cost` | Admin token, when `--token-file` is not given. `top` uses it only to read the local instance's full failure rows. `streams` uses the separate `REIKI_STREAM_ADMIN_TOKEN` by default. |
-| `REIKI_ADMIN_READ_TOKEN` | `top` | Optional read-only admin token. `top` prefers it over `REIKI_ADMIN_TOKEN`; its failure rows then have no body snippets. Mutating commands do not read it. |
+| `REIKI_LISTEN` | server mode, `check` | Client address. Overridden by `--listen`; overrides `listen` in the config. |
+| `REIKI_ADMIN_TOKEN` | `reload`, `keys`, `failures`, `top`, `cost` | Admin token when `--token-file` is not given. `top` uses it only for full local failure rows. `streams` uses `REIKI_STREAM_ADMIN_TOKEN` instead. |
+| `REIKI_ADMIN_READ_TOKEN` | `top` | Optional read-only admin token. Preferred over `REIKI_ADMIN_TOKEN`; failure rows then omit body snippets. Mutating commands do not read it. |
 | `RUST_LOG` | server mode | Log filter. Overrides `[log] level` at startup and after reload. |
 
-`--listen` and `REIKI_LISTEN` accept an `IP:port` address or a `host:port` name.
+`--listen` and `REIKI_LISTEN` accept `IP:port` or `host:port`.
 
 ## Exit codes
 
-The argument parser exits `2` on a usage error: an unknown flag, or two flags that conflict. Beyond that, each command lists its own exit codes in its section. Codes are not the same across commands. For example, a config that does not parse exits `1` for `check` and `2` for `keys`.
+`0` is success and `2` is an argument-parser usage error unless a command says otherwise. A config that does not parse exits `1` for `check` and `2` for `keys`. Codes are not uniform across commands; each section below lists them.
 
 ## Server mode
 
@@ -36,14 +36,15 @@ The argument parser exits `2` on a usage error: an unknown flag, or two flags th
 reiki --config /etc/reiki/reiki.toml
 ```
 
-Starts the client listener, and the admin, peer and tunnel listeners when configured. Logs go to stderr and to `[log] file` when set. Runs until SIGTERM or SIGINT. SIGHUP reloads the config.
+Starts the client listener and the admin, peer and tunnel listeners when configured. Logs go to stderr and to `[log] file` when set. Runs until SIGTERM or SIGINT; SIGHUP reloads the config.
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Stopped cleanly after a signal. |
-| `1` | Startup failed: config, key files, plugin build or a listener could not be bound. |
+| `0` | Clean stop after a signal. |
+| `1` | Startup failed: config, key files, plugin build or listener bind. |
+| `143` / `130` | Second stop signal during drain: SIGTERM / SIGINT. |
 
-Send SIGTERM for a clean stop. Requests in flight get `[service] shutdown_timeout_secs`. A second signal exits at once. See [deploy](deploy.md#signals-and-lifecycle).
+SIGTERM starts a clean stop; in-flight requests get `[service] shutdown_timeout_secs`. See [deploy](deploy.md).
 
 ## hash-token
 
@@ -55,28 +56,22 @@ reiki hash-token
 
 | Behaviour | Detail |
 | --- | --- |
-| Input | All of stdin. Leading and trailing whitespace is removed. |
-| Length | At least 16 characters. A shorter token is refused. |
+| Input | All of stdin, trimmed of leading and trailing whitespace. |
+| Length | At least 16 characters; a shorter token is refused. |
 | Output | 64 lowercase hex characters and a newline. |
 
-Exit codes: `0` on success; `1` when the token is too short or stdin cannot be read.
+Exit `0` on success, `1` when the token is too short or stdin cannot be read.
 
-Example, with a token generated for one client:
-
-```
+```sh
 openssl rand -hex 24 > client.token
 reiki hash-token < client.token
 ```
 
-```
-<64 hex characters>
-```
-
-Keep `client.token` for the client. Put only the hash in the config.
+Keep `client.token` for the client; put only the hash in the config. See [keys](keys.md).
 
 ## check
 
-Loads the config the way the service does, then exits. It does not contact the upstream, an admin listener or a peer.
+Loads the config the way the service does, then exits. It does not contact an upstream, admin listener or peer.
 
 ```
 reiki --config /etc/reiki/reiki.toml check
@@ -84,26 +79,26 @@ reiki --config /etc/reiki/reiki.toml check
 
 | Step | Checked |
 | --- | --- |
-| Config | Parse and validate every table. See [validation](configuration.md#validation). |
+| Config | Parse and validate every table. See [configuration](configuration.md). |
 | Keys | Each key file exists, is readable, is not empty and holds at least 8 bytes. |
 | Plugins | Each `[plugins.NAME]` builds in dry-run mode. |
-| Intercept CA | Key matches, not expired, covers every intercepted host. Prints days left. |
-| Peer certificate | `tls_cert` and `tls_key` load. Prints days left. |
+| Intercept CA | Key matches, is not expired and covers every intercepted host; prints days left. |
+| Peer certificate | `tls_cert` and `tls_key` load; prints days left. |
 | Forwarder socket | Warnings are printed as `warning: ...`. |
 
-Output, for a config with one upstream, one key, one stream and peers off:
+Output for one upstream, one key, one stream and peers off:
 
-```
+```text
 caps: client 1024 (256 per address), admin 64 (16 per address); loopback exempt from the per-address caps
 peers: disabled
 ok: 1 upstream(s), 1 key(s), 1 stream(s), listening on 127.0.0.1:4097, admin on 127.0.0.1:4098
 ```
 
-Exit codes: `0` when every step passes; `1` on any failure, including a config that does not parse.
+Exit `0` when every step passes, `1` on any failure.
 
 ## scan
 
-Runs the detection plugins over files or stdin. It reports where each identifier is. It never prints the matched text, so its output is safe to share. Use it to tune `kinds` before you switch a plugin from `report` to `block`.
+Runs detection plugins over files or stdin and reports where each identifier is. It never prints the matched text. Use it to tune `kinds` before switching a plugin from `report` to `block`; see [plugins](plugins.md).
 
 ```
 reiki scan [--plugin NAME]... [--kinds K1,K2 | --all] [--json] [FILE]...
@@ -111,13 +106,11 @@ reiki scan [--plugin NAME]... [--kinds K1,K2 | --all] [--json] [FILE]...
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--plugin NAME` | every compiled-in plugin | Run only this plugin. Repeat for several. Names: `phi`, `finance`, `controlled`. |
-| `--kinds K1,K2` | each plugin's default set | Kinds to look for, comma separated. A kind is matched only by the selected plugins that know it. Conflicts with `--all`. |
-| `--all` | off | Look for every kind, including the ones that are off by default. |
+| `--plugin NAME` | every compiled-in detector | Run only this plugin. Repeat for several: `phi`, `finance`, `controlled`. |
+| `--kinds K1,K2` | each plugin's default set | Comma-separated kinds. Conflicts with `--all`. |
+| `--all` | off | Look for every kind, including those off by default. |
 | `--json` | off | One JSON object per finding. |
-| `FILE...` | stdin | Files to scan. `-` means stdin. |
-
-Kinds per plugin:
+| `FILE...` | stdin | Files to scan; `-` means stdin. |
 
 | Plugin | Default | With `--all` adds |
 | --- | --- | --- |
@@ -125,43 +118,17 @@ Kinds per plugin:
 | `finance` | `iban`, `swift`, `crypto`, `cusip`, `isin`, `pan_sad` | `account`, `sedol` |
 | `controlled` | `cui`, `classification`, `dissemination` | `ein`, `itin`, `cage`, `uei`, `edipi`, `eccn` |
 
-Text output, one line per finding:
-
-```
-FILE:LINE:COL PLUGIN KIND
-```
-
-JSON output, one object per line:
-
-```
-{"file":"FILE","line":1,"col":6,"plugin":"phi","kind":"card"}
-```
-
-A summary goes to stderr:
-
-```
-scanned 1 input(s): 2 finding(s): phi card x1, phi ssn x1
-```
-
-Example:
+Text output is `FILE:LINE:COL PLUGIN KIND`; JSON output is one object per line, for example `{"file":"FILE","line":1,"col":6,"plugin":"phi","kind":"card"}`. A summary goes to stderr, for example `scanned 1 input(s): 2 finding(s): phi card x1, phi ssn x1`.
 
 ```
 reiki scan --plugin phi --kinds ssn,card notes.txt
 ```
 
-Exit codes:
-
-| Code | Meaning |
-| --- | --- |
-| `0` | No findings. |
-| `1` | At least one finding. |
-| `2` | Unknown plugin or kind, a file cannot be read, or a usage error. |
-
-A named kind that the selected plugin does not know exits `2`. For example, `--plugin finance --kinds ssn` fails.
+Exit `0` with no findings, `1` with at least one, `2` for an unknown plugin or kind, an unreadable file or a usage error.
 
 ## reload
 
-Asks the running instance to reload its config over the admin listener. Posts to `/v1/reload`. Use `--dry-run` to see what a reload would change without applying it. See [upgrades](upgrades.md#reload-vs-restart) and [troubleshooting](troubleshooting.md#reload).
+Asks the running instance to reload its config over the admin listener (`POST /v1/reload`). `--dry-run` reports changes without applying them. See [monitoring](monitoring.md) and [troubleshooting](troubleshooting.md).
 
 ```
 reiki reload [--dry-run] [--url URL] [--token-file PATH]
@@ -169,37 +136,27 @@ reiki reload [--dry-run] [--url URL] [--token-file PATH]
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--dry-run` | off | Report the changes only. Apply nothing. |
-| `--url URL` | `http://` plus `[admin] listen` from the config | Admin address. An unspecified address such as `0.0.0.0` is sent as `127.0.0.1`. |
-| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | File that holds the admin token. Leading and trailing whitespace is removed. |
+| `--dry-run` | off | Report changes only. |
+| `--url URL` | `http://` plus `[admin] listen` | Admin address. An unspecified address such as `0.0.0.0` is sent as `127.0.0.1`. |
+| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | File holding the admin token; whitespace is trimmed. |
 
-Output is the JSON answer from `/v1/reload`, printed to stdout for both success and refusal:
+Output is the JSON answer from `/v1/reload` for both success and refusal:
 
-```
+```json
 {"dry_run":false,"generation":1,"keys":1,"streams":1,"changed":[],"restart_needed":[]}
 ```
 
-Fields: `dry_run`, `generation` (successful reloads since startup), `keys` and `streams` (counts after the reload), `changed` (what differs, such as `plugins phi`), `restart_needed` (settings that apply only after a restart). A successful mutation returns the changed resource, never an `ok` flag; failures use the [error envelope](monitoring.md#error-envelope).
-
-A failed reload answers the admin error envelope, `{"ok":false,"error":{"code":"config_refused","message":"..."}}`, and exits `1`. See [the error envelope](monitoring.md#error-envelope).
-
-Example:
+`generation` counts successful reloads; `keys` and `streams` are post-reload counts; `changed` and `restart_needed` list settings that differ or need a restart. A refusal uses the admin error envelope.
 
 ```
 reiki reload --dry-run --url http://127.0.0.1:4098 --token-file /etc/reiki/admin.token
 ```
 
-Exit codes:
-
-| Code | Meaning |
-| --- | --- |
-| `0` | The reload or the preview succeeded. |
-| `1` | The admin listener refused the request, or the reload failed. |
-| `2` | No admin token, no admin address, config unreadable (when `--url` is not given), or the listener could not be reached. |
+Exit `0` when the reload or preview succeeds, `1` when the admin listener refuses or the reload fails, `2` when no token or address is available, the config is unreadable or the listener cannot be reached.
 
 ## keys
 
-Shows each key's health from the running instance, or checks key files offline. The three forms are mutually exclusive. See [keys and streams](keys.md).
+Shows key health from a running instance or checks key files offline. The three forms are mutually exclusive; see [keys](keys.md).
 
 ```
 reiki keys [--json] [--url URL] [--token-file PATH]
@@ -212,62 +169,38 @@ reiki keys --check
 | `--json` | off | Print JSON instead of a table. Conflicts with `--check` and `--enable`. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. |
-| `--enable NAME` | none | Re-enable a key that is out of rotation. Posts to `/v1/keys/enable`. |
-| `--check` | off | Check the key files in the config without contacting an instance. Conflicts with the other flags. |
+| `--enable NAME` | none | Re-enable a key that is out of rotation (`POST /v1/keys/enable`). |
+| `--check` | off | Check the config's key files without contacting an instance. Conflicts with the other flags. |
 
 ### Health table
 
-Reads `/v1/status` on the admin listener:
+Reads `/v1/status`:
 
-```
+```text
 KEY    UPSTREAM  STATE  COOLDOWN  LAST  STREAMS
 zen-a  zen       ok     -         -     client
 ```
 
 | Column | Meaning |
 | --- | --- |
-| `KEY` | Key name from `[keys.NAME]`. |
+| `KEY` | Name from `[keys.NAME]`. |
 | `UPSTREAM` | Upstream the key authenticates to. |
-| `STATE` | `ok`, `cooling` (for the `COOLDOWN` time) or `disabled` (out of rotation until `--enable`). |
-| `COOLDOWN` | Seconds left on a cooling key, or `-`. |
+| `STATE` | `ok`, `cooling` for the remaining cooldown, or `disabled` until enabled. |
+| `COOLDOWN` | Seconds left, or `-`. |
 | `LAST` | Last upstream status code, or `-`. |
 | `STREAMS` | Streams whose chain holds the key. |
 
-### JSON
-
-```
-{"keys":[{"name":"zen-a","upstream":"zen","state":"ok","cooldown_seconds":null,"last_status_code":null,"streams":["client"],"scopes":[]}]}
-```
-
-`cooldown_class` appears when the instance reports it; `scopes` always appears, empty when there are no cooling combinations. `scopes` lists cooling route and model pairs, soonest first.
-
-### `--enable`
-
-Prints the admin answer, such as `{"key":"zen-a"}`. A name that does not exist gets `404` and exit `1`.
-
-### `--check`
-
-Reads each key file named in the config. It prints one line per key:
-
-```
-zen-a: ok
-loose: warning: /path/to/key has group or world read/write bits (mode 0644)
-gone: error: /path/to/key does not exist
-```
-
-A warning also exits `1`. Problems are listed for every key, not only the first.
-
-Exit codes:
+JSON adds `cooldown_class` when reported and always shows `scopes`, sorted by soonest expiry. `--enable` prints the admin answer, such as `{"key":"zen-a"}`; an unknown name gets `404` and exit `1`. `--check` prints one line per key, for example `zen-a: ok`, a permission warning or a missing-file error. Problems are listed for every key, and a warning also exits `1`.
 
 | Mode | `0` | `1` | `2` |
 | --- | --- | --- | --- |
-| Health table or JSON | Answer received and parsed. | Admin listener answered with an error status, or the answer is not valid `/v1/status` JSON. | No admin token, no admin address, the listener could not be reached, or the answer could not be read. |
-| `--enable` | Key re-enabled. | Refused, such as an unknown key (`404`). | As above. |
-| `--check` | Every key OK. | Any error or warning. | Config unreadable or does not parse. |
+| Table or JSON | Answer received and parsed. | Admin error or invalid `/v1/status` JSON. | No token or address, unreachable listener, unreadable answer. |
+| `--enable` | Key re-enabled. | Refused, such as unknown key (`404`). | As above. |
+| `--check` | Every file clean. | Any error or warning. | Config unreadable or invalid. |
 
 ## streams
 
-Manages opt-in dynamic streams when `[stream_admin]` is configured. The token comes from `--token-file` or the config's `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`), never from an argument. See the [command examples](README.md#stream-admin-api).
+Manages opt-in dynamic streams when `[stream_admin]` is configured. The token comes from `--token-file` or the configured `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`), never from an argument. See [configuration](configuration.md) and the [API examples](README.md).
 
 ```
 reiki streams [--url URL] [--token-file PATH] [--reason TEXT] [--idempotency-key KEY] COMMAND
@@ -276,20 +209,20 @@ reiki streams [--url URL] [--token-file PATH] [--reason TEXT] [--idempotency-key
 | Command | Meaning |
 | --- | --- |
 | `list` | List dynamic streams. |
-| `show NAME` | Show one dynamic stream and its token ids. |
+| `show NAME` | Show one stream and its token ids. |
 | `create NAME KEY [--ttl SECS]` | Create a stream with an assignable key; print the first token once. |
 | `update NAME [--key KEY] [--rpm N] [--tpm N]` | Change the assignable key or per-stream ceilings. |
 | `revoke NAME` | Revoke every token on the stream. |
 | `token add NAME [--ttl SECS]` | Add a token; print it once. |
 | `token revoke NAME TOKEN_ID` | Revoke one token by id from `show`. |
-| `audit verify FILE` | Verify a JSONL audit log, its hash chain and its sibling `audit.head` sidecar offline. |
-| `audit head FILE [--n N]` | Print the first `N` audit records (default 10) offline. |
+| `audit verify FILE` | Verify a JSONL audit log, its hash chain and the sibling `audit.head` sidecar offline. |
+| `audit head FILE [--n N]` | Print the first `N` audit records, default 10, offline. |
 
-`--reason` is required for every mutation and is written to the audit log; `--idempotency-key` is generated when omitted. With two-party confirmation configured, the second raw token is read from `confirm_env`. `audit` needs no running instance or token; the JSONL file must exist. Verification also reads the sibling `audit.head` sidecar when one is present. Without it, a non-empty chain is refused, while an empty log verifies as zero records. Exit `0` on success, `1` when the API refuses a request, and `2` for a usage, config, transport or audit-verification error. There is no CLI delete command and no audit HTTP route. See [monitoring](monitoring.md#stream-administration-routes).
+`--reason` is required for every mutation and is written to the audit log. `--idempotency-key` is generated when omitted. With two-party confirmation, the second raw token is read from `confirm_env` and sent as `X-Confirm-Token`. `audit verify` and `audit head` need no running instance or token and require the JSONL file to exist; verification refuses a non-empty chain without its sidecar. Exit `0` on success, `1` when the API refuses a request, `2` for a usage, config, transport or audit-verification error. There is no CLI delete command and no audit HTTP route. See [monitoring](monitoring.md) and [dynamic streams](dynamic-streams.md).
 
 ## failures
 
-Shows the running instance's last key failures, from the same in-memory ring as `GET /v1/failures`.
+Shows the running instance's recent key failures, from the same in-memory ring as `GET /v1/failures`.
 
 ```
 reiki failures [--limit N] [--key NAME] [--stream NAME] [--json] [--url URL] [--token-file PATH]
@@ -297,18 +230,16 @@ reiki failures [--limit N] [--key NAME] [--stream NAME] [--json] [--url URL] [--
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--limit N` | `20` | Records to show, newest first; 1 to 64. |
-| `--key NAME` | all keys | Only failures for this key name. |
-| `--stream NAME` | all streams | Only failures for this stream name. |
-| `--json` | off | Print the endpoint's failure envelope, with `failures`, `failures_total` and `failures_truncated`. |
+| `--limit N` | `20` | Newest records to show, 1 to 64. |
+| `--key NAME` | all keys | Only this key name. |
+| `--stream NAME` | all streams | Only this stream name. |
+| `--json` | off | Print the failure envelope with `failures`, `failures_total` and `failures_truncated`. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. |
 
-The table:
-
-```
+```text
 TIME                 STREAM  KEY    STATUS  CLASS         ACTION      COOLED  NOTE
-2026-11-17 12:00:00  client  zen-a  429     rate_limited  cooldown    42s     {"error":"rate limited"}
+YYYY-MM-DD HH:MM:SS  client  zen-a  429     rate_limited  cooldown    42s     {"error":"rate limited"}
 ```
 
 | Column | Meaning |
@@ -316,19 +247,17 @@ TIME                 STREAM  KEY    STATUS  CLASS         ACTION      COOLED  NO
 | `TIME` | Failure time in UTC. |
 | `STREAM` | Stream that made the attempt. |
 | `KEY` | Key name from `[keys.NAME]`. |
-| `STATUS` | Upstream status code, or `-` for a transport failure. |
+| `STATUS` | Upstream status, or `-` for a transport failure. |
 | `CLASS` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error`. |
 | `ACTION` | `cooldown`, `rotate` or `pass-through` from the failover walk. |
 | `COOLED` | Seconds left on the cooldown this failure started, or `-`. |
-| `NOTE` | Scrubbed, printable body snippet, cut to 200 bytes and the terminal width (`COLUMNS`, default 120). |
+| `NOTE` | Scrubbed, printable body snippet, cut to 200 bytes and terminal width (`COLUMNS`, default 120). |
 
-Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. The ring holds `failure_ring_size` entries (`200` by default; `0` disables). `--json` prints the failure envelope whether or not `--limit` was given.
-
-Exit codes: `0` on success; `1` when the admin listener refuses the token or answer; `2` when it cannot be reached or no admin token or address is available.
+Lines are cut to `COLUMNS`. Nothing in the ring is written to disk; a restart starts it empty. The ring holds `failure_ring_size` entries (`200` by default; `0` disables). `--json` prints the envelope whether or not `--limit` was given. Exit `0` on success, `1` when the admin listener refuses the token or answer, `2` when it cannot be reached or no token or address is available.
 
 ## cost
 
-Exports the `cost` plugin's estimate report from the running instance. The command exists only in a binary built with `--features plugin-cost`.
+Exports the `cost` plugin's estimate report. The command exists only in a binary built with `--features plugin-cost`.
 
 ```
 reiki cost export --period YYYY-MM --format csv|json [--url URL] [--token-file PATH]
@@ -336,16 +265,16 @@ reiki cost export --period YYYY-MM --format csv|json [--url URL] [--token-file P
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--period PERIOD` | current UTC month | UTC period to export: `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH`. |
+| `--period PERIOD` | current UTC month | `YYYY-MM`, `YYYY-MM-DD` or `YYYY-MM-DDTHH`. |
 | `--format` | `json` | `csv` or `json`. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
-| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. Never pass the token as an argument. |
+| `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file; never an argument. |
 
-The body is printed unchanged, so CSV has the same columns and JSON the same fields as `GET /v1/cost`; see [cost](cost.md#export). Exit codes: `0` on success, `1` when the admin listener refuses the answer, `2` for a bad period, missing token/address or a transport error. Without the running plugin the route returns `404` and the command exits `1`.
+The body is printed unchanged; see [cost](cost.md). Exit `0` on success, `1` when the admin listener refuses the answer or the plugin is absent, `2` for a bad period, missing token or address, or a transport error.
 
 ## peers
 
-Reads `/v1/health` on each `[peers.NAME]` and prints what it reports. Each peer's token comes from its `token_file` in the config. See [provider health](provider-health.md).
+Reads `/v1/health` on each `[peers.NAME]` and prints what it reports, using each peer's `token_file`. See [provider health](provider-health.md).
 
 ```
 reiki peers [--json] [--watch]
@@ -354,11 +283,9 @@ reiki peers [--json] [--watch]
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--json` | off | Print JSON. |
-| `--watch` | off | Follow each peer's `/v1/health/stream` and print the table on each change. A peer whose stream is down is polled. Runs until interrupted. |
+| `--watch` | off | Follow `/v1/health/stream` and redraw on each change; runs until interrupted. |
 
-Table output:
-
-```
+```text
 PEER    INSTANCE  UPSTREAM  STATE  HEALTHY  COOLING  DISABLED  WAIT  AGE
 edge-1  edge-pub  zen       ok     1        0        0         -     0s
 ```
@@ -366,88 +293,46 @@ edge-1  edge-pub  zen       ok     1        0        0         -     0s
 | Column | Meaning |
 | --- | --- |
 | `PEER` | Name from `[peers.NAME]`. |
-| `INSTANCE` | Name the peer publishes, from its `instance` setting. |
-| `UPSTREAM` | One row per upstream the peer reports. |
-| `STATE` | Per upstream: `ok`, `cooling`, `disabled` or `no_keys`. Per peer: `unknown` when the data is missing or older than three poll intervals, and `no_upstreams` when the peer has none. |
+| `INSTANCE` | Name the peer publishes. |
+| `UPSTREAM` | One row per reported upstream. |
+| `STATE` | `ok`, `cooling`, `disabled` or `no_keys`; `unknown` for stale or missing data, `no_upstreams` when none are reported. |
 | `HEALTHY`, `COOLING`, `DISABLED` | Key counts for the upstream. |
 | `WAIT` | Shortest remaining cooldown, or `-`. |
 | `AGE` | Seconds since the peer's data was taken. |
 
-A peer that cannot be reached prints an error line to stderr, for example `reiki: peer `edge-1`: cannot connect: ...`, and shows as `unknown`.
-
-JSON output has a `peers` array with each peer's `name`, `instance`, `state` (`fresh` or `unknown`), `error`, `age_seconds` and `upstreams`.
-
-Exit codes:
-
-| Code | Meaning |
-| --- | --- |
-| `0` | At least one peer gave fresh data. |
-| `1` | No peer gave fresh data. |
-| `2` | Config unreadable or invalid, no `[peers]` table, `[peers]` not enabled, or no peers listed. |
+An unreachable peer prints an error line to stderr and shows as `unknown`. JSON has a `peers` array with `name`, `instance`, `state`, `error`, `age_seconds` and `upstreams`. Exit `0` when at least one peer is fresh, `1` when none is, `2` for a config problem or no peers listed.
 
 ## top
 
-A live terminal view of every peer's key health. The screen is a peers-by-providers matrix, with the selected peer's detail below it; `t` opens a read-only local Streams view. See [top](top.md) for the screens and columns. This page lists the keys.
+A live terminal view of peer key health: a peers-by-providers matrix with the selected peer's detail below it. `t` opens a read-only local Streams screen. See [top](top.md) for the screens; this page lists the keys. Needs the `top` build feature; release binaries include it.
 
 ```
 reiki top [--once] [--interval SECS] [--full] [--provider NAME]
 ```
 
-Needs the `top` build feature. The feature is not in the default build. Release binaries include it.
-
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--once` | off | Poll each peer once, print plain text and exit. |
-| `--interval SECS` | `1` | Seconds between redraws. Values below 1 count as 1. Live mode only. |
-| `--full` | off | Start in the per-peer text view instead of the matrix. |
-| `--provider NAME` | all providers | Show only this provider's column. An unknown name prints `unknown provider: NAME` to stderr and shows everything. |
+| `--interval SECS` | `1` | Seconds between redraws; values below 1 count as 1. Live mode only. |
+| `--full` | off | Start in the per-peer text view. |
+| `--provider NAME` | all providers | Show only this provider's column. |
 
-One-shot output:
-
-```
+```text
 Fleet 1/1 fresh   zen 1/1   [req 1h]
           zen       Ver     load  disk  sess
   edge-1  ■ ······  0.10.3  -     -     -
 ```
 
-Exit codes:
-
 | Mode | `0` | `1` | `2` |
 | --- | --- | --- | --- |
 | `--once` | At least one peer answered. | No peer answered. | Config problem, as for `peers`. |
-| Live | Quit with `q`, `Esc` or Ctrl-C. | Terminal could not be set up or read. | Config problem, or stdout is not a terminal. Use `--once` in scripts. |
+| Live | Quit with `q`, `Esc` or Ctrl-C. | Terminal could not be set up or read. | Config problem or stdout is not a terminal; use `--once` in scripts. |
 
-### Keys in the live view
-
-Some keys act only in matrix mode, which is the default view. Ctrl-C quits from any screen, including the key list.
-
-| Key | Action |
-| --- | --- |
-| `q`, `Esc`, Ctrl-C | Quit. |
-| `j`, `Down` | Matrix: select the next peer. Full view: scroll down. |
-| `k`, `Up` | Matrix: select the previous peer. Full view: scroll up. |
-| `PageUp`, `PageDown` | Scroll one screen in the full view. |
-| `g`, `Home` | Scroll to the top. |
-| `G`, `End` | Scroll to the bottom. |
-| `Tab`, `Shift-Tab` | Select the next or previous peer. |
-| `Enter`, `e` | Matrix: open or close the selected peer's detail. |
-| `v`, `E` | Switch between the matrix and the full text view. |
-| `f` | Matrix: cycle the provider filter, through each provider and back to all. |
-| `c` | Clear the provider and peer filter. |
-| `p` | Pause or resume the screen. The age of the frozen data is shown. |
-| `u` | Matrix: switch the gauge between requests and tokens. |
-| `w` | Matrix: switch the gauge window between the last hour and the last five minutes. |
-| `m` | Matrix: cycle the chart metric. The chart row appears at 28 rows or more. |
-| `?` | Show the key list. The next key press closes it and does nothing else. |
-| `x` | No action. |
-
-The matrix footer hint line reads `q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys`; the full view uses `j/k scroll`.
-
-Source: `crates/reiki-top/src/ui.rs` and `src/top.rs`.
+Keys in the live view: `q`/`Esc`/Ctrl-C quit; `j`/`k` select a peer in matrix mode or scroll in full view; `PageUp`/`PageDown` scroll a screen; `g`/`Home` and `G`/`End` jump; `Tab`/`Shift-Tab` change peer; `Enter`/`e` open or close detail; `v`/`E` switch views; `f` cycles the provider filter; `c` clears filters; `p` pauses; `u` switches the gauge between requests and tokens; `w` switches the window between one hour and five minutes; `m` cycles the chart metric; `?` shows the key list. `x` does nothing. The matrix footer reads `q quit  j/k  Enter detail  f filter  u metric  w window  m chart  s stack  a all  v full  ? keys`; the full view uses `j/k scroll`.
 
 ## ca-init
 
-Creates a certificate authority for `[tunnel.intercept]`. The CA is name-constrained to the hosts you list, so a stolen key cannot sign for anything else.
+Creates a certificate authority for `[tunnel.intercept]`. The CA is name-constrained to the listed hosts.
 
 ```
 reiki ca-init --dir DIR --host HOST [--host HOST]... [--days N] [--replace]
@@ -455,26 +340,16 @@ reiki ca-init --dir DIR --host HOST [--host HOST]... [--days N] [--replace]
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--dir DIR` | required | Directory that receives `ca.pem` and `ca.key`. Created if missing. |
-| `--host HOST` | required, repeatable | A host the CA may sign for. Lowercase DNS name with at least two labels. |
-| `--days N` | `365` | Validity in days. Range 1 to 3650. |
-| `--replace` | off | Overwrite an existing CA in `--dir`. Clients then need the new `ca.pem`. |
-
-Example:
+| `--dir DIR` | required | Directory that receives `ca.pem` and `ca.key`; created if missing. |
+| `--host HOST` | required, repeatable | Lowercase DNS name with at least two labels. |
+| `--days N` | `365` | Validity in days, 1 to 3650. |
+| `--replace` | off | Overwrite an existing CA; clients then need the new `ca.pem`. |
 
 ```
 reiki ca-init --dir /etc/reiki/intercept --host api.example.net --days 365
 ```
 
-```
-wrote /etc/reiki/intercept/ca.pem and /etc/reiki/intercept/ca.key; give ca.pem to clients, keep ca.key private
-```
-
-`ca.key` is created with mode `0600`. Give clients only `ca.pem`.
-
-Exit codes: `0` on success; `1` on a bad host, a bad `--days` value, or an existing CA without `--replace`.
-
-Then point the config at the files:
+`ca.key` is mode `0600`; give clients only `ca.pem`. Exit `0` on success, `1` for a bad host, a bad `--days` or an existing CA without `--replace`. Then point the config at the files:
 
 ```toml
 [tunnel.intercept]
@@ -482,19 +357,14 @@ ca_cert = "/etc/reiki/intercept/ca.pem"
 ca_key = "/etc/reiki/intercept/ca.key"
 ```
 
-See [tunnel](tunnel.md#interception).
+See [tunnel](tunnel.md).
 
 ## plugin inspect
 
-Only builds with the `plugin-wasm` feature have this subcommand. It reads a Wasm component without starting a proxy and prints its manifest, requested and derived capabilities, and configured limits.
+Only builds with `plugin-wasm` have this subcommand. It reads a Wasm component without starting a proxy and prints its manifest, requested and derived capabilities and configured limits.
 
 ```
 reiki plugin inspect FILE [--json]
 ```
 
-| Argument or flag | Default | Meaning |
-| --- | --- | --- |
-| `FILE` | required | Path to the `.wasm` component. |
-| `--json` | off | Print the pretty-printed JSON report instead of text lines such as `name: ...` and `pin: ...`. |
-
-It does not read the config or contact an admin listener. Exit codes: `0` for a readable component; `1` when the file cannot be read, is not a valid component, or the report cannot be printed. See [Wasm plugins](wasm-plugins.md).
+`FILE` is a required `.wasm` path; `--json` prints the report as JSON instead of text lines such as `name: ...` and `pin: ...`. It does not read the config or contact an admin listener. Exit `0` for a readable component, `1` for an unreadable file or invalid component, `2` for a usage error. See [plugin authoring](plugin-authoring.md).

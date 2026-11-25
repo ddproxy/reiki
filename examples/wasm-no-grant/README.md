@@ -19,5 +19,5 @@ preview1 stub adapter using `wasm-tools component new`, injects
 `reiki-manifest.toml` as a top-level custom section, and finishes with
 `wasm-tools validate` and `wasm-tools component wit`. Current `wasm-tools` has
 no `component add-metadata` command. Pass an output path to write elsewhere:
-`./rebuild.sh /tmp/no-grant.wasm`. See [the plugin guide](../../docs/wasm-plugins.md#building-without-cargo-component)
+`./rebuild.sh /tmp/no-grant.wasm`. See [the plugin guide](../../docs/plugin-authoring.md#building-without-cargo-component)
 for the full pipeline.

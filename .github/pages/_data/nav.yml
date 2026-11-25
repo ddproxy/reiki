@@ -4,42 +4,29 @@
     - { title: Quickstart, url: /docs/quickstart.html }
     - { title: Documentation index, url: /docs/README.html }
     - { title: Overview, url: /docs/overview.html }
-    - { title: Architecture, url: /docs/architecture.html }
     - { title: Glossary, url: /docs/glossary.html }
     - { title: Command line, url: /docs/cli.html }
     - { title: Configuration, url: /docs/configuration.html }
-    - { title: Keys and streams, url: /docs/keys.html }
-    - { title: OpenCode, url: /docs/opencode.html }
-    - { title: Claude Code, url: /docs/claude-code.html }
-- title: Reliability
+- title: Keys and traffic
   items:
-    - { title: Failover, url: /docs/failover.html }
-    - { title: Classification, url: /docs/classification.html }
-    - { title: Traffic shaping, url: /docs/shaping.html }
+    - { title: Keys and streams, url: /docs/keys.html }
     - { title: Providers, url: /docs/providers.html }
+    - { title: Clients, url: /docs/clients.html }
+    - { title: Failover, url: /docs/failover.html }
+    - { title: Traffic shaping, url: /docs/shaping.html }
 - title: Security and data
   items:
     - { title: Security, url: /docs/security.html }
-    - { title: Security scanning, url: /docs/security-scanning.html }
-    - { title: What Reiki does not protect against, url: /docs/limits.html }
-    - { title: Observe, then enforce, url: /docs/rollout.html }
-    - { title: Redaction reference, url: /docs/redaction.html }
     - { title: Plugins, url: /docs/plugins.html }
     - { title: Plugin authoring, url: /docs/plugin-authoring.html }
-    - { title: Placeholders, url: /docs/placeholders.html }
-    - { title: PHI and NPPI, url: /docs/phi.html }
-    - { title: Finance, url: /docs/finance.html }
-    - { title: Controlled information, url: /docs/controlled.html }
+    - { title: Cost, url: /docs/cost.html }
     - { title: Tunnel, url: /docs/tunnel.html }
     - { title: Request log, url: /docs/requestlog.html }
 - title: Operate
   items:
+    - { title: Dynamic streams, url: /docs/dynamic-streams.html }
     - { title: Deploy, url: /docs/deploy.html }
-    - { title: Upgrades, url: /docs/upgrades.html }
     - { title: Monitoring, url: /docs/monitoring.html }
     - { title: Provider health, url: /docs/provider-health.html }
     - { title: reiki top, url: /docs/top.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
-    - { title: Examples, url: /docs/examples.html }
-    - { title: FAQ, url: /docs/faq.html }
-    - { title: Hub, url: /docs/hub.html }

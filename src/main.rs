@@ -1419,10 +1419,6 @@ async fn main() {
             "{}",
             reiki::config::PeersConfig::check_line(config.peers.as_ref())
         );
-        #[cfg(feature = "hub")]
-        if let Some(line) = config.hub_check_line() {
-            println!("{line}");
-        }
         println!(
             "ok: {} upstream(s), {} key(s), {} stream(s){plugin_part}, listening on {listen}{admin}",
             config.upstream.len(),

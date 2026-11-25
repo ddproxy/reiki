@@ -1,22 +1,12 @@
-# Quickstart: proof in ten minutes
+# Quickstart
 
 This walkthrough starts one Reiki instance with one upstream, one key, one stream and an admin listener. It ends with three proofs: `check` accepts the config, a wrong stream token gets `401`, and the admin commands answer from the live process.
 
 The `example` upstream is a placeholder. Use a real `base_url` and model from [providers](providers.md) before you expect a successful upstream response.
 
-## Time budget
-
-| Minutes | Step | Done when |
-| --- | --- | --- |
-| 0–2 | Install and prepare directories | `reiki --version` prints a version |
-| 2–4 | Create the key, tokens and config | `reiki.toml` holds hashes, no raw tokens |
-| 4–6 | Validate and start in the foreground | `check` prints the `ok:` line |
-| 6–8 | Send one wrong-token request | The response is `401` with `unknown token` |
-| 8–10 | Read live state | `keys` and `failures` answer |
-
 ## 1. Prepare the host
 
-Install the binary and create the directories from the [deploy layout](deploy.md#directory-layout):
+Install the binary and create the directories from the [deploy layout](deploy.md):
 
 ```bash
 useradd --system --home /nonexistent --shell /usr/sbin/nologin reiki
@@ -25,7 +15,7 @@ install -d -m 0700 -o reiki -g reiki /etc/reiki/keys
 reiki --version
 ```
 
-Create one key file and both tokens. Config takes hashes; CLI calls take the raw admin token.
+Create one key file and both tokens. Config takes hashes; CLI calls take raw tokens.
 
 ```bash
 umask 077
@@ -43,7 +33,7 @@ printf '%s' "$ADMIN_TOKEN"  | reiki hash-token
 
 Put each printed hash in the config below. Keep the raw tokens for the client and the admin CLI calls.
 
-> **Key-file permissions.** Mode `0600` is the right setting. With the default `strict_key_permissions = true`, startup and reload refuse a key file that group or other users can read or write; set it to `false` to warn instead. `reiki keys --check` always reports such a file as a warning and exits `1`. Same-user processes can still read the file. See [limits](limits.md) and [keys](keys.md#key-files).
+> Key files are mode `0600`. With the default `strict_key_permissions = true`, startup and reload refuse a file that group or other users can read or write; `false` warns instead. `reiki keys --check` reports such a file as a warning and exits `1`. Same-user processes can still read the file. See [keys](keys.md) and [security](security.md).
 
 ## 2. Write the config
 
@@ -68,7 +58,7 @@ token_sha256 = "<64 hex from the client token>"
 chain = ["example-a"]
 ```
 
-The client listener is plain HTTP on loopback. The admin listener also needs a bearer token; it has no TLS option, so put TLS in front if it must be reached off-host. See [deploy](deploy.md#listeners).
+The client listener is plain HTTP on loopback. The admin listener also needs a bearer token and has no TLS option; put TLS in front if it must be reached off-host. See [deploy](deploy.md).
 
 ## 3. Validate and start
 
@@ -86,7 +76,7 @@ peers: disabled
 ok: 1 upstream(s), 1 key(s), 1 stream(s), listening on 127.0.0.1:4097, admin on 127.0.0.1:4098
 ```
 
-`keys --check` prints `example-a: ok` when the file is clean. A warning also exits `1`. Start in the foreground first; use `SIGTERM` to stop it before installing a service unit. See [deploy](deploy.md#first-start-checklist).
+`keys --check` prints `example-a: ok` when the file is clean; a warning also exits `1`. Start in the foreground and use `SIGTERM` to stop it before installing a service unit. See [deploy](deploy.md).
 
 ## 4. Check both listeners
 
@@ -99,7 +89,7 @@ curl -s -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
   http://127.0.0.1:4098/v1/status
 ```
 
-The health probe needs no token and answers `ok` while Reiki is up. `/v1/status` returns key health, stream chains and reload state; it carries key names, never key values. See [monitoring](monitoring.md#get-v1status).
+The health probe needs no token and answers `ok` while Reiki is up. `/v1/status` returns key health, stream chains and reload state; it carries key names, never key values. See [monitoring](monitoring.md).
 
 ## 5. Negative test: a wrong stream token
 
@@ -119,7 +109,7 @@ Expected output:
 {"ok":false,"error":{"code":"unauthorized","message":"unknown token"}}
 ```
 
-A request with no token gets the same status with `missing token`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. The wrong-token test proves the request reached Reiki's client listener and was checked against a stream hash; it does not prove the upstream works. See [classification](classification.md#client-errors-from-reiki).
+A request with no token gets the same status with `missing token`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. The test proves the request reached the client listener and was checked against a stream hash; it does not prove the upstream works. See [failover](failover.md) for the full client-error table.
 
 ## 6. Read live state
 
@@ -139,10 +129,11 @@ example-a  example   ok     -         -     client-a
 no failures
 ```
 
-After a successful upstream attempt, `LAST` holds that status code. After a classified failure, `reiki failures` prints a row from the in-memory ring; the ring starts empty on restart and is never written to disk. See [keys](keys.md#key-state-and-enable) and [cli](cli.md#failures).
+After a successful upstream attempt, `LAST` holds that status code. After a classified failure, `reiki failures` prints a row from the in-memory ring; the ring starts empty on restart and is never written to disk. See [keys](keys.md) and [cli](cli.md).
 
 ## Where to go next
 
-- Point a client at Reiki: [OpenCode](opencode.md) or [Claude Code](claude-code.md).
-- Move from observation to enforcement: [rollout](rollout.md).
-- Know the trust boundary: [what Reiki does not protect against](limits.md).
+- Point a client at Reiki: [clients](clients.md).
+- Read the trust boundary: [security](security.md).
+- Diagnose a symptom: [troubleshooting](troubleshooting.md).
+- Browse every setting: [configuration](configuration.md).

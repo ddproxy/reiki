@@ -1,29 +1,17 @@
 # Provider health contract
 
-`GET /v1/health` on the peer listener returns a read-only JSON document describing key health for one Reiki instance. `GET /v1/health/stream` serves the same document as an SSE `snapshot`, then `key`, `host`, and `sessions` events plus `: heartbeat` comments. The machine-readable contract is [`provider-health.openapi.json`](provider-health.openapi.json), generated from the same code as the admin OpenAPI and checked by tests.
+`GET /v1/health` on the peer listener returns a read-only JSON document describing key health for one Reiki instance. `GET /v1/health/stream` serves the same document as an SSE snapshot followed by updates. Peer publishing and tokens are configured in [configuration](configuration.md); listener hardening is in [security](security.md).
 
-## Contract rules
+## Required fields
 
-- **Unknown fields are ignored.** Readers must accept documents with unknown object fields. Writers may add optional fields.
-- **Enum-like values are extensible.** Readers must ignore unknown `state`, `last_status_class`, `status_class`, `cooldown_class`, and similar enum-like values rather than rejecting the document.
-- **Optional means may be absent.** A field not listed as required may be omitted. Readers must not require optional fields.
-- **Nullability is explicit.** Fields typed as `integer|null`, `string|null`, `array|null`, or `object|null` may be null. `soonest_cooldown_seconds` is an integer >= 1 or null; `0` is never published for a cooling wait.
-- **Units are explicit.** Time durations named `*_seconds` are integer seconds; instants named `*_at` are RFC3339 UTC strings. `cooldown_seconds` is the remaining wait for one key or observed upstream, and `soonest_cooldown_seconds` is the soonest wait across a key set. `age_seconds` is the age of figures when sent; readers add their own time since receipt for freshness.
-- **Arrays are bounded.** `upstreams` has at most 64 entries (`upstreams_truncated`), each `keys` array at most 256 (`keys_truncated`), `observed` at most 256 (`observed_truncated`), `host.disks` at most 4 (`disks_truncated`), and `sessions.streams` at most 256 (`streams_truncated`). The matching `*_truncated` flag is always present and true when entries were omitted; OpenAPI declares the same `maxItems`.
-- **Version negotiation.** Readers should use capability/field presence, not strict version pinning. `reiki_version` identifies the publisher; unknown fields and enum-like values must remain readable across versions.
+`instance`, `reiki_version`, `observed_at`, `age_seconds`, `failures`, `upstreams` and `observed` are always present.
 
-## Required top-level fields
-
-`instance`, `reiki_version`, `observed_at`, `age_seconds`, `failures`, `upstreams`, `observed` are always present.
-
-## Optional/non-core extensions
-
-`gateway`, `streams`, `host`, `sessions`, `requestlog_export_dropped_total`, upstream usage arrays, upstream `keys`, and `capacity_group` are optional. `host` and `sessions` are non-core extensions, off by default, enabled only by `expose_host_stats` (and `sessions.streams` also needs `expose_key_labels`).
+Readers must accept unknown object fields and ignore unknown enum-like values such as `state`, `last_status_class`, `status_class` and `cooldown_class`. Optional fields may be absent or null; bounded arrays carry a `*_truncated` flag when entries were omitted. Durations named `*_seconds` are integer seconds, instants named `*_at` are RFC3339 UTC strings, and `age_seconds` is the age of the figures when sent. `cooldown_seconds` is the remaining wait for one key or observed upstream; `soonest_cooldown_seconds` is the soonest wait across a key set and is an integer >= 1 or null. Use field presence rather than strict version pinning.
 
 ## Auth and errors
 
-Requests use `Authorization: Bearer <peer token>` on the peer listener only. Peer tokens are read-only and must differ from admin and stream tokens. Auth/throttle failures return the same JSON error envelope shape as other Reiki listeners: `{"ok":false,"error":{"code":"...","message":"..."}}`.
+Requests use `Authorization: Bearer <peer token>` on the peer listener only. Peer tokens are read-only and must differ from admin and stream tokens. Auth and throttle failures use the standard error envelope: `{"ok":false,"error":{"code":"...","message":"..."}}`.
 
-## Operational notes
+## Fleet view
 
-Peer publishing and reading configuration remain in [`configuration.md`](configuration.md), listener/deploy hardening in [`deploy.md`](deploy.md) and [`security.md`](security.md), and live fleet display in [`top.md`](top.md) and [`monitoring.md`](monitoring.md).
+See [reiki top](top.md) for the live fleet display built from peer health documents.

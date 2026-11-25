@@ -80,6 +80,8 @@ pub enum ConfigError {
     BadAuth(String),
     BadPeers(String),
     BadServer(String),
+    /// `failure_ring_size` is above the hard ceiling.
+    BadFailureRing(String),
     /// The config has a `[hubs]`, `[hub]` or `[accounts]` table, but this binary was built without
     /// the `hub` feature.
     HubFeatureOff,
@@ -201,6 +203,7 @@ impl fmt::Display for ConfigError {
             Self::BadAuth(reason) => write!(f, "invalid [auth]: {reason}"),
             Self::BadPeers(reason) => write!(f, "invalid [peers]: {reason}"),
             Self::BadServer(reason) => write!(f, "invalid [server]: {reason}"),
+            Self::BadFailureRing(reason) => write!(f, "invalid failure_ring_size: {reason}"),
             Self::HubFeatureOff => {
                 write!(
                     f,
@@ -251,6 +254,9 @@ pub struct Config {
     /// Whether a key file that its group or other users can read is a load error.
     #[serde(default = "default_true")]
     pub strict_key_permissions: bool,
+    /// Recent upstream failures kept in memory per instance; zero disables the ring.
+    #[serde(default = "default_failure_ring_size")]
+    pub failure_ring_size: usize,
     #[serde(default)]
     pub streams: BTreeMap<String, StreamConfig>,
     /// Defaults for multi-user gateway behaviour, including counter-store failure policy.
@@ -717,6 +723,10 @@ fn default_log_level() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_failure_ring_size() -> usize {
+    crate::failures::DEFAULT_CAPACITY
 }
 
 fn default_log_file_max_bytes() -> u64 {
@@ -1934,6 +1944,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.failure_ring_size > crate::failures::MAX_CAPACITY {
+            return Err(ConfigError::BadFailureRing(format!(
+                "must be between 0 and {}, got {}",
+                crate::failures::MAX_CAPACITY,
+                self.failure_ring_size
+            )));
+        }
         if let Some(reason) = self.log_problem() {
             return Err(ConfigError::BadLog(reason));
         }
@@ -3771,6 +3788,26 @@ file = "/etc/reiki/keys/zen-b"
         assert!(Config::parse(&base("")).unwrap().strict_key_permissions);
         let text = format!("strict_key_permissions = false\n{}", base(""));
         assert!(!Config::parse(&text).unwrap().strict_key_permissions);
+    }
+
+    #[test]
+    fn failure_ring_size_defaults_to_200_and_zero_disables_it() {
+        assert_eq!(
+            Config::parse(&base("")).unwrap().failure_ring_size,
+            crate::failures::DEFAULT_CAPACITY
+        );
+        let text = format!("failure_ring_size = 0\n{}", base(""));
+        assert_eq!(Config::parse(&text).unwrap().failure_ring_size, 0);
+    }
+
+    #[test]
+    fn failure_ring_size_rejects_a_value_above_the_ceiling() {
+        let too_large = crate::failures::MAX_CAPACITY + 1;
+        let text = format!("failure_ring_size = {too_large}\n{}", base(""));
+        assert!(matches!(
+            Config::parse(&text).unwrap_err(),
+            ConfigError::BadFailureRing(_)
+        ));
     }
 
     #[test]

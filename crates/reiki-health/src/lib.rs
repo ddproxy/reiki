@@ -88,11 +88,18 @@ pub struct Failure {
     pub key: String,
     pub status: Option<u16>,
     pub class: String,
+    /// What the failover walk did after this failure; older documents read as pass-through.
+    #[serde(default = "default_failure_action")]
+    pub action: String,
     pub retry_after: Option<String>,
     pub cooled: bool,
     pub cooling_seconds: Option<u64>,
     /// Scrubbed body snippet; `null` when the caller holds only the read-only admin token.
     pub note: Option<String>,
+}
+
+fn default_failure_action() -> String {
+    "pass-through".to_owned()
 }
 
 /// Quota numbers a passthrough upstream reported in its response headers. Every field is present
@@ -518,6 +525,29 @@ mod tests {
         let health = Health::from_json(BASE).unwrap();
         assert_eq!(health.upstreams[0].capacity_group, None);
         assert_eq!(serde_json::to_value(health).unwrap(), expected);
+    }
+
+    #[test]
+    fn an_older_failure_without_an_action_reads_as_pass_through() {
+        let old = r#"{
+            "time": 1,
+            "stream": "s",
+            "key": "k",
+            "status": 429,
+            "class": "rate_limited",
+            "retry_after": "30",
+            "cooled": false,
+            "cooling_seconds": null,
+            "note": null
+        }"#;
+        let failure: Failure = serde_json::from_str(old).unwrap();
+        assert_eq!(failure.action, "pass-through");
+        let current = Failure {
+            action: "rotate".to_owned(),
+            ..failure
+        };
+        let text = serde_json::to_string(&current).unwrap();
+        assert!(text.contains("\"action\":\"rotate\""), "{text}");
     }
 
     #[test]

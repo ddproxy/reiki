@@ -69,7 +69,7 @@ $ reiki --config /etc/reiki/reiki.toml failures --limit 20 --key zen-b --json
 
 `time` is Unix seconds. `retry_after` is the received header; `cooling_seconds` is the wait left at the snapshot. `note` is a printable body snippet of at most 200 characters with credentials scrubbed.
 
-A quota `429` with `Retry-After: 90` cools the key for 60 to 90 seconds. The next request is refused locally with `503` and a `retry-after` header; the cooled key is not tried again. The ring holds 64 records in memory and is empty after a restart. See [GET /v1/failures](monitoring.md#get-v1failures).
+A quota `429` with `Retry-After: 90` cools the key for 60 to 90 seconds. The next request is refused locally with `503` and a `retry-after` header; the cooled key is not tried again. The ring holds `failure_ring_size` records in memory (200 by default) and is empty after a restart. See [GET /v1/failures](monitoring.md#get-v1failures).
 
 > **Limit:** The row above is illustrative. Failure records are a live sample, not the request log; a record can be dropped when another thread holds the buffer.
 

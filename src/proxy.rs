@@ -20,6 +20,7 @@ use crate::auth::{
 use crate::chain::{Chain, KeyState, Policy, SavedHealth, Scope, scope_route};
 use crate::classify::{Classification, ExtraPhrases, FailureClass, Outcome, classify_with};
 use crate::config::{Config, DEFAULT_SCOPE_ESCALATE_AFTER, PeersConfig, StreamConfig};
+use crate::failures::FailureAction;
 use crate::forward::Forwarder;
 use crate::gateway::{Gateway, Permit as GatewayPermit, Refusal as GatewayRefusal};
 use crate::observed::{self, ObservedStore};
@@ -550,6 +551,7 @@ impl App {
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         let throttle = ThrottleSettings::from(&config.auth);
+        let ring_size = config.failure_ring_size;
         let shaper = Shaper::new();
         shaper.sync(&shaped_keys(&config));
         let app = Arc::new(Self {
@@ -558,7 +560,7 @@ impl App {
             gateway: Arc::new(Gateway::new()),
             pressure: Arc::new(PressureCounter::new()),
             observed: ObservedStore::new(),
-            failures: crate::failures::FailureRing::new(),
+            failures: crate::failures::FailureRing::new(ring_size),
             shaper,
             shaper_saved: Mutex::new((BTreeMap::new(), None)),
             policy,
@@ -715,8 +717,10 @@ impl App {
 
     fn swap_snapshot(&self, config: Config, keys: HashMap<String, Secret>) {
         let throttle = ThrottleSettings::from(&config.auth);
+        let ring_size = config.failure_ring_size;
         let wanted_shapes = shaped_keys(&config);
         let next = Arc::new(Snapshot::new(config, keys));
+        self.failures.set_capacity(ring_size);
         self.gateway.reconcile(&next.config);
         let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
         let mut current = self
@@ -2904,6 +2908,18 @@ fn failure_scope(
     }
 }
 
+/// A ring record waiting for its timestamp and sanitised note.
+struct RingEntry<'a> {
+    app: &'a App,
+    stream: &'a str,
+    key: &'a str,
+    class: &'a str,
+    note: FailureNote<'a>,
+    action: FailureAction,
+    cooled: bool,
+    cooling_seconds: Option<u64>,
+}
+
 /// What an attempt reported about its failure.
 #[derive(Clone, Copy)]
 struct FailureNote<'a> {
@@ -3024,15 +3040,23 @@ fn record(
     if counted && let Some(upstream) = upstream {
         app.pressure.record(&upstream, limited, now);
     }
-    record_ring(
+    let action = if class == FailureClass::Unauthorized && counted {
+        FailureAction::Rotate
+    } else if ring_cooled {
+        FailureAction::Cooldown
+    } else {
+        FailureAction::PassThrough
+    };
+    record_ring(RingEntry {
         app,
         stream,
         key,
-        class.name(),
+        class: class.name(),
         note,
-        ring_cooled,
-        ring_cooling,
-    );
+        action,
+        cooled: ring_cooled,
+        cooling_seconds: ring_cooling,
+    });
     app.persist_state();
 }
 
@@ -3048,7 +3072,16 @@ fn note_failure(app: &App, stream: &str, key: &str, class: FailureClass, note: F
         .ok()
         .and_then(|health| health.cooling_remaining(key, Instant::now()))
         .map(|left| left.as_secs());
-    record_ring(app, stream, key, class.name(), note, false, cooling);
+    record_ring(RingEntry {
+        app,
+        stream,
+        key,
+        class: class.name(),
+        note,
+        action: FailureAction::PassThrough,
+        cooled: false,
+        cooling_seconds: cooling,
+    });
 }
 
 /// Adds a request error to the ring under its own label. Unlike [`note_failure`], this uses a
@@ -3063,39 +3096,42 @@ fn note_request_error(app: &App, stream: &str, key: &str, note: FailureNote<'_>)
         .ok()
         .and_then(|health| health.cooling_remaining(key, Instant::now()))
         .map(|left| left.as_secs());
-    record_ring(
+    record_ring(RingEntry {
         app,
         stream,
         key,
-        FailureKind::RequestError.label(),
+        class: FailureKind::RequestError.label(),
         note,
-        false,
-        cooling,
-    );
+        action: FailureAction::PassThrough,
+        cooled: false,
+        cooling_seconds: cooling,
+    });
 }
 
-fn record_ring(
-    app: &App,
-    stream: &str,
-    key: &str,
-    class: &str,
-    note: FailureNote<'_>,
-    cooled: bool,
-    cooling_seconds: Option<u64>,
-) {
+fn record_ring(entry: RingEntry<'_>) {
+    let RingEntry {
+        app,
+        stream,
+        key,
+        class,
+        note,
+        action,
+        cooled,
+        cooling_seconds,
+    } = entry;
     if !note.ring {
         return;
     }
     let retry_after = note.retry_after.map(|value| {
         let clean = crate::scrub::scrub_text(value, note.secrets);
-        printable_snippet(&clean, crate::failures::MAX_RETRY_AFTER_CHARS)
+        printable_snippet_bytes(&clean, crate::failures::MAX_RETRY_AFTER_BYTES)
     });
     let snippet = note.body.map_or_else(String::new, |body| {
         let clean = crate::scrub::scrub_text(body, note.secrets);
         if crate::scrub::contains_key_material(&clean, note.secrets) {
             WITHHELD_NOTE.to_owned()
         } else {
-            printable_snippet(&clean, crate::failures::MAX_NOTE_CHARS)
+            printable_snippet_bytes(&clean, crate::failures::MAX_NOTE_BYTES)
         }
     });
     let time = app
@@ -3108,6 +3144,7 @@ fn record_ring(
         key: key.to_owned(),
         status: note.status,
         class: class.to_owned(),
+        action,
         retry_after,
         cooled,
         cooling_seconds,
@@ -3147,6 +3184,18 @@ pub(crate) fn printable_snippet(text: &str, max: usize) -> String {
         .take(max)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Printable text for the failure ring, where the cap is in bytes rather than characters.
+fn printable_snippet_bytes(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(max.min(text.len()));
+    for c in text.chars() {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(if c.is_control() { ' ' } else { c });
+    }
+    out
 }
 
 fn exhausted(
@@ -4804,30 +4853,32 @@ mod tests {
         let secret_text = ["sk-ring", "-secret-0123456789"].concat();
         let secret = secret_text.as_str();
         let body = format!("bad {secret}\u{1b}[31m\n{}", "x".repeat(300));
-        record_ring(
-            &app,
-            "s",
-            "a",
-            FailureClass::RateLimited(None).name(),
-            FailureNote {
+        record_ring(RingEntry {
+            app: &app,
+            stream: "s",
+            key: "a",
+            class: FailureClass::RateLimited(None).name(),
+            note: FailureNote {
                 status: Some(429),
                 retry_after: Some("12\n0"),
                 body: Some(&body),
                 secrets: &[secret],
                 ..FailureNote::default()
             },
-            true,
-            Some(30),
-        );
-        let rows = app.failures().snapshot(1, None);
+            action: FailureAction::Cooldown,
+            cooled: true,
+            cooling_seconds: Some(30),
+        });
+        let rows = app.failures().snapshot(1, None, None);
         assert_eq!(rows[0].status, Some(429));
         assert_eq!(rows[0].retry_after.as_deref(), Some("12 0"));
+        assert_eq!(rows[0].action, FailureAction::Cooldown);
         assert!(rows[0].cooled);
         assert_eq!(rows[0].cooling_seconds, Some(30));
         let note = rows[0].note.clone().unwrap_or_default();
         assert!(!note.contains(secret), "{note}");
         assert!(!note.chars().any(char::is_control));
-        assert_eq!(note.chars().count(), crate::failures::MAX_NOTE_CHARS);
+        assert_eq!(note.len(), crate::failures::MAX_NOTE_BYTES);
     }
 
     #[test]
@@ -4841,24 +4892,76 @@ mod tests {
         let secret_text = ["sk-split", "-secret-0123456789"].concat();
         let secret = secret_text.as_str();
         let body = format!("{}\n{}  {}", "x".repeat(300), &secret[..6], &secret[6..]);
-        record_ring(
-            &app,
-            "s",
-            "a",
-            FailureKind::RequestError.label(),
-            FailureNote {
+        record_ring(RingEntry {
+            app: &app,
+            stream: "s",
+            key: "a",
+            class: FailureKind::RequestError.label(),
+            note: FailureNote {
                 status: Some(402),
                 body: Some(&body),
                 secrets: &[secret],
                 ..FailureNote::default()
             },
-            false,
-            None,
-        );
-        let rows = app.failures().snapshot(1, None);
+            action: FailureAction::PassThrough,
+            cooled: false,
+            cooling_seconds: None,
+        });
+        let rows = app.failures().snapshot(1, None, None);
         assert_eq!(rows[0].note.as_deref(), Some(WITHHELD_NOTE));
         assert_eq!(rows[0].class, "request_error");
+        assert_eq!(rows[0].action, FailureAction::PassThrough);
         assert!(!rows[0].cooled);
+    }
+
+    #[test]
+    fn a_ring_snippet_is_capped_in_bytes_not_characters() {
+        let app = App::with_header_timeout(
+            Config::parse("").unwrap(),
+            HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(1),
+        );
+        let body = "é".repeat(150);
+        record_ring(RingEntry {
+            app: &app,
+            stream: "s",
+            key: "a",
+            class: FailureClass::Transient.name(),
+            note: FailureNote {
+                body: Some(&body),
+                ..FailureNote::default()
+            },
+            action: FailureAction::PassThrough,
+            cooled: false,
+            cooling_seconds: None,
+        });
+        let rows = app.failures().snapshot(1, None, None);
+        let note = rows[0].note.as_deref().unwrap();
+        assert_eq!(note.len(), crate::failures::MAX_NOTE_BYTES);
+        assert_eq!(note.chars().count(), crate::failures::MAX_NOTE_BYTES / 2);
+    }
+
+    #[test]
+    fn a_recorded_unauthorized_failure_asks_for_a_rotation() {
+        let app = App::with_header_timeout(
+            Config::parse("").unwrap(),
+            HashMap::new(),
+            Policy::default(),
+            Duration::from_secs(1),
+        );
+        let snapshot = app.snapshot();
+        record(
+            &app,
+            &snapshot,
+            "s",
+            "a",
+            FailureClass::Unauthorized,
+            FailureNote::default(),
+        );
+        let rows = app.failures().snapshot(1, None, None);
+        assert_eq!(rows[0].action, FailureAction::Rotate);
+        assert!(rows[0].cooled);
     }
 
     #[test]
@@ -5124,10 +5227,11 @@ mod tests {
         );
         assert_eq!(cooling(&rig.app, "a"), None);
 
-        let rows = rig.app.failures().snapshot(10, Some("a"));
+        let rows = rig.app.failures().snapshot(10, Some("a"), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].class, FailureKind::RequestError.label());
         assert_eq!(rows[0].status, Some(402));
+        assert_eq!(rows[0].action, FailureAction::PassThrough);
         assert!(!rows[0].cooled);
     }
 
@@ -5153,7 +5257,7 @@ mod tests {
             assert_eq!(cooling(&rig.app, key), None);
         }
 
-        let rows = rig.app.failures().snapshot(10, None);
+        let rows = rig.app.failures().snapshot(10, None, None);
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
@@ -5173,7 +5277,7 @@ mod tests {
         assert_eq!(rig.keys_called(), ["up-a", "up-b"]);
         assert_eq!(cooling(&rig.app, "a"), None);
 
-        let rows = rig.app.failures().snapshot(10, Some("a"));
+        let rows = rig.app.failures().snapshot(10, Some("a"), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].class, FailureKind::RequestError.label());
         assert_eq!(rows[0].status, Some(400));
@@ -5202,10 +5306,11 @@ mod tests {
                 .is_available("a", Instant::now())
         );
 
-        let rows = rig.app.failures().snapshot(10, Some("a"));
+        let rows = rig.app.failures().snapshot(10, Some("a"), None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].class, FailureClass::QuotaExhausted.name());
         assert_eq!(rows[0].status, Some(402));
+        assert_eq!(rows[0].action, FailureAction::Cooldown);
         assert!(rows[0].cooled);
     }
 

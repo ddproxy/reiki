@@ -565,6 +565,7 @@ mod tests {
                 key: "k".to_owned(),
                 status: Some(429),
                 class: "rate_limited".to_owned(),
+                action: "pass-through".to_owned(),
                 retry_after: Some("120".to_owned()),
                 cooled: true,
                 cooling_seconds: Some(1),

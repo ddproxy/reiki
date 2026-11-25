@@ -100,6 +100,9 @@ enum Command {
         /// Only failures for this key name.
         #[arg(long)]
         key: Option<String>,
+        /// Only failures for this stream name.
+        #[arg(long)]
+        stream: Option<String>,
         /// Print the JSON array instead of a table.
         #[arg(long)]
         json: bool,
@@ -485,6 +488,7 @@ async fn run_failures(
     config: &std::path::Path,
     limit: u8,
     key: Option<&str>,
+    stream: Option<&str>,
     url: Option<&str>,
     token_file: Option<&std::path::Path>,
     json: bool,
@@ -500,6 +504,10 @@ async fn run_failures(
     if let Some(key) = key {
         request.push_str("&key=");
         request.push_str(&percent_encode_query(key));
+    }
+    if let Some(stream) = stream {
+        request.push_str("&stream=");
+        request.push_str(&percent_encode_query(stream));
     }
     let response = reqwest::Client::new()
         .get(request)
@@ -1137,6 +1145,7 @@ async fn main() {
     if let Some(Command::Failures {
         limit,
         key,
+        stream,
         json,
         url,
         token_file,
@@ -1147,6 +1156,7 @@ async fn main() {
                 &cli.config,
                 *limit,
                 key.as_deref(),
+                stream.as_deref(),
                 url.as_deref(),
                 token_file.as_deref(),
                 *json,

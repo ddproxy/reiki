@@ -1003,6 +1003,7 @@ fn failure_line(failure: &crate::Failure, width: usize) -> Line {
             Style::Plain,
         ),
         span(format!("  {}", failure.class), Style::Warn),
+        span(format!("  {}", failure.action), Style::Dim),
     ];
     if failure.cooled {
         let left = failure
@@ -4164,6 +4165,7 @@ mod tests {
                 key: "k".to_owned(),
                 status: Some(429),
                 class: "rate_limited".to_owned(),
+                action: "cooldown".to_owned(),
                 retry_after: Some("120".to_owned()),
                 cooled: true,
                 cooling_seconds: Some(30),
@@ -4180,6 +4182,10 @@ mod tests {
         assert!(
             local.iter().any(|l| l.contains("cooled 30s")),
             "the cooldown was not rendered"
+        );
+        assert!(
+            local.iter().any(|l| l.contains("cooldown")),
+            "the action was not rendered"
         );
         assert!(
             local.iter().any(|l| l.contains("body")),

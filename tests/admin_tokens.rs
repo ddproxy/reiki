@@ -309,6 +309,7 @@ async fn the_read_only_token_gets_no_failure_snippets() {
         "no free text for read-only: {read}"
     );
     assert_eq!(read_row["class"], full_row["class"]);
+    assert_eq!(read_row["action"], full_row["action"]);
     assert_eq!(read_row["status"], full_row["status"]);
     assert_eq!(read_row["key"], "a");
 }

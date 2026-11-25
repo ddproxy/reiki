@@ -74,6 +74,8 @@ The `cooling_combinations` count in a peer's view is the number of combinations 
 
 An `access_disabled`, `request_error` or held/second-`401` refusal does not cool the key. A transient 5xx, which is also kept as the last refusal, does cool the key after two in a row. A request-size 402 is recorded in the failure ring as `request_error` but does not cool the key: another key may still afford the request. The client sees the upstream's error, which says more than `reiki_exhausted`.
 
+The ring's `action` field names the outcome of that walk: `cooldown` when a scope or the key cooled, `rotate` when an `unauthorized` disabled the key, and `pass-through` when Reiki only skipped the key for this request. See [GET /v1/failures](monitoring.md#get-v1failures).
+
 ## Confirming a quota 429
 
 `confirm_quota = true` is set per upstream. The default is `false`. With it, the first quota 429 from a key in a request does not count against key health and does not cool the key, though it is still added to the failure ring. Reiki waits 3 seconds and sends the request to the same key again. Only a second quota 429 from that key in the same request cools it. Use this for an upstream that sometimes returns a quota 429 for a good key. It does not apply to 402.

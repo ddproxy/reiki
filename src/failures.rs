@@ -1,18 +1,23 @@
 //! A bounded in-memory ring of recent key failures, and the `reiki failures` table.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
 use reiki_plugin::format_utc;
 
-/// Records kept across all streams. Small on purpose: this is a live diagnostic, not a log.
-pub const CAPACITY: usize = 64;
-/// Longest body snippet kept, matching the existing failure log line.
-pub const MAX_NOTE_CHARS: usize = 200;
-/// Longest `Retry-After` kept. The value comes from the upstream and is only echoed.
-pub const MAX_RETRY_AFTER_CHARS: usize = 64;
+/// Default number of records kept across all streams. Overridden by `failure_ring_size`.
+pub const DEFAULT_CAPACITY: usize = 200;
+/// Hard ceiling for `failure_ring_size`, so a config cannot reserve unbounded memory.
+pub const MAX_CAPACITY: usize = 10_000;
+/// Largest `limit` accepted by `/v1/failures` and `reiki failures`. Independent of capacity.
+pub const MAX_QUERY_LIMIT: usize = 64;
+/// Longest body snippet kept, in bytes rather than characters.
+pub const MAX_NOTE_BYTES: usize = 200;
+/// Longest `Retry-After` kept, in bytes. The value comes from the upstream and is only echoed.
+pub const MAX_RETRY_AFTER_BYTES: usize = 64;
 
 /// The only class labels `/v1/failures` counts. Keeping this fixed means a future or corrupted
 /// label cannot grow the peer health document into an unbounded map.
@@ -29,6 +34,29 @@ pub fn is_known_class(label: &str) -> bool {
     CLASSES.contains(&label)
 }
 
+/// What the failover walk did after this failure. The names are the wire labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureAction {
+    /// The key or one of its scopes was cooled.
+    Cooldown,
+    /// The key was taken out of rotation and needs a new secret.
+    Rotate,
+    /// The key was skipped for this request and the upstream answer was passed on.
+    #[default]
+    PassThrough,
+}
+
+impl FailureAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cooldown => "cooldown",
+            Self::Rotate => "rotate",
+            Self::PassThrough => "pass-through",
+        }
+    }
+}
+
 /// One key failure as `/v1/failures` and `reiki failures` show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
@@ -38,6 +66,9 @@ pub struct FailureRecord {
     pub key: String,
     pub status: Option<u16>,
     pub class: String,
+    /// The action chosen after this failure; absent in records from older instances.
+    #[serde(default)]
+    pub action: FailureAction,
     /// As received, bounded and printable; never parsed.
     pub retry_after: Option<String>,
     /// Whether this failure put the key on cooldown.
@@ -48,44 +79,82 @@ pub struct FailureRecord {
     pub note: Option<String>,
 }
 
-/// The last [`CAPACITY`] failures, newest last.
+#[derive(Debug)]
+struct State {
+    capacity: usize,
+    records: VecDeque<FailureRecord>,
+}
+
+/// The last `capacity` failures, newest last. Entirely in memory: no state or log file is touched.
 #[derive(Debug)]
 pub struct FailureRing {
-    records: Mutex<VecDeque<FailureRecord>>,
+    state: Mutex<State>,
+    /// Records not retained because the ring was disabled, full or contended.
+    drops: AtomicU64,
 }
 
 impl Default for FailureRing {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_CAPACITY)
     }
 }
 
 impl FailureRing {
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.min(MAX_CAPACITY);
         Self {
-            records: Mutex::new(VecDeque::with_capacity(CAPACITY)),
+            state: Mutex::new(State {
+                capacity,
+                records: VecDeque::with_capacity(capacity),
+            }),
+            drops: AtomicU64::new(0),
         }
+    }
+
+    /// Applies a config reload. Records beyond the new capacity are dropped, not moved to disk.
+    pub fn set_capacity(&self, capacity: usize) {
+        let capacity = capacity.min(MAX_CAPACITY);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let trimmed = state.records.len().saturating_sub(capacity);
+        for _ in 0..trimmed {
+            state.records.pop_front();
+        }
+        self.drops.fetch_add(trimmed as u64, Ordering::Relaxed);
+        state.capacity = capacity;
     }
 
     /// Adds one record. Contention drops it: an observability buffer must never make a request
-    /// wait, and the ring is a sample anyway.
+    /// wait. A capacity of zero disables the ring entirely.
     pub fn record(&self, record: FailureRecord) {
-        let Ok(mut records) = self.records.try_lock() else {
+        let Ok(mut state) = self.state.try_lock() else {
+            self.drops.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if records.len() == CAPACITY {
-            records.pop_front();
+        if state.capacity == 0 {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            return;
         }
-        records.push_back(record);
+        if state.records.len() == state.capacity {
+            state.records.pop_front();
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+        state.records.push_back(record);
     }
 
-    /// Newest first, at most `limit`, optionally only failures for one key.
-    pub fn snapshot(&self, limit: usize, key: Option<&str>) -> Vec<FailureRecord> {
-        let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        records
+    /// Newest first, at most `limit`, optionally only failures for one key or stream.
+    pub fn snapshot(
+        &self,
+        limit: usize,
+        key: Option<&str>,
+        stream: Option<&str>,
+    ) -> Vec<FailureRecord> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .records
             .iter()
             .rev()
             .filter(|record| key.is_none_or(|key| record.key == key))
+            .filter(|record| stream.is_none_or(|stream| record.stream == stream))
             .take(limit)
             .cloned()
             .collect()
@@ -93,15 +162,31 @@ impl FailureRing {
 
     /// How many records each failure class has in the ring; only observed classes.
     pub fn counts(&self) -> BTreeMap<String, u64> {
-        let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out = BTreeMap::new();
-        for record in records
+        for record in state
+            .records
             .iter()
             .filter(|record| is_known_class(&record.class))
         {
             *out.entry(record.class.clone()).or_insert(0) += 1;
         }
         out
+    }
+
+    /// Host-owned Prometheus series, appended to `/v1/metrics` even without the metrics plugin.
+    pub fn metrics(&self) -> String {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        format!(
+            "# HELP reiki_failure_ring_entries Recent upstream failures kept in memory.\n\
+                    # TYPE reiki_failure_ring_entries gauge\n\
+                    reiki_failure_ring_entries {}\n\
+                    # HELP reiki_failure_ring_dropped_total Failures not retained by the ring.\n\
+                    # TYPE reiki_failure_ring_dropped_total counter\n\
+                    reiki_failure_ring_dropped_total {}\n",
+            state.records.len(),
+            self.drops.load(Ordering::Relaxed)
+        )
     }
 }
 
@@ -122,7 +207,9 @@ pub fn render_table(records: &[FailureRecord], width: usize) -> String {
     if records.is_empty() {
         return "no failures\n".to_owned();
     }
-    let headers = ["TIME", "STREAM", "KEY", "STATUS", "CLASS", "COOLED", "NOTE"];
+    let headers = [
+        "TIME", "STREAM", "KEY", "STATUS", "CLASS", "ACTION", "COOLED", "NOTE",
+    ];
     let rows: Vec<Vec<String>> = records
         .iter()
         .map(|record| {
@@ -134,6 +221,7 @@ pub fn render_table(records: &[FailureRecord], width: usize) -> String {
                     .status
                     .map_or_else(|| "-".to_owned(), |status| status.to_string()),
                 record.class.clone(),
+                record.action.label().to_owned(),
                 match (record.cooled, record.cooling_seconds) {
                     (true, Some(secs)) => format!("{secs}s"),
                     (true, None) => "yes".to_owned(),
@@ -206,6 +294,7 @@ mod tests {
             key: label.to_owned(),
             status: Some(429),
             class: "rate_limited".to_owned(),
+            action: FailureAction::Cooldown,
             retry_after: Some("120".to_owned()),
             cooled: true,
             cooling_seconds: Some(10),
@@ -215,35 +304,101 @@ mod tests {
 
     #[test]
     fn the_ring_keeps_the_newest_capacity_in_order() {
-        let ring = FailureRing::new();
-        for n in 0..CAPACITY + 5 {
+        let ring = FailureRing::new(8);
+        for n in 0..13 {
             ring.record(failure(&n.to_string()));
         }
-        let all = ring.snapshot(CAPACITY, None);
-        assert_eq!(all.len(), CAPACITY);
-        assert_eq!(all.first().unwrap().key, (CAPACITY + 4).to_string());
+        let all = ring.snapshot(100, None, None);
+        assert_eq!(all.len(), 8);
+        assert_eq!(all.first().unwrap().key, "12");
         assert_eq!(all.last().unwrap().key, "5");
+        assert_eq!(ring.drops.load(Ordering::Relaxed), 5);
     }
 
     #[test]
-    fn snapshot_is_newest_first_and_honours_limit_and_key() {
-        let ring = FailureRing::new();
+    fn snapshot_is_newest_first_and_honours_limit_key_and_stream() {
+        let ring = FailureRing::new(10);
         ring.record(failure("a"));
-        ring.record(failure("b"));
+        let mut other_stream = failure("b");
+        other_stream.stream = "t".to_owned();
+        ring.record(other_stream);
         ring.record(failure("a"));
-        let all = ring.snapshot(10, None);
+        let all = ring.snapshot(10, None, None);
         let keys: Vec<&str> = all.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, ["a", "b", "a"]);
-        assert_eq!(ring.snapshot(1, None)[0].key, "a");
-        let only = ring.snapshot(10, Some("a"));
+        assert_eq!(ring.snapshot(1, None, None)[0].key, "a");
+        let only = ring.snapshot(10, Some("a"), None);
         assert_eq!(only.len(), 2);
         assert!(only.iter().all(|r| r.key == "a"));
-        assert!(ring.snapshot(10, Some("gone")).is_empty());
+        let stream = ring.snapshot(10, None, Some("t"));
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].key, "b");
+        assert!(ring.snapshot(10, Some("a"), Some("t")).is_empty());
+        assert!(ring.snapshot(10, Some("gone"), None).is_empty());
+    }
+
+    #[test]
+    fn a_zero_capacity_ring_records_nothing_and_counts_drops() {
+        let ring = FailureRing::new(0);
+        ring.record(failure("a"));
+        assert!(ring.snapshot(10, None, None).is_empty());
+        assert!(ring.counts().is_empty());
+        assert_eq!(ring.drops.load(Ordering::Relaxed), 1);
+        ring.set_capacity(1);
+        ring.record(failure("b"));
+        assert_eq!(ring.snapshot(10, None, None).len(), 1);
+    }
+
+    #[test]
+    fn shrinking_capacity_trims_the_oldest_records() {
+        let ring = FailureRing::new(3);
+        for n in 0..3 {
+            ring.record(failure(&n.to_string()));
+        }
+        ring.set_capacity(1);
+        let rows = ring.snapshot(10, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "2");
+        assert_eq!(ring.drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn metrics_show_the_live_size_and_drops() {
+        let ring = FailureRing::new(1);
+        ring.record(failure("a"));
+        ring.record(failure("b"));
+        let text = ring.metrics();
+        assert!(
+            text.contains("# TYPE reiki_failure_ring_entries gauge"),
+            "{text}"
+        );
+        assert!(text.contains("reiki_failure_ring_entries 1"), "{text}");
+        assert!(
+            text.contains("# TYPE reiki_failure_ring_dropped_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("reiki_failure_ring_dropped_total 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn actions_have_stable_wire_labels_and_default_to_pass_through() {
+        assert_eq!(FailureAction::Cooldown.label(), "cooldown");
+        assert_eq!(FailureAction::Rotate.label(), "rotate");
+        assert_eq!(FailureAction::PassThrough.label(), "pass-through");
+        let row = failure("a");
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"action\":\"cooldown\""), "{json}");
+        let older = json.replace("\"action\":\"cooldown\",", "");
+        let parsed: FailureRecord = serde_json::from_str(&older).unwrap();
+        assert_eq!(parsed.action, FailureAction::PassThrough);
     }
 
     #[test]
     fn counts_name_only_the_classes_present() {
-        let ring = FailureRing::new();
+        let ring = FailureRing::new(10);
         ring.record(failure("a"));
         let mut other = failure("b");
         other.class = "transient".to_owned();
@@ -256,7 +411,7 @@ mod tests {
 
     #[test]
     fn counts_include_request_errors_and_ignore_unknown_labels() {
-        let ring = FailureRing::new();
+        let ring = FailureRing::new(10);
         let mut request = failure("a");
         request.class = "request_error".to_owned();
         ring.record(request);
@@ -273,10 +428,13 @@ mod tests {
     fn the_table_has_the_columns_and_fits_the_width() {
         let text = render_table(&[failure("a")], 80);
         let header = text.lines().next().unwrap();
-        for column in ["TIME", "STREAM", "KEY", "STATUS", "CLASS", "COOLED", "NOTE"] {
+        for column in [
+            "TIME", "STREAM", "KEY", "STATUS", "CLASS", "ACTION", "COOLED", "NOTE",
+        ] {
             assert!(header.contains(column), "{header}");
         }
         assert!(text.contains("429"), "{text}");
+        assert!(text.contains("cooldown"), "{text}");
         assert!(text.contains("10s"), "{text}");
         for line in render_table(&[failure("long-key")], 24).lines() {
             assert!(line.chars().count() <= 24, "{line:?}");

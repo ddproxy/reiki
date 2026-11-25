@@ -292,13 +292,14 @@ reiki streams [--url URL] [--token-file PATH] [--reason TEXT] [--idempotency-key
 Shows the running instance's last key failures, from the same in-memory ring as `GET /v1/failures`.
 
 ```
-reiki failures [--limit N] [--key NAME] [--json] [--url URL] [--token-file PATH]
+reiki failures [--limit N] [--key NAME] [--stream NAME] [--json] [--url URL] [--token-file PATH]
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--limit N` | `20` | Records to show, newest first; 1 to 64. |
 | `--key NAME` | all keys | Only failures for this key name. |
+| `--stream NAME` | all streams | Only failures for this stream name. |
 | `--json` | off | Print the same JSON array as the endpoint. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. |
@@ -306,8 +307,8 @@ reiki failures [--limit N] [--key NAME] [--json] [--url URL] [--token-file PATH]
 The table:
 
 ```
-TIME               STREAM  KEY    STATUS  CLASS         COOLED  NOTE
-2026-11-17 12:00:00  client  zen-a  429     rate_limited  42s     {"error":"rate limited"}
+TIME                 STREAM  KEY    STATUS  CLASS         ACTION      COOLED  NOTE
+2026-11-17 12:00:00  client  zen-a  429     rate_limited  cooldown    42s     {"error":"rate limited"}
 ```
 
 | Column | Meaning |
@@ -317,10 +318,11 @@ TIME               STREAM  KEY    STATUS  CLASS         COOLED  NOTE
 | `KEY` | Key name from `[keys.NAME]`. |
 | `STATUS` | Upstream status code, or `-` for a transport failure. |
 | `CLASS` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error`. |
+| `ACTION` | `cooldown`, `rotate` or `pass-through` from the failover walk. |
 | `COOLED` | Seconds left on the cooldown this failure started, or `-`. |
-| `NOTE` | Scrubbed, printable body snippet, cut to the terminal width (`COLUMNS`, default 120). |
+| `NOTE` | Scrubbed, printable body snippet, cut to 200 bytes and the terminal width (`COLUMNS`, default 120). |
 
-Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. `--json` prints an array whether or not `--limit` was given.
+Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. The ring holds `failure_ring_size` entries (`200` by default; `0` disables). `--json` prints an array whether or not `--limit` was given.
 
 Exit codes: `0` on success; `1` when the admin listener refuses the token or answer; `2` when it cannot be reached or no admin token or address is available.
 

@@ -619,6 +619,7 @@ mod tests {
                 status: Some(429),
                 class: class.to_owned(),
                 retry_after: Some("120".to_owned()),
+                action: crate::failures::FailureAction::Cooldown,
                 cooled: true,
                 cooling_seconds: Some(10),
                 note: Some("a body with secret-key-name in it".to_owned()),

@@ -1238,9 +1238,6 @@ pub struct StreamAdminConfig {
     /// Hard cap on token TTL in seconds.
     #[serde(default = "default_stream_admin_max_ttl")]
     pub max_ttl: u64,
-    /// Limits applied to new streams unless the request provides its own.
-    #[serde(default)]
-    pub default_limits: Option<StreamLimits>,
     /// Loopback admin addresses explicitly allowed to expose these routes.
     /// The configured `admin.listen` must be one of these.
     pub allowed_listen: Vec<String>,
@@ -1732,49 +1729,6 @@ fn validate_stream_admin_config(
     ] {
         if value == Some(0) {
             return Err(fail(format!("ceilings.{label} must be at least 1")));
-        }
-    }
-    if let Some(limits) = &sa.default_limits {
-        for (value, ceiling, label) in [
-            (
-                limits.rpm.map(u64::from),
-                sa.ceilings.rpm.map(u64::from),
-                "rpm",
-            ),
-            (limits.tpm, sa.ceilings.tpm, "tpm"),
-            (
-                limits.concurrent.map(u64::from),
-                sa.ceilings.concurrent.map(u64::from),
-                "concurrent",
-            ),
-            (
-                limits.daily_requests.map(u64::from),
-                sa.ceilings.daily_requests.map(u64::from),
-                "daily_requests",
-            ),
-            (
-                limits.daily_tokens,
-                sa.ceilings.daily_tokens,
-                "daily_tokens",
-            ),
-            (
-                limits.monthly_requests.map(u64::from),
-                sa.ceilings.monthly_requests.map(u64::from),
-                "monthly_requests",
-            ),
-            (
-                limits.monthly_tokens,
-                sa.ceilings.monthly_tokens,
-                "monthly_tokens",
-            ),
-        ] {
-            if let (Some(value), Some(ceiling)) = (value, ceiling)
-                && value > ceiling
-            {
-                return Err(fail(format!(
-                    "default_limits.{label} exceeds ceilings.{label}"
-                )));
-            }
         }
     }
     Ok(())
@@ -5629,10 +5583,6 @@ monthly_tokens = 1000000
         let zero_ceiling =
             stream_admin_base(&stream_admin_table("").replace("rpm = 100", "rpm = 0"));
         assert!(Config::parse(&zero_ceiling).is_err());
-        let over_ceiling = stream_admin_base(&stream_admin_table(
-            "[stream_admin.default_limits]\nrpm = 101\n",
-        ));
-        assert!(Config::parse(&over_ceiling).is_err());
     }
 
     #[test]

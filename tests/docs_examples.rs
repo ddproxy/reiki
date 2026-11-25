@@ -317,7 +317,6 @@ fn docs_keep_adding_config_keys_and_stream_flags() {
             "max_tokens_per_stream",
             "default_ttl",
             "max_ttl",
-            "default_limits",
             "allowed_listen",
             "require_two_party",
             "confirm_env",
@@ -343,6 +342,10 @@ fn docs_keep_adding_config_keys_and_stream_flags() {
     assert!(
         !docs.contains("rate_limit_per_minute"),
         "docs still describe the removed stream key"
+    );
+    assert!(
+        !docs.contains("default_limits"),
+        "docs still describe the removed stream admin key"
     );
 }
 

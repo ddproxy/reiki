@@ -37,7 +37,7 @@ class CheckRepoHygieneTests(unittest.TestCase):
     def test_development_hostname_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            (root / "notes.md").write_text(f"proxy = {HOST}\n")
+            (root / "scratch.md").write_text(f"proxy = {HOST}\n")
             allowlist = root / "allowlist.txt"
             allowlist.write_text("")
             result = self.run_check(root, allowlist)
@@ -47,7 +47,7 @@ class CheckRepoHygieneTests(unittest.TestCase):
     def test_internal_domain_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            (root / "notes.md").write_text(f"host = {DOMAIN}\n")
+            (root / "scratch.md").write_text(f"host = {DOMAIN}\n")
             allowlist = root / "allowlist.txt"
             allowlist.write_text("")
             result = self.run_check(root, allowlist)

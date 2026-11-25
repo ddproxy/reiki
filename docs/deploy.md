@@ -37,7 +37,7 @@ These are recommended paths. Reiki creates the state file, service log, request-
 | `/var/lib/reiki/requests.jsonl` | `reiki:reiki`, `0600` | Reiki | Optional request-log file |
 | `/run/reiki/requests.sock` | `reiki:reiki`, `0600` | Reiki | Optional request-log socket; parent `0700` |
 
-Reiki enforces `0600` on the state file and request-log file and socket. It tightens an existing service log to `0640`. By default startup and reload refuse a key file with group or other read or write bits (`strict_key_permissions = true`); set it to `false` to warn instead. `reiki keys --check` always reports such a file as a warning and exits `1`. Peer tokens, peer TLS keys and the intercept CA key must be private. See [keys](keys.md#key-files), [peers](peers.md) and [security](security.md#hardening).
+Reiki enforces `0600` on the state file and request-log file and socket. It tightens an existing service log to `0640`. By default startup and reload refuse a key file with group or other read or write bits (`strict_key_permissions = true`); set it to `false` to warn instead. `reiki keys --check` always reports such a file as a warning and exits `1`. Peer tokens, peer TLS keys and the intercept CA key must be private. See [keys](keys.md#key-files), [provider health](provider-health.md) and [security](security.md#hardening).
 
 Before binding listeners, Reiki probes the state directory (the parent of `<config>.state`) and, when `[log] file` is configured, the log directory. Each probe creates and removes an unpredictably named temp file in that directory with `create_new` and `O_NOFOLLOW`, writes a few KB, and removes it. A pre-existing file or a symlink at a probe path cannot satisfy the check, and no files are created outside the configured paths. With `[gateway] on_store_error = "closed"` (default), a failed state directory probe exits 1 naming the path and the OS cause; with `"open"`, Reiki logs one `WARN` and continues. A failed log directory probe never stops startup: Reiki logs one `WARN` and disables the log file for that run. The unit below uses `ReadWritePaths=/etc/reiki` for the default config path. For a config under `StateDirectory`, that line is not needed.
 
@@ -51,7 +51,7 @@ Before binding listeners, Reiki probes the state directory (the parent of `<conf
 | Tunnel | `[tunnel].listen` and `allow` | none; optional table | Opaque CONNECT on an allow-list. No token on the socket, so restrict network access. `[tunnel.intercept]` adds TLS termination for listed hosts. |
 | Hub | `[hub].listen` | none; optional table | Parsed and validated only in this release. No listener is bound and no hub is contacted. The `hub` feature is not in release builds. |
 
-Every bound listener must have a distinct address. Docs examples use `4099` for both peers and tunnel; choose two different ports. Keep plain HTTP listeners on loopback or put TLS in front. See [configuration](configuration.md#validation), [monitoring](monitoring.md), [peers](peers.md) and [tunnel](tunnel.md).
+Every bound listener must have a distinct address. Docs examples use `4099` for both peers and tunnel; choose two different ports. Keep plain HTTP listeners on loopback or put TLS in front. See [configuration](configuration.md#validation), [monitoring](monitoring.md), [provider health](provider-health.md) and [tunnel](tunnel.md).
 
 ## Signals and lifecycle
 
@@ -200,7 +200,7 @@ flowchart TD
 3. Bring up peer publishers: `[peers] enabled = true`, `publish = true`, `listen`, and at least one token hash. Adding or moving the peer listener needs a restart. A non-loopback listener needs `tls_cert` and `tls_key`.
 4. Configure readers with `[peers.NAME] url`, `token_file` and, for HTTPS, `ca_file`. Token and reader changes apply on reload. `reiki peers` and `reiki top` then show the fleet.
 5. Start tunnel clients after the tunnel listener and allow-list are in place. Create the CA with `reiki ca-init` before enabling interception; distribute only `ca.pem`. Keep `deny_private = true` with a broad allow-list.
-6. Use `reiki top` and `/v1/metrics` once admin and peer listeners are healthy. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
+6. Use `reiki top` and `/v1/metrics` once admin and peer listeners are healthy. See [top](top.md), [provider health](provider-health.md) and [monitoring](monitoring.md).
 
 Forwarders run as child commands or Unix sockets and inherit the service limits. A socket in a group- or other-writable directory needs `expect_uid`. See [providers](providers.md#forwarding). Hub configuration cannot be brought up in this release.
 

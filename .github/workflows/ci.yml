@@ -23,9 +23,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo clippy --workspace --all-targets --locked --features top -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features top,plugin-cost -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo test --locked --workspace --features top
+      - run: cargo test --locked --workspace --features top,plugin-cost
       - run: python3 scripts/check-repo-hygiene.py
       - run: python3 -m unittest discover -s scripts/tests -v
 
@@ -38,7 +38,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.99"
       - run: cargo test --locked --test docs_examples
+      # Warning only until 1.0: this becomes a blocking check at 1.0.
+      - name: openapi-diff (warning)
+        continue-on-error: true
+        run: |
+          git fetch --no-tags origin main || true
+          python3 scripts/openapi-diff.py --current tests/golden/openapi.json --base-ref origin/main --base-path tests/golden/openapi.json

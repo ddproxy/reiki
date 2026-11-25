@@ -18,7 +18,7 @@ Without the feature the subcommand and its `--help` entry are absent.
 
 ## Configure
 
-It needs `[peers] enabled = true` and at least one `[peers.NAME]` table, exactly as `reiki peers`; each entry must point at an instance that publishes health and at a token file that instance issued (see [peers](peers.md)).
+It needs `[peers] enabled = true` and at least one `[peers.NAME]` table, exactly as `reiki peers`; each entry must point at an instance that publishes health and at a token file that instance issued (see [provider health](provider-health.md)).
 
 The Streams screen additionally uses the local instance's `[admin] listen` address and an admin token, the same configuration as the local failure rows. `reiki top` reads only, so it prefers the read-only token from `REIKI_ADMIN_READ_TOKEN` and falls back to `REIKI_ADMIN_TOKEN`. With the read-only token the failure rows show their time, key, status and class but no body snippet. It never reads or uses the separate stream-admin token (see [stream administration routes](monitoring.md#stream-administration-routes)).
 

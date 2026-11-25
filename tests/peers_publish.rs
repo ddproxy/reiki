@@ -177,7 +177,9 @@ async fn only_the_peer_token_opens_the_peer_listener() {
     {
         let (code, body) = rig.peer_get("/v1/health", token).await;
         assert_eq!(code, 401, "token #{i} is refused");
-        assert!(body.is_empty(), "a refusal has no body");
+        let err: serde_json::Value = serde_json::from_str(&body).expect("refusal is json");
+        assert_eq!(err["ok"], false, "token #{i} refusal is envelope");
+        assert!(err["error"]["code"].is_string(), "token #{i} has code");
     }
     let other_carriers = [
         rig.client

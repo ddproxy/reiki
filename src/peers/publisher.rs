@@ -249,7 +249,7 @@ pub fn router(app: Arc<App>) -> Router {
 }
 
 fn not_found() -> Response {
-    text_response(StatusCode::NOT_FOUND, "text/plain", String::new())
+    crate::admin::error_response(StatusCode::NOT_FOUND, "not_found", "no such peer route")
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
@@ -326,11 +326,19 @@ async fn subscribe(
         }
         Err(refused) => {
             tracing::warn!(?peer, token, ?refused, "peer stream refused");
-            let status = match refused {
-                Refused::Full => StatusCode::SERVICE_UNAVAILABLE,
-                Refused::PeerFull | Refused::TokenFull => StatusCode::TOO_MANY_REQUESTS,
+            let (status, code, message) = match refused {
+                Refused::Full => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too_many_subscribers",
+                    "max_subscribers streams are open",
+                ),
+                Refused::PeerFull | Refused::TokenFull => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too_many_subscribers",
+                    "too many open streams for this peer or token",
+                ),
             };
-            let mut response = text_response(status, "text/plain", String::new());
+            let mut response = crate::admin::error_response(status, code, message);
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));

@@ -411,7 +411,7 @@ Peer tokens are named `[a-z0-9-]`, at most 32 characters. Each token's hash must
 | `token_file` | string | required | File that holds the token the peer issued to this instance. |
 | `ca_file` | string | required for `https` | PEM CA certificates trusted for this peer only. |
 
-Peer names use letters, digits, `-`, `_` and `.`, at most 64 characters. See [peers](peers.md).
+Peer names use letters, digits, `-`, `_` and `.`, at most 64 characters. See [provider health](provider-health.md).
 
 ## `[plugins.NAME]`
 

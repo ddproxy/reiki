@@ -345,7 +345,7 @@ The body is printed unchanged, so CSV has the same columns and JSON the same fie
 
 ## peers
 
-Reads `/v1/health` on each `[peers.NAME]` and prints what it reports. Each peer's token comes from its `token_file` in the config. See [peers](peers.md).
+Reads `/v1/health` on each `[peers.NAME]` and prints what it reports. Each peer's token comes from its `token_file` in the config. See [provider health](provider-health.md).
 
 ```
 reiki peers [--json] [--watch]

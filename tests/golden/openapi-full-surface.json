@@ -1,0 +1,1759 @@
+{
+  "components": {
+    "schemas": {
+      "Error": {
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ErrorEnvelope": {
+        "additionalProperties": true,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          },
+          "ok": {
+            "const": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "error"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "description": "The full admin token, or the read-only token on read routes. Errors use the admin error envelope.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "peerAuth": {
+        "description": "The read-only peer token; accepted on the peer listener only",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "streamAdminAuth": {
+        "description": "Dedicated stream-management token; never the ordinary admin token",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "Reiki admin API",
+    "version": "<version>"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/failures": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Records to return, newest first; defaults to 64",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 64,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only failures for this key name",
+            "in": "query",
+            "name": "key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only failures for this stream name",
+            "in": "query",
+            "name": "stream",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "limit is not 1..=64, a flag is repeated, or a name is empty or invalid percent-encoding"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Recent key failures, newest first, from an in-memory ring"
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "age_seconds": {
+                      "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "failures": {
+                      "additionalProperties": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "description": "Counts of recent key failures by class over a bounded in-memory ring, newest or not; never bodies, key names or streams",
+                      "type": "object"
+                    },
+                    "gateway": {
+                      "additionalProperties": true,
+                      "description": "Only with expose_usage; aggregate gateway counters, counts only",
+                      "properties": {
+                        "requests": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "store_errors": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "requests",
+                        "tokens",
+                        "store_errors"
+                      ],
+                      "type": "object"
+                    },
+                    "host": {
+                      "additionalProperties": true,
+                      "description": "Optional non-core extension: present only with expose_host_stats; off by default",
+                      "properties": {
+                        "cores": {
+                          "type": "integer"
+                        },
+                        "disks": {
+                          "items": {
+                            "additionalProperties": true,
+                            "description": "Figures are null for a role whose filesystem could not be queried in time",
+                            "properties": {
+                              "available_bytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "roles": {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "total_bytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "used_percent": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "load_average": {
+                          "items": {
+                            "type": "number"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "memory": {
+                          "additionalProperties": true,
+                          "properties": {
+                            "available_bytes": {
+                              "type": "integer"
+                            },
+                            "swap_free_bytes": {
+                              "type": "integer"
+                            },
+                            "swap_total_bytes": {
+                              "type": "integer"
+                            },
+                            "total_bytes": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        }
+                      },
+                      "type": "object",
+                      "x-reiki-default": false,
+                      "x-reiki-extension": "host_stats"
+                    },
+                    "instance": {
+                      "type": "string"
+                    },
+                    "observed": {
+                      "description": "Passthrough upstreams observed by the publisher; always present, may be empty",
+                      "items": {
+                        "additionalProperties": true,
+                        "properties": {
+                          "account": {
+                            "type": "string"
+                          },
+                          "cooldown_class": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "observed_at": {
+                            "type": "string"
+                          },
+                          "quota": {
+                            "additionalProperties": true,
+                            "properties": {
+                              "requests_limit": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "requests_remaining": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "requests_reset_seconds": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "tokens_limit": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "tokens_remaining": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "tokens_reset_seconds": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "requests_limit",
+                              "requests_remaining",
+                              "requests_reset_seconds",
+                              "tokens_limit",
+                              "tokens_remaining",
+                              "tokens_reset_seconds"
+                            ],
+                            "type": "object"
+                          },
+                          "retry_after_seconds": {
+                            "minimum": 0,
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "status_class": {
+                            "type": "string"
+                          },
+                          "upstream": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "upstream",
+                          "account",
+                          "mode",
+                          "status_class",
+                          "observed_at",
+                          "retry_after_seconds",
+                          "cooldown_class",
+                          "quota"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "observed_at": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "reiki_version": {
+                      "description": "The publisher's version, sanitised for terminal display",
+                      "maxLength": 32,
+                      "type": "string"
+                    },
+                    "requestlog_export_dropped_total": {
+                      "description": "Summary records dropped by the bounded queue or failed syslog sends; present when the request-log export reports drops",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "sessions": {
+                      "additionalProperties": true,
+                      "description": "Optional non-core extension: present only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder. Off by default",
+                      "properties": {
+                        "active_sessions": {
+                          "description": "Client-reported distinct values of session_header in the window, not a count of verified devices",
+                          "type": "integer"
+                        },
+                        "streams": {
+                          "items": {
+                            "additionalProperties": true,
+                            "properties": {
+                              "active_sessions": {
+                                "description": "Client-reported distinct values of session_header for this stream",
+                                "type": "integer"
+                              },
+                              "stream": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "window_seconds": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object",
+                      "x-reiki-default": false,
+                      "x-reiki-extension": "host_stats"
+                    },
+                    "streams": {
+                      "additionalProperties": true,
+                      "description": "Only with expose_usage; aggregate stream counts",
+                      "properties": {
+                        "dynamic_streams": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "static_streams": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "static_streams",
+                        "dynamic_streams"
+                      ],
+                      "type": "object"
+                    },
+                    "upstreams": {
+                      "items": {
+                        "additionalProperties": true,
+                        "properties": {
+                          "capacity_group": {
+                            "description": "Opaque, operator-set group for this upstream; only when [upstream.NAME] capacity_group is configured, never derived from a key label or response",
+                            "maxLength": 64,
+                            "pattern": "^[ -~]+$",
+                            "type": "string"
+                          },
+                          "cooling_combinations": {
+                            "description": "How many (route, model) combinations are cooling on this upstream's keys; a count only, never names",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "cooling_keys": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "disabled_keys": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "healthy_keys": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "keys": {
+                            "description": "Only with expose_key_labels",
+                            "items": {
+                              "additionalProperties": true,
+                              "properties": {
+                                "cooldown_class": {
+                                  "description": "Only while cooling, and only when the class is known; readers ignore unknown values",
+                                  "type": "string"
+                                },
+                                "cooldown_seconds": {
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                },
+                                "name": {
+                                  "type": "string"
+                                },
+                                "quota_reset_at": {
+                                  "description": "RFC3339 UTC reset behind a quota cooldown, when the key names a reset schedule or the response supplied Retry-After; only for a cooling quota key",
+                                  "format": "date-time",
+                                  "type": "string"
+                                },
+                                "state": {
+                                  "description": "available, cooling, out_of_rotation; readers ignore unknown values",
+                                  "type": "string"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "last_status_class": {
+                            "description": "2xx, 4xx, 5xx, or null before one; readers ignore unknown values",
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "limited_1h": {
+                            "description": "Attempts that were rate-limited or began a cooldown in the last 60 minutes; only with expose_usage",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "request_buckets": {
+                            "description": "Twelve five-minute attempt counts, oldest first, newest last; only with expose_usage",
+                            "items": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "maxItems": 12,
+                            "minItems": 12,
+                            "type": "array"
+                          },
+                          "request_minutes": {
+                            "description": "Ten one-minute attempt counts ending at the current minute, oldest first, newest last; only with expose_usage",
+                            "items": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "maxItems": 10,
+                            "minItems": 10,
+                            "type": "array"
+                          },
+                          "requests_1h": {
+                            "description": "Attempts in the last 60 minutes; only with expose_usage, a count only",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "soonest_cooldown_seconds": {
+                            "description": "Rounded up to a multiple of cooldown_bucket_secs, unless it is 0",
+                            "minimum": 1,
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "token_buckets": {
+                            "description": "Twelve five-minute token counts, oldest first, newest last; only with expose_usage",
+                            "items": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "maxItems": 12,
+                            "minItems": 12,
+                            "type": "array"
+                          },
+                          "token_minutes": {
+                            "description": "Ten one-minute token counts ending at the current minute, oldest first, newest last; only with expose_usage",
+                            "items": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "maxItems": 10,
+                            "minItems": 10,
+                            "type": "array"
+                          },
+                          "tokens_1h": {
+                            "description": "Input plus output tokens of the responses served by this upstream in the last 60 minutes; only with expose_usage",
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "healthy_keys",
+                          "cooling_keys",
+                          "disabled_keys",
+                          "cooling_combinations",
+                          "soonest_cooldown_seconds",
+                          "last_status_class"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "instance",
+                    "reiki_version",
+                    "observed_at",
+                    "age_seconds",
+                    "failures",
+                    "upstreams",
+                    "observed"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong peer token"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many failed peer logins from this address"
+          }
+        },
+        "security": [
+          {
+            "peerAuth": []
+          }
+        ],
+        "summary": "Coarse key health per upstream, for peers"
+      },
+      "servers": [
+        {
+          "description": "The peer listener; these routes are not served on the admin listener",
+          "url": "http://127.0.0.1:0"
+        }
+      ]
+    },
+    "/v1/health/stream": {
+      "get": {
+        "description": "event: snapshot carries the /v1/health document; event: key carries {observed_at, age_seconds, upstream} for one upstream whose key counts or states changed; event: sessions and event: host carry {observed_at, sessions|host} with expose_host_stats; a `: heartbeat` comment comes every 15 s",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong peer token"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many failed logins, or max_subscribers_per_peer streams open from this address, or max_subscribers_per_token with this token"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "max_subscribers streams are open"
+          }
+        },
+        "security": [
+          {
+            "peerAuth": []
+          }
+        ],
+        "summary": "Server-Sent Events: a snapshot, then key, sessions and host events"
+      },
+      "servers": [
+        {
+          "description": "The peer listener; these routes are not served on the admin listener",
+          "url": "http://127.0.0.1:0"
+        }
+      ]
+    },
+    "/v1/keys/enable": {
+      "post": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "key": {
+                      "type": "string"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "key"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, repeated or unknown flag, or a name that is not valid percent-encoding"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The read-only token was presented; this route needs the full admin token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "No such key"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Re-enable a disabled key"
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "This document"
+      }
+    },
+    "/v1/reload": {
+      "post": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "enum": [
+                "true",
+                "1",
+                "false",
+                "0"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unreadable dry_run value; nothing changed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The read-only token was presented; this route needs the full admin token"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The config was refused; nothing changed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Reload the config, or preview it with dry_run"
+      }
+    },
+    "/v1/requestlog/metrics": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Provided by a plugin"
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "config": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "intercept": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "keys": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "keys_truncated": {
+                      "description": "True when keys were capped at the documented bound",
+                      "type": "boolean"
+                    },
+                    "log": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "observed": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "observed_truncated": {
+                      "description": "True when observed entries were capped at the documented bound",
+                      "type": "boolean"
+                    },
+                    "peers": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "stream_admin": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "streams": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "streams_truncated": {
+                      "description": "True when streams were capped at the documented bound",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "keys",
+                    "streams",
+                    "config",
+                    "observed",
+                    "peers",
+                    "log"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Key, observed upstream, stream limits, usage, config and reload status"
+      }
+    },
+    "/v1/stream-console": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "audit": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 64,
+                      "type": "array"
+                    },
+                    "audit_tail_limit": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "streams": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "streams_total": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "streams_truncated": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "streams",
+                    "audit"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Read-only streams, safe credential ids and bounded audit tail; enabled is false without [stream_admin]"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The audit chain could not be verified"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read-only stream usage, credentials and audit tail for reiki top; either admin token"
+      }
+    },
+    "/v1/streams": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "streams": {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "streams_total": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "streams_truncated": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "streams"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "List dynamic streams"
+      }
+    },
+    "/v1/streams/create": {
+      "post": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Create a dynamic stream and return its first token once"
+      }
+    },
+    "/v1/streams/{name}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Delete a dynamic stream"
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Show one dynamic stream"
+      },
+      "put": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Update a dynamic stream's key or limits"
+      }
+    },
+    "/v1/streams/{name}/revoke": {
+      "post": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Revoke every token on a dynamic stream"
+      }
+    },
+    "/v1/streams/{name}/tokens": {
+      "post": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Add a token to a dynamic stream"
+      }
+    },
+    "/v1/streams/{name}/tokens/{token_id}/revoke": {
+      "post": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Second token, required when two-party confirmation is configured",
+            "in": "header",
+            "name": "X-Confirm-Token",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body, reason or idempotency key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Duplicate idempotency key with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A configured ceiling was exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Audit log or state file write failed"
+          }
+        },
+        "security": [
+          {
+            "streamAdminAuth": []
+          }
+        ],
+        "summary": "Revoke one token"
+      }
+    },
+    "/v1/toolpolicy/metrics": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or wrong token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Provided by a plugin"
+      }
+    }
+  }
+}

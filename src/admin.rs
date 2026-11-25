@@ -188,11 +188,81 @@ async fn with_version(mut response: Response) -> Response {
     response
 }
 
+fn error_content() -> serde_json::Value {
+    serde_json::json!({"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}})
+}
+
+fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
+    let generic_obj = serde_json::json!({"type": "object", "additionalProperties": true});
+    match (path, method) {
+        ("/v1/status", "get") => serde_json::json!({
+            "type":"object","additionalProperties":true,
+            "required":["keys","streams","config","observed","peers","log"],
+            "properties":{
+                "keys":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":true}},
+                "keys_truncated":{"type":"boolean","description":"True when keys were capped at the documented bound"},
+                "streams":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":true}},
+                "streams_truncated":{"type":"boolean","description":"True when streams were capped at the documented bound"},
+                "config":{"type":"object","additionalProperties":true},
+                "observed":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":true}},
+                "observed_truncated":{"type":"boolean","description":"True when observed entries were capped at the documented bound"},
+                "peers":{"type":"object","additionalProperties":true},
+                "log":{"type":"object","additionalProperties":true},
+                "stream_admin":{"type":"object","additionalProperties":true},
+                "intercept":{"type":"object","additionalProperties":true}
+            }
+        }),
+        ("/v1/reload", "post") => generic_obj,
+        ("/v1/keys/enable", "post") => serde_json::json!({
+            "type":"object","additionalProperties":true,
+            "required":["ok","key"],
+            "properties":{"ok":{"type":"boolean"},"key":{"type":"string"}}
+        }),
+        ("/v1/failures", "get") => serde_json::json!({
+            "type":"array",
+            "maxItems": crate::failures::MAX_QUERY_LIMIT,
+            "items":{"type":"object","additionalProperties":true}
+        }),
+        ("/v1/stream-console", "get") => serde_json::json!({
+            "type":"object","additionalProperties":true,
+            "required":["enabled","streams","audit"],
+            "properties":{
+                "enabled":{"type":"boolean"},
+                "streams":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":true}},
+                "streams_total":{"type":"integer","minimum":0},
+                "streams_truncated":{"type":"boolean"},
+                "audit":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":true}},
+                "audit_tail_limit":{"type":"integer","minimum":0}
+            }
+        }),
+        ("/v1/openapi.json", "get") => {
+            serde_json::json!({"type":"object","additionalProperties":true})
+        }
+        (p, "get") if p.ends_with("/metrics") => serde_json::json!({"type":"string"}),
+        ("/v1/cost", "get") => generic_obj,
+        ("/v1/usage", "get") => generic_obj,
+        ("/v1/streams", "get") => serde_json::json!({
+            "type":"object","additionalProperties":true,
+            "required":["streams"],
+            "properties":{
+                "streams":{"type":"array","maxItems":256,"items":{"type":"object","additionalProperties":true}},
+                "streams_total":{"type":"integer","minimum":0},
+                "streams_truncated":{"type":"boolean"}
+            }
+        }),
+        (p, _) if p.starts_with("/v1/streams") => generic_obj,
+        _ => generic_obj,
+    }
+}
+
 fn operation(summary: &str) -> serde_json::Value {
     serde_json::json!({
         "summary": summary,
         "security": [{"bearerAuth": []}],
-        "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or wrong token"}},
+        "responses": {
+            "200": {"description": "OK"},
+            "401": {"description": "Missing or wrong token", "content": error_content()}
+        },
     })
 }
 
@@ -320,14 +390,73 @@ async fn openapi(
     if stream_admin_enabled {
         paths.extend(stream_admin_openapi_paths());
     }
+    for (path, item) in paths.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        for (method, op) in obj.iter_mut() {
+            if !matches!(method.as_str(), "get" | "post" | "put" | "delete" | "patch") {
+                continue;
+            }
+            let Some(responses) = op.get_mut("responses").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for (status, response) in responses.iter_mut() {
+                if status.starts_with('2') {
+                    if response.get("content").is_none() {
+                        let schema = route_response_schema(path, method.as_str());
+                        let is_metrics = path.ends_with("/metrics") && method == "get";
+                        if is_metrics {
+                            response["content"] =
+                                serde_json::json!({"text/plain": {"schema": schema}});
+                        } else if path == "/v1/cost" && method == "get" {
+                            response["content"] = serde_json::json!({
+                                "application/json": {"schema": schema.clone()},
+                                "text/csv": {"schema": {"type":"string"}}
+                            });
+                        } else {
+                            response["content"] =
+                                serde_json::json!({"application/json": {"schema": schema}});
+                        }
+                    }
+                } else if (status.starts_with('4') || status.starts_with('5'))
+                    && response.get("content").is_none()
+                {
+                    response["content"] = error_content();
+                }
+            }
+        }
+    }
     #[allow(unused_mut)]
     let mut document = serde_json::json!({
         "openapi": "3.1.0",
         "info": {"title": "Reiki admin API", "version": VERSION},
-        "components": {"securitySchemes": {"bearerAuth": {
-            "type": "http", "scheme": "bearer",
-            "description": "The full admin token, or the read-only token on read routes. Errors use the admin error envelope.",
-        }}},
+        "components": {
+            "securitySchemes": {"bearerAuth": {
+                "type": "http", "scheme": "bearer",
+                "description": "The full admin token, or the read-only token on read routes. Errors use the admin error envelope.",
+            }},
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["code", "message"],
+                    "properties": {
+                        "code": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+                "ErrorEnvelope": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["ok", "error"],
+                    "properties": {
+                        "ok": {"type": "boolean", "const": false},
+                        "error": {"$ref": "#/components/schemas/Error"}
+                    }
+                }
+            }
+        },
         "paths": paths,
     });
     #[cfg(feature = "peers")]
@@ -383,8 +512,8 @@ async fn status(
                 let now = SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                let _ = file;
                 serde_json::json!({
-                    "file": file,
                     "ca_not_after": not_after,
                     "ca_days_left": (not_after - now).div_euclid(86_400),
                 })
@@ -445,6 +574,7 @@ async fn status(
             "the status document could not be assembled",
         );
     };
+    let body = cap_status_lists(&body);
     text_response(StatusCode::OK, "application/json", body)
 }
 
@@ -782,12 +912,25 @@ async fn stream_console(
         },
         None => Vec::new(),
     };
+    let streams_total = streams.len();
+    let streams_truncated = streams_total > STATUS_LIST_MAX;
+    let streams = if streams_truncated {
+        streams
+            .into_iter()
+            .take(STATUS_LIST_MAX)
+            .collect::<Vec<_>>()
+    } else {
+        streams
+    };
     json_response(
         StatusCode::OK,
         serde_json::json!({
             "enabled": manager.is_some(),
             "streams": streams,
+            "streams_total": streams_total,
+            "streams_truncated": streams_truncated,
             "audit": audit,
+            "audit_tail_limit": 64,
         }),
     )
 }
@@ -1030,16 +1173,21 @@ fn not_found() -> Response {
 
 #[cfg(feature = "peers")]
 pub(crate) fn unauthorized() -> Response {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::UNAUTHORIZED;
-    response
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or wrong peer token",
+    )
 }
 
 /// A refused client waiting out a login lockout, with the remaining seconds.
 #[cfg(feature = "peers")]
 pub(crate) fn throttled(wait: Duration) -> Response {
-    let mut response = Response::new(Body::empty());
-    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_attempts",
+        "too many failed logins; wait before retrying",
+    );
     let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
     if let Ok(value) = HeaderValue::from_str(&secs.max(1).to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -1146,6 +1294,30 @@ fn merge_status_objects(body: &str, fields: &[(&str, &str)]) -> Option<String> {
     }
     out.push('}');
     Some(out)
+}
+
+const STATUS_LIST_MAX: usize = 256;
+
+/// Caps status list fields to a documented bound and reports truncation.
+fn cap_status_lists(body: &str) -> String {
+    let mut doc: Value = match serde_json::from_str(body) {
+        Ok(doc) => doc,
+        Err(_) => return body.to_owned(),
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return body.to_owned();
+    };
+    for key in ["keys", "streams", "observed"] {
+        let truncated = obj
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.len() > STATUS_LIST_MAX);
+        if truncated && let Some(Value::Array(arr)) = obj.get_mut(key) {
+            arr.truncate(STATUS_LIST_MAX);
+        }
+        obj.insert(format!("{key}_truncated"), Value::Bool(truncated));
+    }
+    doc.to_string()
 }
 
 /// Snapshot of key health and stream routing for operators. Carries no key
@@ -1638,9 +1810,24 @@ async fn stream_list(
     let Some(manager) = app.stream_admin() else {
         return admin_unauthorized();
     };
+    let streams = manager.list();
+    let streams_total = streams.len();
+    let streams_truncated = streams_total > STATUS_LIST_MAX;
+    let streams = if streams_truncated {
+        streams
+            .into_iter()
+            .take(STATUS_LIST_MAX)
+            .collect::<Vec<_>>()
+    } else {
+        streams
+    };
     json_response(
         StatusCode::OK,
-        serde_json::json!({"streams": manager.list()}),
+        serde_json::json!({
+            "streams": streams,
+            "streams_total": streams_total,
+            "streams_truncated": streams_truncated,
+        }),
     )
 }
 
@@ -2167,10 +2354,7 @@ mod tests {
         assert_eq!(status["observed"][0]["account"], "acct-a");
         assert_eq!(status["observed"][0]["mode"], "observed");
         assert_eq!(status["observed"][0]["status_class"], "ok");
-        assert_eq!(
-            status["peers"]["tls_ca"][0]["file"],
-            "/etc/reiki/peer/ca.pem"
-        );
+        assert!(status["peers"]["tls_ca"][0].get("file").is_none());
         assert_eq!(status["peers"]["tls_ca"][0]["ca_not_after"], 2_000_086_400);
     }
 

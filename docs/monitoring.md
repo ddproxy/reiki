@@ -1,6 +1,6 @@
 # Monitoring
 
-Reiki serves an admin listener on its own socket when an `[admin]` table exists. This page is the reference for its routes, the Prometheus metrics plugin and the alerts built from them. The client listener's `/__reiki/healthz` and the peer listener's `/v1/health` belong to other sockets; see [peers](peers.md) and [troubleshooting](troubleshooting.md).
+Reiki serves an admin listener on its own socket when an `[admin]` table exists. This page is the reference for its routes, the Prometheus metrics plugin and the alerts built from them. The client listener's `/__reiki/healthz` and the peer listener's `/v1/health` belong to other sockets; see [provider health](provider-health.md) and [troubleshooting](troubleshooting.md).
 
 ## Configure and authenticate
 
@@ -162,7 +162,7 @@ Key fields:
 | `cooldown_class` | Present while cooling with a known class: `rate_limited`, `quota_exhausted` or `transient`; a restored cooldown has no class |
 | `scopes` | Soonest-first route-and-model cooldowns, at most 16 entries; the key can stay `available` for other combinations |
 
-`observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `retry_after_seconds` counts down and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA files with `file`, `ca_not_after` (Unix seconds) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted.
+`observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `retry_after_seconds` counts down and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA expiry with `ca_not_after` (Unix seconds) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted. Raw filesystem paths are not published.
 
 Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`), `limits` and `usage`. `limits` lists each configured numeric limit or `null`, plus `period_zone` when set; `usage` holds lifetime `requests` and `tokens` and the current `minute_requests` and `minute_tokens`. `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
 
@@ -356,7 +356,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | `GET /v1/health` | Peer listener | Peer read token | Coarse health of this instance for other Reikis |
 | `GET /v1/health/stream` | Peer listener | Peer read token | Server-sent changes to that health document |
 
-The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]`, `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`, `/v1/requestlog/metrics` needs `[plugins.requestlog]`, and `/v1/cost` and `/v1/cost/metrics` need `[plugins.cost]` plus the `plugin-cost` build feature. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [peers publishing](peers-publishing.md).
+The plugin routes exist only when their plugin is configured: `/v1/metrics` needs `[plugins.metrics]`, `/v1/toolpolicy/metrics` needs `[plugins.toolpolicy]`, `/v1/requestlog/metrics` needs `[plugins.requestlog]`, and `/v1/cost` and `/v1/cost/metrics` need `[plugins.cost]` plus the `plugin-cost` build feature. An unknown admin path gets `404`, and a plugin route with no plugin answers an empty `404`. Peer routes use the `[peers]` token and belong to the publishing side described in [provider health](provider-health.md).
 
 ## GET /v1/metrics
 

@@ -23,7 +23,7 @@ flowchart LR
 | Stream-admin token | `[stream_admin] token_sha256 = "<64 hex>"` | CLI reads the raw token from `--token-file` or `token_env` (default `REIKI_STREAM_ADMIN_TOKEN`), never an argument | Dedicated to dynamic stream management; distinct hash required |
 | Two-party confirm token | `[stream_admin] require_two_party = ["<64 hex>"]` | CLI reads the second raw token from `confirm_env` and sends `X-Confirm-Token` | Required for mutations when configured |
 | Audit actor id | `[stream_admin] actor_id_sha256 = "<64 hex>"` | No raw form; a hash of the operator id | Written to audit records; not a credential |
-| Peer token | `[peers.NAME] token_file = "/path/to/token"` or `[[peers.tokens]] token_sha256 = "..."` | Raw token file for this instance, hash for tokens it accepts | See [peers](peers.md) |
+| Peer token | `[peers.NAME] token_file = "/path/to/token"` or `[[peers.tokens]] token_sha256 = "..."` | Raw token file for this instance, hash for tokens it accepts | See [provider health](provider-health.md) |
 | Hub token | `[hubs.NAME] token_file = "/path/to/token"` | Raw token file | Hub tables are parsed and validated only in this release; see [hub](hub.md) |
 
 There is no `apiKey` config key and no `{file:...}` reference syntax. Use `file` on a `[keys.NAME]` table. Other credentials use the forms in the table.

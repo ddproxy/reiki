@@ -66,7 +66,7 @@ Requests keep working when one key fails, and you can see what happened.
 - Failover: a stream's chain, and an optional fallback upstream, take over on a rate limit, an exhausted quota or a disabled key. See [failover](failover.md).
 - Traffic shaping: outbound budgets per key, so a key is not sent past its limits. See [shaping](shaping.md).
 - Request log: what the client sent and what came back, with credentials masked. See [requestlog](requestlog.md).
-- Fleet view: `reiki top` shows key health across instances, peers publish that health, and `/v1/metrics` exports it. See [top](top.md), [peers](peers.md) and [monitoring](monitoring.md).
+- Fleet view: `reiki top` shows key health across instances, peers publish that health, and `/v1/metrics` exports it. See [top](top.md), [provider health](provider-health.md) and [monitoring](monitoring.md).
 
 ## Where to go next
 

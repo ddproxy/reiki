@@ -115,9 +115,11 @@
                                 ]
                               },
                               "roles": {
+                                "description": "Up to four fixed roles: config, state, log, requestlog",
                                 "items": {
                                   "type": "string"
                                 },
+                                "maxItems": 4,
                                 "type": "array"
                               },
                               "total_bytes": {
@@ -135,12 +137,18 @@
                             },
                             "type": "object"
                           },
+                          "maxItems": 4,
                           "type": "array"
+                        },
+                        "disks_truncated": {
+                          "description": "True when the disk list was capped at 4",
+                          "type": "boolean"
                         },
                         "load_average": {
                           "items": {
                             "type": "number"
                           },
+                          "maxItems": 3,
                           "type": [
                             "array",
                             "null"
@@ -176,7 +184,7 @@
                       "type": "string"
                     },
                     "observed": {
-                      "description": "Passthrough upstreams observed by the publisher; always present, may be empty",
+                      "description": "Passthrough upstreams observed by the publisher; always present, may be empty; capped at 256",
                       "items": {
                         "additionalProperties": true,
                         "properties": {
@@ -189,10 +197,19 @@
                               "null"
                             ]
                           },
+                          "cooldown_seconds": {
+                            "minimum": 0,
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
                           "mode": {
                             "type": "string"
                           },
                           "observed_at": {
+                            "description": "RFC3339 UTC instant",
+                            "format": "date-time",
                             "type": "string"
                           },
                           "quota": {
@@ -251,13 +268,6 @@
                             ],
                             "type": "object"
                           },
-                          "retry_after_seconds": {
-                            "minimum": 0,
-                            "type": [
-                              "integer",
-                              "null"
-                            ]
-                          },
                           "status_class": {
                             "type": "string"
                           },
@@ -271,17 +281,23 @@
                           "mode",
                           "status_class",
                           "observed_at",
-                          "retry_after_seconds",
+                          "cooldown_seconds",
                           "cooldown_class",
                           "quota"
                         ],
                         "type": "object"
                       },
+                      "maxItems": 256,
                       "type": "array"
                     },
                     "observed_at": {
+                      "description": "RFC3339 UTC instant",
                       "format": "date-time",
                       "type": "string"
+                    },
+                    "observed_truncated": {
+                      "description": "True when observed entries were capped at 256",
+                      "type": "boolean"
                     },
                     "reiki_version": {
                       "description": "The publisher's version, sanitised for terminal display",
@@ -315,7 +331,12 @@
                             },
                             "type": "object"
                           },
+                          "maxItems": 256,
                           "type": "array"
+                        },
+                        "streams_truncated": {
+                          "description": "True when the session streams were capped at 256",
+                          "type": "boolean"
                         },
                         "window_seconds": {
                           "type": "integer"
@@ -345,6 +366,7 @@
                       "type": "object"
                     },
                     "upstreams": {
+                      "description": "Keyed upstreams in config order; capped at 64",
                       "items": {
                         "additionalProperties": true,
                         "properties": {
@@ -372,7 +394,7 @@
                             "type": "integer"
                           },
                           "keys": {
-                            "description": "Only with expose_key_labels",
+                            "description": "Only with expose_key_labels; capped at 256 entries",
                             "items": {
                               "additionalProperties": true,
                               "properties": {
@@ -401,7 +423,12 @@
                               },
                               "type": "object"
                             },
+                            "maxItems": 256,
                             "type": "array"
+                          },
+                          "keys_truncated": {
+                            "description": "True when the labelled keys were capped at 256; present even without expose_key_labels",
+                            "type": "boolean"
                           },
                           "last_status_class": {
                             "description": "2xx, 4xx, 5xx, or null before one; readers ignore unknown values",
@@ -484,11 +511,17 @@
                           "disabled_keys",
                           "cooling_combinations",
                           "soonest_cooldown_seconds",
-                          "last_status_class"
+                          "last_status_class",
+                          "keys_truncated"
                         ],
                         "type": "object"
                       },
+                      "maxItems": 64,
                       "type": "array"
+                    },
+                    "upstreams_truncated": {
+                      "description": "True when keyed upstreams were capped at 64",
+                      "type": "boolean"
                     }
                   },
                   "required": [
@@ -498,7 +531,9 @@
                     "age_seconds",
                     "failures",
                     "upstreams",
-                    "observed"
+                    "upstreams_truncated",
+                    "observed",
+                    "observed_truncated"
                   ],
                   "type": "object"
                 }

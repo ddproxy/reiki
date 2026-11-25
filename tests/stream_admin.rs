@@ -423,7 +423,7 @@ fn created_token(reply: &Reply) -> String {
         json.get("token").is_some(),
         "the initial token must be shown once"
     );
-    json["token"].as_str().unwrap().to_owned()
+    json["token"]["value"].as_str().unwrap().to_owned()
 }
 
 fn audit_lines(path: &std::path::Path) -> Vec<String> {
@@ -624,9 +624,9 @@ async fn stream_console_is_read_only_admin_json_without_secrets() {
         .find(|row| row["name"] == "static-s")
         .unwrap();
     assert!(
-        static_row["last_used"]
-            .as_u64()
-            .is_some_and(|second| second > 0),
+        static_row["last_used_at"]
+            .as_str()
+            .is_some_and(|instant| instant.ends_with('Z')),
         "last used comes from live admissions"
     );
     assert_eq!(static_row["rpm"]["limit"], Value::Null);
@@ -789,13 +789,13 @@ async fn idempotency_replays_hide_tokens_and_conflict_on_a_different_body() {
         )
         .await;
     assert_eq!(replay.status, 200, "the same key must replay");
-    assert_eq!(
-        replay.json()["token_id"],
-        first.json()["token_id"],
-        "same token id"
-    );
     assert!(
-        replay.json().get("token").is_none(),
+        first.json()["token"]["id"].is_string(),
+        "the first answer names the minted token"
+    );
+    assert_eq!(
+        replay.json(),
+        serde_json::json!({}),
         "a replay must not reshow a token"
     );
     assert_no_credential(&replay, &[&token]);
@@ -1216,7 +1216,7 @@ async fn the_full_lifecycle_returns_tokens_once_and_persists_hashes_only() {
         "the added token is not stored raw"
     );
 
-    let first_id = created.json()["token_id"].as_str().unwrap().to_owned();
+    let first_id = created.json()["token"]["id"].as_str().unwrap().to_owned();
     let revoke = serde_json::json!({"reason": "first client left"}).to_string();
     let reply = rig
         .stream_call(
@@ -1368,7 +1368,7 @@ async fn state_survives_a_reload_or_restart_and_bad_state_only_blocks_dynamic_st
         .await;
     assert_eq!(created.status, 200, "create must succeed");
     let token = created_token(&created);
-    let token_id = created.json()["token_id"].as_str().unwrap().to_owned();
+    let token_id = created.json()["token"]["id"].as_str().unwrap().to_owned();
     assert_eq!(
         rig.send_relay(&token).await,
         200,
@@ -1700,7 +1700,7 @@ async fn a_dynamic_token_works_then_expires_and_revocation_is_immediate() {
         .await;
     assert_eq!(created.status, 200, "the long-lived stream was created");
     let token = created_token(&created);
-    let token_id = created.json()["token_id"].as_str().unwrap().to_owned();
+    let token_id = created.json()["token"]["id"].as_str().unwrap().to_owned();
     assert_eq!(rig.send_relay(&token).await, 200, "the second token works");
     let revoke = serde_json::json!({"reason": "client revoked"}).to_string();
     let reply = rig

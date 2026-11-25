@@ -489,7 +489,7 @@ async fn readme_proof_runs_against_a_throwaway_instance() {
     assert_eq!(response.status(), 401);
     assert_eq!(
         response.text().await.unwrap(),
-        r#"{"error":{"type":"unauthorized","message":"unknown token"}}"#
+        r#"{"error":{"code":"unauthorized","message":"unknown token"},"ok":false}"#
     );
 
     // The config placeholder is the digest of this raw token.

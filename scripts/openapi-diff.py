@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare two OpenAPI documents and report breaking changes.
 
-Breaking: REMOVED, RETYPED, NEWLY-REQUIRED. Exits non-zero when breaking changes
-are found. Intended as a warning in CI until 1.0.
+Breaking: REMOVED, RENAMED, PATH-REMOVED, RETYPED, NEWLY-REQUIRED and
+CONSTRAINT-CHANGED (tightened bounds, formats or constants). Exits non-zero when
+breaking changes are found. Intended as a warning in CI until 1.0.
 """
 from __future__ import annotations
 
@@ -11,6 +12,15 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+
+# Metadata text is documentation, not a contract obligation.
+METADATA_KEYS = {"description", "summary", "example", "examples", "title"}
+
+# A tightened bound excludes answers the old contract allowed. A relaxed one does not.
+UPPER_BOUNDS = {"maxItems", "maxLength", "maximum", "exclusiveMaximum"}
+LOWER_BOUNDS = {"minItems", "minLength", "minimum", "exclusiveMinimum"}
+FORMAT_KEYS = {"format", "pattern", "const"}
+CONSTRAINT_KEYS = UPPER_BOUNDS | LOWER_BOUNDS | FORMAT_KEYS
 
 
 def load_json(path: str) -> dict:
@@ -46,15 +56,40 @@ def type_name(schema) -> str:
     return "unknown"
 
 
+def constraint_tightened(key: str, base, current) -> bool:
+    if key in UPPER_BOUNDS:
+        return isinstance(current, (int, float)) and (
+            not isinstance(base, (int, float)) or current < base
+        )
+    if key in LOWER_BOUNDS:
+        return isinstance(current, (int, float)) and (
+            not isinstance(base, (int, float)) or current > base
+        )
+    return base != current
+
+
 def walk(prefix: str, base, current, breaking: list[str]) -> None:
     if isinstance(base, dict) and isinstance(current, dict):
         base_keys = set(base.keys())
         cur_keys = set(current.keys())
-        for key in sorted(base_keys - cur_keys):
-            # Ignore some noisy metadata fields that are not contract.
-            if key in {"description", "summary", "example", "examples", "title"}:
+        added = cur_keys - base_keys
+        removed = base_keys - cur_keys
+        for key in sorted(removed):
+            if key in METADATA_KEYS or key in CONSTRAINT_KEYS:
                 continue
-            breaking.append(f"REMOVED {prefix}.{key}")
+            # A removed field with the same schema under a new name is a rename, not a
+            # compatibility-safe removal: old readers will not recognise the new field.
+            matches = [new for new in sorted(added) if base[key] == current[new]]
+            if len(matches) == 1:
+                breaking.append(f"RENAMED {prefix}.{key} -> {prefix}.{matches[0]}")
+            elif prefix == "$.paths" and key.startswith("/"):
+                breaking.append(f"PATH-REMOVED {prefix}.{key}")
+            else:
+                breaking.append(f"REMOVED {prefix}.{key}")
+        for key in sorted(added & CONSTRAINT_KEYS):
+            breaking.append(
+                f"CONSTRAINT-CHANGED {prefix}.{key}: absent -> {current[key]!r}"
+            )
         for key in sorted(base_keys & cur_keys):
             child = f"{prefix}.{key}"
             if key == "required":
@@ -67,6 +102,12 @@ def walk(prefix: str, base, current, breaking: list[str]) -> None:
                 c = current[key]
                 if b != c:
                     breaking.append(f"RETYPED {child}: {b!r} -> {c!r}")
+                continue
+            if key in CONSTRAINT_KEYS:
+                b = base[key]
+                c = current[key]
+                if constraint_tightened(key, b, c):
+                    breaking.append(f"CONSTRAINT-CHANGED {child}: {b!r} -> {c!r}")
                 continue
             walk(child, base[key], current[key], breaking)
         return

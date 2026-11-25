@@ -23,9 +23,15 @@ pub struct Health {
     /// How old the figures were when the peer sent them.
     pub age_seconds: u64,
     pub upstreams: Vec<Upstream>,
+    /// True when the publisher had more keyed upstreams than the documented bound.
+    #[serde(default)]
+    pub upstreams_truncated: bool,
     /// Passthrough upstreams Reiki has observed. These carry no key state; a reader synthesises
     /// display-only upstream entries so they can be seen beside keyed upstreams.
     pub observed: Vec<ObservedUpstream>,
+    /// True when the publisher had more observed entries than the documented bound.
+    #[serde(default)]
+    pub observed_truncated: bool,
     /// Counts of recent key failures by class over the peer's bounded ring. Counts only: the
     /// bodies behind them never leave the peer.
     pub failures: BTreeMap<String, u64>,
@@ -79,8 +85,8 @@ impl Health {
 /// listener supplies these; a remote peer publishes counts only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
-    /// Unix seconds.
-    pub time: u64,
+    /// RFC3339 UTC instant.
+    pub time_at: String,
     pub stream: String,
     pub key: String,
     pub status: Option<u16>,
@@ -90,7 +96,7 @@ pub struct Failure {
     pub action: String,
     pub retry_after: Option<String>,
     pub cooled: bool,
-    pub cooling_seconds: Option<u64>,
+    pub cooldown_seconds: Option<u64>,
     /// Scrubbed body snippet; `null` when the caller holds only the read-only admin token.
     pub note: Option<String>,
 }
@@ -117,7 +123,7 @@ pub struct ObservedQuota {
     pub tokens_reset_seconds: Option<u64>,
 }
 
-/// One observed passthrough account. `retry_after_seconds` is the remaining wait on the host's
+/// One observed passthrough account. `cooldown_seconds` is the remaining wait on the host's
 /// clock, not a value copied from the upstream; `null` means it has elapsed or was never reported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedUpstream {
@@ -132,7 +138,7 @@ pub struct ObservedUpstream {
     #[serde(deserialize_with = "safe_label_field")]
     pub observed_at: String,
     #[serde(deserialize_with = "required_nullable_u64")]
-    pub retry_after_seconds: Option<u64>,
+    pub cooldown_seconds: Option<u64>,
     #[serde(deserialize_with = "required_nullable_label")]
     pub cooldown_class: Option<String>,
     pub quota: ObservedQuota,
@@ -266,6 +272,9 @@ pub struct Upstream {
     /// Labelled keys, only when the peer sets `expose_key_labels`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<KeyView>>,
+    /// True when the labelled keys were capped at the documented bound.
+    #[serde(default)]
+    pub keys_truncated: bool,
     /// Attempts in the last hour; absent with `expose_usage = false`.
     #[serde(
         default,
@@ -333,6 +342,8 @@ struct UpstreamWire {
     capacity_group: Option<String>,
     #[serde(default)]
     keys: Option<Vec<KeyView>>,
+    #[serde(default)]
+    keys_truncated: bool,
     #[serde(default, deserialize_with = "usage_u64")]
     requests_1h: Option<u64>,
     #[serde(default, deserialize_with = "usage_u32")]
@@ -361,6 +372,7 @@ impl From<UpstreamWire> for Upstream {
             last_status_class: wire.last_status_class.0,
             capacity_group: wire.capacity_group,
             keys: wire.keys,
+            keys_truncated: wire.keys_truncated,
             requests_1h: wire.requests_1h,
             limited_1h: wire.limited_1h,
             request_buckets: wire.request_buckets,
@@ -504,9 +516,12 @@ mod tests {
             "cooling_combinations": 0,
             "soonest_cooldown_seconds": null,
             "last_status_class": null,
+            "keys_truncated": false,
             "keys": [{"name": "k", "state": "available", "cooldown_seconds": null}]
         }],
+        "upstreams_truncated": false,
         "observed": [],
+        "observed_truncated": false,
         "failures": {"rate_limited": 2},
         "requestlog_export_dropped_total": 3,
         "host": {"cores": 4},
@@ -524,14 +539,14 @@ mod tests {
     #[test]
     fn an_older_failure_without_an_action_reads_as_pass_through() {
         let old = r#"{
-            "time": 1,
+            "time_at": "1970-01-01T00:00:01Z",
             "stream": "s",
             "key": "k",
             "status": 429,
             "class": "rate_limited",
             "retry_after": "30",
             "cooled": false,
-            "cooling_seconds": null,
+            "cooldown_seconds": null,
             "note": null
         }"#;
         let failure: Failure = serde_json::from_str(old).unwrap();
@@ -618,7 +633,7 @@ mod tests {
                 "mode": "observed",
                 "status_class": "rate_limited",
                 "observed_at": "2026-11-22T00:00:00Z",
-                "retry_after_seconds": 30,
+                "cooldown_seconds": 30,
                 "cooldown_class": "rate_limited",
                 "quota": {
                     "requests_limit": 60,
@@ -632,22 +647,19 @@ mod tests {
         );
         let health = Health::from_json(&text).unwrap();
         assert_eq!(health.observed.len(), 1);
-        assert_eq!(health.observed[0].retry_after_seconds, Some(30));
+        assert_eq!(health.observed[0].cooldown_seconds, Some(30));
         assert_eq!(health.observed[0].quota.requests_remaining, Some(0));
         assert_eq!(
             serde_json::to_value(health).unwrap()["observed"][0]["mode"],
             "observed"
         );
 
-        let missing = text.replace("\"retry_after_seconds\": 30,", "");
+        let missing = text.replace("\"cooldown_seconds\": 30,", "");
         assert!(
             Health::from_json(&missing).is_err(),
             "a missing key is an error"
         );
-        let wrong_type = text.replace(
-            "\"retry_after_seconds\": 30,",
-            "\"retry_after_seconds\": \"30\",",
-        );
+        let wrong_type = text.replace("\"cooldown_seconds\": 30,", "\"cooldown_seconds\": \"30\",");
         assert!(Health::from_json(&wrong_type).is_err());
         let unknown = text.replace(
             "\"mode\": \"observed\",",

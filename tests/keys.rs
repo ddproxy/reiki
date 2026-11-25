@@ -216,8 +216,11 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
 
     let (code, body) = rig.admin_get("/v1/failures", true).await;
     assert_eq!(code, 200, "the failures endpoint must answer 200");
-    let all: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let all = doc["failures"].as_array().unwrap();
     assert!(!all.is_empty(), "the failure ring must have an entry");
+    assert_eq!(doc["failures_total"], all.len());
+    assert_eq!(doc["failures_truncated"], false);
     let (code, _bare) = rig.admin_get("/failures", true).await;
     assert_eq!(code, 404, "the bare route is not served");
     let first = &all[0];
@@ -229,8 +232,10 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     assert_eq!(first["retry_after"], "120");
     assert_eq!(first["cooled"], true);
     assert!(
-        first["time"].as_u64().is_some(),
-        "the failure must have a time"
+        first["time_at"]
+            .as_str()
+            .is_some_and(|time| time.ends_with('Z')),
+        "the failure must have an RFC3339 UTC instant"
     );
     assert!(
         first["note"].as_str().unwrap().contains("mock"),
@@ -238,18 +243,22 @@ async fn the_failure_route_needs_the_admin_token_and_honours_limit_and_key() {
     );
 
     let (_, body) = rig.admin_get("/v1/failures?limit=1", true).await;
-    let one: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let one = doc["failures"].as_array().unwrap();
     assert_eq!(one.len(), 1, "the limit must return one entry");
 
     let (_, body) = rig.admin_get("/v1/failures?key=b", true).await;
-    let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let empty = doc["failures"].as_array().unwrap();
     assert!(empty.is_empty(), "the key filter must exclude the failure");
 
     let (_, body) = rig.admin_get("/v1/failures?stream=s", true).await;
-    let matched: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let matched = doc["failures"].as_array().unwrap();
     assert_eq!(matched.len(), all.len(), "the stream filter must match");
     let (_, body) = rig.admin_get("/v1/failures?stream=t", true).await;
-    let empty: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let empty = doc["failures"].as_array().unwrap();
     assert!(
         empty.is_empty(),
         "the stream filter must exclude the failure"
@@ -310,8 +319,12 @@ async fn the_failures_table_and_json_read_the_same_ring() {
     .await
     .unwrap();
     assert_eq!(code, 0, "{err}");
-    let body: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
-    assert_eq!(body.len(), 1, "the JSON limit must return one entry");
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        doc["failures"].as_array().unwrap().len(),
+        1,
+        "the JSON limit must return one entry"
+    );
 
     let (url, token) = (rig.admin.clone(), rig.token_file().display().to_string());
     let (code, out, err) = tokio::task::spawn_blocking(move || {

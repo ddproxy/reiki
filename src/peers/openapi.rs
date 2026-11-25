@@ -10,7 +10,7 @@ fn upstream_schema() -> Value {
         "additionalProperties": true,
         "required": ["name", "healthy_keys", "cooling_keys", "disabled_keys",
                      "cooling_combinations",
-                     "soonest_cooldown_seconds", "last_status_class"],
+                     "soonest_cooldown_seconds", "last_status_class", "keys_truncated"],
         "properties": {
             "name": {"type": "string"},
             "healthy_keys": {"type": "integer", "minimum": 0},
@@ -43,9 +43,11 @@ fn upstream_schema() -> Value {
             "token_minutes": {"type": "array", "items": {"type": "integer", "minimum": 0},
                 "minItems": 10, "maxItems": 10,
                 "description": "Ten one-minute token counts ending at the current minute, oldest first, newest last; only with expose_usage"},
+            "keys_truncated": {"type": "boolean",
+                "description": "True when the labelled keys were capped at 256; present even without expose_key_labels"},
             "keys": {
-                "description": "Only with expose_key_labels",
-                "type": "array",
+                "description": "Only with expose_key_labels; capped at 256 entries",
+                "type": "array", "maxItems": 256,
                 "items": {"type": "object", "additionalProperties": true, "properties": {
                     "name": {"type": "string"},
                     "state": {"type": "string",
@@ -66,14 +68,15 @@ fn observed_schema() -> Value {
         "type": "object",
         "additionalProperties": true,
         "required": ["upstream", "account", "mode", "status_class", "observed_at",
-                     "retry_after_seconds", "cooldown_class", "quota"],
+                     "cooldown_seconds", "cooldown_class", "quota"],
         "properties": {
             "upstream": {"type": "string"},
             "account": {"type": "string"},
             "mode": {"type": "string"},
             "status_class": {"type": "string"},
-            "observed_at": {"type": "string"},
-            "retry_after_seconds": {"type": ["integer", "null"], "minimum": 0},
+            "observed_at": {"type": "string", "format": "date-time",
+                "description": "RFC3339 UTC instant"},
+            "cooldown_seconds": {"type": ["integer", "null"], "minimum": 0},
             "cooldown_class": {"type": ["string", "null"]},
             "quota": {
                 "type": "object",
@@ -93,21 +96,90 @@ fn observed_schema() -> Value {
     })
 }
 
+/// Optional host extension: four fixed filesystem roles at most.
+fn host_schema() -> Value {
+    json!({
+        "description": "Optional non-core extension: present only with expose_host_stats; off by default",
+        "x-reiki-extension": "host_stats",
+        "x-reiki-default": false,
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "load_average": {"type": ["array", "null"], "maxItems": 3,
+                "items": {"type": "number"}},
+            "cores": {"type": "integer"},
+            "memory": {"type": ["object", "null"], "additionalProperties": true, "properties": {
+                "total_bytes": {"type": "integer"},
+                "available_bytes": {"type": "integer"},
+                "swap_total_bytes": {"type": "integer"},
+                "swap_free_bytes": {"type": "integer"},
+            }},
+            "disks": {"type": "array", "maxItems": 4,
+                "items": {"type": "object", "additionalProperties": true,
+                "description": "Figures are null for a role whose filesystem could not be queried in time",
+                "properties": {
+                    "roles": {"type": "array", "maxItems": 4, "items": {"type": "string"},
+                        "description": "Up to four fixed roles: config, state, log, requestlog"},
+                    "total_bytes": {"type": ["integer", "null"]},
+                    "available_bytes": {"type": ["integer", "null"]},
+                    "used_percent": {"type": ["number", "null"]},
+                }}},
+            "disks_truncated": {"type": "boolean",
+                "description": "True when the disk list was capped at 4"},
+        },
+    })
+}
+
+/// Optional session extension: stream counts are capped at the documented bound.
+fn sessions_schema() -> Value {
+    json!({
+        "description": "Optional non-core extension: present only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder. Off by default",
+        "x-reiki-extension": "host_stats",
+        "x-reiki-default": false,
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "window_seconds": {"type": "integer"},
+            "active_sessions": {
+                "type": "integer",
+                "description": "Client-reported distinct values of session_header in the window, not a count of verified devices",
+            },
+            "streams": {"type": "array", "maxItems": 256,
+                "items": {"type": "object", "additionalProperties": true, "properties": {
+                    "stream": {"type": "string"},
+                    "active_sessions": {
+                        "type": "integer",
+                        "description": "Client-reported distinct values of session_header for this stream",
+                    },
+                }}},
+            "streams_truncated": {"type": "boolean",
+                "description": "True when the session streams were capped at 256"},
+        },
+    })
+}
+
 pub(crate) fn health_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["instance", "reiki_version", "observed_at", "age_seconds", "failures", "upstreams", "observed"],
+        "required": ["instance", "reiki_version", "observed_at", "age_seconds", "failures",
+                     "upstreams", "upstreams_truncated", "observed", "observed_truncated"],
         "properties": {
             "instance": {"type": "string"},
             "reiki_version": {"type": "string", "maxLength": 32,
                 "description": "The publisher's version, sanitised for terminal display"},
-            "observed_at": {"type": "string", "format": "date-time"},
+            "observed_at": {"type": "string", "format": "date-time",
+                "description": "RFC3339 UTC instant"},
             "age_seconds": {"type": "integer", "minimum": 0,
                 "description": "How old the figures were when sent; readers judge freshness by it plus their own time since receipt, not by observed_at"},
-            "upstreams": {"type": "array", "items": upstream_schema()},
-            "observed": {"type": "array", "items": observed_schema(),
-                "description": "Passthrough upstreams observed by the publisher; always present, may be empty"},
+            "upstreams": {"type": "array", "maxItems": 64, "items": upstream_schema(),
+                "description": "Keyed upstreams in config order; capped at 64"},
+            "upstreams_truncated": {"type": "boolean",
+                "description": "True when keyed upstreams were capped at 64"},
+            "observed": {"type": "array", "maxItems": 256, "items": observed_schema(),
+                "description": "Passthrough upstreams observed by the publisher; always present, may be empty; capped at 256"},
+            "observed_truncated": {"type": "boolean",
+                "description": "True when observed entries were capped at 256"},
             "requestlog_export_dropped_total": {
                 "type": "integer",
                 "minimum": 0,
@@ -139,52 +211,8 @@ pub(crate) fn health_schema() -> Value {
                     "dynamic_streams": {"type": "integer", "minimum": 0}
                 }
             },
-            "host": {
-                "description": "Optional non-core extension: present only with expose_host_stats; off by default",
-                "x-reiki-extension": "host_stats",
-                "x-reiki-default": false,
-                "type": "object",
-                "additionalProperties": true,
-                "properties": {
-                    "load_average": {"type": ["array", "null"], "items": {"type": "number"}},
-                    "cores": {"type": "integer"},
-                    "memory": {"type": ["object", "null"], "additionalProperties": true, "properties": {
-                        "total_bytes": {"type": "integer"},
-                        "available_bytes": {"type": "integer"},
-                        "swap_total_bytes": {"type": "integer"},
-                        "swap_free_bytes": {"type": "integer"},
-                    }},
-                    "disks": {"type": "array", "items": {"type": "object", "additionalProperties": true,
-                        "description": "Figures are null for a role whose filesystem could not be queried in time",
-                        "properties": {
-                        "roles": {"type": "array", "items": {"type": "string"}},
-                        "total_bytes": {"type": ["integer", "null"]},
-                        "available_bytes": {"type": ["integer", "null"]},
-                        "used_percent": {"type": ["number", "null"]},
-                    }}},
-                },
-            },
-            "sessions": {
-                "description": "Optional non-core extension: present only with expose_host_stats; streams only with expose_key_labels too. Counts are client-reported and can be inflated by a token holder. Off by default",
-                "x-reiki-extension": "host_stats",
-                "x-reiki-default": false,
-                "type": "object",
-                "additionalProperties": true,
-                "properties": {
-                    "window_seconds": {"type": "integer"},
-                    "active_sessions": {
-                        "type": "integer",
-                        "description": "Client-reported distinct values of session_header in the window, not a count of verified devices",
-                    },
-                    "streams": {"type": "array", "items": {"type": "object", "additionalProperties": true, "properties": {
-                        "stream": {"type": "string"},
-                        "active_sessions": {
-                            "type": "integer",
-                            "description": "Client-reported distinct values of session_header for this stream",
-                        },
-                    }}},
-                },
-            },
+            "host": host_schema(),
+            "sessions": sessions_schema(),
         },
     })
 }

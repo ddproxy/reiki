@@ -26,7 +26,7 @@ Every route below requires `Authorization: Bearer <token>`. A missing or wrong t
 
 ### Error envelope
 
-Every refusal on the admin listener, including `401`, `403`, `404`, `400`, `422`, `429` and `5xx`, has one JSON body:
+Every refusal on every Reiki listener — admin, client, peer and plugin — including `401`, `403`, `404`, `400`, `422`, `429` and `5xx`, has the same JSON body:
 
 ```json
 {"ok":false,"error":{"code":"read_only_token","message":"the read-only token cannot change state; this route needs the full admin token"}}
@@ -80,13 +80,13 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
       "consecutive_failures": 2,
       "last_status_code": 429,
       "state": "cooling",
-      "retry_after_seconds": 42,
+      "cooldown_seconds": 42,
       "cooldown_class": "rate_limited",
       "scopes": [
         {
           "route": "/chat/completions",
           "model": "gpt-4o-mini",
-          "retry_after_seconds": 60,
+          "cooldown_seconds": 60,
           "cooldown_class": "rate_limited"
         }
       ]
@@ -127,7 +127,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
       "mode": "observed",
       "status_class": "rate_limited",
       "observed_at": "2026-11-18T10:12:05Z",
-      "retry_after_seconds": 42,
+      "cooldown_seconds": 42,
       "cooldown_class": "rate_limited",
       "quota": {
         "requests_limit": 100,
@@ -141,10 +141,10 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/status 
   ],
   "peers": {
     "tls_ca": [
-      { "file": "/etc/reiki/peers/peer-a-ca.pem", "ca_not_after": 1790000000, "ca_days_left": 120 }
+      { "ca_not_after_at": "2026-09-21T14:13:20Z", "ca_days_left": 120 }
     ]
   },
-  "intercept": { "ca_not_after": 1790000000, "ca_days_left": 120 },
+  "intercept": { "ca_not_after_at": "2026-09-21T14:13:20Z", "ca_days_left": 120 },
   "log": { "write_errors": 0 },
   "requestlog": { "export_dropped_total": 0 }
 }
@@ -158,19 +158,19 @@ Key fields:
 | `state` | `available`, `cooling` or `out_of_rotation` |
 | `consecutive_failures` | Transient failures since the last success |
 | `last_status_code` | Latest upstream status, or `null` before an attempt |
-| `retry_after_seconds` | Present while `cooling`, rounded up to at least 1 |
+| `cooldown_seconds` | Present while `cooling`, rounded up to at least 1 |
 | `cooldown_class` | Present while cooling with a known class: `rate_limited`, `quota_exhausted` or `transient`; a restored cooldown has no class |
 | `scopes` | Soonest-first route-and-model cooldowns, at most 16 entries; the key can stay `available` for other combinations |
 
-`observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `retry_after_seconds` counts down and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA expiry with `ca_not_after` (Unix seconds) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted. Raw filesystem paths are not published.
+`observed` always appears, with one entry per `(upstream, account)` pair from passthrough answers. Its `status_class` is one of `ok`, `rate_limited`, `quota_exhausted`, `credential_rejected`, `access_disabled`, `request_error`, `error` or `pass_through`; `mode` is always `observed`. `cooldown_seconds` is the remaining wait and becomes `null` when expired; `cooldown_class` is `null` when the answer started none. `quota` holds request and token limits, remaining counts and reset seconds read from response headers, with `null` for fields the upstream did not send. No credential value is held in the store. `peers.tls_ca` lists configured peer CA expiry with `ca_not_after_at` (RFC3339 UTC) and `ca_days_left`; unreadable or non-certificate files are warned about and omitted. Raw filesystem paths are not published. The `keys`, `streams` and `observed` arrays are capped at 256 entries each; a `*_truncated` flag beside each array is true when entries were omitted.
 
-Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`), `limits` and `usage`. `limits` lists each configured numeric limit or `null`, plus `period_zone` when set; `usage` holds lifetime `requests` and `tokens` and the current `minute_requests` and `minute_tokens`. `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after` in Unix seconds and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
+Stream fields: `name`, `strategy` (`sticky` or `round_robin`), `chain`, `current_key` (or `null`), `limits` and `usage`. `limits` lists each configured numeric limit or `null`, plus `period_zone` when set; `usage` holds lifetime `requests` and `tokens` and the current `minute_requests` and `minute_tokens`. `config` holds `generation`, `loaded_at` and `last_reload`, which is `null` before any reload and otherwise has `ok`, `at` and an `error` after a failure. `intercept` appears with `[tunnel.intercept]` and holds `ca_not_after_at` as an RFC3339 UTC instant and `ca_days_left`. `log.write_errors` counts service-log file writes that failed and were dropped since start, `0` without a log file. `requestlog.export_dropped_total` counts summary records the request-log export could not queue or send; it is `0` unless `[plugins.requestlog.export]` is enabled. The response carries key names, never key values, token hashes or file paths.
 
 `reiki keys` reads this route and prints a table; `reiki keys --json` prints a derived key-only document with remapped states and a `streams` name list per key. See [key health](troubleshooting.md#key-health).
 
 ## GET /v1/failures
 
-Method `GET`. Auth: either token. Query: `limit` (1 to 64, default 64), `key` (one key name), `stream` (one stream name). Returns the in-memory ring, newest first. `note` is the scrubbed body snippet for the full token and `null` for the read-only token. A repeated flag, a bad `limit`, an empty name or invalid percent-encoding gets `400` with the [error envelope](#error-envelope).
+Method `GET`. Auth: either token. Query: `limit` (1 to 64, default 64), `key` (one key name), `stream` (one stream name). Returns an envelope with `failures` (the in-memory ring, newest first), `failures_total` (matching rows before the cap) and `failures_truncated`. `note` is the scrubbed body snippet for the full token and `null` for the read-only token. A repeated flag, a bad `limit`, an empty name or invalid percent-encoding gets `400` with the [error envelope](#error-envelope).
 
 ```bash
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -178,47 +178,51 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 ```json
-[
-  {
-    "time": 1763465051,
-    "stream": "client-b",
-    "key": "zen-b",
-    "status": 429,
-    "class": "rate_limited",
-    "action": "cooldown",
-    "retry_after": "30",
-    "cooled": true,
-    "cooling_seconds": 60,
-    "note": "rate limit exceeded"
-  },
-  {
-    "time": 1763464980,
-    "stream": "client-b",
-    "key": "zen-b",
-    "status": null,
-    "class": "transient",
-    "action": "pass-through",
-    "retry_after": null,
-    "cooled": false,
-    "cooling_seconds": null,
-    "note": "connection refused"
-  }
-]
+{
+  "failures": [
+    {
+      "time_at": "2025-11-18T11:24:11Z",
+      "stream": "client-b",
+      "key": "zen-b",
+      "status": 429,
+      "class": "rate_limited",
+      "action": "cooldown",
+      "retry_after": "30",
+      "cooled": true,
+      "cooldown_seconds": 60,
+      "note": "rate limit exceeded"
+    },
+    {
+      "time_at": "2025-11-18T11:23:00Z",
+      "stream": "client-b",
+      "key": "zen-b",
+      "status": null,
+      "class": "transient",
+      "action": "pass-through",
+      "retry_after": null,
+      "cooled": false,
+      "cooldown_seconds": null,
+      "note": "connection refused"
+    }
+  ],
+  "failures_total": 2,
+  "failures_truncated": false
+}
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `time` | Unix seconds |
+| `time_at` | RFC3339 UTC instant |
 | `stream`, `key` | Where the failure happened |
 | `status` | Upstream status, or `null` for a transport failure |
 | `class` | `rate_limited`, `quota_exhausted`, `access_disabled`, `unauthorized`, `transient` or `request_error` |
 | `action` | `cooldown` when this failure cooled a scope or the key, `rotate` when an `unauthorized` disabled the key, or `pass-through` when the key was only skipped for this request |
-| `retry_after` | Received `Retry-After` header, cut to 64 bytes, or `null` |
+| `retry_after` | Received `Retry-After` header, cut to 64 bytes, or `null`; not a remaining duration |
 | `cooled` | True when this failure started a cooldown or disabled the key |
-| `cooling_seconds` | Seconds left on the key's cooldown, or `null` |
+| `cooldown_seconds` | Seconds left on the key's cooldown, or `null` |
 | `note` | Printable body snippet up to 200 bytes with credentials scrubbed |
 
-The ring is in memory only: [`failure_ring_size`](configuration.md#top-level) sets its capacity, `200` by default, `0` disables it and the maximum is `10,000`. It starts empty after a restart and drops a record when it is full, disabled or another thread holds the buffer. A reload applies a smaller cap by dropping the oldest records. `limit` stays capped at `64` regardless of capacity. `reiki failures --limit 20` prints this data as a table; `--json` prints the array. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
+The ring is in memory only: [`failure_ring_size`](configuration.md#top-level) sets its capacity, `200` by default, `0` disables it and the maximum is `10,000`. It starts empty after a restart and drops a record when it is full, disabled or another thread holds the buffer. A reload applies a smaller cap by dropping the oldest records. `limit` stays capped at `64` regardless of capacity. `reiki failures --limit 20` prints this data as a table; `--json` prints the envelope unchanged. The [worked example](troubleshooting.md#worked-example-quota-rate-limit-or-request-size) reads those rows.
 
 ## GET /v1/stream-console
 
@@ -239,30 +243,32 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
       "chain": ["zen-a", "zen-b"],
       "limits": { "rpm": 120, "tpm": null, "concurrent": 4 },
       "tokens": [
-        { "id": "<token id>", "expires_at": 1790000000, "state": "active" }
+        { "id": "<token id>", "expires_at": "2026-09-21T14:13:20Z", "state": "active" }
       ],
-      "expiry": 1790000000,
+      "expires_at": "2026-09-21T14:13:20Z",
       "rpm": { "current": 12, "limit": 120 },
       "concurrency": { "current": 1, "limit": 4 },
-      "last_used": 1763465051,
+      "last_used_at": "2025-11-18T11:24:11Z",
       "state": "active"
     }
   ],
   "audit": [
     {
       "seq": 2,
-      "time": "2026-11-23T00:01:00Z",
+      "time_at": "2026-11-23T00:01:00Z",
       "action": "token.add",
       "stream": "client-a",
       "outcome": "success",
       "reason": "rotation",
       "changes": [{ "field": "token.id", "from": "-", "to": "<first 8 of id>" }]
     }
-  ]
+  ],
+  "audit_total": 2,
+  "audit_truncated": false
 }
 ```
 
-`enabled` is false when `[stream_admin]` is absent; static streams are still listed and `audit` is empty. `tokens` carries only an id, expiry and derived state, never a credential value or hash. `rpm.current` is admissions in the current fixed 60-second window, `concurrency.current` is in-flight requests, and `last_used` is the Unix time of the last admission in this process (`null` before one). `expiry` is the soonest live token expiry, and `state` is `active`, `expired` or `revoked`. Audit records are newest first, capped at 64, and carry only `seq`, `time`, `action`, `stream`, `outcome`, `reason` and field-level `changes`; the actor hash, source, `prev`, `hash` and raw log path are omitted. A corrupt audit chain answers `500` instead of returning partial records. See [keys](keys.md#dynamic-stream-credentials) for the audit log itself.
+`enabled` is false when `[stream_admin]` is absent; static streams are still listed and `audit` is empty. `tokens` carries only an id, expiry and derived state, never a credential value or hash. `rpm.current` is admissions in the current fixed 60-second window, `concurrency.current` is in-flight requests, and `last_used_at` is the RFC3339 UTC instant of the last admission in this process (`null` before one). `expires_at` is the soonest live token expiry, and `state` is `active`, `expired` or `revoked`. Audit records are newest first, capped at 64, with `audit_total` and `audit_truncated` beside the array; each carries only `seq`, `time_at`, `action`, `stream`, `outcome`, `reason` and field-level `changes`; the actor hash, source, `prev`, `hash` and raw log path are omitted. A corrupt audit chain answers `500` instead of returning partial records. See [keys](keys.md#dynamic-stream-credentials) for the audit log itself.
 
 ## POST /v1/keys/enable
 
@@ -274,12 +280,12 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 ```json
-{"ok":true,"key":"zen-a"}
+{"key":"zen-a"}
 ```
 
 | Status | Response |
 | --- | --- |
-| `200` | `{"ok":true,"key":"<name>"}`; also for a key that was available |
+| `200` | `{"key":"<name>"}`; also for a key that was available |
 | `400` | Missing `key`, a repeated or bare `key` flag, an unknown flag, or a name with invalid percent-encoding (`bad_request`) |
 | `401` | Missing or wrong token (`unauthorized`) |
 | `403` | The read-only token (`read_only_token`) |
@@ -297,7 +303,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 ```json
-{"ok":true,"dry_run":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
+{"dry_run":true,"generation":3,"keys":2,"streams":1,"changed":["plugins phi","tunnel allow +2/-0"],"restart_needed":[]}
 ```
 
 A successful apply has the same fields with `"dry_run":false`; `changed` lists what differs and `restart_needed` lists settings that wait for a restart. A config that fails validation gets `422` with error code `config_refused`, and its message names the problem with the file, never a value from it; a failed task gets `500` (`reload_task_failed`). `reiki reload --dry-run` calls this route and prints the JSON answer. A preview leaves `/v1/status` unchanged. See [reload](troubleshooting.md#reload) for the live-change list.
@@ -317,7 +323,7 @@ With `[stream_admin]` configured, the admin listener also serves these routes. A
 | `POST /v1/streams/{name}/tokens/{token_id}/revoke` | Revoke one token. |
 | `POST /v1/streams/{name}/revoke` | Revoke every token on a stream. |
 
-Every write needs an `Idempotency-Key` header and a `reason` in the JSON body; strict JSON parsing rejects unknown fields, and a configured second party also requires `X-Confirm-Token`. Keys must be listed in `[stream_admin.allowed_keys]` with `assignable = true`, and limits must stay within `[stream_admin.ceilings]`. Failed attempts are throttled per source, and a failed audit write refuses the mutation. The [route list and CLI examples](README.md#stream-admin-api) cover the `reiki streams` commands. With the feature on, `GET /v1/status` adds a `stream_admin` object with `enabled`, `streams` and `state_error`.
+Every write needs an `Idempotency-Key` header and a `reason` in the JSON body; strict JSON parsing rejects unknown fields, and a configured second party also requires `X-Confirm-Token`. Mutation answers name the changed resource: create and token-add return `{"token":{"id":"<id>","value":"<token>","expires_at":"<RFC3339 UTC>"}}` once, while update, delete and both revoke routes return `{}`. There is no `ok` flag; refusals use the [error envelope](#error-envelope). Replays of a credential-minting write return `{}` so the token is never shown twice. Keys must be listed in `[stream_admin.allowed_keys]` with `assignable = true`, and limits must stay within `[stream_admin.ceilings]`. Failed attempts are throttled per source, and a failed audit write refuses the mutation. The [route list and CLI examples](README.md#stream-admin-api) cover the `reiki streams` commands. With the feature on, `GET /v1/status` adds a `stream_admin` object with `enabled`, `streams` and `state_error`.
 
 ## GET /v1/openapi.json
 
@@ -337,7 +343,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 /v1/reload
 /v1/status
 /v1/stream-console
-/v1/usage
+/v1/usage/streams
 ```
 
 ## Other routes
@@ -349,7 +355,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/openapi
 | `GET /v1/metrics` | Admin listener, `metrics` plugin | Either admin token | Prometheus text exposition |
 | `GET /v1/requestlog/metrics` | Admin listener, `requestlog` plugin | Either admin token | Prometheus summary-export drop counter |
 | `GET /v1/toolpolicy/metrics` | Admin listener, `toolpolicy` plugin | Either admin token | Prometheus tool-call counters |
-| `GET /v1/usage` | Admin listener, `metrics` plugin | Either admin token | JSON token totals per stream and upstream |
+| `GET /v1/usage/streams` | Admin listener, `metrics` plugin | Either admin token | JSON token totals per stream and upstream |
 | `GET /v1/stream-console` | Admin listener | Either admin token | Read-only stream table and redacted audit tail for `reiki top` |
 | `GET /v1/cost` | Admin listener, `cost` plugin | Either admin token | Estimated spend with period, stream and upstream filters |
 | `GET /v1/cost/metrics` | Admin listener, `cost` plugin | Either admin token | Cost estimate metrics in Prometheus text |
@@ -450,14 +456,14 @@ curl -s -H "Authorization: Bearer $STREAM_TOKEN" http://127.0.0.1:4097/v1/usage
 {"streams":[{"name":"client-a","requests":42,"tokens":2100,"minute_requests":12,"minute_tokens":600,"cost":{"currency":"USD","period":"2026-11","estimated_micros":"12500000","estimated_display":"12.500000","unpriced_requests":0,"note":"Estimates from the operator price table, not provider invoices."}}]}
 ```
 
-`requests` and `tokens` are lifetime totals from admitted requests; `tokens` uses the provider's measured usage when present and the request-size estimate otherwise. The minute values come from the current fixed 60-second window. The `cost` object appears only when the `cost` plugin is active, and only on the authenticated caller's row; see [cost](cost.md#self-service-get-v1usage). The body contains only configured stream names and counts, never token hashes, key values, upstream credentials or model names. This route is separate from the admin plugin route below.
+`requests` and `tokens` are lifetime totals from admitted requests; `tokens` uses the provider's measured usage when present and the request-size estimate otherwise. The minute values come from the current fixed 60-second window. The `cost` object appears only when the `cost` plugin is active, and only on the authenticated caller's row; see [cost](cost.md#self-service-get-v1usage). The body contains only configured stream names and counts, never token hashes, key values, upstream credentials or model names. This route is separate from the admin plugin route at `/v1/usage/streams`.
 
-## GET /v1/usage (admin listener)
+## GET /v1/usage/streams (admin listener)
 
-Method `GET`. Auth: bearer token. Query: none. Same plugin as `/v1/metrics`. Totals come from provider `usage` objects: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`; event streams combine the events that carry `usage`. Bodies over 1 MiB and compressed responses count nothing.
+Method `GET`. Auth: bearer token. Query: none. Same plugin as `/v1/metrics`. This admin path is distinct from the client listener's self-service `/v1/usage`. Totals come from provider `usage` objects: `prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens`; event streams combine the events that carry `usage`. Bodies over 1 MiB and compressed responses count nothing.
 
 ```bash
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/usage
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:4098/v1/usage/streams
 ```
 
 ```json

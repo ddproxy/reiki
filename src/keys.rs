@@ -13,7 +13,7 @@ use crate::config::Config;
 pub struct KeyScope {
     pub route: String,
     pub model: String,
-    pub retry_after_seconds: u64,
+    pub cooldown_seconds: u64,
     pub cooldown_class: String,
 }
 
@@ -56,7 +56,7 @@ struct StatusKey {
     _consecutive_failures: u32,
     state: String,
     #[serde(default)]
-    retry_after_seconds: Option<u64>,
+    cooldown_seconds: Option<u64>,
     #[serde(default)]
     last_status_code: Option<u16>,
     #[serde(default)]
@@ -87,9 +87,9 @@ pub fn parse_status(body: &str) -> Result<Vec<KeyHealth>, String> {
     for key in status.keys {
         let (state, cooldown_seconds) = match key.state.as_str() {
             "available" => ("ok".to_owned(), None),
-            "cooling" => ("cooling".to_owned(), key.retry_after_seconds),
+            "cooling" => ("cooling".to_owned(), key.cooldown_seconds),
             "out_of_rotation" => ("disabled".to_owned(), None),
-            other => (other.to_owned(), key.retry_after_seconds),
+            other => (other.to_owned(), key.cooldown_seconds),
         };
         let streams = status
             .streams
@@ -330,9 +330,9 @@ mod tests {
     #[test]
     fn parse_status_keeps_key_order_and_lists_streams_in_status_order() {
         let body = r#"{"keys":[
-            {"name":"b","upstream":"zen","consecutive_failures":2,"state":"cooling","retry_after_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429,"scopes":[]},
+            {"name":"b","upstream":"zen","consecutive_failures":2,"state":"cooling","cooldown_seconds":7,"cooldown_class":"quota_exhausted","last_status_code":429,"scopes":[]},
             {"name":"a","upstream":"zen","consecutive_failures":0,"state":"out_of_rotation","scopes":[]},
-            {"name":"c","upstream":"zen","consecutive_failures":0,"state":"available","scopes":[{"route":"/responses","model":"gpt-big","retry_after_seconds":9,"cooldown_class":"quota_exhausted"}]}],
+            {"name":"c","upstream":"zen","consecutive_failures":0,"state":"available","scopes":[{"route":"/responses","model":"gpt-big","cooldown_seconds":9,"cooldown_class":"quota_exhausted"}]}],
           "streams":[{"name":"s2","strategy":"sticky","chain":["a","b"],"current_key":"a","limits":{"rpm":null},"usage":{"requests":0,"tokens":0,"minute_requests":0,"minute_tokens":0}},{"name":"s1","strategy":"round_robin","chain":["b"],"current_key":null,"limits":{"rpm":10},"usage":{"requests":0,"tokens":0,"minute_requests":0,"minute_tokens":0}}],"config":{"generation":0,"loaded_at":"t","last_reload":null},"log":{"write_errors":0}}"#;
         let keys = parse_status(body).unwrap();
         let names: Vec<_> = keys.iter().map(|k| k.name.as_str()).collect();
@@ -367,7 +367,7 @@ mod tests {
         let body = r#"{
           "keys":[{
             "name":"a","upstream":"u","consecutive_failures":0,"state":"available",
-            "scopes":[{"route":"/v1/*","model":"m","retry_after_seconds":1,"cooldown_class":"quota_exhausted","extra_scope":true}],
+            "scopes":[{"route":"/v1/*","model":"m","cooldown_seconds":1,"cooldown_class":"quota_exhausted","extra_scope":true}],
             "extra_key":1
           }],
           "streams":[{

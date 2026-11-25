@@ -300,7 +300,7 @@ impl Watcher {
             events.push(Event::Frame(frame("snapshot", &doc)));
         }
         if peers.expose_host_stats && now >= self.next_host {
-            let host = super::host::stats(&super::health::disk_dirs(app, &snapshot.config)).await;
+            let host = super::health::host_stats(app, &snapshot.config).await;
             events.push(Event::Frame(frame(
                 "host",
                 &json!({"observed_at": seen.observed_at, "host": host}),

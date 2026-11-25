@@ -2537,13 +2537,13 @@ mod tests {
               "streams": [
                 {{"name":"quiet","dynamic":false,"chain":["zen"],"limits":{{"rpm":30}},
                   "tokens":[],"rpm":{{"current":1}},"concurrency":{{"current":0}},
-                  "last_used":1000,"state":"active"}},
+                  "last_used_at":"1970-01-01T00:16:40Z","state":"active"}},
                 {{"name":"busy","dynamic":true,"chain":["zen"],"limits":{{"rpm":10}},
-                  "tokens":[{{"id":"abcdef1234567890","expires_at":1900}}],"expiry":1900,
+                  "tokens":[{{"id":"abcdef1234567890","expires_at":"1970-01-01T00:31:40Z"}}],"expires_at":"1970-01-01T00:31:40Z",
                   "rpm":{{"current":9,"limit":10}},"concurrency":{{"current":2,"limit":2}},
-                  "last_used":1150,"state":"active","token":"{secret}"}}
+                  "last_used_at":"1970-01-01T00:19:10Z","state":"active","token":"{secret}"}}
               ],
-              "audit":[{{"seq":1,"time":"2026-11-23T00:01:00Z","action":"create",
+              "audit":[{{"seq":1,"time_at":"2026-11-23T00:01:00Z","action":"create",
                 "stream":"busy","outcome":"success","reason":"setup","changes":[]}}]
             }}"#
         ))

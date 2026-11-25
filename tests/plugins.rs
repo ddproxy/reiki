@@ -570,7 +570,7 @@ async fn a_body_a_plugin_made_too_large_is_refused_like_any_oversize_body() {
     let res = h.post("tok-a", "/zen/x", "{}").send().await.unwrap();
     assert_eq!(res.status(), 413);
     let body: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
-    assert_eq!(body["error"]["type"], "too_large");
+    assert_eq!(body["error"]["code"], "too_large");
     assert!(h.mock.calls().is_empty(), "the upstream must not be called");
 }
 

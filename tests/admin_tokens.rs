@@ -295,7 +295,7 @@ async fn the_read_only_token_gets_no_failure_snippets() {
     rig.fail_once().await;
 
     let (_, full) = rig.get("/v1/failures", Caller::Full).await;
-    let full_row = &full[0];
+    let full_row = &full["failures"][0];
     assert!(
         full_row["note"].is_string(),
         "the full token sees the snippet: {full}"
@@ -303,7 +303,7 @@ async fn the_read_only_token_gets_no_failure_snippets() {
 
     let (status, read) = rig.get("/v1/failures", Caller::ReadOnly).await;
     assert_eq!(status, 200);
-    let read_row = &read[0];
+    let read_row = &read["failures"][0];
     assert!(
         read_row["note"].is_null(),
         "no free text for read-only: {read}"

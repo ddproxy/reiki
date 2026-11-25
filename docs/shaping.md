@@ -5,7 +5,7 @@ Shaping limits what Reiki sends. It keeps a stream within budgets that a provide
 - The gateway admits a client request once, using `[streams.NAME.limits]`, `[streams.NAME].allowed_*` and `weight`. It runs before a key is chosen, so failover and fallback attempts do not spend another stream request.
 - `[upstream.NAME.limits]` gives each key of that upstream its own budget: requests per minute, tokens per minute, concurrency and daily totals. It counts every upstream attempt and can wait or move to the next key.
 
-The two layers answer different `429`s. See [response classification](classification.md#response-rules) for the status and `error.type` mapping.
+The two layers answer different `429`s. See [response classification](classification.md#response-rules) for the status and `error.code` mapping.
 
 ## Gateway admission
 
@@ -38,9 +38,9 @@ Every limit is optional; an omitted one is not enforced. `rpm` and `tpm` use fix
 
 `weight` is the stream's relative share of a key's contested rate and concurrency budget. Fairness only engages when two or more streams with recent traffic on the same key could use the same route and model; it compares admitted requests divided by weight. An idle stream does not hold a share, and a key used by only one active stream is not throttled by fairness.
 
-Refusals carry a fixed JSON `error.type` and message; no model name, token, request body or upstream key appears in either. Allowlist failures are `403`; limit failures are `429` with `Retry-After` as the whole seconds left in the window, at least 1. No key is cooled, no fallback is tried and no `x-reiki-origin` header is added by the gateway.
+Refusals carry a fixed JSON `error.code` and message; no model name, token, request body or upstream key appears in either. Allowlist failures are `403`; limit failures are `429` with `Retry-After` as the whole seconds left in the window, at least 1. No key is cooled, no fallback is tried and no `x-reiki-origin` header is added by the gateway.
 
-| `error.type` | Reason |
+| `error.code` | Reason |
 | --- | --- |
 | `gateway_forbidden`, `gateway_upstream_forbidden`, `gateway_model_unknown`, `gateway_model_forbidden` | Unknown stream, upstream or model outside the allowlists, or no determinable model |
 | `gateway_rate_limited`, `gateway_token_limited` | `rpm` or `tpm` reached |

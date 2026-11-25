@@ -92,8 +92,12 @@ impl CostPlugin {
 
 fn bad_request(message: &str) -> AdminReply {
     AdminReply {
-        content_type: "text/plain",
-        body: message.to_owned(),
+        content_type: "application/json",
+        body: serde_json::json!({
+            "ok": false,
+            "error": {"code": "bad_request", "message": message},
+        })
+        .to_string(),
     }
 }
 

@@ -2589,7 +2589,7 @@ mod tests {
         session.on_response_chunk(&mut body, true);
 
         let reply = chain
-            .on_admin("/usage", KeyCounts::default(), None, vec![])
+            .on_admin("/usage/streams", KeyCounts::default(), None, vec![])
             .unwrap();
         let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(usage["s"]["u"]["input"], 2);
@@ -2625,7 +2625,7 @@ mod tests {
         session.on_response_chunk(&mut body, true);
 
         let reply = chain
-            .on_admin("/usage", KeyCounts::default(), None, vec![])
+            .on_admin("/usage/streams", KeyCounts::default(), None, vec![])
             .unwrap();
         let usage: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(usage["s"]["fallback"]["input"], 5);

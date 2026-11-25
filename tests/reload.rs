@@ -287,10 +287,8 @@ async fn post_reload_needs_the_admin_token_and_reports_the_generation() {
         .unwrap();
     assert_eq!(ok.status(), 200);
     let body = ok.text().await.unwrap();
-    assert!(
-        body.contains("\"ok\":true") && body.contains("\"generation\":1"),
-        "{body}"
-    );
+    assert!(body.contains("\"generation\":1"), "{body}");
+    assert!(!body.contains("\"ok\":"), "{body}");
     assert!(body.contains("\"changed\":[\"plugins phi\"]"), "{body}");
     assert!(
         rig.admin_get("/v1/status")

@@ -192,6 +192,23 @@ fn error_content() -> serde_json::Value {
     serde_json::json!({"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}})
 }
 
+/// The single credential shape returned by stream creation and token additions.
+fn token_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object","additionalProperties":false,
+        "required":["token"],
+        "properties":{"token":{
+            "type":"object","additionalProperties":false,
+            "required":["id","value","expires_at"],
+            "properties":{
+                "id":{"type":"string"},
+                "value":{"type":"string","description":"The credential is shown only in this response"},
+                "expires_at":{"type":"string","format":"date-time","description":"RFC3339 UTC instant"}
+            }
+        }}
+    })
+}
+
 fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
     let generic_obj = serde_json::json!({"type": "object", "additionalProperties": true});
     match (path, method) {
@@ -214,14 +231,19 @@ fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
         }),
         ("/v1/reload", "post") => generic_obj,
         ("/v1/keys/enable", "post") => serde_json::json!({
-            "type":"object","additionalProperties":true,
-            "required":["ok","key"],
-            "properties":{"ok":{"type":"boolean"},"key":{"type":"string"}}
+            "type":"object","additionalProperties":false,
+            "required":["key"],
+            "properties":{"key":{"type":"string"}}
         }),
         ("/v1/failures", "get") => serde_json::json!({
-            "type":"array",
-            "maxItems": crate::failures::MAX_QUERY_LIMIT,
-            "items":{"type":"object","additionalProperties":true}
+            "type":"object","additionalProperties":false,
+            "required":["failures","failures_total","failures_truncated"],
+            "properties":{
+                "failures":{"type":"array","maxItems":crate::failures::MAX_QUERY_LIMIT,
+                    "items":{"type":"object","additionalProperties":true}},
+                "failures_total":{"type":"integer","minimum":0},
+                "failures_truncated":{"type":"boolean"}
+            }
         }),
         ("/v1/stream-console", "get") => serde_json::json!({
             "type":"object","additionalProperties":true,
@@ -232,6 +254,8 @@ fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
                 "streams_total":{"type":"integer","minimum":0},
                 "streams_truncated":{"type":"boolean"},
                 "audit":{"type":"array","maxItems":64,"items":{"type":"object","additionalProperties":true}},
+                "audit_total":{"type":"integer","minimum":0},
+                "audit_truncated":{"type":"boolean"},
                 "audit_tail_limit":{"type":"integer","minimum":0}
             }
         }),
@@ -240,7 +264,7 @@ fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
         }
         (p, "get") if p.ends_with("/metrics") => serde_json::json!({"type":"string"}),
         ("/v1/cost", "get") => generic_obj,
-        ("/v1/usage", "get") => generic_obj,
+        ("/v1/usage/streams", "get") => generic_obj,
         ("/v1/streams", "get") => serde_json::json!({
             "type":"object","additionalProperties":true,
             "required":["streams"],
@@ -250,7 +274,11 @@ fn route_response_schema(path: &str, method: &str) -> serde_json::Value {
                 "streams_truncated":{"type":"boolean"}
             }
         }),
-        (p, _) if p.starts_with("/v1/streams") => generic_obj,
+        ("/v1/streams/create", "post") => token_response_schema(),
+        (p, "post") if p.ends_with("/tokens") => token_response_schema(),
+        (p, _) if p.starts_with("/v1/streams") => serde_json::json!({
+            "type":"object","additionalProperties":false
+        }),
         _ => generic_obj,
     }
 }
@@ -501,7 +529,11 @@ async fn status(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         let days_left = (not_after - now).div_euclid(86_400);
-        format!("{{\"ca_not_after\":{not_after},\"ca_days_left\":{days_left}}}")
+        serde_json::json!({
+            "ca_not_after_at": crate::reload::rfc3339_i64(not_after),
+            "ca_days_left": days_left,
+        })
+        .to_string()
     });
     let observed =
         serde_json::to_string(&app.observed().snapshot()).unwrap_or_else(|_| "[]".into());
@@ -514,7 +546,7 @@ async fn status(
                     .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
                 let _ = file;
                 serde_json::json!({
-                    "ca_not_after": not_after,
+                    "ca_not_after_at": crate::reload::rfc3339_i64(not_after),
                     "ca_days_left": (not_after - now).div_euclid(86_400),
                 })
             })
@@ -757,7 +789,7 @@ async fn enable_key(
         text_response(
             StatusCode::OK,
             "application/json",
-            format!("{{\"ok\":true,\"key\":{}}}", json_string(&key)),
+            format!("{{\"key\":{}}}", json_string(&key)),
         )
     } else {
         audit_mutation("keys_enable", class, actor.as_deref(), "unknown_key");
@@ -791,8 +823,19 @@ async fn failures(
             record.note = None;
         }
     }
-    match serde_json::to_string(&records) {
-        Ok(body) => text_response(StatusCode::OK, "application/json", body),
+    let total = app
+        .failures()
+        .count_matching(key.as_deref(), stream.as_deref());
+    match serde_json::to_value(&records) {
+        Ok(rows) => {
+            let body = serde_json::json!({
+                "failures": rows,
+                "failures_total": total,
+                "failures_truncated": total > records.len(),
+            })
+            .to_string();
+            text_response(StatusCode::OK, "application/json", body)
+        }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failures_unavailable",
@@ -842,7 +885,7 @@ async fn stream_console(
                         };
                         serde_json::json!({
                             "id": token.id,
-                            "expires_at": token.expires_at,
+                            "expires_at": token.expires_at.map(crate::reload::rfc3339_secs),
                             "state": state,
                         })
                     })
@@ -871,23 +914,23 @@ async fn stream_console(
                 "chain": stream.chain,
                 "limits": limits,
                 "tokens": tokens,
-                "expiry": expiry,
+                "expires_at": expiry.map(crate::reload::rfc3339_secs),
                 "rpm": {"current": usage.minute.requests, "limit": stream.limits.as_ref().and_then(|l| l.rpm).map(u64::from)},
                 "concurrency": {"current": gateway.active_count(name), "limit": stream.limits.as_ref().and_then(|l| l.concurrent).map(u64::from)},
-                "last_used": gateway.last_used(name),
+                "last_used_at": gateway.last_used(name).map(crate::reload::rfc3339_secs),
                 "state": state,
             })
         })
         .collect::<Vec<_>>();
 
-    let audit = match manager {
-        Some(manager) => match manager.audit_tail(64) {
-            Ok(records) => records
+    let (audit, audit_total) = match manager {
+        Some(manager) => match manager.audit_tail_with_total(64) {
+            Ok((records, total)) => (records
                 .iter()
                 .map(|record| {
                     serde_json::json!({
                         "seq": record.seq,
-                        "time": record.time,
+                        "time_at": record.time,
                         "action": record.action,
                         "stream": record.stream,
                         "outcome": record.outcome,
@@ -901,7 +944,7 @@ async fn stream_console(
                         }).collect::<Vec<_>>(),
                     })
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>(), total),
             Err(_) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -910,7 +953,7 @@ async fn stream_console(
                 );
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), 0),
     };
     let streams_total = streams.len();
     let streams_truncated = streams_total > STATUS_LIST_MAX;
@@ -930,6 +973,8 @@ async fn stream_console(
             "streams_total": streams_total,
             "streams_truncated": streams_truncated,
             "audit": audit,
+            "audit_total": audit_total,
+            "audit_truncated": audit_total > 64,
             "audit_tail_limit": 64,
         }),
     )
@@ -1072,7 +1117,17 @@ async fn plugin_route(
         observed,
         extra,
     ) {
-        Some(reply) => text_response(StatusCode::OK, reply.content_type, reply.body),
+        Some(reply) => {
+            // A plugin that returns the shared error envelope gets the matching status.
+            let status = if reply.content_type.starts_with("application/json")
+                && reply.body.trim_start().starts_with("{\"ok\":false")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            };
+            text_response(status, reply.content_type, reply.body)
+        }
         None => not_found(),
     }
 }
@@ -1348,7 +1403,7 @@ fn build_status(
             KeyStatus::Available => out.push_str(",\"state\":\"available\""),
             KeyStatus::OutOfRotation => out.push_str(",\"state\":\"out_of_rotation\""),
             KeyStatus::Cooling(remaining) => {
-                out.push_str(",\"state\":\"cooling\",\"retry_after_seconds\":");
+                out.push_str(",\"state\":\"cooling\",\"cooldown_seconds\":");
                 out.push_str(&remaining.as_secs().max(1).to_string());
                 if let Some(class) = health.cooling_class(name, now) {
                     out.push_str(",\"cooldown_class\":\"");
@@ -1368,7 +1423,7 @@ fn build_status(
             out.push_str(&json_string(&cooling.scope.route));
             out.push_str(",\"model\":");
             out.push_str(&json_string(&cooling.scope.model));
-            out.push_str(",\"retry_after_seconds\":");
+            out.push_str(",\"cooldown_seconds\":");
             let secs =
                 cooling.remaining.as_secs() + u64::from(cooling.remaining.subsec_nanos() > 0);
             out.push_str(&secs.max(1).to_string());
@@ -1681,7 +1736,7 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
         status,
         "application/json",
         serde_json::to_string(&body)
-            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into()),
+            .unwrap_or_else(|_| error_envelope("serialization_failed", "cannot write the answer")),
     )
 }
 
@@ -2355,7 +2410,10 @@ mod tests {
         assert_eq!(status["observed"][0]["mode"], "observed");
         assert_eq!(status["observed"][0]["status_class"], "ok");
         assert!(status["peers"]["tls_ca"][0].get("file").is_none());
-        assert_eq!(status["peers"]["tls_ca"][0]["ca_not_after"], 2_000_086_400);
+        assert_eq!(
+            status["peers"]["tls_ca"][0]["ca_not_after_at"],
+            "2033-05-19T03:33:20Z"
+        );
     }
 
     #[test]

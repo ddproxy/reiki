@@ -119,7 +119,7 @@ Unparseable numbers and resets beyond 24 hours are ignored. The observed view ap
 
 ## Client errors from Reiki
 
-| Status | `error.type` | Cause |
+| Status | `error.code` | Cause |
 | --- | --- | --- |
 | `400` | `bad_path` | Malformed request path |
 | `401` | `unauthorized` | Missing or unknown stream token |

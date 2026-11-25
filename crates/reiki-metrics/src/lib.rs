@@ -125,7 +125,7 @@ impl Plugin for MetricsPlugin {
     }
 
     fn admin_paths(&self) -> Vec<&'static str> {
-        vec!["/metrics", "/usage"]
+        vec!["/metrics", "/usage/streams"]
     }
 
     fn on_admin(&self, ctx: &AdminCtx<'_>) -> Option<AdminReply> {
@@ -140,7 +140,7 @@ impl Plugin for MetricsPlugin {
                     text
                 },
             })
-        } else if ctx.path == "/usage" {
+        } else if ctx.path == "/usage/streams" {
             Some(AdminReply {
                 content_type: "application/json",
                 body: self.metrics.render_usage(),
@@ -1013,7 +1013,7 @@ mod tests {
             )
         );
         assert!(reply.body.contains("reiki_keys{state=\"available\"} 4"));
-        assert_eq!(plugin.admin_paths(), ["/metrics", "/usage"]);
+        assert_eq!(plugin.admin_paths(), ["/metrics", "/usage/streams"]);
         assert!(!plugin.uses_bodies());
         assert!(plugin.needs_response_hooks());
     }

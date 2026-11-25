@@ -106,7 +106,12 @@ impl LocalFailures {
         if !status.is_success() {
             return Err(format!("the admin listener answered {status}"));
         }
-        serde_json::from_str(&body).map_err(|e| format!("bad failure list: {e}"))
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("bad failure list: {e}"))?;
+        let rows = value
+            .get("failures")
+            .ok_or_else(|| "bad failure list: missing failures".to_owned())?;
+        serde_json::from_value(rows.clone()).map_err(|e| format!("bad failure list: {e}"))
     }
 
     /// Fetches estimated spend from the cost plugin. A 404 means the plugin is not compiled
@@ -2654,18 +2659,18 @@ mod tests {
               "streams": [
                 {{"name": "busy", "dynamic": true, "chain": ["zen"],
                   "limits": {{"rpm": 10, "concurrent": 2}},
-                  "tokens": [{{"id": "abcdef1234567890", "expires_at": 4102444800}}],
-                  "expiry": 4102444800, "rpm": {{"current": {busy_rate}, "limit": 10}},
+                  "tokens": [{{"id": "abcdef1234567890", "expires_at": "2100-01-01T00:00:00Z"}}],
+                  "expires_at": "2100-01-01T00:00:00Z", "rpm": {{"current": {busy_rate}, "limit": 10}},
                   "concurrency": {{"current": 2, "limit": 2}},
-                  "last_used": 1000, "state": "active",
+                  "last_used_at": "1970-01-01T00:16:40Z", "state": "active",
                   "token": "{secret}", "hash": "not shown"}},
                 {{"name": "quiet", "dynamic": false, "chain": ["zen", "openrouter"],
                   "limits": {{}}, "tokens": [], "rpm": {{"current": {quiet_rate}, "limit": 30}},
                   "concurrency": {{"current": 0, "limit": 2}},
-                  "last_used": null, "state": "active"}}
+                  "last_used_at": null, "state": "active"}}
               ],
               "audit": [
-                {{"seq": 2, "time": "2026-11-23T00:01:00Z", "action": "token.add",
+                {{"seq": 2, "time_at": "2026-11-23T00:01:00Z", "action": "token.add",
                   "stream": "busy", "outcome": "success", "reason": "rotation",
                   "changes": []}}
               ]

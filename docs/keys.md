@@ -130,7 +130,7 @@ A request uses only the chain keys whose upstream matches the request path. One 
 | `reiki keys` state | `/v1/status` state | Meaning |
 | --- | --- | --- |
 | `ok` | `available` | Key can be selected. |
-| `cooling` | `cooling` | Key waits for `retry_after_seconds`. |
+| `cooling` | `cooling` | Key waits for `cooldown_seconds`. |
 | `disabled` | `out_of_rotation` | Key stays out until enabled or its file changes. |
 
 A key with scoped cooldowns stays `ok` for other routes and models. `reiki keys --json` shows the `scopes` array. See [monitoring](monitoring.md#get-v1status).
@@ -152,7 +152,7 @@ curl -X POST -H "Authorization: Bearer $REIKI_ADMIN_TOKEN" \
   "http://127.0.0.1:4098/v1/keys/enable?key=zen-a"
 ```
 
-The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"ok":true,"key":"zen-a"}`. `400` means a missing, repeated, bare or invalid `key` parameter, or an unknown flag; `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-v1keysenable).
+The endpoint clears the key's cooldown, disabled flag, failure count and scoped cooldowns, then persists the state. A successful call answers `200` with `{"key":"zen-a"}`. `400` means a missing, repeated, bare or invalid `key` parameter, or an unknown flag; `401` a bad admin token, `404` an unknown key name. Enable a key after fixing its file or upstream; otherwise the next failure takes it out again. See [failover](failover.md#re-enabling-keys) and [monitoring](monitoring.md#post-v1keysenable).
 
 ## Rotate a key without downtime
 

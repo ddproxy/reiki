@@ -1391,10 +1391,11 @@ pub(crate) fn decode_path_layer(path: &str) -> Option<String> {
 }
 
 fn json_error(status: StatusCode, kind: &str, message: &str) -> Response {
-    let body = format!(
-        "{{\"error\":{{\"type\":\"{kind}\",\"message\":\"{}\"}}}}",
-        json_escape(message)
-    );
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {"code": kind, "message": message},
+    })
+    .to_string();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -2917,7 +2918,7 @@ struct RingEntry<'a> {
     note: FailureNote<'a>,
     action: FailureAction,
     cooled: bool,
-    cooling_seconds: Option<u64>,
+    cooldown_seconds: Option<u64>,
 }
 
 /// What an attempt reported about its failure.
@@ -3055,7 +3056,7 @@ fn record(
         note,
         action,
         cooled: ring_cooled,
-        cooling_seconds: ring_cooling,
+        cooldown_seconds: ring_cooling,
     });
     app.persist_state();
 }
@@ -3080,7 +3081,7 @@ fn note_failure(app: &App, stream: &str, key: &str, class: FailureClass, note: F
         note,
         action: FailureAction::PassThrough,
         cooled: false,
-        cooling_seconds: cooling,
+        cooldown_seconds: cooling,
     });
 }
 
@@ -3104,7 +3105,7 @@ fn note_request_error(app: &App, stream: &str, key: &str, note: FailureNote<'_>)
         note,
         action: FailureAction::PassThrough,
         cooled: false,
-        cooling_seconds: cooling,
+        cooldown_seconds: cooling,
     });
 }
 
@@ -3117,7 +3118,7 @@ fn record_ring(entry: RingEntry<'_>) {
         note,
         action,
         cooled,
-        cooling_seconds,
+        cooldown_seconds,
     } = entry;
     if !note.ring {
         return;
@@ -3147,7 +3148,7 @@ fn record_ring(entry: RingEntry<'_>) {
         action,
         retry_after,
         cooled,
-        cooling_seconds,
+        cooldown_seconds,
         note: Some(snippet),
     });
 }
@@ -4867,14 +4868,14 @@ mod tests {
             },
             action: FailureAction::Cooldown,
             cooled: true,
-            cooling_seconds: Some(30),
+            cooldown_seconds: Some(30),
         });
         let rows = app.failures().snapshot(1, None, None);
         assert_eq!(rows[0].status, Some(429));
         assert_eq!(rows[0].retry_after.as_deref(), Some("12 0"));
         assert_eq!(rows[0].action, FailureAction::Cooldown);
         assert!(rows[0].cooled);
-        assert_eq!(rows[0].cooling_seconds, Some(30));
+        assert_eq!(rows[0].cooldown_seconds, Some(30));
         let note = rows[0].note.clone().unwrap_or_default();
         assert!(!note.contains(secret), "{note}");
         assert!(!note.chars().any(char::is_control));
@@ -4905,7 +4906,7 @@ mod tests {
             },
             action: FailureAction::PassThrough,
             cooled: false,
-            cooling_seconds: None,
+            cooldown_seconds: None,
         });
         let rows = app.failures().snapshot(1, None, None);
         assert_eq!(rows[0].note.as_deref(), Some(WITHHELD_NOTE));
@@ -4934,7 +4935,7 @@ mod tests {
             },
             action: FailureAction::PassThrough,
             cooled: false,
-            cooling_seconds: None,
+            cooldown_seconds: None,
         });
         let rows = app.failures().snapshot(1, None, None);
         let note = rows[0].note.as_deref().unwrap();
@@ -5157,7 +5158,7 @@ mod tests {
         assert_eq!(entry.mode, "observed");
         assert_eq!(entry.status_class, observed::RATE_LIMITED);
         assert_eq!(entry.cooldown_class, Some("rate_limited"));
-        assert_eq!(entry.retry_after_seconds, Some(12));
+        assert_eq!(entry.cooldown_seconds, Some(12));
         assert_eq!(entry.quota.requests_limit, Some(100));
         assert_eq!(entry.quota.requests_remaining, Some(7));
         assert_eq!(entry.quota.requests_reset_seconds, Some(60));

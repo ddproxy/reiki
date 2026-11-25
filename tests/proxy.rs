@@ -763,7 +763,7 @@ async fn a_request_size_402_fails_over_without_cooling_the_key() {
     assert_eq!(admin_key_state(&h, "a").await, "available");
 
     let failures = failure_ring(&h).await;
-    let rows = failures.as_array().unwrap();
+    let rows = failures["failures"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "the failure ring must have one entry");
     assert_eq!(rows[0]["class"], "request_error");
     assert_eq!(rows[0]["cooled"], false);
@@ -789,7 +789,7 @@ async fn a_request_size_402_from_every_key_is_returned_unchanged() {
     assert_eq!(admin_key_state(&h, "b").await, "available");
 
     let failures = failure_ring(&h).await;
-    let rows = failures.as_array().unwrap();
+    let rows = failures["failures"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "the failure ring must have two entries");
     assert!(rows.iter().all(|row| row["class"] == "request_error"));
     assert!(rows.iter().all(|row| row["cooled"] == false));
@@ -2379,7 +2379,7 @@ async fn admin_status_reports_key_and_stream_state_without_secrets() {
     assert!(body.contains("\"name\":\"client-a\""), "body was {body}");
     assert!(body.contains("\"state\":\"available\""), "body was {body}");
     assert!(body.contains("\"state\":\"cooling\""), "body was {body}");
-    assert!(body.contains("\"retry_after_seconds\":"), "body was {body}");
+    assert!(body.contains("\"cooldown_seconds\":"), "body was {body}");
     assert!(
         body.contains("\"cooldown_class\":\"rate_limited\""),
         "body was {body}"
@@ -2504,16 +2504,15 @@ async fn a_restart_keeps_a_cooling_key_cooling() {
     let _ = std::fs::remove_file(&state);
 }
 
-fn retry_after_seconds(body: &str, key: &str) -> u64 {
-    let marker = format!("\"name\":\"{key}\"");
-    let rest = &body[body.find(&marker).expect("key in status")..];
-    let field = "\"retry_after_seconds\":";
-    let value = &rest[rest.find(field).expect("retry_after_seconds in status") + field.len()..];
-    value
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
+fn cooldown_seconds(body: &str, key: &str) -> u64 {
+    let doc: serde_json::Value = serde_json::from_str(body).expect("status JSON");
+    doc["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .find(|entry| entry["name"] == key)
+        .expect("key in status")["cooldown_seconds"]
+        .as_u64()
         .expect("a number")
 }
 
@@ -2550,12 +2549,12 @@ async fn a_quota_reset_schedule_cools_a_key_until_the_reset_not_the_default() {
 
     // `a` has a schedule, so it cools only until the reset; `b` has none and
     // keeps the fixed five-hour window.
-    let a = retry_after_seconds(&body, "a");
+    let a = cooldown_seconds(&body, "a");
     assert!(
         (1..=5).contains(&a),
         "key a cooled for {a}s; body was {body}"
     );
-    let b = retry_after_seconds(&body, "b");
+    let b = cooldown_seconds(&body, "b");
     assert!(
         (17_990..=18_000).contains(&b),
         "key b cooled for {b}s; body was {body}"
@@ -3040,7 +3039,7 @@ async fn admin_keys_enable_re_enables_a_disabled_key() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
-    assert_eq!(ok.text().await.unwrap(), "{\"ok\":true,\"key\":\"a\"}");
+    assert_eq!(ok.text().await.unwrap(), "{\"key\":\"a\"}");
     assert_eq!(admin_key_state(&h, "a").await, "available");
 
     // The key serves traffic again.
@@ -3060,23 +3059,32 @@ async fn usage_needs_the_admin_token_and_answers_under_v1() {
     let admin = h.admin.as_ref().unwrap();
     let refused = h
         .client
-        .get(format!("{admin}/v1/usage"))
+        .get(format!("{admin}/v1/usage/streams"))
         .send()
         .await
         .unwrap();
     assert_eq!(refused.status(), 401);
     let ok = h
         .client
-        .get(format!("{admin}/v1/usage"))
+        .get(format!("{admin}/v1/usage/streams"))
         .bearer_auth("admin-secret")
         .send()
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
     assert_eq!(ok.headers()["content-type"], "application/json");
+    // The client listener keeps /v1/usage; the admin listener does not serve the bare path.
+    let collision = h
+        .client
+        .get(format!("{admin}/v1/usage"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(collision.status(), 404);
     let bare = h
         .client
-        .get(format!("{admin}/usage"))
+        .get(format!("{admin}/usage/streams"))
         .bearer_auth("admin-secret")
         .send()
         .await

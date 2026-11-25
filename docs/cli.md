@@ -176,10 +176,10 @@ reiki reload [--dry-run] [--url URL] [--token-file PATH]
 Output is the JSON answer from `/v1/reload`, printed to stdout for both success and refusal:
 
 ```
-{"ok":true,"dry_run":false,"generation":1,"keys":1,"streams":1,"changed":[],"restart_needed":[]}
+{"dry_run":false,"generation":1,"keys":1,"streams":1,"changed":[],"restart_needed":[]}
 ```
 
-Fields: `ok`, `dry_run`, `generation` (successful reloads since startup), `keys` and `streams` (counts after the reload), `changed` (what differs, such as `plugins phi`), `restart_needed` (settings that apply only after a restart).
+Fields: `dry_run`, `generation` (successful reloads since startup), `keys` and `streams` (counts after the reload), `changed` (what differs, such as `plugins phi`), `restart_needed` (settings that apply only after a restart). A successful mutation returns the changed resource, never an `ok` flag; failures use the [error envelope](monitoring.md#error-envelope).
 
 A failed reload answers the admin error envelope, `{"ok":false,"error":{"code":"config_refused","message":"..."}}`, and exits `1`. See [the error envelope](monitoring.md#error-envelope).
 
@@ -243,7 +243,7 @@ zen-a  zen       ok     -         -     client
 
 ### `--enable`
 
-Prints the admin answer, such as `{"ok":true,"key":"zen-a"}`. A name that does not exist gets `404` and exit `1`.
+Prints the admin answer, such as `{"key":"zen-a"}`. A name that does not exist gets `404` and exit `1`.
 
 ### `--check`
 
@@ -300,7 +300,7 @@ reiki failures [--limit N] [--key NAME] [--stream NAME] [--json] [--url URL] [--
 | `--limit N` | `20` | Records to show, newest first; 1 to 64. |
 | `--key NAME` | all keys | Only failures for this key name. |
 | `--stream NAME` | all streams | Only failures for this stream name. |
-| `--json` | off | Print the same JSON array as the endpoint. |
+| `--json` | off | Print the endpoint's failure envelope, with `failures`, `failures_total` and `failures_truncated`. |
 | `--url URL` | `[admin] listen` from the config | Admin address. |
 | `--token-file PATH` | `REIKI_ADMIN_TOKEN` | Admin token file. |
 
@@ -322,7 +322,7 @@ TIME                 STREAM  KEY    STATUS  CLASS         ACTION      COOLED  NO
 | `COOLED` | Seconds left on the cooldown this failure started, or `-`. |
 | `NOTE` | Scrubbed, printable body snippet, cut to 200 bytes and the terminal width (`COLUMNS`, default 120). |
 
-Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. The ring holds `failure_ring_size` entries (`200` by default; `0` disables). `--json` prints an array whether or not `--limit` was given.
+Lines are cut to `COLUMNS`, so a narrow terminal keeps the columns aligned. Nothing in the ring is written to disk; a restart starts it empty. The ring holds `failure_ring_size` entries (`200` by default; `0` disables). `--json` prints the failure envelope whether or not `--limit` was given.
 
 Exit codes: `0` on success; `1` when the admin listener refuses the token or answer; `2` when it cannot be reached or no admin token or address is available.
 

@@ -8,7 +8,7 @@ Short answers. The linked pages are the source of truth.
 
 | Where | What it means | What it does to keys |
 | --- | --- | --- |
-| Gateway admission | A `[streams.NAME.limits]` budget or fair-share turn was reached; `error.type` starts with `gateway_`, with `Retry-After` at least 1 | None |
+| Gateway admission | A `[streams.NAME.limits]` budget or fair-share turn was reached; `error.code` starts with `gateway_`, with `Retry-After` at least 1 | None |
 | Local shaping | An upstream `limits` budget held the request; `reiki_shaped` with `x-reiki-origin: local` | None |
 | Login backoff | Too many wrong stream or admin tokens from one address | None |
 | Upstream | A `rate_limited` or `quota_exhausted` ring row | Cools a scope or the key |

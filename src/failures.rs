@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use reiki_plugin::format_utc;
 
@@ -60,7 +60,12 @@ impl FailureAction {
 /// One key failure as `/v1/failures` and `reiki failures` show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
-    /// Unix seconds, from the wall clock the instance uses elsewhere.
+    /// RFC3339 UTC instant from the wall clock the instance uses elsewhere.
+    #[serde(
+        rename = "time_at",
+        serialize_with = "write_time_at",
+        deserialize_with = "read_time_at"
+    )]
     pub time: u64,
     pub stream: String,
     pub key: String,
@@ -74,7 +79,7 @@ pub struct FailureRecord {
     /// Whether this failure put the key on cooldown.
     pub cooled: bool,
     /// Seconds left on the key's cooldown, when it has one.
-    pub cooling_seconds: Option<u64>,
+    pub cooldown_seconds: Option<u64>,
     /// Scrubbed, printable body snippet. `None` for read-only admin callers, who get no free text.
     pub note: Option<String>,
 }
@@ -160,6 +165,17 @@ impl FailureRing {
             .collect()
     }
 
+    /// How many records match a filter, before the response limit is applied.
+    pub fn count_matching(&self, key: Option<&str>, stream: Option<&str>) -> usize {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state
+            .records
+            .iter()
+            .filter(|record| key.is_none_or(|key| record.key == key))
+            .filter(|record| stream.is_none_or(|stream| record.stream == stream))
+            .count()
+    }
+
     /// How many records each failure class has in the ring; only observed classes.
     pub fn counts(&self) -> BTreeMap<String, u64> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -192,12 +208,22 @@ impl FailureRing {
 
 /// Turns a `/v1/failures` answer into rows.
 pub fn parse(body: &str) -> Result<Vec<FailureRecord>, String> {
-    serde_json::from_str(body).map_err(|e| format!("cannot read /v1/failures: {e}"))
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("cannot read /v1/failures: {e}"))?;
+    let rows = value
+        .get("failures")
+        .ok_or_else(|| "cannot read /v1/failures: missing failures".to_owned())?;
+    serde_json::from_value(rows.clone()).map_err(|e| format!("cannot read /v1/failures: {e}"))
 }
 
-/// The JSON document `reiki failures --json` prints: the same array as the endpoint.
+/// The JSON document `reiki failures --json` prints: the same envelope as the endpoint.
 pub fn render_json(records: &[FailureRecord]) -> Result<String, String> {
-    serde_json::to_string(records)
+    let body = serde_json::json!({
+        "failures": records,
+        "failures_total": records.len(),
+        "failures_truncated": false,
+    });
+    serde_json::to_string(&body)
         .map(|text| format!("{text}\n"))
         .map_err(|e| format!("cannot write JSON: {e}"))
 }
@@ -222,7 +248,7 @@ pub fn render_table(records: &[FailureRecord], width: usize) -> String {
                     .map_or_else(|| "-".to_owned(), |status| status.to_string()),
                 record.class.clone(),
                 record.action.label().to_owned(),
-                match (record.cooled, record.cooling_seconds) {
+                match (record.cooled, record.cooldown_seconds) {
                     (true, Some(secs)) => format!("{secs}s"),
                     (true, None) => "yes".to_owned(),
                     (false, _) => "-".to_owned(),
@@ -283,6 +309,18 @@ fn format_time(unix: u64) -> String {
     format_utc(secs, ' ', None, "")
 }
 
+fn write_time_at<S: Serializer>(secs: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::reload::rfc3339_secs(*secs))
+}
+
+fn read_time_at<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    use time::format_description::well_known::Rfc3339;
+    let text = String::deserialize(deserializer)?;
+    let parsed = time::OffsetDateTime::parse(&text, &Rfc3339).map_err(serde::de::Error::custom)?;
+    u64::try_from(parsed.unix_timestamp())
+        .map_err(|_| serde::de::Error::custom("an instant before the Unix epoch"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,7 +335,7 @@ mod tests {
             action: FailureAction::Cooldown,
             retry_after: Some("120".to_owned()),
             cooled: true,
-            cooling_seconds: Some(10),
+            cooldown_seconds: Some(10),
             note: Some(format!("failure {label}")),
         }
     }

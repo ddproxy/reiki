@@ -65,7 +65,7 @@ With `[gateway] on_store_error = "closed"` (the default), a state directory prob
 
 ## Troubleshoot gateway store unavailable
 
-A client gets `503` with `{"error":{"type":"gateway_store_unavailable","message":"per-stream counters are unavailable"}}` when the gateway store is closed and the stream is fail-closed (`[gateway] on_store_error = "closed"`, the default, or a per-stream override). With `"open"`, requests continue while the failure is counted in `reiki_gateway_store_errors_total{stream}` and reported as `GatewayStoreError` events. See [gateway admission](shaping.md#gateway-admission) for the two modes.
+A client gets `503` with `{"ok":false,"error":{"code":"gateway_store_unavailable","message":"per-stream counters are unavailable"}}` when the gateway store is closed and the stream is fail-closed (`[gateway] on_store_error = "closed"`, the default, or a per-stream override). With `"open"`, requests continue while the failure is counted in `reiki_gateway_store_errors_total{stream}` and reported as `GatewayStoreError` events. See [gateway admission](shaping.md#gateway-admission) for the two modes.
 
 The store closes when a state write fails, for example `ENOSPC`, a read-only state file or directory, or another I/O error. It also closes at startup when an existing `<config>.state` cannot be read or parsed, including a corrupt file. A missing state file is not an error: counters and saved cooldowns start fresh. Check free space, mounts, and the owner and mode of the state directory and file (mode `0600`; see [backup and restore](#backup-and-restore)).
 

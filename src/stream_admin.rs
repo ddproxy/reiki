@@ -1076,10 +1076,17 @@ impl Manager {
             return Err(ApiError::STORE);
         }
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+        // A replay must never reshow a minted credential. Other mutations replay
+        // their empty changed-resource shape.
+        let replay_response = if response.get("token").is_some() {
+            serde_json::json!({})
+        } else {
+            response.clone()
+        };
         self.idempotency
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, fingerprint, response.clone());
+            .insert(key, fingerprint, replay_response);
         self.apply();
         self.record_action("success");
         Ok(response)
@@ -1148,11 +1155,11 @@ impl Manager {
                     },
                 );
                 let response = serde_json::json!({
-                    "name": name,
-                    "key": key,
-                    "token": raw,
-                    "token_id": id,
-                    "expires_at": expires_at,
+                    "token": {
+                        "id": id,
+                        "value": raw,
+                        "expires_at": expires_at.map(crate::reload::rfc3339_secs),
+                    },
                 });
                 Ok((response, changes))
             }
@@ -1185,7 +1192,7 @@ impl Manager {
                 if changes.is_empty() {
                     return Err(ApiError::BAD_REQUEST);
                 }
-                Ok((serde_json::json!({"name": name, "updated": true}), changes))
+                Ok((serde_json::json!({}), changes))
             }
             Mutation::AddToken { name, ttl } => {
                 let stream = state.streams.get_mut(name).ok_or(ApiError::NOT_FOUND)?;
@@ -1220,10 +1227,11 @@ impl Manager {
                 });
                 Ok((
                     serde_json::json!({
-                        "name": name,
-                        "token": raw,
-                        "token_id": id,
-                        "expires_at": expires_at,
+                        "token": {
+                            "id": id,
+                            "value": raw,
+                            "expires_at": expires_at.map(crate::reload::rfc3339_secs),
+                        },
                     }),
                     changes,
                 ))
@@ -1247,10 +1255,7 @@ impl Manager {
                     ),
                     AuditChange::new("token.id", token_id, "-"),
                 ];
-                Ok((
-                    serde_json::json!({"name": name, "revoked": token_id}),
-                    changes,
-                ))
+                Ok((serde_json::json!({}), changes))
             }
             Mutation::RevokeAll { name } => {
                 let stream = state.streams.get_mut(name).ok_or(ApiError::NOT_FOUND)?;
@@ -1269,7 +1274,7 @@ impl Manager {
                     AuditChange::new("tokens.count", before.to_string(), "0"),
                     AuditChange::new("tokens.all", "active", "revoked"),
                 ];
-                Ok((serde_json::json!({"name": name, "revoked": "all"}), changes))
+                Ok((serde_json::json!({}), changes))
             }
             Mutation::Delete { name } => {
                 let stream = state.streams.get(name).ok_or(ApiError::NOT_FOUND)?;
@@ -1281,7 +1286,7 @@ impl Manager {
                 }
                 state.streams.remove(name);
                 Ok((
-                    serde_json::json!({"name": name, "deleted": true}),
+                    serde_json::json!({}),
                     vec![AuditChange::new("stream", name, "-")],
                 ))
             }
@@ -1390,10 +1395,10 @@ impl Manager {
                     "limits": limits_json(&stream.limits),
                     "tokens": stream.tokens.iter().map(|token| serde_json::json!({
                         "id": token.id,
-                        "expires_at": token.expires_at,
-                        "created_at": token.created_at,
+                        "expires_at": token.expires_at.map(crate::reload::rfc3339_secs),
+                        "created_at": crate::reload::rfc3339_secs(token.created_at),
                     })).collect::<Vec<_>>(),
-                    "created_at": stream.created_at,
+                    "created_at": crate::reload::rfc3339_secs(stream.created_at),
                 })
             })
             .collect()
@@ -1401,12 +1406,18 @@ impl Manager {
 
     /// The last `limit` audit records, newest first. The whole chain is verified first: a
     /// truncated or edited log is an error, never a partial answer for the read-only console.
-    pub(crate) fn audit_tail(&self, limit: usize) -> Result<Vec<AuditRecord>, String> {
+    /// The bounded tail plus the full verified record count, for list envelopes that report
+    /// truncation. The chain is verified once for both numbers.
+    pub(crate) fn audit_tail_with_total(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<AuditRecord>, usize), String> {
         let records = self.audit.read()?;
-        let skip = records.len().saturating_sub(limit);
+        let total = records.len();
+        let skip = total.saturating_sub(limit);
         let mut tail: Vec<AuditRecord> = records.into_iter().skip(skip).collect();
         tail.reverse();
-        Ok(tail)
+        Ok((tail, total))
     }
 
     pub(crate) fn show(&self, name: &str) -> Option<serde_json::Value> {
@@ -1419,10 +1430,10 @@ impl Manager {
             "limits": limits_json(&stream.limits),
             "tokens": stream.tokens.iter().map(|token| serde_json::json!({
                 "id": token.id,
-                "expires_at": token.expires_at,
-                "created_at": token.created_at,
+                "expires_at": token.expires_at.map(crate::reload::rfc3339_secs),
+                "created_at": crate::reload::rfc3339_secs(token.created_at),
             })).collect::<Vec<_>>(),
-            "created_at": stream.created_at,
+            "created_at": crate::reload::rfc3339_secs(stream.created_at),
         }))
     }
 }

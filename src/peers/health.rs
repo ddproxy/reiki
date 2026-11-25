@@ -22,6 +22,12 @@ fn ceil_secs(wait: Duration, bucket: u64) -> u64 {
     }
 }
 
+fn cap<T>(mut items: Vec<T>, max: usize) -> (Vec<T>, bool) {
+    let truncated = items.len() > max;
+    items.truncate(max);
+    (items, truncated)
+}
+
 fn status_class(status: Option<u16>) -> Option<String> {
     match status {
         Some(200..=299) => Some("2xx".to_owned()),
@@ -119,6 +125,7 @@ pub(crate) fn upstreams(
         } else {
             (None, None, None, None, None, None, None)
         };
+        let (listed, keys_truncated) = cap(listed, MAX_KEYS_PER_UPSTREAM);
         let entry = reiki_health::Upstream {
             name: name.clone(),
             healthy_keys: healthy,
@@ -131,6 +138,7 @@ pub(crate) fn upstreams(
                 .and_then(status_class),
             capacity_group: upstream.capacity_group.clone(),
             keys: labels.then_some(listed),
+            keys_truncated,
             requests_1h,
             limited_1h,
             request_buckets,
@@ -139,11 +147,27 @@ pub(crate) fn upstreams(
             request_minutes,
             token_minutes,
         };
-        out.push(
-            serde_json::to_value(entry).expect("a health upstream entry always serializes to JSON"),
-        );
+        let value =
+            serde_json::to_value(entry).expect("a health upstream entry always serializes to JSON");
+        out.push(value);
     }
-    out
+    cap(out, MAX_UPSTREAMS).0
+}
+
+/// Host figures with the disk array capped; the total roles for each disk are fixed by
+/// [`disk_dirs`], so no further sub-array bound is needed.
+pub(crate) async fn host_stats(app: &App, config: &Config) -> Value {
+    let mut value = super::host::stats(&disk_dirs(app, config)).await;
+    let mut truncated = false;
+    if let Some(disks) = value.as_object_mut().and_then(|obj| obj.remove("disks"))
+        && let Value::Array(items) = disks
+    {
+        let (items, over) = cap(items, MAX_DISKS);
+        truncated = over;
+        value["disks"] = json!(items);
+    }
+    value["disks_truncated"] = json!(truncated);
+    value
 }
 
 /// The name this instance publishes: the configured one, or a fixed `reiki`, so a host,
@@ -156,6 +180,14 @@ pub(crate) fn instance_name(peers: &PeersConfig) -> String {
 }
 
 const DEFAULT_INSTANCE: &str = "reiki";
+
+/// Published array limits. Counts and truncation flags keep a reader from treating a capped
+/// document as complete; the limits are part of the provider health contract.
+pub(crate) const MAX_UPSTREAMS: usize = 64;
+pub(crate) const MAX_KEYS_PER_UPSTREAM: usize = 256;
+pub(crate) const MAX_OBSERVED: usize = 256;
+pub(crate) const MAX_DISKS: usize = 4;
+pub(crate) const MAX_SESSION_STREAMS: usize = 256;
 
 /// The whole `/v1/health` answer for the current snapshot and key health.
 pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
@@ -174,6 +206,14 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
             peers.expose_usage.then(|| app.pressure()),
         )
     };
+    let upstream_total = snapshot
+        .config
+        .upstream
+        .values()
+        .filter(|upstream| !upstream.passthrough)
+        .count();
+    let observed_snapshot = app.observed().snapshot_at(app.wall_now());
+    let (observed_snapshot, observed_truncated) = cap(observed_snapshot, MAX_OBSERVED);
     let mut doc = json!({
         "instance": instance_name(peers),
         "reiki_version": env!("CARGO_PKG_VERSION"),
@@ -183,9 +223,7 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         "upstreams": upstreams,
         // Passthrough answers have no keys, so they live in their own list rather than pretending
         // to be keyed upstreams. Only operator labels and parsed header numbers are published.
-        "observed": app
-            .observed()
-            .snapshot_at(app.wall_now())
+        "observed": observed_snapshot
             .iter()
             .map(|entry| {
                 serde_json::to_value(reiki_health::ObservedUpstream::from(entry))
@@ -195,6 +233,8 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         // Counts over the same bounded ring as `/v1/failures`; bodies and key names never leave.
         "failures": app.failures().counts(),
     });
+    doc["upstreams_truncated"] = json!(upstream_total > MAX_UPSTREAMS);
+    doc["observed_truncated"] = json!(observed_truncated);
     // Aggregate gateway counters: fixed names and counts only, gated by the same usage switch as
     // per-upstream traffic figures. No stream, model or key name ever reaches the wire.
     if peers.expose_usage {
@@ -214,7 +254,7 @@ pub(crate) async fn document(app: &App, peers: &PeersConfig) -> Value {
         doc[name] = json!(value);
     }
     if peers.expose_host_stats {
-        doc["host"] = super::host::stats(&disk_dirs(app, &snapshot.config)).await;
+        doc["host"] = host_stats(app, &snapshot.config).await;
         doc["sessions"] = sessions(app, peers);
     }
     doc
@@ -265,10 +305,14 @@ pub(crate) fn sessions(app: &App, peers: &PeersConfig) -> Value {
         "active_sessions": total,
     });
     if peers.expose_key_labels {
-        out["streams"] = counts
-            .iter()
-            .map(|(stream, count)| json!({"stream": stream, "active_sessions": count}))
-            .collect();
+        let (streams, truncated) = cap(counts.iter().collect::<Vec<_>>(), MAX_SESSION_STREAMS);
+        out["streams"] = json!(
+            streams
+                .iter()
+                .map(|(stream, count)| json!({"stream": stream, "active_sessions": count}))
+                .collect::<Vec<_>>()
+        );
+        out["streams_truncated"] = json!(truncated);
     }
     out
 }
@@ -289,6 +333,54 @@ mod tests {
              [keys.c]\nupstream = \"zen\"\nfile = \"/c\"\n",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn every_published_array_reports_truncation_when_it_exceeds_its_bound() {
+        for (total, max) in [
+            (MAX_UPSTREAMS + 1, MAX_UPSTREAMS),
+            (MAX_KEYS_PER_UPSTREAM + 1, MAX_KEYS_PER_UPSTREAM),
+            (MAX_OBSERVED + 1, MAX_OBSERVED),
+            (MAX_DISKS + 1, MAX_DISKS),
+            (MAX_SESSION_STREAMS + 1, MAX_SESSION_STREAMS),
+        ] {
+            let (items, truncated) = cap((0..total).collect::<Vec<_>>(), max);
+            assert_eq!(items.len(), max);
+            assert!(
+                truncated,
+                "a bounded array of {total} must report truncation"
+            );
+            let (items, truncated) = cap((0..max).collect::<Vec<_>>(), max);
+            assert_eq!(items.len(), max);
+            assert!(
+                !truncated,
+                "an array at the bound must not report truncation"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_and_key_arrays_stop_at_their_bounds() {
+        let mut text = String::new();
+        for index in 0..=MAX_UPSTREAMS {
+            text.push_str(&format!(
+                "[upstream.u{index}]\nbase_url = \"https://u{index}.example\"\n"
+            ));
+        }
+        for index in 0..=MAX_KEYS_PER_UPSTREAM {
+            text.push_str(&format!(
+                "[keys.k{index}]\nupstream = \"u0\"\nfile = \"/dev/null\"\n"
+            ));
+        }
+        let config = Config::parse(&text).unwrap();
+        let mut health = KeyState::default();
+        let out = upstreams(&config, &mut health, Instant::now(), true, 0, None);
+        assert_eq!(out.len(), MAX_UPSTREAMS);
+        assert_eq!(
+            out[0]["keys"].as_array().unwrap().len(),
+            MAX_KEYS_PER_UPSTREAM
+        );
+        assert_eq!(out[0]["keys_truncated"], true);
     }
 
     #[test]
@@ -583,6 +675,7 @@ mod tests {
                 "cooling_keys",
                 "disabled_keys",
                 "healthy_keys",
+                "keys_truncated",
                 "last_status_class",
                 "name",
                 "soonest_cooldown_seconds"
@@ -621,7 +714,7 @@ mod tests {
                 retry_after: Some("120".to_owned()),
                 action: crate::failures::FailureAction::Cooldown,
                 cooled: true,
-                cooling_seconds: Some(10),
+                cooldown_seconds: Some(10),
                 note: Some("a body with secret-key-name in it".to_owned()),
             });
         }

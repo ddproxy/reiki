@@ -204,10 +204,11 @@ async fn every_encoding_is_scrubbed_from_the_failure_ring() {
         .unwrap();
     let rows: serde_json::Value = serde_json::from_str(&ring).unwrap();
     assert_eq!(
-        rows.as_array().unwrap().len(),
+        rows["failures"].as_array().unwrap().len(),
         forms.len(),
         "the failure ring has one row per key form"
     );
+    assert_eq!(rows["failures_total"], forms.len());
     assert!(!ring.contains(KEY), "the key leaked into the failure ring");
     for (name, form) in forms {
         assert!(

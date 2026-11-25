@@ -26,7 +26,7 @@ pub struct ReloadReport {
 impl ReloadReport {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"ok\":true,\"dry_run\":{},\"generation\":{},\"keys\":{},\"streams\":{},\"changed\":{},\"restart_needed\":{}}}",
+            "{{\"dry_run\":{},\"generation\":{},\"keys\":{},\"streams\":{},\"changed\":{},\"restart_needed\":{}}}",
             self.dry_run,
             self.generation,
             self.keys,
@@ -251,7 +251,16 @@ pub(crate) fn rfc3339(time: SystemTime) -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+    rfc3339_secs(secs)
+}
+
+/// Unix seconds as an RFC3339 UTC instant, for wire fields named `*_at`.
+pub(crate) fn rfc3339_secs(secs: u64) -> String {
+    format_utc(i64::try_from(secs).unwrap_or(i64::MAX), 'T', None, "Z")
+}
+
+/// Signed Unix seconds (as used for certificate validity) as an RFC3339 UTC instant.
+pub(crate) fn rfc3339_i64(secs: i64) -> String {
     format_utc(secs, 'T', None, "Z")
 }
 
@@ -276,7 +285,7 @@ mod tests {
         let r = report(4);
         assert_eq!(
             r.to_json(),
-            "{\"ok\":true,\"dry_run\":false,\"generation\":4,\"keys\":3,\"streams\":2,\"changed\":[\"plugins phi\",\"tunnel allow +2/-0\"],\"restart_needed\":[\"listen\"]}"
+            "{\"dry_run\":false,\"generation\":4,\"keys\":3,\"streams\":2,\"changed\":[\"plugins phi\",\"tunnel allow +2/-0\"],\"restart_needed\":[\"listen\"]}"
         );
         assert_eq!(
             r.summary(),

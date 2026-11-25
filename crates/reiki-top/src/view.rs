@@ -492,7 +492,7 @@ pub fn stream_detail(
                 format!(
                     "  {}  {}  {}",
                     token.short_id(),
-                    crate::streams::fmt_countdown(token.expires_at, now),
+                    crate::streams::fmt_countdown(token.expires_secs(), now),
                     token.state_at(now)
                 ),
                 if token.active_at(now) {
@@ -517,7 +517,7 @@ pub fn stream_detail(
             vec![span(
                 format!(
                     "  {} {} {} {}",
-                    record.time, record.action, record.outcome, record.reason
+                    record.time_at, record.action, record.outcome, record.reason
                 ),
                 match record.outcome.as_str() {
                     "success" => Style::Plain,
@@ -731,7 +731,7 @@ pub fn fleet_detail(fleet: &Fleet, peers: &[String], now: Instant, width: usize)
                             name,
                             col.upstream,
                             entry.account,
-                            entry.retry_after_seconds.unwrap_or(0),
+                            entry.cooldown_seconds.unwrap_or(0),
                             entry.status_class
                         ),
                         observed_style(&entry.status_class),
@@ -936,7 +936,7 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
             format!("last {}", entry.status_class),
             observed_style(&entry.status_class),
         ));
-        if let Some(seconds) = entry.retry_after_seconds {
+        if let Some(seconds) = entry.cooldown_seconds {
             spans.push(span(format!("  retry {seconds}s"), Style::Warn));
         }
         if let Some(class) = entry.cooldown_class.as_deref() {
@@ -983,17 +983,9 @@ fn peer_card(fleet: &Fleet, name: &str, now: Instant, width: usize, out: &mut Ve
 }
 
 fn failure_line(failure: &crate::Failure, width: usize) -> Line {
-    let time = failure.time.rem_euclid(86_400);
+    let clock = failure.time_at.get(11..19).unwrap_or("00:00:00").to_owned();
     let mut spans = vec![
-        span(
-            format!(
-                "    {:02}:{:02}:{:02}  ",
-                time / 3_600,
-                time % 3_600 / 60,
-                time % 60
-            ),
-            Style::Dim,
-        ),
+        span(format!("    {clock}  "), Style::Dim),
         span(format!("{}  ", failure.stream), Style::Plain),
         span(format!("{}  ", failure.key), Style::Plain),
         span(
@@ -1007,7 +999,7 @@ fn failure_line(failure: &crate::Failure, width: usize) -> Line {
     ];
     if failure.cooled {
         let left = failure
-            .cooling_seconds
+            .cooldown_seconds
             .map_or_else(|| "cooled".to_owned(), |secs| format!("cooled {secs}s"));
         spans.push(span(format!("  {left}"), Style::Warn));
     }
@@ -2264,7 +2256,7 @@ mod tests {
         let doc = MIX_DOC.replace(
             "\"observed\" : [],",
             r#""observed" : [{"upstream":"oauth","account":"alice","mode":"observed",
-                "status_class":"rate_limited","observed_at":"t","retry_after_seconds":20,
+                "status_class":"rate_limited","observed_at":"t","cooldown_seconds":20,
                 "cooldown_class":"rate_limited","quota":{"requests_limit":100,
                 "requests_remaining":0,"requests_reset_seconds":30,"tokens_limit":null,
                 "tokens_remaining":null,"tokens_reset_seconds":null}}],"#,
@@ -4160,7 +4152,7 @@ mod tests {
         f.set_local_failures(
             "peer-a",
             vec![crate::Failure {
-                time: 3_600,
+                time_at: "1970-01-01T01:00:00Z".to_owned(),
                 stream: "s".to_owned(),
                 key: "k".to_owned(),
                 status: Some(429),
@@ -4168,7 +4160,7 @@ mod tests {
                 action: "cooldown".to_owned(),
                 retry_after: Some("120".to_owned()),
                 cooled: true,
-                cooling_seconds: Some(30),
+                cooldown_seconds: Some(30),
                 note: Some("body".to_owned()),
             }],
         );
@@ -4360,17 +4352,17 @@ mod tests {
               "enabled": true,
               "streams": [
                 {{"name":"quiet","dynamic":false,"chain":["zen","openrouter"],
-                  "limits":{{"rpm":30,"concurrent":2}},"tokens":[],"expiry":null,
+                  "limits":{{"rpm":30,"concurrent":2}},"tokens":[],"expires_at":null,
                   "rpm":{{"current":1,"limit":30}},"concurrency":{{"current":0,"limit":2}},
-                  "last_used":1000,"state":"active"}},
+                  "last_used_at":"1970-01-01T00:16:40Z","state":"active"}},
                 {{"name":"busy","dynamic":true,"chain":["zen"],
-                  "limits":{{"rpm":10}},"tokens":[{{"id":"abcdef1234567890","expires_at":1900}}],
-                  "expiry":1900,"rpm":{{"current":9,"limit":10}},
-                  "concurrency":{{"current":2,"limit":2}},"last_used":1150,"state":"active",
+                  "limits":{{"rpm":10}},"tokens":[{{"id":"abcdef1234567890","expires_at":"1970-01-01T00:31:40Z"}}],
+                  "expires_at":"1970-01-01T00:31:40Z","rpm":{{"current":9,"limit":10}},
+                  "concurrency":{{"current":2,"limit":2}},"last_used_at":"1970-01-01T00:19:10Z","state":"active",
                   "token":"{secret}"}}
               ],
               "audit": [
-                {{"seq":2,"time":"2026-11-23T00:01:00Z","action":"token.add","stream":"busy",
+                {{"seq":2,"time_at":"2026-11-23T00:01:00Z","action":"token.add","stream":"busy",
                   "outcome":"success","reason":"rotation","changes":[{{"field":"token.id",
                   "from":"-","to":"abcdef12"}}]}}
               ]

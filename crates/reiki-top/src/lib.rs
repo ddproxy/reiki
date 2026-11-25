@@ -559,7 +559,7 @@ mod tests {
         fleet.set_local_failures(
             "peer-a",
             vec![Failure {
-                time: 1,
+                time_at: "1970-01-01T00:00:01Z".to_owned(),
                 stream: "s".to_owned(),
                 key: "k".to_owned(),
                 status: Some(429),
@@ -567,7 +567,7 @@ mod tests {
                 action: "pass-through".to_owned(),
                 retry_after: Some("120".to_owned()),
                 cooled: true,
-                cooling_seconds: Some(1),
+                cooldown_seconds: Some(1),
                 note: Some("n".to_owned()),
             }],
         );
@@ -594,6 +594,7 @@ mod tests {
                 last_status_class: Some("4xx".to_owned()),
                 capacity_group: None,
                 keys: None,
+                keys_truncated: false,
                 requests_1h: None,
                 limited_1h: None,
                 request_buckets: None,

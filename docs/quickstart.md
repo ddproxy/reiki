@@ -116,7 +116,7 @@ Expected output:
 
 ```text
 401
-{"error":{"type":"unauthorized","message":"unknown token"}}
+{"ok":false,"error":{"code":"unauthorized","message":"unknown token"}}
 ```
 
 A request with no token gets the same status with `missing token`. After ten bad tokens from one address in a minute, the next request gets `429` with `Retry-After`. The wrong-token test proves the request reached Reiki's client listener and was checked against a stream hash; it does not prove the upstream works. See [classification](classification.md#client-errors-from-reiki).

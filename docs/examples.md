@@ -33,7 +33,7 @@ A request body with an SSN and a card is rejected before a key is used:
 HTTP/1.1 422 Unprocessable Entity
 content-type: application/json
 
-{"error":{"type":"blocked","message":"phi: request blocked, it contains ssn x1, card x1"}}
+{"ok":false,"error":{"code":"blocked","message":"phi: request blocked, it contains ssn x1, card x1"}}
 ```
 
 > **Limit:** The rejection names kinds and counts, never values. Only the request body is checked. In `block` mode an encoded or invalid UTF-8 body gets `415`; in `report` mode it is logged as unchecked. See [PHI behavior](phi.md#behavior).
@@ -64,10 +64,10 @@ Ask the admin listener for recent failures on one key:
 
 ```console
 $ reiki --config /etc/reiki/reiki.toml failures --limit 20 --key zen-b --json
-[{"time":1763465051,"stream":"client-a","key":"zen-b","status":429,"class":"quota_exhausted","retry_after":"18000","cooled":true,"cooling_seconds":17999,"note":"quota exceeded for this key"}]
+{"failures":[{"time_at":"2025-11-18T11:24:11Z","stream":"client-a","key":"zen-b","status":429,"class":"quota_exhausted","retry_after":"18000","cooled":true,"cooldown_seconds":17999,"note":"quota exceeded for this key"}],"failures_total":1,"failures_truncated":false}
 ```
 
-`time` is Unix seconds. `retry_after` is the received header; `cooling_seconds` is the wait left at the snapshot. `note` is a printable body snippet of at most 200 characters with credentials scrubbed.
+`time_at` is an RFC3339 UTC instant. `retry_after` is the received header, not a remaining duration; `cooldown_seconds` is the wait left at the snapshot. `note` is a printable body snippet of at most 200 characters with credentials scrubbed. The response is an envelope: `failures` is the bounded row array, with `failures_total` and `failures_truncated` beside it.
 
 A quota `429` with `Retry-After: 90` cools the key for 60 to 90 seconds. The next request is refused locally with `503` and a `retry-after` header; the cooled key is not tried again. The ring holds `failure_ring_size` records in memory (200 by default) and is empty after a restart. See [GET /v1/failures](monitoring.md#get-v1failures).
 
@@ -96,8 +96,8 @@ stream = "client-a"
 | Cause | Client sees |
 | --- | --- |
 | Destination not allowed | `HTTP/1.1 403 Forbidden`, body `destination not allowed` |
-| Path outside the intercepted API | `403`, `{"error":{"type":"forbidden","message":"the path is outside the intercepted API"}}` |
-| `Host` header differs from the tunnel destination | `421`, `{"error":{"type":"misdirected","message":"the Host header does not match the tunnel destination"}}` |
+| Path outside the intercepted API | `403`, `{"ok":false,"error":{"code":"forbidden","message":"the path is outside the intercepted API"}}` |
+| `Host` header differs from the tunnel destination | `421`, `{"ok":false,"error":{"code":"misdirected","message":"the Host header does not match the tunnel destination"}}` |
 | Intercepted host without a valid stream token | `HTTP/1.1 407 Proxy Authentication Required`, `proxy-authenticate: Basic realm="reiki"`, body `a stream token is required` |
 | Too many bad `Proxy-Authorization` attempts from one address | `HTTP/1.1 429 Too Many Requests`, `retry-after: <seconds>`, body `too many failed logins` |
 
@@ -111,7 +111,7 @@ Change a plugin table, then preview before applying it:
 
 ```console
 $ reiki --config /etc/reiki/reiki.toml reload --dry-run --token-file /etc/reiki/admin.token
-{"ok":true,"dry_run":true,"generation":0,"keys":1,"streams":1,"changed":["plugins phi,requestlog"],"restart_needed":[]}
+{"dry_run":true,"generation":0,"keys":1,"streams":1,"changed":["plugins phi,requestlog"],"restart_needed":[]}
 ```
 
 The test asserts `"dry_run":true`, `"generation":0` and `plugins phi,requestlog`; the key and stream counts here are illustrative. A preview applies nothing: `/v1/status` still reports `generation:0` and `last_reload:null`.

@@ -38,13 +38,13 @@ pub struct StreamJson {
     #[serde(default)]
     pub tokens: Vec<TokenJson>,
     #[serde(default)]
-    pub expiry: Option<u64>,
+    pub expires_at: Option<String>,
     #[serde(default)]
     pub rpm: UsageJson,
     #[serde(default)]
     pub concurrency: UsageJson,
     #[serde(default)]
-    pub last_used: Option<u64>,
+    pub last_used_at: Option<String>,
     #[serde(default)]
     pub state: String,
 }
@@ -105,7 +105,7 @@ impl LimitsJson {
 pub struct TokenJson {
     pub id: String,
     #[serde(default)]
-    pub expires_at: Option<u64>,
+    pub expires_at: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
 }
@@ -116,9 +116,14 @@ impl TokenJson {
         self.id.chars().take(8).collect()
     }
 
+    /// The expiry as Unix seconds, for comparisons against a caller-supplied clock.
+    pub fn expires_secs(&self) -> Option<u64> {
+        self.expires_at.as_deref().and_then(parse_instant)
+    }
+
     /// Whether this token can still be used at `now`.
     pub fn active_at(&self, now: u64) -> bool {
-        self.expires_at.is_none_or(|expires| expires > now)
+        self.expires_secs().is_none_or(|expires| expires > now)
     }
 
     /// A fixed label for the detail pane; expiry wins over a stale server-side label.
@@ -137,7 +142,7 @@ pub struct AuditJson {
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
-    pub time: String,
+    pub time_at: String,
     #[serde(default)]
     pub action: String,
     #[serde(default)]
@@ -214,6 +219,48 @@ pub fn usage_label(usage: &UsageJson) -> String {
         Some(limit) => format!("{}/{}", usage.current, limit),
         None => format!("{}/-", usage.current),
     }
+}
+
+/// Days since 1970-01-01 from a proleptic Gregorian date (the inverse of `civil_from_days`).
+fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// An RFC3339 UTC instant as Unix seconds. Malformed instants read as unknown.
+pub fn parse_instant(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number = |at: usize, len: usize| -> Option<i64> {
+        std::str::from_utf8(&bytes[at..at + len]).ok()?.parse().ok()
+    };
+    let (year, month, day) = (number(0, 4)?, number(5, 2)?, number(8, 2)?);
+    let (hour, minute, second) = (number(11, 2)?, number(14, 2)?, number(17, 2)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(secs).ok()
 }
 
 /// A short countdown such as `4h02m`, `12m05s` or `45s`.
@@ -379,8 +426,10 @@ impl StreamsAnswer {
             .map(|stream| {
                 let tokens = stream.tokens;
                 let expiry = stream
-                    .expiry
-                    .or_else(|| tokens.iter().filter_map(|token| token.expires_at).min());
+                    .expires_at
+                    .as_deref()
+                    .and_then(parse_instant)
+                    .or_else(|| tokens.iter().filter_map(|token| token.expires_secs()).min());
                 let state = if stream.state.is_empty() {
                     if stream.dynamic && tokens.is_empty() {
                         "revoked".to_owned()
@@ -397,7 +446,7 @@ impl StreamsAnswer {
                     expiry,
                     rpm: stream.rpm,
                     concurrency: stream.concurrency,
-                    last_used: stream.last_used,
+                    last_used: stream.last_used_at.as_deref().and_then(parse_instant),
                     state,
                     limits: stream.limits,
                     tokens,
@@ -412,7 +461,7 @@ impl StreamsAnswer {
                 .then_with(|| a.name.cmp(&b.name))
         });
         let mut audit = self.audit;
-        audit.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| b.time.cmp(&a.time)));
+        audit.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| b.time_at.cmp(&a.time_at)));
         StreamsView {
             enabled: self.enabled,
             rows,
@@ -441,33 +490,33 @@ mod tests {
                   "limits": {{"rpm": 30, "tpm": null, "concurrent": 2,
                     "daily_requests": null, "daily_tokens": null,
                     "monthly_requests": null, "monthly_tokens": null}},
-                  "tokens": [], "expiry": null,
+                  "tokens": [], "expires_at": null,
                   "rpm": {{"current": 1, "limit": 30}},
                   "concurrency": {{"current": 0, "limit": 2}},
-                  "last_used": 1000, "state": "active"
+                  "last_used_at": "1970-01-01T00:16:40Z", "state": "active"
                 }},
                 {{
                   "name": "busy", "dynamic": true,
                   "chain": ["zen"], "limits": {{"rpm": 10}},
                   "tokens": [
-                    {{"id": "abcdef1234567890", "expires_at": 1900, "state": "active"}},
-                    {{"id": "9999888877776666", "expires_at": 1200}}
+                    {{"id": "abcdef1234567890", "expires_at": "1970-01-01T00:31:40Z", "state": "active"}},
+                    {{"id": "9999888877776666", "expires_at": "1970-01-01T00:20:00Z"}}
                   ],
-                  "expiry": 1200,
+                  "expires_at": "1970-01-01T00:20:00Z",
                   "rpm": {{"current": 9, "limit": 10}},
                   "concurrency": {{"current": 2, "limit": 2}},
-                  "last_used": 1150, "state": "active",
+                  "last_used_at": "1970-01-01T00:19:10Z", "state": "active",
                   "hash": "not shown", "token": "{secret}"
                 }}
               ],
               "audit": [
-                {{"seq": 2, "time": "2026-11-23T00:01:00Z", "action": "token.add",
+                {{"seq": 2, "time_at": "2026-11-23T00:01:00Z", "action": "token.add",
                   "stream": "busy", "outcome": "success", "reason": "rotation",
                   "changes": [{{"field": "token.id", "from": "-", "to": "abcdef12"}}]}},
-                {{"seq": 1, "time": "2026-11-23T00:00:00Z", "action": "create",
+                {{"seq": 1, "time_at": "2026-11-23T00:00:00Z", "action": "create",
                   "stream": "busy", "outcome": "success", "reason": "new tenant",
                   "changes": []}},
-                {{"seq": 3, "time": "2026-11-23T00:02:00Z", "action": "create",
+                {{"seq": 3, "time_at": "2026-11-23T00:02:00Z", "action": "create",
                   "stream": "quiet", "outcome": "success", "reason": "earlier config",
                   "changes": []}}
               ]
@@ -548,7 +597,7 @@ mod tests {
         let view = StreamsView::from_json(
             r#"{"enabled":false,"streams":[{"name":"local","dynamic":false,
                  "chain":["zen"],"limits":{},"tokens":[],"rpm":{"current":0},
-                 "concurrency":{"current":0},"last_used":null,"state":"active",
+                 "concurrency":{"current":0},"last_used_at":null,"state":"active",
                  "token":"value-that-must-not-appear"}]}"#,
         )
         .expect("disabled answer parses");

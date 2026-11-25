@@ -214,7 +214,7 @@ async fn the_peer_token_works_nowhere_else() {
         "/v1/status",
         "/v1/openapi.json",
         "/v1/metrics",
-        "/v1/usage",
+        "/v1/usage/streams",
     ] {
         let res = rig
             .client
@@ -271,7 +271,7 @@ async fn every_other_path_and_method_on_the_peer_listener_is_404() {
         "/v1/status",
         "/v1/openapi.json",
         "/v1/metrics",
-        "/v1/usage",
+        "/v1/usage/streams",
         "/reload",
         "/__reiki/healthz",
         "/zen/chat/completions",

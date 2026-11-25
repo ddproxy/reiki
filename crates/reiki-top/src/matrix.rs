@@ -382,13 +382,14 @@ fn observed_upstreams(health: &Health) -> Vec<Upstream> {
             disabled_keys: disabled,
             cooling_combinations: 0,
             soonest_cooldown_seconds: if cooling > 0 {
-                entry.retry_after_seconds
+                entry.cooldown_seconds
             } else {
                 None
             },
             last_status_class: Some(entry.status_class.clone()),
             capacity_group: Some(format!("observed/{}", entry.account)),
             keys: None,
+            keys_truncated: false,
             requests_1h: None,
             limited_1h: None,
             request_buckets: None,
@@ -1404,7 +1405,7 @@ mod tests {
         let mut f = fleet();
         let doc = r#"{"instance":"x","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
             "observed":[{"upstream":"oauth","account":"alice","mode":"observed",
-            "status_class":"rate_limited","observed_at":"t","retry_after_seconds":20,
+            "status_class":"rate_limited","observed_at":"t","cooldown_seconds":20,
             "cooldown_class":"rate_limited","quota":{"requests_limit":100,"requests_remaining":0,
             "requests_reset_seconds":30,"tokens_limit":null,"tokens_remaining":null,
             "tokens_reset_seconds":null}}],"failures":{},"upstreams":[]}"#;

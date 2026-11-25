@@ -8,7 +8,8 @@
 - **Enum-like values are extensible.** Readers must ignore unknown `state`, `last_status_class`, `status_class`, `cooldown_class`, and similar enum-like values rather than rejecting the document.
 - **Optional means may be absent.** A field not listed as required may be omitted. Readers must not require optional fields.
 - **Nullability is explicit.** Fields typed as `integer|null`, `string|null`, `array|null`, or `object|null` may be null. `soonest_cooldown_seconds` is an integer >= 1 or null; `0` is never published for a cooling wait.
-- **Units are explicit.** Time durations named `*_seconds` are seconds. `*_at`/`observed_at` are RFC3339 UTC timestamps. `age_seconds` is the age of figures when sent; readers add their own time since receipt for freshness.
+- **Units are explicit.** Time durations named `*_seconds` are integer seconds; instants named `*_at` are RFC3339 UTC strings. `cooldown_seconds` is the remaining wait for one key or observed upstream, and `soonest_cooldown_seconds` is the soonest wait across a key set. `age_seconds` is the age of figures when sent; readers add their own time since receipt for freshness.
+- **Arrays are bounded.** `upstreams` has at most 64 entries (`upstreams_truncated`), each `keys` array at most 256 (`keys_truncated`), `observed` at most 256 (`observed_truncated`), `host.disks` at most 4 (`disks_truncated`), and `sessions.streams` at most 256 (`streams_truncated`). The matching `*_truncated` flag is always present and true when entries were omitted; OpenAPI declares the same `maxItems`.
 - **Version negotiation.** Readers should use capability/field presence, not strict version pinning. `reiki_version` identifies the publisher; unknown fields and enum-like values must remain readable across versions.
 
 ## Required top-level fields

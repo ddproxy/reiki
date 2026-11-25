@@ -249,7 +249,7 @@ async fn plugin_budget_refusal_uses_the_gateway_429_path() {
     assert_eq!(refused.status(), 429);
     assert_eq!(refused.headers()["retry-after"], "60");
     let body: serde_json::Value = serde_json::from_str(&refused.text().await.unwrap()).unwrap();
-    assert_eq!(body["error"]["type"], "budget_monthly");
+    assert_eq!(body["error"]["code"], "budget_monthly");
     assert_eq!(body["error"]["message"], "monthly cost budget exceeded");
 
     // A stream without a budget still goes through the normal path.

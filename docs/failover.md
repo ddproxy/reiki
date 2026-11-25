@@ -124,7 +124,7 @@ Replaying a non-idempotent request could duplicate a side effect, so Reiki does 
 | --- | --- |
 | `reiki keys` | Per key: `ok`, `cooling` or `disabled`, cooldown seconds, last status, streams. See [cli](cli.md). |
 | `reiki keys --json` | Adds a `scopes` array for keys with cooling combinations. |
-| `GET /v1/status` (admin) | `keys[].state` is `available`, `cooling` or `out_of_rotation`. Also `retry_after_seconds`, `cooldown_class`, `consecutive_failures`, `last_status_code` and `scopes`. See [monitoring](monitoring.md). |
+| `GET /v1/status` (admin) | `keys[].state` is `available`, `cooling` or `out_of_rotation`. Also `cooldown_seconds`, `cooldown_class`, `consecutive_failures`, `last_status_code` and `scopes`. See [monitoring](monitoring.md). |
 | `reiki top` | Live view of cooldowns and failures. See [top](top.md). |
 | `/v1/metrics` | `reiki_cooldowns_total{key,class,scope}` and `reiki_failovers_total{stream,key,class}`. Needs the `metrics` plugin. |
 | Log | `upstream key failed` (with class, status, whether it cooled and seconds remaining), `request needs more than this key can afford, trying the next key`, `falling back`, `key refused this request, trying the next key`, and `not replaying a non-idempotent request`. |

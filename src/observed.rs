@@ -76,7 +76,7 @@ impl From<ObservedQuota> for QuotaSnapshot {
     }
 }
 
-/// One published observed entry. `retry_after_seconds` is the remaining wait when read, not a
+/// One published observed entry. `cooldown_seconds` is the remaining wait when read, not a
 /// value copied from the upstream's own (possibly skewed) clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ObservedEntry {
@@ -85,7 +85,7 @@ pub(crate) struct ObservedEntry {
     pub(crate) mode: &'static str,
     pub(crate) status_class: &'static str,
     pub(crate) observed_at: String,
-    pub(crate) retry_after_seconds: Option<u64>,
+    pub(crate) cooldown_seconds: Option<u64>,
     pub(crate) cooldown_class: Option<&'static str>,
     pub(crate) quota: QuotaSnapshot,
 }
@@ -98,7 +98,7 @@ impl From<&ObservedEntry> for reiki_health::ObservedUpstream {
             mode: entry.mode.to_owned(),
             status_class: entry.status_class.to_owned(),
             observed_at: entry.observed_at.clone(),
-            retry_after_seconds: entry.retry_after_seconds,
+            cooldown_seconds: entry.cooldown_seconds,
             cooldown_class: entry.cooldown_class.map(str::to_owned),
             quota: reiki_health::ObservedQuota {
                 requests_limit: entry.quota.requests_limit,
@@ -163,7 +163,7 @@ impl ObservedStore {
             mode: "observed",
             status_class: class,
             observed_at: crate::reload::rfc3339(now),
-            retry_after_seconds: remaining,
+            cooldown_seconds: remaining,
             cooldown_class: cooldown,
             quota: quota.into(),
         };
@@ -191,7 +191,7 @@ impl ObservedStore {
             .values()
             .map(|stored| {
                 let mut entry = stored.entry.clone();
-                entry.retry_after_seconds = stored.retry_after_until.and_then(|until| {
+                entry.cooldown_seconds = stored.retry_after_until.and_then(|until| {
                     until
                         .duration_since(now)
                         .ok()
@@ -208,7 +208,7 @@ impl ObservedStore {
         self.snapshot_at(now)
             .into_iter()
             .filter_map(|entry| {
-                let seconds = entry.retry_after_seconds?;
+                let seconds = entry.cooldown_seconds?;
                 Some(reiki_plugin::ObservedCooldown {
                     upstream: entry.upstream,
                     account: entry.account,
@@ -252,7 +252,7 @@ mod tests {
         let entries = store.snapshot_at(now);
         assert_eq!(entries.len(), 1, "one account per upstream has one entry");
         assert_eq!(entries[0].status_class, RATE_LIMITED);
-        assert_eq!(entries[0].retry_after_seconds, Some(30));
+        assert_eq!(entries[0].cooldown_seconds, Some(30));
         assert_eq!(entries[0].quota.requests_remaining, Some(0));
         assert_eq!(entries[0].mode, "observed");
     }

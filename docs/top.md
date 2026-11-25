@@ -52,7 +52,7 @@ reiki top --interval 2    # redraw every two seconds instead of every second
 │  peer-c  zen  ◐ cooling  [▅▅▅░░]  45s  last 429                   │
 ╰───────────────────────────────────────────────────────────────────╯
 ╭Requests · fleet · req/interval─────╮╭Keys─────────────────────────╮
-│■ zen 12  ■ openrouter 3  ■ worklog 1  ││ healthy cooling disab  │
+│■ zen 12  ■ openrouter 3  ■ sample1 1  ││ healthy cooling disab  │
 │20                                     ││                        │
 │   ●───────────────────────────────●   ││                        │
 │0  ■                               ▲   ││                        │
@@ -66,7 +66,7 @@ reiki top --interval 2    # redraw every two seconds instead of every second
 - The Peers panel holds the matrix. Its first line is the fleet line described below.
 - The Cooling panel appears only while some fresh peer has a cooling key. It lists the same lines `--once` prints, without its title.
 - The chart row appears at 28 rows or more, and only while no peer detail is open. Its rows are 10, borders included. `m` cycles load, disk, sessions and requests; the chart follows the selected row, so `ALL` (the default) shows the fleet and a peer row shows only that peer. The right panel counts keys by state across the fleet: healthy, cooling and disabled. Fresh peers only; every provider counts.
-- The Requests chart draws one coloured line per upstream, including credential upstreams such as `worklog` and `forgejo`, in provider-column order. The legend shows the latest value per upstream: `■ zen 12  ■ openrouter 3  ■ worklog 1`, clipped to the panel width. The title carries the unit (`req/interval`); the X axis is labelled from the real sample interval and point count (`-12m` on the left, `now` on the right), and the Y axis starts at `0` and ends at a rounded step. An all-zero series sits on the baseline. `s` toggles between overlaid lines and a stacked total. While Requests is selected, `u` also cycles the chart series requests, limited and tokens.
+- The Requests chart draws one coloured line per upstream, including credential upstreams such as `sample1` and `sample2`, in provider-column order. The legend shows the latest value per upstream: `■ zen 12  ■ openrouter 3  ■ sample1 1`, clipped to the panel width. The title carries the unit (`req/interval`); the X axis is labelled from the real sample interval and point count (`-12m` on the left, `now` on the right), and the Y axis starts at `0` and ends at a rounded step. An all-zero series sits on the baseline. `s` toggles between overlaid lines and a stacked total. While Requests is selected, `u` also cycles the chart series requests, limited and tokens.
 - The chart uses twelve one-minute points when any fresh peer publishes them, otherwise twelve five-minute buckets from the last hour. Stale peers are excluded, and a fleet chart that is missing peers adds `fleet N of M fresh` to its title.
 - The footer shows chips: `[■ detail]` or `[□ detail]` for the peer card, `[req 1h]` for the gauge, `[chart: <metric>]`, `[filter: <provider>]` when a filter is set, and `[paused]`. With the Requests chart it also shows `[stack]` when the stacked total is on and `[series: <metric>]` for the chart series.
 - `?` opens the key list over the screen. The next key closes it; Ctrl-C still quits.

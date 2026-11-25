@@ -1099,6 +1099,7 @@ mod tests {
         ] {
             assert!(!t.reachable(&addr.parse().unwrap()), "{addr}");
         }
+        // The private literal is intentional: it exercises the private-address policy.
         for addr in [
             "93.184.216.34:443",
             "10.0.0.5:443",
@@ -1128,6 +1129,7 @@ mod tests {
 
     #[test]
     fn private_ip_covers_benchmarking_6to4_and_teredo_forms() {
+        // Private literals are intentional: this test defines the private-address policy.
         let private = |text: &str| private_ip(text.parse().unwrap());
         assert!(private("198.18.0.1") && private("198.19.255.1") && private("192.0.0.8"));
         assert!(!private("198.20.0.1") && !private("8.8.8.8"));
@@ -1143,6 +1145,7 @@ mod tests {
     fn deny_private_refuses_the_local_network_but_not_the_internet() {
         let open = tunnel(&["*"]);
         let closed = tunnel_with(&["*"], true);
+        // Private-range literals are intentional: this test defines the refusal policy.
         let private = [
             "10.0.0.5:443",
             "172.16.1.1:443",

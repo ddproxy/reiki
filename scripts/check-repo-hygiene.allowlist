@@ -1,0 +1,4 @@
+# Justified exceptions: path and exact match, one per line.
+# Config table names below are not hostnames.
+src/config.rs peers.local
+tests/stream_admin.rs peers.local

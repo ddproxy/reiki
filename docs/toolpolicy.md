@@ -16,7 +16,7 @@ The plugin reads the request to learn two things: the tools the harness declared
 | `container_escape` | high | `unshare`, `nsenter`, `chroot` or `mount --bind`. |
 | `proxy_bypass` | medium | Proxy variables, `--noproxy`, `*_BASE_URL` overrides or `unset` of proxy settings. |
 | `credential_file` | high | Known credential paths such as `~/.ssh`, `.git-credentials`, `.npmrc`, `.aws/credentials`, `.password-store` or `/etc/reiki`. |
-| `self_protection` | high | Text that would stop, kill, reload or reconfigure Reiki or `toolgate`. |
+| `self_protection` | high | Text that would stop, kill, reload or reconfigure Reiki or a protected helper tool. |
 
 Arguments are checked as written and again after shell quote removal, so `c''url` and `uns\\hare` are not hidden by splitting. Hosts are read from URLs, bare IPv4/IPv6 addresses, bracketed IPv6 with a port, and host-shaped words after a network command. An allow-list entry is a suffix match: `example.org` allows `docs.example.org` and `example.org` but not `evil-example.org`. The default allow-list is empty.
 

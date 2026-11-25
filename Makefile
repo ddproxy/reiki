@@ -1,4 +1,4 @@
-.PHONY: help build install uninstall test test-scripts lint check docs-check ci du clean clean-debug clean-release clean-stale
+.PHONY: help build install uninstall test test-scripts hygiene lint check docs-check ci du clean clean-debug clean-release clean-stale
 
 # root installs to /usr/local, anyone else to ~/.local; override with PREFIX=
 PREFIX ?= $(if $(filter 0,$(shell id -u)),/usr/local,$(HOME)/.local)
@@ -42,10 +42,17 @@ test: test-scripts ## workspace tests, default and top features
 check:  ## compile every target without running tests
 	cargo check --workspace --all-targets --locked
 
+hygiene:  ## reject internal hostnames and domains in tracked files
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 scripts/check-repo-hygiene.py; \
+	else \
+		echo "python3 not found; skipping repo hygiene check"; \
+	fi
+
 docs-check:  ## validate documented config examples, CLI flags and links
 	cargo test --locked --test docs_examples
 
-ci: check lint test docs-check  ## everything CI runs
+ci: check lint hygiene test docs-check  ## everything CI runs
 
 du:  ## show target/ size breakdown (debug/release/musl), biggest first
 	@du -sh target/* 2>/dev/null | sort -rh || echo "no target/ yet"

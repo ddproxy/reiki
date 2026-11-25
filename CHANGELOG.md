@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Public-repo hygiene: examples and tests use documentation IP ranges and neutral upstream names. Private literals remain only in the tunnel policy tests, each with a one-line comment explaining why. A tracked-file check rejects internal hostnames and domains, with justified exceptions in an allowlist, and runs in CI. No behavior, wire format or stored value changed.
 - At startup, before binding listeners, Reiki probes the state directory (the parent of `<config>.state`) and, when `[log] file` is configured, the log directory by creating, writing a few KB to, and removing a uniquely named temp file in the same directory. With `[gateway] on_store_error = "closed"` (default) a state directory probe failure exits with a message naming the path and the OS error; with `"open"` Reiki logs one `WARN` and continues. A log directory probe failure never stops startup: Reiki logs one `WARN` and disables the log file for that run. No files are created outside the configured paths and no probe file is left behind. Operators with an unwritable state or log directory must fix permissions or free space, or set `[gateway] on_store_error = "open"` before upgrading. See [operations](docs/operations.md#startup-checks).
 
 ## 0.15.1

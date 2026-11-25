@@ -128,6 +128,7 @@ fn self_protection(text: &str) -> bool {
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
         .filter(|w| !w.is_empty())
         .collect();
+    // One legacy helper-tool name stays in the matcher for behaviour compatibility.
     let target = words
         .iter()
         .any(|w| w.eq_ignore_ascii_case("reiki") || w.eq_ignore_ascii_case("toolgate"));
@@ -401,6 +402,7 @@ mod tests {
             "cat .git-credentials",
             "cat /etc/reiki/config.toml",
             "systemctl stop reiki",
+            // The legacy matcher target is intentional here; it is not an example tool name.
             "pkill -f toolgate",
         ] {
             let found = rules("run", args);

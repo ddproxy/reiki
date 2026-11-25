@@ -1669,7 +1669,7 @@ mod tests {
     fn the_all_view_sums_providers_into_a_fleet_chart_and_opens_fleet_detail() {
         let now = Instant::now();
         let mut fleet = fleet();
-        let usage = |name: &str, zen: &str, worklog: &str| {
+        let usage = |name: &str, zen: &str, sample1: &str| {
             format!(
                 r#"{{"instance":"{name}","reiki_version":"0.10.3","observed_at":"t","age_seconds":0,
                     "observed" : [],
@@ -1679,11 +1679,11 @@ mod tests {
                       "requests_1h":10,"limited_1h":2,"request_buckets":[0,0,0,0,0,0,0,0,0,0,1,9],
                       "tokens_1h":10,"token_buckets":[0,0,0,0,0,0,0,0,0,0,1,9],
                       "request_minutes":{zen},"token_minutes":{zen}}},
-                    {{"name":"worklog","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
+                    {{"name":"sample1","healthy_keys":1,"cooling_keys":0,"disabled_keys":0,
                       "cooling_combinations":0,"soonest_cooldown_seconds":null,"last_status_class":"2xx",
                       "requests_1h":3,"limited_1h":1,"request_buckets":[0,0,0,0,0,0,0,0,0,0,0,3],
                       "tokens_1h":3,"token_buckets":[0,0,0,0,0,0,0,0,0,0,0,3],
-                      "request_minutes":{worklog},"token_minutes":{worklog}}}]}}"#
+                      "request_minutes":{sample1},"token_minutes":{sample1}}}]}}"#
             )
         };
         apply_feed(
@@ -1754,7 +1754,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            ["worklog", "zen"]
+            ["sample1", "zen"]
         );
         assert_eq!(parts.chart_series[0].points[11], Some(3.0));
         assert!(

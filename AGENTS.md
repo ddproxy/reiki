@@ -12,6 +12,7 @@ Run these from the repository root. Rust 1.99 or newer is required. `make help` 
 | `make check` | `cargo check --workspace --all-targets --locked`. |
 | `make test` | Version script tests (when `python3` is present) and workspace tests with default features and with `--features top`. |
 | `make test-scripts` | Version script tests; skipped locally without `python3`, always run in CI. |
+| `make hygiene` | Tracked-file check for internal hostnames and domains, with justified exceptions in `scripts/check-repo-hygiene.allowlist`; skipped locally without `python3`. |
 | `make lint` | `cargo fmt --all --check` and clippy for all targets with `-D warnings`, default and `top`. |
 | `make docs-check` | `cargo test --locked --test docs_examples`: validates documented config examples, CLI flags and links, and runs the quickstart against a throwaway instance. |
 | `make ci` | All of the above. |
@@ -33,7 +34,7 @@ Optional checks when the tools are installed: `cargo deny check`, `vale --config
 | `crates/reiki-*` | Plugin API and built-in plugins: detect, phi, finance, controlled, placeholders, requestlog, metrics, toolpolicy, cost, wasm, health, top. |
 | `docs/`, `README.md`, `CHANGELOG.md` | User documentation and release notes; `docs/README.md` is the index. |
 | `tests/`, `tests/golden/` | Integration tests and golden admin documents; `tests/docs_examples.rs` checks documentation. |
-| `scripts/check-workflows/`, `scripts/set-release-version.py`, `scripts/tests/` | Workflow policy checker and release version validation with unit tests. |
+| `scripts/check-workflows/`, `scripts/set-release-version.py`, `scripts/check-repo-hygiene.py`, `scripts/tests/` | Workflow policy checker, release version validation and tracked-file hygiene check with unit tests. |
 | `.github/workflows/` | CI, stable release (tag push) and dev release (tags, then dispatches the release workflow on the tag ref, which also prunes old dev pre-releases), CodeQL, audit, fuzz and docs checks. |
 
 ## Conventions
@@ -43,6 +44,7 @@ Optional checks when the tools are installed: `cargo deny check`, `vale --config
 - Stable vocabulary: "stream" is a tenant, "key" is a provider credential, "chain" is a list of keys. Do not alternate between words such as "suspicious" and "WARN" for one finding class.
 - Every command, flag, default and limit in docs is verified against `src/main.rs` or `src/config.rs`. Every config snippet must pass `reiki --config FILE check`. `make docs-check` enforces this for the documented examples.
 - No secret-shaped literals in docs or tests. Use obvious placeholders such as `<64 hex from the admin token>` and generate values at runtime. The controller scrubs patches, so a plausible-looking token mangles the diff.
+- Examples and tests use documentation IP ranges and neutral upstream names. Keep a private literal only where a test exercises private-address policy, and say so in a one-line comment.
 - Commit messages are terse and describe the change. Do not put job names, ticket IDs or personal names in commits or release notes.
 - Behavior changes need a CHANGELOG entry under the correct `Added`, `Changed`, `Fixed`, `Security` or `Removed` heading and an upgrade note when an operator must act. This docs job does not bump the Cargo version.
 
